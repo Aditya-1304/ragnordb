@@ -1,0 +1,13 @@
+[package]
+name = "ragnordb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ragnordb"
+path = "src/main.rs"
+
+[dependencies]
+ragnordb-server = { path = "../ragnordb-server" }

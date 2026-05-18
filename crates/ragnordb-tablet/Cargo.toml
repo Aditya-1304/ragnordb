@@ -1,0 +1,11 @@
+[package]
+name = "ragnordb-tablet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ragnordb-common = { path = "../ragnordb-common" }
+ragnordb-storage = { path = "../ragnordb-storage" }
+ragnordb-txn = { path = "../ragnordb-txn" }

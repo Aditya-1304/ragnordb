@@ -1,6 +1,25 @@
-[package]
-name = "ragnordb"
+[workspace]
+resolver = "3"
+members = [
+    "crates/ragnordb-common",
+    "crates/ragnordb-sql",
+    "crates/ragnordb-catalog",
+    "crates/ragnordb-txn",
+    "crates/ragnordb-tablet",
+    "crates/ragnordb-storage",
+    "crates/ragnordb-multiraft",
+    "crates/ragnordb-server",
+    "crates/ragnordb-cli",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/Aditya-1304/ragnordb"
 
-[dependencies]
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

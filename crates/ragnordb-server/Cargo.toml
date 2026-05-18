@@ -1,0 +1,13 @@
+[package]
+name = "ragnordb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ragnordb-catalog = { path = "../ragnordb-catalog" }
+ragnordb-common = { path = "../ragnordb-common" }
+ragnordb-multiraft = { path = "../ragnordb-multiraft" }
+ragnordb-sql = { path = "../ragnordb-sql" }
+ragnordb-tablet = { path = "../ragnordb-tablet" }

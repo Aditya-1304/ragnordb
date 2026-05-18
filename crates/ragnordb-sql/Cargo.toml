@@ -1,0 +1,10 @@
+[package]
+name = "ragnordb-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ragnordb-common = { path = "../ragnordb-common" }
+ragnordb-catalog = { path = "../ragnordb-catalog" }
