@@ -1,0 +1,32 @@
+syntax = "proto3";
+package ragnordb.ids;
+
+message NodeId {
+    uint64 id = 1;
+}
+
+message TabletId {
+    uint64 id = 1;
+}
+
+message TableId {
+    uint64 id = 1;
+}
+
+message TxnId {
+    uint64 id = 1;
+}
+
+message Timestamp {
+    uint64 id = 1;
+}
+
+message RaftGroupId {
+    uint64 id = 1;
+}
+
+message RequestId {
+    bytes client_id = 1; // this will be u128 as 16 bytes
+    uint64 sequence = 2;
+}
+

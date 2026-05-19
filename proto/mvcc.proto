@@ -1,0 +1,42 @@
+syntax = "proto3";
+package ragnordb.mvcc;
+
+import "ids.proto";
+
+enum WriteKind {
+    WRITE_KIND_UNSPECIFIED = 0;
+    WRITE_KIND_PUT = 1;
+    WRITE_KIND_DELETE = 2;
+    WRITE_KIND_ROLLBACK = 3;
+}
+
+message LockRecord {
+    ragnordb.ids.TxnId txn_id = 1;
+    bytes primary_key = 2;
+    ragnordb.ids.Timestamp start_timestamp = 3;
+    uint64 ttl_ms = 4;
+    WriteKind op = 5;
+}
+
+message WriteRecord {
+    ragnordb.ids.Timestamp start_timestamp = 1;
+    ragnordb.ids.Timestamp commit_timestamp = 2;
+    WriteKind op = 3;
+}
+
+message TxnStatusRecord {
+  ragnordb.ids.TxnId txn_id = 1;
+  ragnordb.ids.Timestamp start_timestamp = 2;
+  ragnordb.ids.Timestamp commit_timestamp = 3;
+  TxnStatus status = 4;
+  bytes primary_key = 5;
+  repeated uint64 participant_tablet_ids = 6;
+  ragnordb.ids.Timestamp last_heartbeat_timestamp = 7;
+}
+
+enum TxnStatus {
+  TXN_STATUS_UNSPECIFIED = 0;
+  TXN_STATUS_PENDING = 1;
+  TXN_STATUS_COMMITTED = 2;
+  TXN_STATUS_ABORTED = 3;
+}

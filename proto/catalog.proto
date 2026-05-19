@@ -1,0 +1,27 @@
+syntax = "proto3";
+package ragnordb.catalog;
+
+import "ids.proto";
+
+enum DataType {
+    DATA_TYPE_UNSPECIFIED = 0;
+    DATA_TYPE_INT = 1;
+    DATA_TYPE_TEXT = 2;
+    DATA_TYPE_BOOL = 3;
+}
+
+message ColumnDefinition {
+    uint64 column_id = 1;
+    string name = 2;
+    DataType type = 3;
+    bool nullable = 4;
+}
+
+message TableDefinition {
+    uint64 table_id = 1;
+    string name = 2;
+    repeated ColumnDefinition columns = 3;
+    repeated uint64 primary_key_column_ids = 4;
+    uint64 schema_version = 5;
+    uint32 tablet_count = 6;
+}

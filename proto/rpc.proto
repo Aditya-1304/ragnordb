@@ -1,0 +1,77 @@
+syntax = "proto3";
+package ragnordb.rpc;
+
+import "ids.proto";
+import "command.proto";
+
+enum MessageType {
+    MESSAGE_TYPE_UNSPECIFIED = 0;
+    MESSAGE_TYPE_RAFT_CONSENSUS = 1;
+    MESSAGE_TYPE_TABLET_COMMAND_REQUEST = 2;
+    MESSAGE_TYPE_TABLET_COMMAND_RESPONSE = 3;
+    MESSAGE_TYPE_METADATA_REQUEST = 4;
+    MESSAGE_TYPE_METADATA_RESPONSE = 5;
+}
+
+message RpcFrame {
+    MessageType msg_type = 1;
+    ragnordb.ids.RaftGroupId raft_group_id = 2;
+    bytes payload = 3;
+}
+
+message TabletCommandRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.command.TabletCommand command = 2;
+}
+
+message TabletCommandResponse {
+    ragnordb.ids.RequestId request_id = 1;
+    bool success = 2;
+    string error_message = 3;
+    string error_code = 4;
+    bool retryable = 5;
+    bytes result_data = 6;
+}
+
+message MetadataRequest {
+    oneof request {
+        AllocateTimestampRequest allocate_timestamp = 1;
+        LookupTabletRequest lookup_tablet = 2;
+        LookupSchemaRequest lookup_schema = 3;
+    }
+}
+
+message AllocateTimestampRequest {
+}
+
+message LookupTabletRequest {
+    uint64 table_id = 1;
+    bytes key = 2;
+}
+
+message LookupSchemaRequest {
+    uint64 table_id = 1;
+}
+
+message MetadataResponse {
+    oneof response {
+        AllocateTimestampResponse allocate_timestamp = 1;
+        LookupTabletResponse lookup_tablet = 2;
+        LookupSchemaResponse lookup_schema = 3;
+    }
+}
+
+message AllocateTimestampResponse {
+    ragnordb.ids.Timestamp timestamp = 1;
+}
+
+message LookupTabletResponse {
+    ragnordb.ids.TabletId tablet_id = 1;
+    ragnordb.ids.NodeId leader_id = 2;
+    repeated ragnordb.ids.NodeId replica_ids = 3;
+}
+
+message LookupSchemaResponse {
+    bytes schema_bytes = 1;
+    uint64 schema_version = 2;
+}

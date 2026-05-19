@@ -1,0 +1,24 @@
+syntax = "proto3";
+package ragnordb.row;
+
+message Value {
+    oneof kind {
+        int64 int_value = 1;
+        string text_value = 2;
+        bool bool_value = 3;
+        NullValue null_value = 4;
+    }
+}
+
+enum NullValue {
+    NULL = 0;
+}
+
+message Row {
+    repeated Value values = 1;
+}
+
+message RowKey {
+    bytes table_id_bytes = 1; // TableId encoded bytes 
+    bytes primary_key_bytes = 2; // primary key encoded bytes
+}

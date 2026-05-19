@@ -1,0 +1,76 @@
+syntax = "proto3";
+package ragnordb.command;
+
+import "ids.proto";
+import "row.proto";
+import "mvcc.proto";
+import "catalog.proto";
+
+message TabletCommand {
+    oneof command {
+        PrewriteCommand commit = 2;
+        CommitCommand commit = 2;
+        RollbackCommand rollback = 3;
+        SingleShardCommitCommand single_shard_commit = 4;
+        ResolveIntentCommand resolve_intent = 5;
+        CatalogCommand catalog_update = 6;
+        NoopCommand noop = 7;
+    }
+}
+
+message PrewriteCommand {
+    ragnordb.ids.TxnId txn_id = 1;
+    ragnordb.ids.Timestamp start_timestamp = 2;
+    bytes key = 3;
+    ragnordb.row.Value value = 4;
+    bytes primary_key = 5;
+    ragnordb.mvcc.WriteKind op = 6;
+    uint64 ttl_ms = 7;
+}
+
+message CommitCommand {
+    ragnordb.ids.TxnId txn_id = 1;
+    ragnordb.ids.Timestamp start_timestamp = 2;
+    ragnordb.ids.Timestamp commit_timestamp = 3;
+    bytes key = 4;
+}
+
+message RollbackCommand {
+    ragnordb.ids.TxnId txn_id = 1;
+    ragnordb.ids.Timestamp start_timestamp = 2;
+    bytes key = 3;
+}
+
+message SingleShardCommitCommand {
+    ragnordb.ids.TxnId txn_id = 1;
+    ragnordb.ids.Timestamp start_timestamp = 2;
+    ragnordb.ids.Timestamp commit_timestamp = 3;
+    repeated WriteEntry writes = 4;
+}
+
+message WriteEntry {
+    bytes key = 1;
+    ragnordb.row.Value value = 2;
+    ragnordb.mvcc.WriteKind op = 3;
+}
+
+message ResolveIntentCommand {
+    ragnordb.ids.TxnId txn_id = 1;
+    ragnordb.ids.Timestamp start_ts = 2;
+    bytes key = 3;
+    ragnordb.mvcc.TxnStatus resolved_status = 4;
+    ragnordb.ids.Timestamp commit_ts = 5;
+}
+
+message CatalogCommand {
+    oneof operation {
+        CreateTableOperation create_table = 1;
+    }
+}
+
+message CreateTableOperation {
+    ragnordb.catalog.TableDef table_def = 1;
+}
+
+message NoopCommand {
+}
