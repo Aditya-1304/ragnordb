@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
+wal.workspace = true
+bloom-bloom.workspace = true

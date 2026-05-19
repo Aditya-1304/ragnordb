@@ -8,3 +8,5 @@ repository.workspace = true
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
+raft.workspace = true
+wal.workspace = true

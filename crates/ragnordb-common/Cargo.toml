@@ -8,3 +8,8 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+raft.workspace = true
+wal.workspace = true
+bloom-bloom.workspace = true
