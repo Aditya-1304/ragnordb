@@ -23,6 +23,8 @@ anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prost = "0.13"
+prost-build = "0.13"
 
 raft = { path = "../Papers/raft" }
 wal = { path = "../wal" }

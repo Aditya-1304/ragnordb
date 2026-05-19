@@ -8,6 +8,10 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
 
 [dev-dependencies]
 raft.workspace = true
