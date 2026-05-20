@@ -1,12 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = "../..proto";
+    let proto_dir = "../../proto";
     let protos = &[
-        "proto/ids.proto",
-        "proto/row.proto",
-        "proto/catalog.proto",
-        "proto/mvcc.proto",
-        "proto/command.proto",
-        "proto/rpc.proto",
+        "../../proto/ids.proto",
+        "../../proto/row.proto",
+        "../../proto/catalog.proto",
+        "../../proto/mvcc.proto",
+        "../../proto/command.proto",
+        "../../proto/rpc.proto",
     ];
 
     std::fs::create_dir_all("src/proto")?;

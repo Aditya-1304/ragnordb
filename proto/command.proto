@@ -8,7 +8,7 @@ import "catalog.proto";
 
 message TabletCommand {
     oneof command {
-        PrewriteCommand commit = 2;
+        PrewriteCommand prewrite = 1;
         CommitCommand commit = 2;
         RollbackCommand rollback = 3;
         SingleShardCommitCommand single_shard_commit = 4;
@@ -69,7 +69,7 @@ message CatalogCommand {
 }
 
 message CreateTableOperation {
-    ragnordb.catalog.TableDef table_def = 1;
+    ragnordb.catalog.TableDefinition table_def = 1;
 }
 
 message NoopCommand {

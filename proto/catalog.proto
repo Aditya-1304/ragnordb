@@ -18,7 +18,7 @@ message ColumnDefinition {
 }
 
 message TableDefinition {
-    uint64 table_id = 1;
+    ragnordb.ids.TableId table_id = 1;
     string name = 2;
     repeated ColumnDefinition columns = 3;
     repeated uint64 primary_key_column_ids = 4;
