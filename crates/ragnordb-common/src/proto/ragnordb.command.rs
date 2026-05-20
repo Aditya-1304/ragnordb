@@ -86,13 +86,13 @@ pub struct ResolveIntentCommand {
     #[prost(message, optional, tag = "1")]
     pub txn_id: ::core::option::Option<super::ids::TxnId>,
     #[prost(message, optional, tag = "2")]
-    pub start_ts: ::core::option::Option<super::ids::Timestamp>,
+    pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
     #[prost(bytes = "vec", tag = "3")]
     pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "super::mvcc::TxnStatus", tag = "4")]
     pub resolved_status: i32,
     #[prost(message, optional, tag = "5")]
-    pub commit_ts: ::core::option::Option<super::ids::Timestamp>,
+    pub commit_timestamp: ::core::option::Option<super::ids::Timestamp>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CatalogCommand {
@@ -110,7 +110,7 @@ pub mod catalog_command {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateTableOperation {
     #[prost(message, optional, tag = "1")]
-    pub table_def: ::core::option::Option<super::catalog::TableDefinition>,
+    pub table_definition: ::core::option::Option<super::catalog::TableDefinition>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct NoopCommand {}

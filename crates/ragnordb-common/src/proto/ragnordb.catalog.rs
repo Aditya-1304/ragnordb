@@ -12,8 +12,8 @@ pub struct ColumnDefinition {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableDefinition {
-    #[prost(message, optional, tag = "1")]
-    pub table_id: ::core::option::Option<super::ids::TableId>,
+    #[prost(uint64, tag = "1")]
+    pub table_id: u64,
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]

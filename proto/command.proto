@@ -56,10 +56,10 @@ message WriteEntry {
 
 message ResolveIntentCommand {
     ragnordb.ids.TxnId txn_id = 1;
-    ragnordb.ids.Timestamp start_ts = 2;
+    ragnordb.ids.Timestamp start_timestamp = 2;
     bytes key = 3;
     ragnordb.mvcc.TxnStatus resolved_status = 4;
-    ragnordb.ids.Timestamp commit_ts = 5;
+    ragnordb.ids.Timestamp commit_timestamp = 5;
 }
 
 message CatalogCommand {
@@ -69,7 +69,7 @@ message CatalogCommand {
 }
 
 message CreateTableOperation {
-    ragnordb.catalog.TableDefinition table_def = 1;
+    ragnordb.catalog.TableDefinition table_definition = 1;
 }
 
 message NoopCommand {
