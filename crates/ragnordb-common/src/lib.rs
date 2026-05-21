@@ -3,6 +3,7 @@ pub mod codec;
 pub mod command_codec;
 pub mod ids;
 pub mod result;
+pub mod rpc_codec;
 
 pub mod proto {
     pub mod ids {
