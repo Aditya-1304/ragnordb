@@ -1,5 +1,6 @@
 pub mod catalog_codec;
 pub mod codec;
+pub mod command_codec;
 pub mod ids;
 pub mod result;
 
