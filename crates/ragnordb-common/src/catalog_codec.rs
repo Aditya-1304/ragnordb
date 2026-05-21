@@ -1,5 +1,6 @@
 use crate::proto::catalog;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefinition {
     pub column_id: u64,
     pub name: String,
@@ -55,6 +56,7 @@ impl ColumnDefinition {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableDefinition {
     pub table_id: u64,
     pub name: String,
@@ -90,5 +92,68 @@ impl TableDefinition {
             schema_version: proto.schema_version,
             tablet_count: proto.tablet_count,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_def_roundtrip() {
+        let col = ColumnDefinition {
+            column_id: 1,
+            name: "name".to_string(),
+            ty: DataType::Text,
+            nullable: false,
+        };
+
+        let proto = col.to_proto();
+        let decoded = ColumnDefinition::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.column_id, 1);
+        assert_eq!(decoded.name, "name");
+        assert!(matches!(decoded.ty, DataType::Text));
+        assert!(!decoded.nullable);
+    }
+
+    #[test]
+    fn table_def_roundtrip() {
+        let table = TableDefinition {
+            table_id: 100,
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    column_id: 1,
+                    name: "id".to_string(),
+                    ty: DataType::Int,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    column_id: 2,
+                    name: "name".to_string(),
+                    ty: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key_column_ids: vec![1],
+            schema_version: 1,
+            tablet_count: 4,
+        };
+
+        let proto = table.to_proto();
+        let decoded = TableDefinition::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.table_id, 100);
+        assert_eq!(decoded.name, "users");
+        assert_eq!(decoded.columns.len(), 2);
+        assert_eq!(decoded.primary_key_column_ids, vec![1]);
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.tablet_count, 4);
+    }
+
+    #[test]
+    fn data_type_unspecified_rejected() {
+        assert!(DataType::from_proto(catalog::DataType::Unspecified).is_err());
     }
 }

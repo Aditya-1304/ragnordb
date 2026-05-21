@@ -133,3 +133,85 @@ impl RequestId {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_id_roundtrip() {
+        let id = NodeId(42);
+        let decoded = NodeId::from_proto(id.to_proto());
+
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn tablet_id_roundtrip() {
+        let id = TabletId(99);
+        let decoded = TabletId::from_proto(id.to_proto());
+
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn raft_group_id_roundtrip() {
+        let id = RaftGroupId(7);
+        let decoded = RaftGroupId::from_proto(id.to_proto());
+
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn request_id_roundtrip() {
+        let id = RequestId {
+            client_id: u128::MAX,
+            sequence: 12345,
+        };
+
+        let decoded = RequestId::from_proto(id.to_proto()).unwrap();
+
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn request_id_invalid_client_id_length() {
+        let proto = crate::proto::ids::RequestId {
+            client_id: vec![1, 2, 3],
+            sequence: 0,
+        };
+
+        assert!(RequestId::from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn row_key_roundtrip() {
+        let key = RowKey {
+            table_id: TableId(5),
+            primary_key_bytes: vec![0, 0, 0, 1],
+        };
+
+        let decoded = RowKey::from_proto(key.to_proto()).unwrap();
+
+        assert_eq!(key, decoded);
+    }
+
+    #[test]
+    fn row_key_invalid_table_id_bytes() {
+        let proto = crate::proto::row::RowKey {
+            table_id_bytes: vec![1, 2, 3],
+            primary_key_bytes: vec![],
+        };
+
+        assert!(RowKey::from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn timestamp_ordering() {
+        let a = Timestamp(100);
+        let b = Timestamp(200);
+
+        assert!(a < b);
+        assert_eq!(Timestamp::from_proto(a.to_proto()), a);
+    }
+}

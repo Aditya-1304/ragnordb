@@ -1,6 +1,7 @@
 use crate::ids::{Timestamp, TxnId};
 use crate::proto::{mvcc, row};
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Text(String),
@@ -31,6 +32,7 @@ impl Value {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub values: Vec<Value>,
 }
@@ -52,6 +54,7 @@ impl Row {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct LockRecord {
     pub txn_id: TxnId,
     pub primary_key: Vec<u8>,
@@ -60,6 +63,7 @@ pub struct LockRecord {
     pub op: WriteKind,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct WriteRecord {
     pub start_timestamp: Timestamp,
     pub commit_timestamp: Timestamp,
@@ -138,6 +142,7 @@ impl WriteRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct TxnStatusRecord {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
@@ -201,5 +206,138 @@ impl TxnStatusRecord {
             participant_tablet_ids: proto.participant_tablet_ids,
             last_heartbeat_timestamp: proto.last_heartbeat_timestamp.map(Timestamp::from_proto),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::TxnId;
+
+    #[test]
+    fn value_int_roundtrip() {
+        let v = Value::Int(42);
+        let proto = v.to_proto();
+        let decoded = Value::from_proto(proto).unwrap();
+
+        assert!(matches!(decoded, Value::Int(42)));
+    }
+
+    #[test]
+    fn value_text_roundtrip() {
+        let v = Value::Text("hello".to_string());
+        let proto = v.to_proto();
+        let decoded = Value::from_proto(proto).unwrap();
+
+        assert!(matches!(decoded, Value::Text(ref s) if s == "hello"));
+    }
+
+    #[test]
+    fn value_bool_roundtrip() {
+        let v = Value::Bool(true);
+        let proto = v.to_proto();
+        let decoded = Value::from_proto(proto).unwrap();
+
+        assert!(matches!(decoded, Value::Bool(true)));
+    }
+
+    #[test]
+    fn value_null_roundtrip() {
+        let v = Value::Null;
+        let proto = v.to_proto();
+        let decoded = Value::from_proto(proto).unwrap();
+
+        assert!(matches!(decoded, Value::Null));
+    }
+
+    #[test]
+    fn row_roundtrip() {
+        let row = Row {
+            values: vec![
+                Value::Int(1),
+                Value::Text("Ada".to_string()),
+                Value::Bool(true),
+                Value::Null,
+            ],
+        };
+
+        let proto = row.to_proto();
+        let decoded = Row::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.values.len(), 4);
+        assert!(matches!(&decoded.values[0], Value::Int(1)));
+        assert!(matches!(&decoded.values[3], Value::Null));
+    }
+
+    #[test]
+    fn lock_record_roundtrip() {
+        let record = LockRecord {
+            txn_id: TxnId(99),
+            primary_key: b"/table/1/pk/1".to_vec(),
+            start_timestamp: Timestamp(100),
+            ttl_ms: 30_000,
+            op: WriteKind::Put,
+        };
+
+        let proto = record.to_proto();
+        let decoded = LockRecord::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.txn_id.0, 99);
+        assert_eq!(decoded.start_timestamp.0, 100);
+        assert_eq!(decoded.ttl_ms, 30_000);
+        assert!(matches!(decoded.op, WriteKind::Put));
+    }
+
+    #[test]
+    fn write_record_roundtrip() {
+        let record = WriteRecord {
+            start_timestamp: Timestamp(100),
+            commit_timestamp: Timestamp(105),
+            op: WriteKind::Delete,
+        };
+
+        let proto = record.to_proto();
+        let decoded = WriteRecord::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.start_timestamp.0, 100);
+        assert_eq!(decoded.commit_timestamp.0, 105);
+        assert!(matches!(decoded.op, WriteKind::Delete));
+    }
+
+    #[test]
+    fn txn_status_record_roundtrip() {
+        let record = TxnStatusRecord {
+            txn_id: TxnId(42),
+            start_timestamp: Timestamp(200),
+            commit_timestamp: Some(Timestamp(210)),
+            status: TxnStatus::Committed,
+            primary_key: b"/table/1/pk/1".to_vec(),
+            participant_tablet_ids: vec![1, 2, 3],
+            last_heartbeat_timestamp: Some(Timestamp(205)),
+        };
+
+        let proto = record.to_proto();
+        let decoded = TxnStatusRecord::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.txn_id.0, 42);
+        assert!(matches!(decoded.status, TxnStatus::Committed));
+        assert_eq!(decoded.participant_tablet_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn write_kind_unspecified_rejected() {
+        assert!(WriteKind::from_proto(mvcc::WriteKind::Unspecified).is_err());
+    }
+
+    #[test]
+    fn txn_status_unspecified_rejected() {
+        assert!(TxnStatus::from_proto(mvcc::TxnStatus::Unspecified).is_err());
+    }
+
+    #[test]
+    fn value_from_proto_none_rejected() {
+        let proto = row::Value { kind: None };
+
+        assert!(Value::from_proto(proto).is_err());
     }
 }
