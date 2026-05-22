@@ -11,3 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 ragnordb-server = { path = "../ragnordb-server" }
+clap ={ version = "4", features = ["derive"]}
+tokio ={ version = "1", features = ["full"]}
