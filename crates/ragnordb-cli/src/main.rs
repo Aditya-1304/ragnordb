@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use ragnordb_common::ids::NodeId;
 use ragnordb_server::config::NodeConfig;
 use std::net::SocketAddr;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 #[derive(Parser)]
 #[command(name = "ragnordb", about = "Distributed OLTP SQL Database")]
@@ -63,12 +65,82 @@ async fn run_node(
     listen: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen);
+
     let server = ragnordb_server::Server::new(config);
     server.start().await?;
+
     Ok(())
 }
+
+/// this will open a TCP connection to RagnorDB node and start an interactive REPL
+///
+/// the user can type SQL statements and see JSON responses
 async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("run_sql not implemented yet (addr={addr})");
+    let stream = TcpStream::connect(addr).await?;
+    println!("connected to RagnorDB at {addr}");
+    println!("type 'exit' or 'quit' to disconnect.\n");
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut stdin = BufReader::new(tokio::io::stdin());
+
+    let server_task = tokio::spawn(async move {
+        let mut response = String::new();
+        loop {
+            response.clear();
+            match reader.read_line(&mut response).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => match serde_json::from_str::<serde_json::Value>(response.trim()) {
+                    Ok(json) => {
+                        println!("{}", serde_json::to_string_pretty(&json).unwrap())
+                    }
+                    Err(_) => {
+                        println!("{}", response.trim());
+                    }
+                },
+            }
+        }
+
+        println!("[connection closed]")
+    });
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        print!("ragnordb> ");
+
+        use std::io::Write;
+        std::io::stdout().flush()?;
+
+        match stdin.read_line(&mut line).await {
+            Ok(0) => {
+                println!();
+                break;
+            }
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
+            }
+            Ok(_) => {}
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if matches!(trimmed, "exit" | "quit") {
+            println!("bye");
+            break;
+        }
+
+        writer.write_all(trimmed.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+
+    server_task.abort();
+
     Ok(())
 }
 

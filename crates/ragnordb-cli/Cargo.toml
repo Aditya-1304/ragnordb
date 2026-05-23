@@ -14,3 +14,4 @@ ragnordb-server = { path = "../ragnordb-server" }
 ragnordb-common ={ path = "../ragnordb-common"}
 clap ={ version = "4", features = ["derive"]}
 tokio ={ version = "1", features = ["full"]}
+serde_json.workspace = true

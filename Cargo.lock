@@ -511,6 +511,7 @@ dependencies = [
  "clap",
  "ragnordb-common",
  "ragnordb-server",
+ "serde_json",
  "tokio",
 ]
 
