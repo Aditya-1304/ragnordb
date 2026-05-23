@@ -144,7 +144,21 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// this checks if a ragnordb node is alive by attempting a TCP connection
+/// this will only verify if process is listening or not
 async fn run_status(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("run_status not implemented yet (addr={addr})");
+    println!("RagnorDB node status");
+    println!("  Address: {addr}");
+
+    match TcpStream::connect(addr).await {
+        Ok(_stream) => {
+            println!("  Alive: yes");
+        }
+        Err(e) => {
+            println!(" Alive: no");
+            println!(" Error: {e}");
+        }
+    }
+
     Ok(())
 }
