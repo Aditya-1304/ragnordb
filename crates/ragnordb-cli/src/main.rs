@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use ragnordb_common::ids::NodeId;
+use ragnordb_server::config::NodeConfig;
 use std::net::SocketAddr;
 
 #[derive(Parser)]
@@ -60,10 +62,11 @@ async fn run_node(
     data_dir: &str,
     listen: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("run_node not implemented yet (id={id}, data_dir={data_dir}, listen={listen})");
+    let config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen);
+    let server = ragnordb_server::Server::new(config);
+    server.start().await?;
     Ok(())
 }
-
 async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("run_sql not implemented yet (addr={addr})");
     Ok(())
