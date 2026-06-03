@@ -15,3 +15,5 @@ ragnordb-common ={ path = "../ragnordb-common"}
 clap ={ version = "4", features = ["derive"]}
 tokio ={ version = "1", features = ["full"]}
 serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
