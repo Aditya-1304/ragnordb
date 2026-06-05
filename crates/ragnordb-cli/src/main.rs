@@ -4,6 +4,7 @@ use ragnordb_server::config::NodeConfig;
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "ragnordb", about = "Distributed OLTP SQL Database")]
@@ -47,6 +48,7 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -60,7 +62,7 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        error!(error = %e, "fatal");
         std::process::exit(1);
     }
 }
@@ -78,13 +80,13 @@ async fn run_node(
     Ok(())
 }
 
-/// this will open a TCP connection to RagnorDB node and start an interactive REPL
+/// Open a TCP connection to a RagnorDB node and start an interactive REPL.
 ///
-/// the user can type SQL statements and see JSON responses
+/// The user can type SQL statements and see JSON responses.
 async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(addr).await?;
-    println!("connected to RagnorDB at {addr}");
-    println!("type 'exit' or 'quit' to disconnect.\n");
+    info!(%addr, "connected to RagnorDB");
+    info!("type 'exit' or 'quit' to disconnect");
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -107,7 +109,7 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        println!("[connection closed]")
+        warn!("connection closed by server")
     });
 
     let mut line = String::new();
@@ -124,7 +126,7 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             Err(e) => {
-                eprintln!("read error: {e}");
+                error!(error = %e, "stdin read error");
                 break;
             }
             Ok(_) => {}
@@ -136,7 +138,7 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if matches!(trimmed, "exit" | "quit") {
-            println!("bye");
+            info!("bye");
             break;
         }
 
@@ -150,19 +152,18 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// this checks if a ragnordb node is alive by attempting a TCP connection
-/// this will only verify if process is listening or not
+/// Check if a RagnorDB node is alive by attempting a TCP connection.
+/// Also prints build info for the local binary.
 async fn run_status(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    println!("RagnorDB node status");
-    println!("  Address: {addr}");
+    println!("{}", ragnordb_server::build_info::BUILD_INFO);
 
     match TcpStream::connect(addr).await {
         Ok(_stream) => {
             println!("  Alive: yes");
         }
         Err(e) => {
-            println!(" Alive: no");
-            println!(" Error: {e}");
+            println!("  Alive: no");
+            println!("  Error: {e}");
         }
     }
 
