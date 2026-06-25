@@ -12,5 +12,10 @@ ragnordb-multiraft = { path = "../ragnordb-multiraft" }
 ragnordb-sql = { path = "../ragnordb-sql" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
 serde_json.workspace = true
+serde.workspace = true
 tokio = { version = "1", features = ["full"] }
+tokio-util.workspace = true
 tracing.workspace = true
+axum.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

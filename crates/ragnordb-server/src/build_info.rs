@@ -1,4 +1,4 @@
-/// Compile-time build metadata for RagnorDB and its infrastructure crates.
+/// compile time build metadata for RagnorDB .
 pub struct BuildInfo {
     pub ragnordb_version: &'static str,
     pub target: &'static str,

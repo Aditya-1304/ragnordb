@@ -27,6 +27,10 @@ prost = "0.13"
 prost-build = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+tokio-util = "0.7"
 
 raft = { path = "../Papers/raft" }
 wal = { path = "../wal" }

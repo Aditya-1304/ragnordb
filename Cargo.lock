@@ -573,6 +573,7 @@ dependencies = [
  "ragnordb-multiraft",
  "ragnordb-sql",
  "ragnordb-tablet",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
