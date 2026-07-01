@@ -1,5 +1,7 @@
 pub mod build_info;
 pub mod config;
+pub mod protocol;
+pub mod service;
 
 use config::NodeConfig;
 use std::time::Duration;
