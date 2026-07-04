@@ -80,6 +80,31 @@ async fn run_node(
     Ok(())
 }
 
+const LEN_SIZE: usize = 4;
+
+async fn send_frame(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len() as u32;
+    writer.write_all(&len.to_le_bytes()).await?;
+    writer.write_all(bytes).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_frame(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut len_buf = [0u8; LEN_SIZE];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    Ok(String::from_utf8(buf)?)
+}
+
 /// Open a TCP connection to a RagnorDB node and start an interactive REPL.
 ///
 /// The user can type SQL statements and see JSON responses.
@@ -158,13 +183,25 @@ async fn run_status(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
     println!("{}", ragnordb_server::build_info::BUILD_INFO);
 
     match TcpStream::connect(addr).await {
-        Ok(_stream) => {
-            println!("  Alive: yes");
-        }
-        Err(e) => {
-            println!("  Alive: no");
-            println!("  Error: {e}");
-        }
+        Ok(_) => println!("  SQL port: alive"),
+        Err(e) => println!("  SQL port: unreachable ({e})"),
+    }
+
+    let admin_port = addr.port() + 100;
+    let admin_addr = SocketAddr::new(addr.ip(), admin_port);
+    let url = format!("http://{admin_addr}/status");
+
+    match reqwest::get(&url).await {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => {
+                println!("  Admin HTTP: alive");
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    println!("  Status: {}", serde_json::to_string_pretty(&json).unwrap());
+                }
+            }
+            Err(e) => println!("  Admin HTTP: response error ({e})"),
+        },
+        Err(e) => println!("  Admin HTTP: unreachable ({e})"),
     }
 
     Ok(())
