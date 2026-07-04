@@ -48,4 +48,9 @@ impl NodeConfig {
         self.max_connections = max;
         self
     }
+
+    pub fn with_admin_addr(mut self, admin_addr: SocketAddr) -> Self {
+        self.admin_addr = admin_addr;
+        self
+    }
 }

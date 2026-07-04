@@ -2,6 +2,7 @@ use axum::{Router, routing::get};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::build_info::BUILD_INFO;
@@ -16,16 +17,32 @@ pub struct AdminState {
 pub async fn start_admin_server(
     addr: SocketAddr,
     state: Arc<AdminState>,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_admin(listener, state, shutdown).await
+}
+
+pub async fn serve_admin(
+    listener: tokio::net::TcpListener,
+    state: Arc<AdminState>,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = listener.local_addr()?;
+
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/status", get(handle_status))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(admin_addr = %addr, "admin HTTP server listening");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+            info!("admin HTTP server shutting down");
+        })
+        .await?;
 
     Ok(())
 }

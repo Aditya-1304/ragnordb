@@ -1,11 +1,12 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const LEN_SIZE: usize = 4;
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
-pub async fn read_frame(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn read_frame<R>(reader: &mut R) -> Result<String, Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; LEN_SIZE];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -20,10 +21,13 @@ pub async fn read_frame(
     Ok(String::from_utf8(buf)?)
 }
 
-pub async fn write_frame(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+pub async fn write_frame<W>(
+    writer: &mut W,
     response: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: AsyncWrite + Unpin,
+{
     let bytes = serde_json::to_vec(response)?;
     let len = bytes.len() as u32;
 

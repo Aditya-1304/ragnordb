@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[derive(Debug)]
@@ -48,8 +49,8 @@ impl Server {
 
         let started_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let connection_semaphore = Arc::new(Semaphore::new(max_connections as usize));
 
@@ -59,8 +60,12 @@ impl Server {
             max_connections,
         });
 
-        tokio::spawn(async move {
-            if let Err(e) = admin::start_admin_server(admin_addr, admin_state).await {
+        let admin_shutdown = CancellationToken::new();
+        let admin_task_shutdown = admin_shutdown.clone();
+        let admin_task = tokio::spawn(async move {
+            if let Err(e) =
+                admin::start_admin_server(admin_addr, admin_state, admin_task_shutdown).await
+            {
                 error!(error = %e, "admin server failed");
             }
         });
@@ -99,12 +104,8 @@ impl Server {
                                         &format!("server has reached its configured max connection count ({max_connections})"),
                                         true,
                                     );
-                                    if let Ok(bytes) = serde_json::to_vec(&response) {
-                                        let _ = tokio::io::AsyncWriteExt::write_all(
-                                            &mut tokio::io::BufWriter::new(stream),
-                                            &bytes,
-                                        ).await;
-                                    }
+                                    let mut stream = stream;
+                                    let _ = write_frame(&mut stream, &response).await;
                                 }
                             }
                         }
@@ -116,9 +117,14 @@ impl Server {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("received SIGINT, shutting down");
+                    admin_shutdown.cancel();
                     break;
                 }
             }
+        }
+
+        if let Err(e) = admin_task.await {
+            warn!(error = %e, "admin server task join failed");
         }
 
         info!("goodbye");
@@ -129,7 +135,7 @@ impl Server {
 /// Handle a single client connection.
 ///
 /// Reads SQL statements line by line and returns JSON responses.
-async fn handle_connection(
+pub async fn handle_connection(
     stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut reader, mut writer) = stream.into_split();

@@ -1,16 +1,24 @@
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
+use tracing::warn;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 pub fn init_metrics() {
-    let handle = PrometheusBuilder::new()
-        .install_recorder()
-        .expect("failed to install Prometheus recorder");
-    PROMETHEUS_HANDLE
-        .set(handle)
-        .unwrap_or_else(|_| panic!("metrics already initialized"));
+    if PROMETHEUS_HANDLE.get().is_some() {
+        return;
+    }
 
+    match PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => {
+            let _ = PROMETHEUS_HANDLE.set(handle);
+            describe_metrics();
+        }
+        Err(e) => warn!(error = %e, "metrics recorder already installed or unavailable"),
+    }
+}
+
+fn describe_metrics() {
     metrics::describe_counter!(
         "RagnorDB_connections_accepted_total",
         "Total connections accepted"

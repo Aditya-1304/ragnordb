@@ -19,3 +19,6 @@ tracing.workspace = true
 axum.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true
