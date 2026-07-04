@@ -11,6 +11,7 @@ pub struct Session {
     pub session_id: SessionId,
     pub current_txn: Option<TxnId>,
     pub autocommit: bool,
+    pub statement_timeout_ms: u64,
 }
 
 impl Session {
@@ -20,6 +21,7 @@ impl Session {
             session_id: SessionId(id),
             current_txn: None,
             autocommit: true,
+            statement_timeout_ms: 30_000,
         }
     }
 

@@ -9,6 +9,8 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 prost.workspace = true
+tokio = { version = "1", features = ["full"] }
+serde_json.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

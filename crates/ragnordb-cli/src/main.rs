@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 use ragnordb_common::ids::NodeId;
+use ragnordb_common::protocol::read_frame;
 use ragnordb_server::config::NodeConfig;
 use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
@@ -73,14 +74,10 @@ async fn run_node(
     listen: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen);
-
     let server = ragnordb_server::Server::new(config);
     server.start().await?;
-
     Ok(())
 }
-
-const LEN_SIZE: usize = 4;
 
 async fn send_frame(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -94,47 +91,25 @@ async fn send_frame(
     Ok(())
 }
 
-async fn read_frame(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut len_buf = [0u8; LEN_SIZE];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    Ok(String::from_utf8(buf)?)
-}
-
-/// Open a TCP connection to a RagnorDB node and start an interactive REPL.
-///
-/// The user can type SQL statements and see JSON responses.
 async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(addr).await?;
     info!(%addr, "connected to RagnorDB");
     info!("type 'exit' or 'quit' to disconnect");
 
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut stdin = BufReader::new(tokio::io::stdin());
+    let (mut reader, mut writer) = stream.into_split();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
 
     let server_task = tokio::spawn(async move {
-        let mut response = String::new();
         loop {
-            response.clear();
-            match reader.read_line(&mut response).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => match serde_json::from_str::<serde_json::Value>(response.trim()) {
-                    Ok(json) => {
-                        println!("{}", serde_json::to_string_pretty(&json).unwrap())
-                    }
-                    Err(_) => {
-                        println!("{}", response.trim());
-                    }
+            match read_frame(&mut reader).await {
+                Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
+                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap()),
+                    Err(_) => println!("{response}"),
                 },
+                Err(_) => break,
             }
         }
-
-        warn!("connection closed by server")
+        warn!("connection closed by server");
     });
 
     let mut line = String::new();
@@ -167,9 +142,7 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        writer.write_all(trimmed.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        send_frame(&mut writer, trimmed).await?;
     }
 
     server_task.abort();

@@ -1238,7 +1238,9 @@ dependencies = [
  "prost-build",
  "raft",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
  "wal",
 ]
 

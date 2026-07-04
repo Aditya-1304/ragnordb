@@ -7,11 +7,11 @@ pub mod session;
 
 use admin::AdminState;
 use config::NodeConfig;
-use protocol::{error_response, ok_response, read_frame, write_frame};
+use protocol::error_response;
+use ragnordb_common::protocol::{read_frame, write_frame};
 use session::Session;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -27,18 +27,23 @@ impl Server {
     }
 
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let config = &self.config;
+        let max_connections = self.config.max_connections;
+        let data_dir = self.config.data_dir.clone();
+        let listen_addr = self.config.listen_addr;
+        let admin_addr = self.config.admin_addr;
+
+        metrics::init_metrics();
 
         info!(
-            node_id = config.node_id.0,
-            data_dir = %config.data_dir.display(),
-            listen = %config.listen_addr,
-            admin = %config.admin_addr,
-            max_connections = config.max_connections,
+            node_id = self.config.node_id.0,
+            data_dir = %data_dir.display(),
+            listen = %listen_addr,
+            admin = %admin_addr,
+            max_connections = max_connections,
             "node starting",
         );
 
-        tokio::fs::create_dir_all(&config.data_dir).await?;
+        tokio::fs::create_dir_all(&data_dir).await?;
         info!("data directory ready");
 
         let started_at = SystemTime::now()
@@ -46,23 +51,22 @@ impl Server {
             .unwrap()
             .as_secs();
 
-        let connection_semaphore = Arc::new(Semaphore::new(config.max_connections as usize));
+        let connection_semaphore = Arc::new(Semaphore::new(max_connections as usize));
 
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),
-            max_connections: config.max_connections,
+            max_connections,
         });
 
-        let admin_addr = config.admin_addr;
         tokio::spawn(async move {
             if let Err(e) = admin::start_admin_server(admin_addr, admin_state).await {
                 error!(error = %e, "admin server failed");
             }
         });
 
-        let listener = TcpListener::bind(config.listen_addr).await?;
-        info!(listen = %config.listen_addr, "listening (SQL protocol)");
+        let listener = TcpListener::bind(listen_addr).await?;
+        info!(listen = %listen_addr, "listening (SQL protocol)");
 
         loop {
             tokio::select! {
@@ -70,28 +74,29 @@ impl Server {
                     match result {
                         Ok((stream, addr)) => {
                             let sem = connection_semaphore.clone();
-                            match sem.try_acquire() {
+                            match sem.try_acquire_owned() {
                                 Ok(permit) => {
                                     metrics::counter_inc("RagnorDB_connections_accepted_total");
-                                    let active = config.max_connections as usize - sem.available_permits();
+                                    let active = max_connections as usize - connection_semaphore.available_permits();
                                     metrics::gauge_set("RagnorDB_connections_active", active as f64);
 
                                     info!(from = %addr, active_connections = active, "accepted connection");
+                                    let sem2 = connection_semaphore.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = handle_connection(stream).await {
                                             warn!(from = %addr, error = %e, "connection error");
                                         }
                                         drop(permit);
-                                        let active = config.max_connections as usize - sem.available_permits();
+                                        let active = max_connections as usize - sem2.available_permits();
                                         metrics::gauge_set("RagnorDB_connections_active", active as f64);
                                         info!(from = %addr, "connection closed");
                                     });
                                 }
                                 Err(_) => {
-                                    warn!(from = %addr, max = config.max_connections, "connection limit reached, rejecting");
+                                    warn!(from = %addr, max = max_connections, "connection limit reached, rejecting");
                                     let response = error_response(
                                         "CONNECTION_LIMIT",
-                                        &format!("server has reached its configured max connection count ({})", config.max_connections),
+                                        &format!("server has reached its configured max connection count ({max_connections})"),
                                         true,
                                     );
                                     if let Ok(bytes) = serde_json::to_vec(&response) {
@@ -116,7 +121,6 @@ impl Server {
             }
         }
 
-        // admin server shuts down when the tokio runtime drops
         info!("goodbye");
         Ok(())
     }
@@ -129,7 +133,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut reader, mut writer) = stream.into_split();
-    let mut session = Session::new();
+    let mut _session = Session::new();
 
     loop {
         let sql = match read_frame(&mut reader).await {
@@ -143,7 +147,7 @@ async fn handle_connection(
         }
 
         metrics::counter_inc("RagnorDB_requests_received_total");
-        info!(session_id = %session.session_id.0, statement = %trimmed, "received SQL");
+        info!(session_id = %_session.session_id.0, statement = %trimmed, "received SQL");
 
         let response = error_response(
             "UNSUPPORTED_SQL",
