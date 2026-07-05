@@ -26,6 +26,12 @@ enum Commands {
 
         #[arg(long, default_value = "127.0.0.1:7101")]
         listen: SocketAddr,
+
+        #[arg(long)]
+        admin_listen: Option<SocketAddr>,
+
+        #[arg(long, default_value = "100")]
+        max_connections: u32,
     },
 
     /// command to open interactive SQL shell
@@ -38,6 +44,9 @@ enum Commands {
     Status {
         #[arg(long, default_value = "127.0.0.1:7101")]
         addr: SocketAddr,
+
+        #[arg(long)]
+        admin_addr: Option<SocketAddr>,
     },
 }
 
@@ -57,9 +66,11 @@ async fn main() {
             id,
             data_dir,
             listen,
-        } => run_node(id, &data_dir, listen).await,
+            admin_listen,
+            max_connections,
+        } => run_node(id, &data_dir, listen, admin_listen, max_connections).await,
         Commands::Sql { addr } => run_sql(addr).await,
-        Commands::Status { addr } => run_status(addr).await,
+        Commands::Status { addr, admin_addr } => run_status(addr, admin_addr).await,
     };
 
     if let Err(e) = result {
@@ -72,8 +83,16 @@ async fn run_node(
     id: u64,
     data_dir: &str,
     listen: SocketAddr,
+    admin_listen: Option<SocketAddr>,
+    max_connections: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen);
+    let mut config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen)
+        .with_max_connections(max_connections);
+
+    if let Some(admin_addr) = admin_listen {
+        config = config.with_admin_addr(admin_addr);
+    }
+
     let server = ragnordb_server::Server::new(config);
     server.start().await?;
     Ok(())
@@ -152,7 +171,10 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Check if a RagnorDB node is alive by attempting a TCP connection.
 /// Also prints build info for the local binary.
-async fn run_status(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_status(
+    addr: SocketAddr,
+    admin_addr: Option<SocketAddr>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", ragnordb_server::build_info::BUILD_INFO);
 
     match TcpStream::connect(addr).await {
@@ -160,8 +182,17 @@ async fn run_status(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
         Err(e) => println!("  SQL port: unreachable ({e})"),
     }
 
-    let admin_port = addr.port() + 100;
-    let admin_addr = SocketAddr::new(addr.ip(), admin_port);
+    let admin_addr = match admin_addr {
+        Some(admin_addr) => admin_addr,
+        None => match addr.port().checked_add(100) {
+            Some(admin_port) => SocketAddr::new(addr.ip(), admin_port),
+            None => {
+                println!("  Admin HTTP: unreachable (derived admin port overflow)");
+                return Ok(());
+            }
+        },
+    };
+
     let url = format!("http://{admin_addr}/status");
 
     match reqwest::get(&url).await {
