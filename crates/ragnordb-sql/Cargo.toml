@@ -8,3 +8,4 @@ repository.workspace = true
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-catalog = { path = "../ragnordb-catalog" }
+sqlparser = "0.53"
