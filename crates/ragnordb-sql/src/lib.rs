@@ -3,6 +3,8 @@ use sqlparser::ast::Statement as SqlStatement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+pub mod parser;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub raw: String,
