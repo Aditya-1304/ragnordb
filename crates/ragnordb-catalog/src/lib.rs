@@ -3,6 +3,7 @@ use ragnordb_common::ids::TableId;
 use ragnordb_common::{Error, Result};
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSchema {
@@ -65,6 +66,41 @@ impl MemoryCatalog {
             return Err(Error::InvalidArgument(format!(
                 "table already exists: {name}"
             )));
+        }
+
+        if primary_key_column_ids.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "table {name} must have at least one primary key column"
+            )));
+        }
+
+        let mut seen_names = HashSet::new();
+        for col in &columns {
+            if !seen_names.insert(&col.name) {
+                return Err(Error::InvalidArgument(format!(
+                    "duplicate column name: {}",
+                    col.name
+                )));
+            }
+        }
+
+        let mut seen_ids = HashSet::new();
+        for col in &columns {
+            if !seen_ids.insert(col.id) {
+                return Err(Error::InvalidArgument(format!(
+                    "duplicate column id: {}",
+                    col.id
+                )));
+            }
+        }
+
+        let column_ids: HashSet<u64> = columns.iter().map(|c| c.id).collect();
+        for pk_id in &primary_key_column_ids {
+            if !column_ids.contains(pk_id) {
+                return Err(Error::InvalidArgument(format!(
+                    "primary key column id {pk_id} does not exist in table {name}"
+                )));
+            }
         }
 
         let table_id = TableId(self.next_table_id);
