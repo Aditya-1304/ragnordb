@@ -1,3 +1,13 @@
+//! root file of this crate, used to re-export Error and Result so other crates can use it
+//!
+//! also maps protos sub-module to:
+//!  ids          - domain ID newtypes (NodeId, TxnId, etc.)
+//!  codec        - row values + MVCC record types + proto roundtrips
+//!  catalog_codec– catalog-specific codecs (ColumnDef, TableDef, DataType)
+//!  command_codec– TabletCommand variants + proto roundtrips
+//!  rpc_codec    - inter-node frame + metadata request/response codecs
+//!  protocol     - V1 TCP frame reading/writing
+
 pub mod catalog_codec;
 pub mod codec;
 pub mod command_codec;

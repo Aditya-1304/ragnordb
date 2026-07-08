@@ -1,3 +1,6 @@
+# Lowest level crate in the workspace. mostly every crate is dependent on this
+# It contains all id types, protobuf codecs, Errors, etc 
+
 [package]
 name = "ragnordb-common"
 version.workspace = true

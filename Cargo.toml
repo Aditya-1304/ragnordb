@@ -1,3 +1,5 @@
+# Main workspace that contains every ragnorDB crates under itself 
+# it contains centralized versioning of all dependencies, package versions, editions, license, etc
 [workspace]
 resolver = "3"
 members = [
