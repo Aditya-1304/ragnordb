@@ -138,10 +138,10 @@ fn analyze_create_table(
 
     let mut primary_key_column_ids = Vec::new();
 
-    for pk_name in primary_key_names {
+    for pk_name in &primary_key_names {
         let column = columns
             .iter_mut()
-            .find(|column| column.name == pk_name)
+            .find(|column| column.name == *pk_name)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!("primary key column does not exist: {pk_name}"))
             })?;
@@ -234,9 +234,7 @@ fn analyze_insert(
 
         for (expr, column) in row.iter().zip(insert_columns.iter()) {
             let value = analyze_literal(expr)?;
-
             validate_value_type(&value, column)?;
-
             analyzed_row.push(value);
         }
 
@@ -322,6 +320,7 @@ fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<AnalyzedStatem
 
     if let Some(selection) = &select.selection {
         validate_expr_columns(selection, table)?;
+        validate_where_types(selection, table)?;
     }
 
     Ok(AnalyzedStatement::Select(AnalyzedSelect {
@@ -329,6 +328,71 @@ fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<AnalyzedStatem
         columns,
         selection: select.selection.clone(),
     }))
+}
+
+fn validate_expr_columns(expr: &Expr, table: &ragnordb_catalog::TableSchema) -> Result<()> {
+    match expr {
+        Expr::Identifier(ident) => {
+            if table.column_by_name(&ident.value).is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown column {} on table {}",
+                    ident.value, table.name
+                )));
+            }
+            Ok(())
+        }
+        Expr::Value(_) => Ok(()),
+        Expr::BinaryOp { left, right, .. } => {
+            validate_expr_columns(left, table)?;
+            validate_expr_columns(right, table)
+        }
+        Expr::Nested(e) => validate_expr_columns(e, table),
+        Expr::UnaryOp { expr: e, .. } => validate_expr_columns(e, table),
+        other => Err(unsupported(format!("unsupported expression: {other}"))),
+    }
+}
+
+fn validate_where_types(expr: &Expr, table: &ragnordb_catalog::TableSchema) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            validate_where_types(left, table)?;
+            validate_where_types(right, table)?;
+
+            let col_name = get_column_name(left).or_else(|| get_column_name(right));
+            let lit_expr = if is_literal(left) {
+                Some(left)
+            } else if is_literal(right) {
+                Some(right)
+            } else {
+                None
+            };
+
+            if let (Some(col_name), Some(lit)) = (col_name, lit_expr) {
+                let column = table
+                    .column_by_name(&col_name)
+                    .ok_or_else(|| Error::InvalidArgument(format!("unknown column: {col_name}")))?;
+                let value = analyze_literal(lit)?;
+                validate_value_type(&value, column)?;
+            }
+
+            Ok(())
+        }
+        Expr::Nested(e) => validate_where_types(e, table),
+        Expr::UnaryOp { expr: e, .. } => validate_where_types(e, table),
+        Expr::Identifier(_) | Expr::Value(_) => Ok(()),
+        other => Err(unsupported(format!("unsupported expression: {other}"))),
+    }
+}
+
+fn get_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        _ => None,
+    }
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(_))
 }
 
 fn analyze_data_type(data_type: &SqlDataType) -> Result<DataType> {
@@ -346,7 +410,6 @@ fn analyze_literal(expr: &Expr) -> Result<Value> {
             let parsed = value
                 .parse::<i64>()
                 .map_err(|_| Error::InvalidArgument(format!("invalid INT literal: {value}")))?;
-
             Ok(Value::Int(parsed))
         }
         Expr::Value(SqlValue::SingleQuotedString(value)) => Ok(Value::Text(value.clone())),
@@ -375,27 +438,6 @@ fn validate_value_type(value: &Value, column: &ColumnSchema) -> Result<()> {
     }
 }
 
-fn validate_expr_columns(expr: &Expr, table: &ragnordb_catalog::TableSchema) -> Result<()> {
-    match expr {
-        Expr::Identifier(ident) => {
-            if table.column_by_name(&ident.value).is_none() {
-                return Err(Error::InvalidArgument(format!(
-                    "unknown column {} on table {}",
-                    ident.value, table.name
-                )));
-            }
-
-            Ok(())
-        }
-        Expr::Value(_) => Ok(()),
-        Expr::BinaryOp { left, right, .. } => {
-            validate_expr_columns(left, table)?;
-            validate_expr_columns(right, table)
-        }
-        other => Err(unsupported(format!("unsupported expression: {other}"))),
-    }
-}
-
 fn reject_query_clauses(query: &Query) -> Result<()> {
     if query.with.is_some()
         || query.order_by.is_some()
@@ -410,22 +452,275 @@ fn reject_query_clauses(query: &Query) -> Result<()> {
     {
         return Err(unsupported("unsupported SELECT query clause"));
     }
-
     Ok(())
 }
 
 fn simple_name(name: &ObjectName) -> Result<String> {
     let name = name.to_string();
-
     if name.contains('.') {
         return Err(unsupported(format!(
             "qualified names are not supported yet: {name}"
         )));
     }
-
     Ok(name)
 }
 
 fn unsupported(message: impl Into<String>) -> Error {
     Error::InvalidArgument(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ragnordb_catalog::{ColumnSchema, MemoryCatalog};
+    use ragnordb_common::catalog_codec::DataType;
+    use ragnordb_common::codec::Value;
+
+    fn make_catalog() -> MemoryCatalog {
+        let mut catalog = MemoryCatalog::new();
+        catalog
+            .add_table(
+                "users",
+                vec![
+                    ColumnSchema {
+                        id: 1,
+                        name: "id".into(),
+                        ty: DataType::Int,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        id: 2,
+                        name: "name".into(),
+                        ty: DataType::Text,
+                        nullable: true,
+                    },
+                    ColumnSchema {
+                        id: 3,
+                        name: "active".into(),
+                        ty: DataType::Bool,
+                        nullable: true,
+                    },
+                ],
+                vec![1],
+            )
+            .unwrap();
+        catalog
+    }
+
+    fn parse(sql: &str) -> Statement {
+        crate::parser::parse_one(sql).unwrap()
+    }
+
+    #[test]
+    fn analyze_create_table() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)");
+        let analyzed = analyze(&stmt, &catalog).unwrap();
+        match analyzed {
+            AnalyzedStatement::CreateTable(t) => {
+                assert_eq!(t.table_name, "items");
+                assert_eq!(t.columns.len(), 2);
+                assert_eq!(t.primary_key_column_ids, vec![1]);
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn reject_create_duplicate_table() {
+        let mut catalog = MemoryCatalog::new();
+        catalog
+            .add_table(
+                "items",
+                vec![ColumnSchema {
+                    id: 1,
+                    name: "id".into(),
+                    ty: DataType::Int,
+                    nullable: false,
+                }],
+                vec![1],
+            )
+            .unwrap();
+        let stmt = parse("CREATE TABLE items (id INT PRIMARY KEY)");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn reject_create_no_pk() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("CREATE TABLE items (id INT)");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn reject_unsupported_data_type() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("CREATE TABLE items (id FLOAT PRIMARY KEY)");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unsupported data type"));
+    }
+
+    #[test]
+    fn analyze_insert_success() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)");
+        let analyzed = analyze(&stmt, &catalog).unwrap();
+        match analyzed {
+            AnalyzedStatement::Insert(ins) => {
+                assert_eq!(ins.table_name, "users");
+                assert_eq!(ins.rows.len(), 1);
+                assert_eq!(ins.rows[0][0], Value::Int(1));
+                assert_eq!(ins.rows[0][1], Value::Text("Ada".into()));
+                assert_eq!(ins.rows[0][2], Value::Bool(true));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn reject_insert_unknown_table() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("INSERT INTO ghost (id) VALUES (1)");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+    }
+
+    #[test]
+    fn reject_insert_missing_pk() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (name) VALUES ('Ada')");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn reject_insert_unknown_column() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unknown column"));
+    }
+
+    #[test]
+    fn reject_insert_wrong_type() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (id, name) VALUES ('abc', 'Ada')");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("type"));
+    }
+
+    #[test]
+    fn reject_insert_null_into_not_null_column() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (id, name) VALUES (NULL, 'Ada')");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("NULL"));
+    }
+
+    #[test]
+    fn reject_insert_wrong_value_count() {
+        let catalog = make_catalog();
+        let stmt = parse("INSERT INTO users (id, name) VALUES (1, 'Ada', true)");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("values"));
+    }
+
+    #[test]
+    fn analyze_select_wildcard() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users");
+        let analyzed = analyze(&stmt, &catalog).unwrap();
+        match analyzed {
+            AnalyzedStatement::Select(s) => {
+                assert_eq!(s.table_name, "users");
+                assert_eq!(s.columns, vec![SelectColumn::Wildcard]);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_named_columns() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT id, name FROM users");
+        let analyzed = analyze(&stmt, &catalog).unwrap();
+        match analyzed {
+            AnalyzedStatement::Select(s) => {
+                assert_eq!(s.table_name, "users");
+                assert_eq!(
+                    s.columns,
+                    vec![
+                        SelectColumn::Named("id".into()),
+                        SelectColumn::Named("name".into())
+                    ]
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn analyze_select_with_where() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users WHERE id = 1");
+        analyze(&stmt, &catalog).unwrap();
+    }
+
+    #[test]
+    fn reject_select_unknown_table() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("SELECT * FROM ghost");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+    }
+
+    #[test]
+    fn reject_select_unknown_column() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT nonexistent FROM users");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unknown column"));
+    }
+
+    #[test]
+    fn reject_select_where_wrong_type_int_vs_text() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users WHERE id = 'abc'");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("type"));
+    }
+
+    #[test]
+    fn reject_select_where_wrong_type_text_vs_int() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users WHERE name = 123");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("type"));
+    }
+
+    #[test]
+    fn reject_select_where_wrong_type_bool() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users WHERE active = 42");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("type"));
+    }
+
+    #[test]
+    fn reject_unsupported_statement() {
+        let catalog = MemoryCatalog::new();
+        let stmt = parse("DROP TABLE users");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unsupported SQL statement"));
+    }
+
+    #[test]
+    fn reject_select_with_order_by() {
+        let catalog = make_catalog();
+        let stmt = parse("SELECT * FROM users ORDER BY id");
+        let err = analyze(&stmt, &catalog).unwrap_err();
+        assert!(err.to_string().contains("unsupported SELECT"));
+    }
 }

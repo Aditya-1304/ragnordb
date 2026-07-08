@@ -126,3 +126,110 @@ impl Catalog for MemoryCatalog {
         self.tables_by_name.get(name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_columns() -> Vec<ColumnSchema> {
+        vec![
+            ColumnSchema {
+                id: 1,
+                name: "id".into(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnSchema {
+                id: 2,
+                name: "name".into(),
+                ty: DataType::Text,
+                nullable: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn add_table_success() {
+        let mut catalog = MemoryCatalog::new();
+        let id = catalog
+            .add_table("users", valid_columns(), vec![1])
+            .unwrap();
+        assert_eq!(id, TableId(1));
+
+        let table = catalog.table_by_name("users").unwrap();
+        assert_eq!(table.name, "users");
+        assert_eq!(table.columns.len(), 2);
+    }
+
+    #[test]
+    fn reject_duplicate_name() {
+        let mut catalog = MemoryCatalog::new();
+        catalog
+            .add_table("users", valid_columns(), vec![1])
+            .unwrap();
+        let err = catalog
+            .add_table("users", valid_columns(), vec![1])
+            .unwrap_err();
+        assert!(err.to_string().contains("table already exists"));
+    }
+
+    #[test]
+    fn reject_empty_primary_key() {
+        let mut catalog = MemoryCatalog::new();
+        let err = catalog
+            .add_table("users", valid_columns(), vec![])
+            .unwrap_err();
+        assert!(err.to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn reject_duplicate_column_name() {
+        let mut catalog = MemoryCatalog::new();
+        let columns = vec![
+            ColumnSchema {
+                id: 1,
+                name: "id".into(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnSchema {
+                id: 2,
+                name: "id".into(),
+                ty: DataType::Text,
+                nullable: true,
+            },
+        ];
+        let err = catalog.add_table("users", columns, vec![1]).unwrap_err();
+        assert!(err.to_string().contains("duplicate column name"));
+    }
+
+    #[test]
+    fn reject_duplicate_column_id() {
+        let mut catalog = MemoryCatalog::new();
+        let columns = vec![
+            ColumnSchema {
+                id: 1,
+                name: "id".into(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnSchema {
+                id: 1,
+                name: "name".into(),
+                ty: DataType::Text,
+                nullable: true,
+            },
+        ];
+        let err = catalog.add_table("users", columns, vec![1]).unwrap_err();
+        assert!(err.to_string().contains("duplicate column id"));
+    }
+
+    #[test]
+    fn reject_bad_primary_key_id() {
+        let mut catalog = MemoryCatalog::new();
+        let err = catalog
+            .add_table("users", valid_columns(), vec![99])
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+}
