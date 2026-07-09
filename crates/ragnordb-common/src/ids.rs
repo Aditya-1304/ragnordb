@@ -1,6 +1,22 @@
+//! This file contains all the IDs which other crate uses throughout the codebase
+//! every ID type implements:
+//!  to_proto(&self) -> proto::ids::{Type}
+//!  from_proto(proto) -> Self
+//!
+//! The proto field is always a single uint64 { id: self.0 },
+//! except for RequestId (client_id as 16 bytes + sequence as u64)
+//! and RowKey (table_id_bytes + primary_key_bytes).
+
 use crate::proto::ids;
 use serde::{Deserialize, Serialize};
 
+/// Works as an identifier for a node in the DB cluster
+///
+/// Node IDs are statically added in the bootstrap or generation of node and never changes during a node's lifetime.
+/// It is used in:
+/// - Raft group membership
+/// - Internode transport
+/// - Metadata group leader/tablet leader caches
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
@@ -14,6 +30,11 @@ impl NodeId {
     }
 }
 
+/// This Identifies a single tablet (shard) within in the cluster
+///
+/// Each tablet is owned by exactly one raft group and holds
+/// a partition of a table's key space.
+/// Tablet IDs are assigned by the metadata of the raft group during the table creation (CREATE TABLE)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TabletId(pub u64);
 
@@ -27,6 +48,11 @@ impl TabletId {
     }
 }
 
+/// This identifies a logical SQL table across the cluster
+///
+/// Table IDs are assigned once by the metadata Raft group
+/// and are never reused after that, even after Dropping the Table
+/// they form the first component of every internal key path (/table/{table_id}/...)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TableId(pub u64);
 
@@ -40,6 +66,11 @@ impl TableId {
     }
 }
 
+/// This identifies a distributed transaction globally.
+///
+/// Assigned by the timestamp oracle (also called metadata Raft group) during the start/begining of a transaction
+/// this is used in lock records, write records and transaction status records
+/// to associate intents with their corresponding owning transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TxnId(pub u64);
 
@@ -53,6 +84,17 @@ impl TxnId {
     }
 }
 
+/// A hybrid-monotonic timestamp for MVCC ordering
+///
+/// Timestamps are allocated from the timestamp oracle in the
+/// metadata raft group. They satisfy:
+///   start_ts < commit_ts for every committed transaction
+///   timestamps are monotonic and never reused
+///
+/// Used in:
+///   - MVCC version keys (default/{user_key}/{start_ts})
+///   - Write records (write/{user_key}/{commit_ts})
+///   - Snapshot reads (read at start_ts)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Timestamp(pub u64);
 
@@ -66,6 +108,14 @@ impl Timestamp {
     }
 }
 
+/// This identifies a single Raft consensus group.
+///
+/// Every tablet has its own Raft group. also there is only one
+/// metadata raft group
+/// RaftgroupID binds together :
+///   - A-WAL records (each record stores group_id)
+///   - Raft log stores (per-group index→LSN maps)
+///   - Inter-node transport demux
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u64);
 impl RaftGroupId {
@@ -77,6 +127,14 @@ impl RaftGroupId {
     }
 }
 
+/// This identifies a singe row by its table and primary key encoded in it
+///
+/// Rowkey is the internal representation of a SQL row's location:
+///   /table/{table_id}/pk/{encoded_primary_key}
+///
+/// still it is not the full MVCC internal key - it does not include
+/// timestamp or column family. Those will be added by the tablet layer
+/// when constructing default/lock/write keys
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RowKey {
     pub table_id: TableId,
@@ -105,6 +163,17 @@ impl RowKey {
         })
     }
 }
+
+/// This helps in uniquely identifing a client request for idempotent retry
+///
+/// When a client retries after a timeout, the same RequestId ensures
+/// that the tablet state machine does not apply the command twice or even
+/// multiple times
+/// the state machine caches (client_id, last_sequence) and compares
+/// incoming requests against it
+///
+/// client_id: 128-bit unique client identifier (e.g., UUID v4).
+/// sequence:  monotonically increasing per-client counter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestId {
     pub client_id: u128,
