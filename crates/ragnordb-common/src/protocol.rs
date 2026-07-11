@@ -3,6 +3,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const LEN_SIZE: usize = 4;
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// V1 client wire protocol: length-prefixed TCP frames
+///
+/// Request wire format:
+///   [len: u32 little-endian][UTF-8 SQL bytes]
+///
+/// Response wire format:
+///   [len: u32 little-endian][UTF-8 JSON bytes]
+///
+/// MAX_FRAME_SIZE = 16 MiB - prevents memory exhaustion on
+/// oversized frames from misbehaving clients
+
 pub async fn read_frame<R>(reader: &mut R) -> Result<String, Box<dyn std::error::Error>>
 where
     R: AsyncRead + Unpin,

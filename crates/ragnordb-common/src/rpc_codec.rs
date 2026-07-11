@@ -2,6 +2,17 @@ use super::command_codec::TabletCommand;
 use crate::ids::{NodeId, RaftGroupId, RequestId, TabletId, Timestamp};
 use crate::proto::rpc;
 
+/// A framed inter-node message on the multiplexed TCP transport.
+///
+/// Wire format:
+///   [msg_type: u8][raft_group_id: u64][len: u32 LE][prost payload bytes]
+///
+/// msg_type determines how the payload is decoded:
+///   0x01 — Raft consensus message (AppendEntries, Vote, etc.)
+///   0x02 — TabletCommandRequest
+///   0x03 — TabletCommandResponse
+///   0x04 — MetadataRequest
+///   0x05 — MetadataResponse
 #[derive(Debug, Clone, PartialEq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
@@ -63,6 +74,8 @@ impl RpcFrame {
     }
 }
 
+/// this is a tablet command request sent from a gateway to a tablet leader
+/// it includes the RequestId for idempotent retry deduplication
 pub struct TabletCommandRequest {
     pub request_id: RequestId,
     pub command: TabletCommand,
@@ -84,6 +97,14 @@ impl TabletCommandRequest {
     }
 }
 
+/// The response from a tablet after applying a command.
+///
+/// Fields match the V1 client wire protocol's error taxonomy:
+///   success       — whether the command succeeded
+///   error_message — human-readable description
+///   error_code    — canonical error code (WRITE_CONFLICT, NOT_LEADER, etc.)
+///   retryable     — whether the client can retry with the same RequestId
+///   result_data   — output data (e.g., row bytes for a read)
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabletCommandResponse {
     pub request_id: RequestId,
@@ -118,6 +139,7 @@ impl TabletCommandResponse {
     }
 }
 
+/// Requests the gateway/router sends to the metadata Raft group
 pub enum MetadataRequest {
     AllocateTimestamp,
     LookupTablet { table_id: u64, key: Vec<u8> },
@@ -166,6 +188,7 @@ impl MetadataRequest {
     }
 }
 
+/// Responses from the metadata Raft group
 pub enum MetadataResponse {
     AllocateTimestamp {
         timestamp: Timestamp,
