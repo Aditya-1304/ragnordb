@@ -1,6 +1,11 @@
 use crate::ids::{Timestamp, TxnId};
 use crate::proto::{mvcc, row};
 
+/// A typed SQL cell value
+///
+/// Maps to SQL's INT, TEXT, BOOL, and NULL
+/// These are the only supported types rn, will add more in future
+/// all are encoded by prost oneof
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
@@ -32,6 +37,11 @@ impl Value {
     }
 }
 
+/// complete SQL row (orderded list)
+///
+/// this is returned by the executor and used in write entries
+/// column order matches the table schemma
+/// or the INSERT column list
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub values: Vec<Value>,
@@ -54,6 +64,19 @@ impl Row {
     }
 }
 
+/// This is an uncommited lock/intent on a key
+///
+/// this is written during the prewrite phase of distributed transaction
+/// if a reader encounters a lock, it must check the status of
+/// transaction before resolving
+///
+/// Fields:
+///   txn_id         - owning transaction
+///   primary_key    - the primary key of this transaction
+///   start_timestamp- transaction start timestamp
+///   ttl_ms         - lock time-to-live; after expiry, the lock
+///                    can be cleaned if the txn status is expired
+///   op             - Put, Delete, or Rollback
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockRecord {
     pub txn_id: TxnId,
@@ -63,6 +86,12 @@ pub struct LockRecord {
     pub op: WriteKind,
 }
 
+/// this is a committed version for a key
+///
+/// this is Written during the commit phase. Maps commit_ts -> (starts_ts, op).
+/// the actual data is stored at default/{key}/{start_ts}.
+/// readers find the latest write record with commit_ts <= read_ts
+/// then loade the default/{key}/{start_ts}.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteRecord {
     pub start_timestamp: Timestamp,
@@ -70,6 +99,11 @@ pub struct WriteRecord {
     pub op: WriteKind,
 }
 
+/// Kind of write operation
+///   Put      — insert or update
+///   Delete   — tombstone (row is considered absent)
+///   Rollback— marks a rolled-back key so late prewrite/commit
+///             messages do not resurrect data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteKind {
     Put,
@@ -142,6 +176,17 @@ impl WriteRecord {
     }
 }
 
+///This is the durable transaction status, stored on the primary key's tablet
+///
+/// it is the source of truth for intent resolution:
+///   Pending   — transaction is active or prewriting
+///   Committed — transaction committed at commit_timestamp
+///   Aborted   — transaction was rolled back
+///
+/// participant_tablet_ids: the set of tablets involved, so
+///   intent cleaners can find all keys that need resolution.
+/// last_heartbeat_timestamp: updated by the coordinator to
+///   prevent lock expiry on active transactions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxnStatusRecord {
     pub txn_id: TxnId,

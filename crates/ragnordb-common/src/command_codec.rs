@@ -4,6 +4,11 @@ use crate::ids::{Timestamp, TxnId};
 
 use crate::proto::command;
 
+/// A single-key prewrite command (part of distributed txn 2PC).
+///
+/// this wil; be proposed to the tablet Raft group during the prewrite phase.
+/// The tablet atomically checks for conflicts and writes
+/// default/{key}/{start_ts} + lock/{key}
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrewriteCommand {
     pub txn_id: TxnId,
@@ -45,6 +50,9 @@ impl PrewriteCommand {
     }
 }
 
+/// Commit a single key (secondary commit in distributed txn)
+///
+/// this removes lock/{key}
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitCommand {
     pub txn_id: TxnId,
@@ -77,6 +85,10 @@ impl CommitCommand {
     }
 }
 
+/// Rollbacks a single key
+///
+/// Removes lock/{key} and writes a rollback record so
+/// late prewrite or commot messages are ignored
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollbackCommand {
     pub txn_id: TxnId,
@@ -104,6 +116,7 @@ impl RollbackCommand {
     }
 }
 
+/// A single key value write within a SingkeShardCommit batch
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteEntry {
     pub key: Vec<u8>,
@@ -131,6 +144,11 @@ impl WriteEntry {
     }
 }
 
+/// Atomic commit for a single-tablet transaction
+///
+/// all writes, lock removals, and write creations happens in only
+/// one raft proposed command. this is the optional path when all
+/// keys live on the same tablet
 #[derive(Debug, Clone, PartialEq)]
 pub struct SingleShardCommitCommand {
     pub txn_id: TxnId,
@@ -167,6 +185,11 @@ impl SingleShardCommitCommand {
     }
 }
 
+/// this resolves an intent encountered during a read
+///
+/// if the transaction status is Committed: write the commit recors
+/// and remove the lock (roll forward)
+/// if aborted: remove the lock and write a rollback record
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolveIntentCommand {
     pub txn_id: TxnId,
@@ -205,6 +228,7 @@ impl ResolveIntentCommand {
     }
 }
 
+/// catalog change command, can be anything like CREATE TABLE
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableOperation {
     pub table_def: TableDef,
@@ -226,6 +250,9 @@ impl CreateTableOperation {
     }
 }
 
+/// A raft no-op commands that is used for linearizablle
+/// read barrier
+/// also used as a heartbeat/ping in the raft group
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogCommand {
     pub operation: CatalogOperation,
@@ -259,6 +286,8 @@ impl CatalogCommand {
     }
 }
 
+/// A raft no-op command used for the linearizable read barrier
+/// also used as a heartbear.ping in the raft group
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoopCommand;
 
@@ -272,6 +301,13 @@ impl NoopCommand {
     }
 }
 
+/// this is the most topp level enum for every command
+/// a tablet's raft state machine can process
+///
+/// every variant must be:
+///   - deterministic (same bytes → same state transition)
+///   - serializable to protobuf
+///   - idempotent (safe to apply twice under request dedup)
 #[derive(Debug, Clone, PartialEq)]
 pub enum TabletCommand {
     Prewrite(PrewriteCommand),

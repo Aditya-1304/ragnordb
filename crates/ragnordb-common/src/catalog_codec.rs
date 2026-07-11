@@ -1,5 +1,13 @@
+//! this file uses r#type in multiple places
+//! The protobuf field `type` is Rust keyword, so prost generates it as `r#type`. The codec uses `self.ty.to_proto() as i32` for the prost field
+
 use crate::proto::catalog;
 
+/// This describes a single column in a table schema, used in
+/// catalog Raft commands and WAL records
+///
+/// This is the durable network representation (with the column_id)
+/// the in-memory equivalent is ragnordb_catalog::ColumnSchema
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefinition {
     pub column_id: u64,
@@ -8,6 +16,8 @@ pub struct ColumnDefinition {
     pub nullable: bool,
 }
 
+/// This is the supported SQL types for now
+/// Maps to proto/catalog.proto Datatype enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Int,
@@ -56,6 +66,12 @@ impl ColumnDefinition {
     }
 }
 
+/// Durable table definition as stores inside the catalog
+/// raft group and serialized into WAL records / snapshot files
+///
+/// schema_version: monotonically increasing, bumped on every
+///     ALTER TABLE (future)
+/// tablet_count: number of tablets this table is hash partitioned into
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDefinition {
     pub table_id: u64,
