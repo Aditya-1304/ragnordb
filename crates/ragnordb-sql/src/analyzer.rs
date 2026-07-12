@@ -1185,4 +1185,204 @@ mod tests {
         let err = analyze(&stmt, &catalog).unwrap_err();
         assert!(err.to_string().contains("unsupported SELECT"));
     }
+
+    #[test]
+    fn unquoted_identifiers_are_case_insensitive() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT ID, NAME FROM USERS");
+
+        let analyzed = analyze(&statement, &catalog).unwrap();
+
+        match analyzed {
+            AnalyzedStatement::Select(select) => {
+                assert_eq!(select.table_name, "users");
+                assert_eq!(
+                    select.columns,
+                    vec![
+                        SelectColumn::Named("id".into()),
+                        SelectColumn::Named("name".into()),
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn rejects_select_distinct_instead_of_discarding_it() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT DISTINCT id FROM users");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("DISTINCT"));
+    }
+
+    #[test]
+    fn rejects_group_by_instead_of_discarding_it() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT id FROM users GROUP BY id");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("GROUP BY"));
+    }
+
+    #[test]
+    fn rejects_insert_returning_instead_of_discarding_it() {
+        let catalog = make_catalog();
+        let statement = parse("INSERT INTO users (id, name) VALUES (1, 'Ada') RETURNING id");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("RETURNING"));
+    }
+
+    #[test]
+    fn rejects_create_table_if_not_exists() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("CREATE TABLE IF NOT EXISTS items (id INT PRIMARY KEY)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn rejects_multiple_primary_key_definitions() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+            id INT PRIMARY KEY,
+            name TEXT,
+            PRIMARY KEY (name)
+        )",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("more than one primary key"));
+    }
+
+    #[test]
+    fn rejects_duplicate_columns_inside_composite_primary_key() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+            tenant_id INT,
+            id INT,
+            PRIMARY KEY (tenant_id, tenant_id)
+        )",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("primary key contains duplicate column")
+        );
+    }
+
+    #[test]
+    fn accepts_minimum_signed_integer_literal() {
+        let catalog = make_catalog();
+        let statement = parse("INSERT INTO users (id, name) VALUES (-9223372036854775808, 'Ada')");
+
+        let analyzed = analyze(&statement, &catalog).unwrap();
+
+        match analyzed {
+            AnalyzedStatement::Insert(insert) => {
+                assert_eq!(insert.rows[0][0], Value::Int(i64::MIN));
+            }
+            _ => panic!("expected INSERT"),
+        }
+    }
+
+    #[test]
+    fn rejects_integer_literal_above_i64_maximum() {
+        let catalog = make_catalog();
+        let statement = parse("INSERT INTO users (id, name) VALUES (9223372036854775808, 'Ada')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("outside the i64 range"));
+    }
+
+    #[test]
+    fn rejects_non_boolean_where_expression() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("WHERE expression must evaluate to BOOL")
+        );
+    }
+
+    #[test]
+    fn rejects_column_to_column_type_mismatch() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id = name");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("cannot compare INT with TEXT"));
+    }
+
+    #[test]
+    fn rejects_nested_arithmetic_type_mismatch() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id = 1 + 'invalid'");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("requires INT operands"));
+    }
+
+    #[test]
+    fn supports_is_null_without_conflating_column_nullability() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id IS NULL");
+
+        analyze(&statement, &catalog).unwrap();
+    }
+
+    #[test]
+    fn rejects_equality_comparison_with_null() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id = NULL");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("use IS NULL"));
+    }
+
+    #[test]
+    fn accepts_boolean_predicate_composition() {
+        let catalog = make_catalog();
+        let statement = parse(
+            "SELECT * FROM users
+         WHERE id >= 1 AND active = true",
+        );
+
+        analyze(&statement, &catalog).unwrap();
+    }
+
+    #[test]
+    fn rejects_arithmetic_as_final_where_result() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id + 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("WHERE expression must evaluate to BOOL")
+        );
+    }
 }

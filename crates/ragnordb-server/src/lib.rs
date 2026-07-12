@@ -60,22 +60,24 @@ impl Server {
             max_connections,
         });
 
+        // Bind every required public endpoint before spawning background tasks. A node
+        // must not report successful startup if either SQL or administrative access is
+        // unavailable.
+        let admin_listener = TcpListener::bind(admin_addr).await?;
+        let sql_listener = TcpListener::bind(listen_addr).await?;
+
         let admin_shutdown = CancellationToken::new();
         let admin_task_shutdown = admin_shutdown.clone();
+
         let admin_task = tokio::spawn(async move {
-            if let Err(e) =
-                admin::start_admin_server(admin_addr, admin_state, admin_task_shutdown).await
-            {
-                error!(error = %e, "admin server failed");
-            }
+            admin::serve_admin(admin_listener, admin_state, admin_task_shutdown).await
         });
 
-        let listener = TcpListener::bind(listen_addr).await?;
         info!(listen = %listen_addr, "listening (SQL protocol)");
 
         loop {
             tokio::select! {
-                result = listener.accept() => {
+                result = sql_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
                             let sem = connection_semaphore.clone();
@@ -123,8 +125,14 @@ impl Server {
             }
         }
 
-        if let Err(e) = admin_task.await {
-            warn!(error = %e, "admin server task join failed");
+        match admin_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(Box::new(error));
+            }
         }
 
         info!("goodbye");
@@ -132,9 +140,11 @@ impl Server {
     }
 }
 
-/// Handle a single client connection.
+/// Handle one framed SQL client connection
 ///
-/// Reads SQL statements line by line and returns JSON responses.
+/// Each connection owns one session and processes at most one statement at a
+/// time
+/// Requests use the V1 length-prefixed protocol; they are not line-based
 pub async fn handle_connection(
     stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -148,7 +158,14 @@ pub async fn handle_connection(
         };
 
         let trimmed = sql.trim().to_string();
+
         if trimmed.is_empty() {
+            metrics::counter_inc("RagnorDB_requests_received_total");
+            metrics::counter_inc("RagnorDB_requests_error_total");
+
+            let response = error_response("UNSUPPORTED_SQL", "SQL statement is empty", false);
+
+            write_frame(&mut writer, &response).await?;
             continue;
         }
 

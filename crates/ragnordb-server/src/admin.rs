@@ -8,6 +8,12 @@ use tracing::info;
 use crate::build_info::BUILD_INFO;
 use crate::metrics;
 
+/// Thread-safe error type returned by administrative server tasks.
+///
+/// Tokio may move spawned futures and their outputs between worker threads.
+/// Therefore, errors returned from a spawned task must implement `Send`.
+pub type AdminError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 pub struct AdminState {
     pub started_at: u64,
     pub connection_semaphore: Arc<Semaphore>,
@@ -18,7 +24,7 @@ pub async fn start_admin_server(
     addr: SocketAddr,
     state: Arc<AdminState>,
     shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     serve_admin(listener, state, shutdown).await
 }
@@ -27,7 +33,7 @@ pub async fn serve_admin(
     listener: tokio::net::TcpListener,
     state: Arc<AdminState>,
     shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AdminError> {
     let addr = listener.local_addr()?;
 
     let app = Router::new()
