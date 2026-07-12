@@ -185,46 +185,71 @@ impl SingleShardCommitCommand {
     }
 }
 
-/// this resolves an intent encountered during a read
+/// Replicated command used to resolve an abandoned or completed intent.
 ///
-/// if the transaction status is Committed: write the commit recors
-/// and remove the lock (roll forward)
-/// if aborted: remove the lock and write a rollback record
+/// A committed transaction must carry its commit timestamp so the tablet can
+/// roll the intent forward. An aborted transaction must not carry one because
+/// rollback creates no committed MVCC version.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolveIntentCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
     pub key: Vec<u8>,
     pub resolved_status: crate::codec::TxnStatus,
-    pub commit_timestamp: Timestamp,
+    pub commit_timestamp: Option<Timestamp>,
 }
 
 impl ResolveIntentCommand {
-    pub fn to_proto(&self) -> command::ResolveIntentCommand {
-        command::ResolveIntentCommand {
+    /// Convert a validated intent-resolution command to protobuf.
+    pub fn to_proto(&self) -> Result<command::ResolveIntentCommand, &'static str> {
+        validate_resolved_status(self.resolved_status, self.commit_timestamp)?;
+
+        Ok(command::ResolveIntentCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             key: self.key.clone(),
             resolved_status: self.resolved_status.to_proto() as i32,
-            commit_timestamp: Some(self.commit_timestamp.to_proto()),
-        }
+            commit_timestamp: self.commit_timestamp.map(|timestamp| timestamp.to_proto()),
+        })
     }
 
+    /// Decode and validate an intent-resolution command.
     pub fn from_proto(proto: command::ResolveIntentCommand) -> Result<Self, &'static str> {
-        Ok(ResolveIntentCommand {
+        let resolved_status = crate::codec::TxnStatus::from_proto(
+            crate::proto::mvcc::TxnStatus::try_from(proto.resolved_status)
+                .map_err(|_| "invalid resolved status")?,
+        )?;
+
+        let commit_timestamp = proto.commit_timestamp.map(Timestamp::from_proto);
+
+        validate_resolved_status(resolved_status, commit_timestamp)?;
+
+        Ok(Self {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
             key: proto.key,
-            resolved_status: crate::codec::TxnStatus::from_proto(
-                crate::proto::mvcc::TxnStatus::try_from(proto.resolved_status)
-                    .map_err(|_| "invalid status")?,
-            )?,
-            commit_timestamp: Timestamp::from_proto(
-                proto.commit_timestamp.ok_or("missing commit_timestamp")?,
-            ),
+            resolved_status,
+            commit_timestamp,
         })
+    }
+}
+
+fn validate_resolved_status(
+    status: crate::codec::TxnStatus,
+    commit_timestamp: Option<Timestamp>,
+) -> Result<(), &'static str> {
+    match (status, commit_timestamp) {
+        (crate::codec::TxnStatus::Committed, Some(_)) => Ok(()),
+        (crate::codec::TxnStatus::Aborted, None) => Ok(()),
+        (crate::codec::TxnStatus::Committed, None) => {
+            Err("committed intent resolution requires commit_timestamp")
+        }
+        (crate::codec::TxnStatus::Aborted, Some(_)) => {
+            Err("aborted intent resolution must not contain commit_timestamp")
+        }
+        (crate::codec::TxnStatus::Pending, _) => Err("pending transaction cannot be resolved"),
     }
 }
 
@@ -320,29 +345,32 @@ pub enum TabletCommand {
 }
 
 impl TabletCommand {
-    pub fn to_proto(&self) -> command::TabletCommand {
+    pub fn to_proto(&self) -> Result<command::TabletCommand, &'static str> {
         let command = match self {
-            TabletCommand::Prewrite(c) => {
-                Some(command::tablet_command::Command::Prewrite(c.to_proto()))
-            }
-            TabletCommand::Commit(c) => {
-                Some(command::tablet_command::Command::Commit(c.to_proto()))
-            }
-            TabletCommand::Rollback(c) => {
-                Some(command::tablet_command::Command::Rollback(c.to_proto()))
-            }
-            TabletCommand::SingleShardCommit(c) => Some(
-                command::tablet_command::Command::SingleShardCommit(c.to_proto()),
-            ),
-            TabletCommand::ResolveIntent(c) => Some(
-                command::tablet_command::Command::ResolveIntent(c.to_proto()),
-            ),
-            TabletCommand::Catalog(c) => Some(command::tablet_command::Command::CatalogUpdate(
-                c.to_proto(),
+            TabletCommand::Prewrite(command) => Some(command::tablet_command::Command::Prewrite(
+                command.to_proto(),
             )),
-            TabletCommand::Noop(c) => Some(command::tablet_command::Command::Noop(c.to_proto())),
+            TabletCommand::Commit(command) => {
+                Some(command::tablet_command::Command::Commit(command.to_proto()))
+            }
+            TabletCommand::Rollback(command) => Some(command::tablet_command::Command::Rollback(
+                command.to_proto(),
+            )),
+            TabletCommand::SingleShardCommit(command) => Some(
+                command::tablet_command::Command::SingleShardCommit(command.to_proto()),
+            ),
+            TabletCommand::ResolveIntent(command) => Some(
+                command::tablet_command::Command::ResolveIntent(command.to_proto()?),
+            ),
+            TabletCommand::Catalog(command) => Some(
+                command::tablet_command::Command::CatalogUpdate(command.to_proto()),
+            ),
+            TabletCommand::Noop(command) => {
+                Some(command::tablet_command::Command::Noop(command.to_proto()))
+            }
         };
-        command::TabletCommand { command }
+
+        Ok(command::TabletCommand { command })
     }
 
     pub fn from_proto(proto: command::TabletCommand) -> Result<Self, &'static str> {
@@ -466,9 +494,9 @@ mod tests {
             start_timestamp: Timestamp(100),
             key: b"/table/1/pk/1".to_vec(),
             resolved_status: TxnStatus::Committed,
-            commit_timestamp: Timestamp(105),
+            commit_timestamp: Some(Timestamp(105)),
         };
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = ResolveIntentCommand::from_proto(proto).unwrap();
         assert!(matches!(decoded.resolved_status, TxnStatus::Committed));
     }
@@ -537,7 +565,7 @@ mod tests {
             op: WriteKind::Put,
             ttl_ms: 30_000,
         });
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
         assert!(matches!(decoded, TabletCommand::Prewrite(_)));
     }
@@ -550,7 +578,7 @@ mod tests {
             commit_timestamp: Timestamp(105),
             key: b"/table/1/pk/1".to_vec(),
         });
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
         assert!(matches!(decoded, TabletCommand::Commit(_)));
     }
@@ -562,7 +590,7 @@ mod tests {
             start_timestamp: Timestamp(100),
             key: b"/table/1/pk/1".to_vec(),
         });
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
         assert!(matches!(decoded, TabletCommand::Rollback(_)));
     }
@@ -570,7 +598,7 @@ mod tests {
     #[test]
     fn tablet_command_noop_roundtrip() {
         let cmd = TabletCommand::Noop(NoopCommand);
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
         assert!(matches!(decoded, TabletCommand::Noop(_)));
     }
@@ -579,5 +607,22 @@ mod tests {
     fn tablet_command_missing_rejected() {
         let proto = command::TabletCommand { command: None };
         assert!(TabletCommand::from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn aborted_intent_resolution_has_no_commit_timestamp() {
+        let command = ResolveIntentCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            key: b"/table/1/pk/1".to_vec(),
+            resolved_status: TxnStatus::Aborted,
+            commit_timestamp: None,
+        };
+
+        let proto = command.to_proto().unwrap();
+        let decoded = ResolveIntentCommand::from_proto(proto).unwrap();
+
+        assert_eq!(decoded.commit_timestamp, None);
+        assert!(matches!(decoded.resolved_status, TxnStatus::Aborted));
     }
 }

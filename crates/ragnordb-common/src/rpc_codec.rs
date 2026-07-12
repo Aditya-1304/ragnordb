@@ -82,11 +82,11 @@ pub struct TabletCommandRequest {
 }
 
 impl TabletCommandRequest {
-    pub fn to_proto(&self) -> rpc::TabletCommandRequest {
-        rpc::TabletCommandRequest {
+    pub fn to_proto(&self) -> Result<rpc::TabletCommandRequest, &'static str> {
+        Ok(rpc::TabletCommandRequest {
             request_id: Some(self.request_id.to_proto()),
-            command: Some(self.command.to_proto()),
-        }
+            command: Some(self.command.to_proto()?),
+        })
     }
 
     pub fn from_proto(proto: rpc::TabletCommandRequest) -> Result<Self, &'static str> {
@@ -309,7 +309,7 @@ mod tests {
                 key: b"/table/1/pk/1".to_vec(),
             }),
         };
-        let proto = req.to_proto();
+        let proto = req.to_proto().unwrap();
         let decoded = TabletCommandRequest::from_proto(proto).unwrap();
         assert_eq!(decoded.request_id.sequence, 1);
         assert!(matches!(decoded.command, TabletCommand::Commit(_)));

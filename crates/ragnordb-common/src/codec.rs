@@ -225,32 +225,69 @@ impl TxnStatus {
 }
 
 impl TxnStatusRecord {
-    pub fn to_proto(&self) -> mvcc::TxnStatusRecord {
-        mvcc::TxnStatusRecord {
+    pub fn to_proto(&self) -> Result<mvcc::TxnStatusRecord, &'static str> {
+        self.validate()?;
+
+        Ok(mvcc::TxnStatusRecord {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
-            commit_timestamp: self.commit_timestamp.map(|ts| ts.to_proto()),
+            commit_timestamp: self.commit_timestamp.map(|timestamp| timestamp.to_proto()),
             status: self.status.to_proto() as i32,
             primary_key: self.primary_key.clone(),
             participant_tablet_ids: self.participant_tablet_ids.clone(),
-            last_heartbeat_timestamp: self.last_heartbeat_timestamp.map(|ts| ts.to_proto()),
-        }
+            last_heartbeat_timestamp: self
+                .last_heartbeat_timestamp
+                .map(|timestamp| timestamp.to_proto()),
+        })
     }
 
+    /// Decode and validate a durable transaction status record.
+    ///
+    /// Validation is performed after decoding so malformed WAL, snapshot, or
+    /// network data cannot introduce an impossible transaction state.
     pub fn from_proto(proto: mvcc::TxnStatusRecord) -> Result<Self, &'static str> {
-        Ok(TxnStatusRecord {
+        let record = TxnStatusRecord {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
-                proto.start_timestamp.ok_or("missing start_ts")?,
+                proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
             commit_timestamp: proto.commit_timestamp.map(Timestamp::from_proto),
             status: TxnStatus::from_proto(
-                mvcc::TxnStatus::try_from(proto.status).map_err(|_| "inv")?,
+                mvcc::TxnStatus::try_from(proto.status)
+                    .map_err(|_| "invalid transaction status")?,
             )?,
             primary_key: proto.primary_key,
             participant_tablet_ids: proto.participant_tablet_ids,
             last_heartbeat_timestamp: proto.last_heartbeat_timestamp.map(Timestamp::from_proto),
-        })
+        };
+
+        record.validate()?;
+
+        Ok(record)
+    }
+
+    /// Validate invariants that must hold before a transaction status is persisted,
+    /// replicated or accepted during recovery
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.status, self.commit_timestamp) {
+            (TxnStatus::Committed, Some(commit_timestamp))
+                if commit_timestamp > self.start_timestamp =>
+            {
+                Ok(())
+            }
+            (TxnStatus::Committed, Some(_)) => {
+                Err("commit_timestamp must be greater than start_timestamp")
+            }
+            (TxnStatus::Committed, None) => Err("committed transaction requires commit_timestamp"),
+
+            (TxnStatus::Pending, None) | (TxnStatus::Aborted, None) => Ok(()),
+            (TxnStatus::Pending, Some(_)) => {
+                Err("pending transaction must not contain commit_timestamp")
+            }
+            (TxnStatus::Aborted, Some(_)) => {
+                Err("aborted transaction must not contain commit_timestamp")
+            }
+        }
     }
 }
 
@@ -361,7 +398,7 @@ mod tests {
             last_heartbeat_timestamp: Some(Timestamp(205)),
         };
 
-        let proto = record.to_proto();
+        let proto = record.to_proto().unwrap();
         let decoded = TxnStatusRecord::from_proto(proto).unwrap();
 
         assert_eq!(decoded.txn_id.0, 42);
