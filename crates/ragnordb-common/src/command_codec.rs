@@ -202,7 +202,11 @@ pub struct ResolveIntentCommand {
 impl ResolveIntentCommand {
     /// Convert a validated intent-resolution command to protobuf.
     pub fn to_proto(&self) -> Result<command::ResolveIntentCommand, &'static str> {
-        validate_resolved_status(self.resolved_status, self.commit_timestamp)?;
+        validate_resolved_status(
+            self.resolved_status,
+            self.start_timestamp,
+            self.commit_timestamp,
+        )?;
 
         Ok(command::ResolveIntentCommand {
             txn_id: Some(self.txn_id.to_proto()),
@@ -222,13 +226,14 @@ impl ResolveIntentCommand {
 
         let commit_timestamp = proto.commit_timestamp.map(Timestamp::from_proto);
 
-        validate_resolved_status(resolved_status, commit_timestamp)?;
+        let start_timestamp =
+            Timestamp::from_proto(proto.start_timestamp.ok_or("missing start_timestamp")?);
+
+        validate_resolved_status(resolved_status, start_timestamp, commit_timestamp)?;
 
         Ok(Self {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
-            start_timestamp: Timestamp::from_proto(
-                proto.start_timestamp.ok_or("missing start_timestamp")?,
-            ),
+            start_timestamp,
             key: proto.key,
             resolved_status,
             commit_timestamp,
@@ -238,17 +243,32 @@ impl ResolveIntentCommand {
 
 fn validate_resolved_status(
     status: crate::codec::TxnStatus,
+    start_timestamp: Timestamp,
     commit_timestamp: Option<Timestamp>,
 ) -> Result<(), &'static str> {
     match (status, commit_timestamp) {
-        (crate::codec::TxnStatus::Committed, Some(_)) => Ok(()),
+        (crate::codec::TxnStatus::Committed, Some(commit_timestamp))
+            if commit_timestamp > start_timestamp =>
+        {
+            Ok(())
+        }
+
+        (crate::codec::TxnStatus::Committed, Some(_)) => {
+            Err("committed intent resolution requires commit_timestamp \
+                 greater than start_timestamp")
+        }
+
         (crate::codec::TxnStatus::Aborted, None) => Ok(()),
+
         (crate::codec::TxnStatus::Committed, None) => {
             Err("committed intent resolution requires commit_timestamp")
         }
+
         (crate::codec::TxnStatus::Aborted, Some(_)) => {
-            Err("aborted intent resolution must not contain commit_timestamp")
+            Err("aborted intent resolution must not contain \
+                 commit_timestamp")
         }
+
         (crate::codec::TxnStatus::Pending, _) => Err("pending transaction cannot be resolved"),
     }
 }
@@ -624,5 +644,68 @@ mod tests {
 
         assert_eq!(decoded.commit_timestamp, None);
         assert!(matches!(decoded.resolved_status, TxnStatus::Aborted));
+    }
+
+    #[test]
+    fn pending_transaction_cannot_be_resolved() {
+        let command = ResolveIntentCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            key: b"/table/1/pk/1".to_vec(),
+            resolved_status: TxnStatus::Pending,
+            commit_timestamp: None,
+        };
+
+        let error = command.to_proto().unwrap_err();
+
+        assert_eq!(error, "pending transaction cannot be resolved");
+    }
+
+    #[test]
+    fn committed_resolution_requires_commit_timestamp() {
+        let command = ResolveIntentCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            key: b"/table/1/pk/1".to_vec(),
+            resolved_status: TxnStatus::Committed,
+            commit_timestamp: None,
+        };
+
+        let error = command.to_proto().unwrap_err();
+
+        assert_eq!(
+            error,
+            "committed intent resolution requires commit_timestamp"
+        );
+    }
+
+    #[test]
+    fn committed_resolution_requires_newer_timestamp() {
+        let command = ResolveIntentCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            key: b"/table/1/pk/1".to_vec(),
+            resolved_status: TxnStatus::Committed,
+            commit_timestamp: Some(Timestamp(100)),
+        };
+
+        let error = command.to_proto().unwrap_err();
+
+        assert!(error.contains("greater than start_timestamp"));
+    }
+
+    #[test]
+    fn aborted_resolution_rejects_commit_timestamp() {
+        let command = ResolveIntentCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            key: b"/table/1/pk/1".to_vec(),
+            resolved_status: TxnStatus::Aborted,
+            commit_timestamp: Some(Timestamp(105)),
+        };
+
+        let error = command.to_proto().unwrap_err();
+
+        assert!(error.contains("must not contain commit_timestamp"));
     }
 }

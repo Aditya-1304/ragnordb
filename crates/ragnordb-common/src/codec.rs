@@ -422,4 +422,71 @@ mod tests {
 
         assert!(Value::from_proto(proto).is_err());
     }
+
+    fn transaction_status_record(
+        status: TxnStatus,
+        commit_timestamp: Option<Timestamp>,
+    ) -> TxnStatusRecord {
+        TxnStatusRecord {
+            txn_id: TxnId(42),
+            start_timestamp: Timestamp(100),
+            commit_timestamp,
+            status,
+            primary_key: b"/table/1/pk/1".to_vec(),
+            participant_tablet_ids: vec![1, 2],
+            last_heartbeat_timestamp: Some(Timestamp(100)),
+        }
+    }
+
+    #[test]
+    fn committed_status_requires_commit_timestamp() {
+        let record = transaction_status_record(TxnStatus::Committed, None);
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "committed transaction requires commit_timestamp"
+        );
+    }
+
+    #[test]
+    fn committed_status_requires_newer_timestamp() {
+        let record = transaction_status_record(TxnStatus::Committed, Some(Timestamp(100)));
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "commit_timestamp must be greater than start_timestamp"
+        );
+    }
+
+    #[test]
+    fn pending_status_rejects_commit_timestamp() {
+        let record = transaction_status_record(TxnStatus::Pending, Some(Timestamp(110)));
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "pending transaction must not contain commit_timestamp"
+        );
+    }
+
+    #[test]
+    fn aborted_status_rejects_commit_timestamp() {
+        let record = transaction_status_record(TxnStatus::Aborted, Some(Timestamp(110)));
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "aborted transaction must not contain commit_timestamp"
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_invalid_committed_status() {
+        let valid = transaction_status_record(TxnStatus::Committed, Some(Timestamp(110)));
+
+        let mut proto = valid.to_proto().unwrap();
+        proto.commit_timestamp = None;
+
+        let error = TxnStatusRecord::from_proto(proto).unwrap_err();
+
+        assert_eq!(error, "committed transaction requires commit_timestamp");
+    }
 }

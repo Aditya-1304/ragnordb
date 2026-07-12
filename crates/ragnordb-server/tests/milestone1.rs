@@ -160,3 +160,66 @@ async fn empty_sql_frame_receives_a_framed_error() {
     drop(writer);
     server_task.await.unwrap();
 }
+
+async fn read_http_response(
+    addr: SocketAddr,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+
+    Ok(response)
+}
+
+#[tokio::test]
+async fn admin_status_uses_json_content_type() {
+    ragnordb_server::metrics::init_metrics();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+
+    let state = Arc::new(AdminState {
+        started_at: 123,
+        connection_semaphore: Arc::new(Semaphore::new(10)),
+        max_connections: 10,
+    });
+
+    let server_task = {
+        let shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            ragnordb_server::admin::serve_admin(listener, state, shutdown)
+                .await
+                .unwrap();
+        })
+    };
+
+    let response = read_http_response(address, "/status").await.unwrap();
+
+    let headers = response
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .0
+        .to_ascii_lowercase();
+
+    assert!(
+        headers.contains("content-type: application/json"),
+        "unexpected response headers: {headers}"
+    );
+
+    shutdown.cancel();
+    server_task.await.unwrap();
+}

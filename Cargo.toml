@@ -33,6 +33,7 @@ axum = "0.8"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 tokio-util = "0.7"
+toml = "0.8"
 
 raft = { path = "../Papers/raft" }
 wal = { path = "../wal" }

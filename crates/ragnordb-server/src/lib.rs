@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod session;
 
 use admin::AdminState;
+use build_info::BUILD_INFO;
 use config::NodeConfig;
 use protocol::error_response;
 use ragnordb_common::protocol::{read_frame, write_frame};
@@ -40,8 +41,20 @@ impl Server {
             data_dir = %data_dir.display(),
             listen = %listen_addr,
             admin = %admin_addr,
-            max_connections = max_connections,
+            max_connections,
+            ragnordb_version = BUILD_INFO.ragnordb_version,
+            raft_version = BUILD_INFO.raft_version,
+            wal_version = BUILD_INFO.wal_version,
+            bloom_version = BUILD_INFO.bloom_version,
+            feature_flags = BUILD_INFO.feature_flags,
             "node starting",
+        );
+
+        info!(
+            cluster_id = self.config.cluster_id.as_deref().unwrap_or("single-node"),
+            bootstrap = self.config.bootstrap,
+            seed_nodes = self.config.seed_nodes.len(),
+            "cluster configuration loaded",
         );
 
         tokio::fs::create_dir_all(&data_dir).await?;

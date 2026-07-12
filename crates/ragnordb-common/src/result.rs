@@ -32,6 +32,10 @@ pub enum Error {
     /// A schema or data constraint would be violated
     #[error("constraint violation: {0}")]
     ConstraintViolation(String),
+
+    /// Node or cluster configuration could not be loaded or validated
+    #[error("configuration error: {0}")]
+    Configuration(String),
 }
 
 /// Standard result type used throughout RagnorDB

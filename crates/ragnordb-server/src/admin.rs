@@ -1,4 +1,4 @@
-use axum::{Router, routing::get};
+use axum::{Json, Router, http::header, response::IntoResponse, routing::get};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -53,21 +53,30 @@ pub async fn serve_admin(
     Ok(())
 }
 
-async fn handle_metrics() -> String {
-    metrics::render_metrics()
+/// Return metrics using the Prometheus text exposition content type.
+async fn handle_metrics() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics::render_metrics(),
+    )
 }
 
+/// Return structured node status as JSON.
 async fn handle_status(
     axum::extract::State(state): axum::extract::State<Arc<AdminState>>,
-) -> String {
+) -> Json<serde_json::Value> {
     let active = state.max_connections as usize - state.connection_semaphore.available_permits();
 
-    serde_json::json!({
+    Json(serde_json::json!({
         "build": {
             "version": BUILD_INFO.ragnordb_version,
             "target": BUILD_INFO.target,
             "built_at": BUILD_INFO.built_at,
             "rust_version": BUILD_INFO.rust_version,
+            "features": BUILD_INFO.feature_flags,
         },
         "infra": {
             "raft": BUILD_INFO.raft_version,
@@ -79,6 +88,5 @@ async fn handle_status(
             "max_connections": state.max_connections,
             "active_connections": active,
         }
-    })
-    .to_string()
+    }))
 }

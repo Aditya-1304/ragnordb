@@ -314,22 +314,25 @@ fn analyze_insert(
         insert_columns.push(column);
     }
 
-    for column in &table.columns {
-        if !column.nullable && !column_names.contains(&column.name) {
-            return Err(Error::ConstraintViolation(format!(
-                "INSERT must include non-nullable column: {}",
-                column.name
-            )));
-        }
-    }
-
-    // Resolve the primary-key list explicitly so malformed catalog state is
-    // detected before any row reaches the planner or transaction layer.
+    // Resolve primary-key columns first so missing primary-key errors remain
+    // specific and actionable for the client.
     for primary_key_column in table.primary_key_columns()? {
         if !column_names.contains(&primary_key_column.name) {
             return Err(Error::ConstraintViolation(format!(
                 "INSERT must include primary key column: {}",
                 primary_key_column.name
+            )));
+        }
+    }
+
+    // Once primary-key presence has been established, validate every remaining
+    // required column. Defaults are not supported yet, so all non-nullable
+    // columns must appear explicitly in the INSERT column list.
+    for column in &table.columns {
+        if !column.nullable && !column_names.contains(&column.name) {
+            return Err(Error::ConstraintViolation(format!(
+                "INSERT must include non-nullable column: {}",
+                column.name
             )));
         }
     }
@@ -779,7 +782,7 @@ fn reject_create_table_features(create: &sqlparser::ast::CreateTable) -> Result<
         || create.transient
         || create.volatile
         || !matches!(&create.hive_distribution, HiveDistributionStyle::NONE)
-        || create.hive_formats.is_some()
+        || has_hive_format_options(&create.hive_formats)
         || !create.table_properties.is_empty()
         || !create.with_options.is_empty()
         || create.file_format.is_some()
@@ -818,6 +821,20 @@ fn reject_create_table_features(create: &sqlparser::ast::CreateTable) -> Result<
     }
 
     Ok(())
+}
+
+/// Determine whether a parsed `CREATE TABLE` contains actual Hive options.
+///
+/// `sqlparser` stores `Some(HiveFormat::default())` even when the statement
+/// contains no Hive syntax. Checking only `Option::is_some()` would therefore
+/// reject every ordinary `CREATE TABLE`.
+fn has_hive_format_options(hive_formats: &Option<sqlparser::ast::HiveFormat>) -> bool {
+    hive_formats.as_ref().is_some_and(|format| {
+        format.row_format.is_some()
+            || format.serde_properties.is_some()
+            || format.storage.is_some()
+            || format.location.is_some()
+    })
 }
 
 fn reject_insert_features(insert: &sqlparser::ast::Insert) -> Result<()> {
@@ -1004,8 +1021,15 @@ mod tests {
             )
             .unwrap();
         let stmt = parse("CREATE TABLE items (id INT PRIMARY KEY)");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("already exists"));
+        let error = analyze(&stmt, &catalog).unwrap_err();
+        match error {
+            Error::ConstraintViolation(message) => {
+                assert!(message.contains("table already exists"));
+            }
+            other => {
+                panic!("expected ConstraintViolation, got {other:?}");
+            }
+        }
     }
 
     #[test]
@@ -1020,8 +1044,13 @@ mod tests {
     fn reject_unsupported_data_type() {
         let catalog = MemoryCatalog::new();
         let stmt = parse("CREATE TABLE items (id FLOAT PRIMARY KEY)");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unsupported data type"));
+        let error = analyze(&stmt, &catalog).unwrap_err();
+        match error {
+            Error::UnsupportedSql(message) => {
+                assert!(message.contains("unsupported data type"));
+            }
+            other => panic!("expected UnsupportedSql, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1151,7 +1180,17 @@ mod tests {
         let catalog = make_catalog();
         let stmt = parse("SELECT * FROM users WHERE id = 'abc'");
         let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("type"));
+        match err {
+            Error::SchemaMismatch(message) => {
+                assert!(
+                    message.contains("cannot compare INT with TEXT"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => {
+                panic!("expected SchemaMismatch, got {other:?}");
+            }
+        }
     }
 
     #[test]
@@ -1159,7 +1198,12 @@ mod tests {
         let catalog = make_catalog();
         let stmt = parse("SELECT * FROM users WHERE name = 123");
         let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("type"));
+        match err {
+            Error::SchemaMismatch(message) => {
+                assert!(message.contains("cannot compare TEXT with INT"));
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1167,7 +1211,12 @@ mod tests {
         let catalog = make_catalog();
         let stmt = parse("SELECT * FROM users WHERE active = 42");
         let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("type"));
+        match err {
+            Error::SchemaMismatch(message) => {
+                assert!(message.contains("cannot compare BOOL with INT"));
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1175,7 +1224,12 @@ mod tests {
         let catalog = MemoryCatalog::new();
         let stmt = parse("DROP TABLE users");
         let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unsupported SQL statement"));
+        match err {
+            Error::UnsupportedSql(message) => {
+                assert!(message.contains("statement type"));
+            }
+            other => panic!("expected UnsupportedSql, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1183,7 +1237,12 @@ mod tests {
         let catalog = make_catalog();
         let stmt = parse("SELECT * FROM users ORDER BY id");
         let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unsupported SELECT"));
+        match err {
+            Error::UnsupportedSql(message) => {
+                assert!(message.contains("ORDER BY"));
+            }
+            other => panic!("expected UnsupportedSql, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1384,5 +1443,40 @@ mod tests {
                 .to_string()
                 .contains("WHERE expression must evaluate to BOOL")
         );
+    }
+    #[test]
+    fn ordinary_create_table_is_not_treated_as_hive_ddl() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+            id INT PRIMARY KEY,
+            name TEXT
+        )",
+        );
+
+        let analyzed = analyze(&statement, &catalog).unwrap();
+
+        match analyzed {
+            AnalyzedStatement::CreateTable(table) => {
+                assert_eq!(table.table_name, "items");
+                assert_eq!(table.columns.len(), 2);
+                assert_eq!(table.primary_key_column_ids, vec![1]);
+            }
+            other => panic!("expected CREATE TABLE analysis, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_create_table_with_hive_storage_format() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+            id INT PRIMARY KEY
+        ) STORED AS PARQUET",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedSql(_)));
     }
 }

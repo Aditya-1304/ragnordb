@@ -3,6 +3,7 @@ use ragnordb_common::ids::NodeId;
 use ragnordb_common::protocol::read_frame;
 use ragnordb_server::config::NodeConfig;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
@@ -18,6 +19,20 @@ struct Cli {
 enum Commands {
     /// command to start a single ragnorDB node
     Node {
+        /// Load node and static cluster configuration from TOML.
+        ///
+        /// When provided, the configuration file is authoritative and individual node
+        /// flags cannot be supplied at the same time.
+        #[arg(long, value_name = "PATH", conflicts_with_all = [
+            "id",
+            "data_dir",
+            "listen",
+            "admin_listen",
+            "max_connections"
+            ]
+        )]
+        config: Option<PathBuf>,
+
         #[arg(long, default_value = "1")]
         id: u64,
 
@@ -63,12 +78,13 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Node {
+            config,
             id,
             data_dir,
             listen,
             admin_listen,
             max_connections,
-        } => run_node(id, &data_dir, listen, admin_listen, max_connections).await,
+        } => run_node(config, id, &data_dir, listen, admin_listen, max_connections).await,
         Commands::Sql { addr } => run_sql(addr).await,
         Commands::Status { addr, admin_addr } => run_status(addr, admin_addr).await,
     };
@@ -80,21 +96,30 @@ async fn main() {
 }
 
 async fn run_node(
+    config_path: Option<PathBuf>,
     id: u64,
     data_dir: &str,
     listen: SocketAddr,
     admin_listen: Option<SocketAddr>,
     max_connections: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = NodeConfig::new(NodeId(id), std::path::PathBuf::from(data_dir), listen)
-        .with_max_connections(max_connections);
+    let config = match config_path {
+        Some(path) => NodeConfig::load_from_toml(path)?,
+        None => {
+            let mut config = NodeConfig::new(NodeId(id), PathBuf::from(data_dir), listen)?
+                .with_max_connections(max_connections)?;
 
-    if let Some(admin_addr) = admin_listen {
-        config = config.with_admin_addr(admin_addr);
-    }
+            if let Some(admin_addr) = admin_listen {
+                config = config.with_admin_addr(admin_addr)?;
+            }
+
+            config
+        }
+    };
 
     let server = ragnordb_server::Server::new(config);
     server.start().await?;
+
     Ok(())
 }
 
@@ -118,16 +143,22 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let (mut reader, mut writer) = stream.into_split();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
 
+    // reads the server responses concurrently so the interactive shell remains
+    // responsive while a statement is being processed.
     let server_task = tokio::spawn(async move {
-        loop {
-            match read_frame(&mut reader).await {
-                Ok(response) => match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap()),
-                    Err(_) => println!("{response}"),
-                },
-                Err(_) => break,
+        while let Ok(response) = read_frame(&mut reader).await {
+            match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(json) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json)
+                            .expect("serializing serde_json::Value cannot fail")
+                    );
+                }
+                Err(_) => println!("{response}"),
             }
         }
+
         warn!("connection closed by server");
     });
 
