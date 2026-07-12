@@ -11,6 +11,10 @@ use sqlparser::ast::{
 
 use crate::parser::Statement;
 
+/// The result of analyzing a parsed SQL statement.
+///
+/// Each variant carries fully resolved, type-checked information
+/// needed by the planned to build a Plan.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnalyzedStatement {
     CreateTable(AnalyzedCreateTable),
@@ -45,6 +49,15 @@ pub enum SelectColumn {
     Named(String),
 }
 
+/// Analyze a parsed statement
+///
+/// Resolution steps performed:
+///   1. Look up table names in the catalog
+///   2. Resolve column names to ColumnSchema
+///   3. Type-check INSERT literal values against column types
+///   4. Type-check WHERE clause literals against column types
+///   5. Validate primary key constraints (PK must be in INSERT)
+///   6. Reject unsupported SQL forms explicitly
 pub fn analyze(statement: &Statement, catalog: &dyn Catalog) -> Result<AnalyzedStatement> {
     match &statement.ast {
         SqlStatement::CreateTable(create) => analyze_create_table(create, catalog),
