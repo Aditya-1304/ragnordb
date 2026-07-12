@@ -33,3 +33,42 @@ impl Session {
         self.current_txn = None;
     }
 }
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_session_uses_v1_defaults() {
+        let session = Session::new();
+
+        assert!(session.autocommit);
+        assert_eq!(session.current_txn, None);
+        assert_eq!(session.statement_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn session_transaction_lifecycle_is_explicit() {
+        let mut session = Session::new();
+
+        session.begin_txn(TxnId(42));
+        assert_eq!(session.current_txn, Some(TxnId(42)));
+
+        session.end_txn();
+        assert_eq!(session.current_txn, None);
+    }
+
+    #[test]
+    fn session_ids_are_unique() {
+        let first = Session::new();
+        let second = Session::new();
+
+        assert_ne!(first.session_id, second.session_id);
+    }
+}

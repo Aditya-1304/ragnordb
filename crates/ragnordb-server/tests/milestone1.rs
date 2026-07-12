@@ -134,3 +134,29 @@ async fn admin_metrics_returns_prometheus_text() {
     shutdown.cancel();
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn empty_sql_frame_receives_a_framed_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        ragnordb_server::handle_connection(stream).await.unwrap();
+    });
+
+    let stream = TcpStream::connect(address).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+
+    write_sql_frame(&mut writer, "   ").await.unwrap();
+
+    let response = read_frame(&mut reader).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "UNSUPPORTED_SQL");
+    assert_eq!(response["error"]["retryable"], false);
+
+    drop(writer);
+    server_task.await.unwrap();
+}
