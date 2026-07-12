@@ -7,10 +7,9 @@ use std::collections::HashSet;
 
 /// this describes a single column in a table schema (in-memory representation)
 ///
-/// id:       unique within the table, assigned by position (1-indexed)
-/// name:     SQL column name
-/// ty:       INT, TEXT, or BOOL
-/// nullable: whether NULL values are allowed
+/// Column IDs are unique and stable within a table. They are assigned by the
+/// analyzer during `CREATE TABLE` processing and must never be reused after a
+/// column is removed in future schema-change implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSchema {
     pub id: u64,
@@ -26,6 +25,8 @@ pub struct ColumnSchema {
 ///   by the tablet layer to construct internal keys
 /// schema_version: bumped on every schema change (DDL)
 /// tablet_count: number of hash partitions for this table
+/// `primary_key_column_ids` preserves primary-key column order because that
+/// order defines deterministic composite-key encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub id: TableId,
@@ -37,39 +38,62 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    /// Find a column by its canonical SQL identifier.
     pub fn column_by_name(&self, name: &str) -> Option<&ColumnSchema> {
         self.columns.iter().find(|column| column.name == name)
     }
 
-    pub fn primary_key_columns(&self) -> Vec<&ColumnSchema> {
+    /// Find a column by its stable catalog ID.
+    pub fn column_by_id(&self, id: u64) -> Option<&ColumnSchema> {
+        self.columns.iter().find(|column| column.id == id)
+    }
+
+    /// Resolve the ordered primary-key column list.
+    ///
+    /// Returning an error instead of silently dropping missing IDs prevents a
+    /// corrupted schema from producing a different internal key layout.
+    pub fn primary_key_columns(&self) -> Result<Vec<&ColumnSchema>> {
         self.primary_key_column_ids
             .iter()
-            .filter_map(|id| self.columns.iter().find(|column| column.id == *id))
+            .map(|id| {
+                self.column_by_id(*id).ok_or_else(|| {
+                    Error::SchemaMismatch(format!(
+                        "table {} references missing primary key column id {id}",
+                        self.name
+                    ))
+                })
+            })
             .collect()
     }
 }
 
-/// an abstracted catalog interface
+/// Read-only catalog interface used during SQL analysis.
 ///
-/// currently has only one method (table_by_name). Will grow to
-/// include table_by_id, create_table, etc as the metadata Raft
-/// group replaces the in-memory catalog
+/// The analyzer depends on this interface instead of `MemoryCatalog` directly,
+/// allowing a metadata-backed schema cache to replace the local implementation
+/// in later milestones.
 pub trait Catalog {
     fn table_by_name(&self, name: &str) -> Option<&TableSchema>;
 }
 
-/// In-memory catalog implementation for single-node mode and testing
+/// In-memory catalog used by single-node mode and analyzer tests.
 ///
-/// Replaced by the metadata Raft group in the distributed mode
-/// For now, all CREATE TABLE commands write here and all
-/// table lookups read from here
-#[derive(Debug, Default)]
+/// Table IDs begin at one. Zero remains unused so default protobuf scalar values
+/// cannot accidentally identify a valid table.
+#[derive(Debug)]
 pub struct MemoryCatalog {
     tables_by_name: HashMap<String, TableSchema>,
     next_table_id: u64,
 }
 
+impl Default for MemoryCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryCatalog {
+    /// Create an empty catalog with the first valid table ID set to one.
     pub fn new() -> Self {
         Self {
             tables_by_name: HashMap::new(),
@@ -77,6 +101,11 @@ impl MemoryCatalog {
         }
     }
 
+    /// Register a validated single-tablet schema.
+    ///
+    /// This method is the invariant boundary for schemas entering the local
+    /// catalog. Callers cannot register duplicate IDs, nullable primary keys,
+    /// missing primary-key columns, or otherwise ambiguous definitions.
     pub fn add_table(
         &mut self,
         name: impl Into<String>,
@@ -85,49 +114,93 @@ impl MemoryCatalog {
     ) -> Result<TableId> {
         let name = name.into();
 
+        if name.trim().is_empty() {
+            return Err(Error::ConstraintViolation(
+                "table name cannot be empty".to_string(),
+            ));
+        }
+
         if self.tables_by_name.contains_key(&name) {
-            return Err(Error::InvalidArgument(format!(
+            return Err(Error::ConstraintViolation(format!(
                 "table already exists: {name}"
             )));
         }
 
+        if columns.is_empty() {
+            return Err(Error::ConstraintViolation(format!(
+                "table {name} must define at least one column"
+            )));
+        }
+
         if primary_key_column_ids.is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "table {name} must have at least one primary key column"
+            return Err(Error::ConstraintViolation(format!(
+                "table {name} must define a primary key"
             )));
         }
 
         let mut seen_names = HashSet::new();
-        for col in &columns {
-            if !seen_names.insert(&col.name) {
-                return Err(Error::InvalidArgument(format!(
-                    "duplicate column name: {}",
-                    col.name
-                )));
-            }
-        }
-
         let mut seen_ids = HashSet::new();
-        for col in &columns {
-            if !seen_ids.insert(col.id) {
-                return Err(Error::InvalidArgument(format!(
+
+        for column in &columns {
+            if column.id == 0 {
+                return Err(Error::ConstraintViolation(format!(
+                    "column {} on table {name} uses reserved column id 0",
+                    column.name
+                )));
+            }
+
+            if column.name.trim().is_empty() {
+                return Err(Error::ConstraintViolation(format!(
+                    "table {name} contains an empty column name"
+                )));
+            }
+
+            if !seen_names.insert(column.name.as_str()) {
+                return Err(Error::ConstraintViolation(format!(
+                    "duplicate column name: {}",
+                    column.name
+                )));
+            }
+
+            if !seen_ids.insert(column.id) {
+                return Err(Error::ConstraintViolation(format!(
                     "duplicate column id: {}",
-                    col.id
+                    column.id
                 )));
             }
         }
 
-        let column_ids: HashSet<u64> = columns.iter().map(|c| c.id).collect();
-        for pk_id in &primary_key_column_ids {
-            if !column_ids.contains(pk_id) {
-                return Err(Error::InvalidArgument(format!(
-                    "primary key column id {pk_id} does not exist in table {name}"
+        let mut seen_primary_key_ids = HashSet::new();
+
+        for primary_key_id in &primary_key_column_ids {
+            if !seen_primary_key_ids.insert(*primary_key_id) {
+                return Err(Error::ConstraintViolation(format!(
+                    "duplicate primary key column id: {primary_key_id}"
+                )));
+            }
+
+            let column = columns
+                .iter()
+                .find(|column| column.id == *primary_key_id)
+                .ok_or_else(|| {
+                    Error::ConstraintViolation(format!(
+                        "primary key column id {primary_key_id} does not exist in table {name}"
+                    ))
+                })?;
+
+            if column.nullable {
+                return Err(Error::ConstraintViolation(format!(
+                    "primary key column {} on table {name} cannot be nullable",
+                    column.name
                 )));
             }
         }
 
         let table_id = TableId(self.next_table_id);
-        self.next_table_id += 1;
+
+        self.next_table_id = self.next_table_id.checked_add(1).ok_or_else(|| {
+            Error::ConstraintViolation("table ID space has been exhausted".to_string())
+        })?;
 
         let table = TableSchema {
             id: table_id,
@@ -172,87 +245,120 @@ mod tests {
     }
 
     #[test]
-    fn add_table_success() {
+    fn new_and_default_allocate_the_same_first_table_id() {
+        let mut new_catalog = MemoryCatalog::new();
+        let mut default_catalog = MemoryCatalog::default();
+
+        let new_id = new_catalog
+            .add_table("users", valid_columns(), vec![1])
+            .unwrap();
+
+        let default_id = default_catalog
+            .add_table("users", valid_columns(), vec![1])
+            .unwrap();
+
+        assert_eq!(new_id, TableId(1));
+        assert_eq!(default_id, TableId(1));
+    }
+
+    #[test]
+    fn add_table_registers_a_valid_schema() {
         let mut catalog = MemoryCatalog::new();
+
         let id = catalog
             .add_table("users", valid_columns(), vec![1])
             .unwrap();
+
         assert_eq!(id, TableId(1));
 
         let table = catalog.table_by_name("users").unwrap();
-        assert_eq!(table.name, "users");
-        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.schema_version, 1);
+        assert_eq!(table.tablet_count, 1);
+        assert_eq!(table.primary_key_columns().unwrap()[0].name, "id");
     }
 
     #[test]
-    fn reject_duplicate_name() {
+    fn rejects_duplicate_table_name() {
         let mut catalog = MemoryCatalog::new();
+
         catalog
             .add_table("users", valid_columns(), vec![1])
             .unwrap();
-        let err = catalog
+
+        let error = catalog
             .add_table("users", valid_columns(), vec![1])
             .unwrap_err();
-        assert!(err.to_string().contains("table already exists"));
+
+        assert!(error.to_string().contains("table already exists"));
     }
 
     #[test]
-    fn reject_empty_primary_key() {
-        let mut catalog = MemoryCatalog::new();
-        let err = catalog
-            .add_table("users", valid_columns(), vec![])
+    fn rejects_duplicate_column_name() {
+        let mut columns = valid_columns();
+        columns[1].name = "id".to_string();
+
+        let error = MemoryCatalog::new()
+            .add_table("users", columns, vec![1])
             .unwrap_err();
-        assert!(err.to_string().contains("primary key"));
+
+        assert!(error.to_string().contains("duplicate column name"));
     }
 
     #[test]
-    fn reject_duplicate_column_name() {
-        let mut catalog = MemoryCatalog::new();
-        let columns = vec![
-            ColumnSchema {
-                id: 1,
-                name: "id".into(),
-                ty: DataType::Int,
-                nullable: false,
-            },
-            ColumnSchema {
-                id: 2,
-                name: "id".into(),
-                ty: DataType::Text,
-                nullable: true,
-            },
-        ];
-        let err = catalog.add_table("users", columns, vec![1]).unwrap_err();
-        assert!(err.to_string().contains("duplicate column name"));
+    fn rejects_duplicate_column_id() {
+        let mut columns = valid_columns();
+        columns[1].id = 1;
+
+        let error = MemoryCatalog::new()
+            .add_table("users", columns, vec![1])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate column id"));
     }
 
     #[test]
-    fn reject_duplicate_column_id() {
-        let mut catalog = MemoryCatalog::new();
-        let columns = vec![
-            ColumnSchema {
-                id: 1,
-                name: "id".into(),
-                ty: DataType::Int,
-                nullable: false,
-            },
-            ColumnSchema {
-                id: 1,
-                name: "name".into(),
-                ty: DataType::Text,
-                nullable: true,
-            },
-        ];
-        let err = catalog.add_table("users", columns, vec![1]).unwrap_err();
-        assert!(err.to_string().contains("duplicate column id"));
+    fn rejects_duplicate_primary_key_id() {
+        let error = MemoryCatalog::new()
+            .add_table("users", valid_columns(), vec![1, 1])
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate primary key column id")
+        );
     }
 
     #[test]
-    fn reject_bad_primary_key_id() {
-        let mut catalog = MemoryCatalog::new();
-        let err = catalog
+    fn rejects_missing_primary_key_column() {
+        let error = MemoryCatalog::new()
             .add_table("users", valid_columns(), vec![99])
             .unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn rejects_nullable_primary_key() {
+        let mut columns = valid_columns();
+        columns[0].nullable = true;
+
+        let error = MemoryCatalog::new()
+            .add_table("users", columns, vec![1])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot be nullable"));
+    }
+
+    #[test]
+    fn rejects_reserved_zero_column_id() {
+        let mut columns = valid_columns();
+        columns[0].id = 0;
+
+        let error = MemoryCatalog::new()
+            .add_table("users", columns, vec![0])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reserved column id 0"));
     }
 }
