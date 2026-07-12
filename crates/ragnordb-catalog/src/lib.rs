@@ -5,6 +5,12 @@ use ragnordb_common::{Error, Result};
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+/// this describes a single column in a table schema (in-memory representation)
+///
+/// id:       unique within the table, assigned by position (1-indexed)
+/// name:     SQL column name
+/// ty:       INT, TEXT, or BOOL
+/// nullable: whether NULL values are allowed
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSchema {
     pub id: u64,
@@ -13,6 +19,13 @@ pub struct ColumnSchema {
     pub nullable: bool,
 }
 
+/// this is the full table schema held in memory by the catalog
+///
+/// primary_key_column_ids: ordered list of column IDs forming the PK
+///   Used by the SQL analyzer to enforce PK-in-INSERT rules and
+///   by the tablet layer to construct internal keys
+/// schema_version: bumped on every schema change (DDL)
+/// tablet_count: number of hash partitions for this table
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub id: TableId,
@@ -36,10 +49,20 @@ impl TableSchema {
     }
 }
 
+/// an abstracted catalog interface
+///
+/// currently has only one method (table_by_name). Will grow to
+/// include table_by_id, create_table, etc as the metadata Raft
+/// group replaces the in-memory catalog
 pub trait Catalog {
     fn table_by_name(&self, name: &str) -> Option<&TableSchema>;
 }
 
+/// In-memory catalog implementation for single-node mode and testing
+///
+/// Replaced by the metadata Raft group in the distributed mode
+/// For now, all CREATE TABLE commands write here and all
+/// table lookups read from here
 #[derive(Debug, Default)]
 pub struct MemoryCatalog {
     tables_by_name: HashMap<String, TableSchema>,

@@ -1,3 +1,16 @@
+//! Crate root for the SQL layer.
+//!
+//! Re-exports the two public APIs:
+//!   parse_one(&str) -> Result<Statement>
+//!   analyze(&Statement, &dyn Catalog) -> Result<AnalyzedStatement>
+//!
+//! Also re-exports the core types:
+//!   Statement            — parsed SQL (raw + AST)
+//!   AnalyzedStatement    — analyzed statement with resolved names & types
+//!
+//! This is the only public surface other crates (ragnordb-server)
+//! should use
+
 pub mod analyzer;
 pub mod parser;
 
