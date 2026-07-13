@@ -515,11 +515,11 @@ fn analyze_update(
     }
 
     let table = resolve_direct_table(table, catalog, "UPDATE")?;
-    let selection = selection.ok_or_else(|| {
-        Error::ConstraintViolation(
-            "UPDATE requires a WHERE clause in the current SQL version".to_string(),
-        )
-    })?;
+    // Unbounded UPDATE is intentionally outside the currently supported SQL
+    // surface. Classifying this as UnsupportedSql gives protocol layers a stable
+    // semantic error code without requiring inspection of the error message.
+    let selection = selection
+        .ok_or_else(|| unsupported("UPDATE requires a WHERE clause in the current SQL version"))?;
 
     let mut seen_columns = HashSet::new();
     let mut bound_assignments = Vec::with_capacity(assignments.len());
@@ -603,11 +603,14 @@ fn analyze_delete(delete: &Delete, catalog: &dyn Catalog) -> Result<BoundStateme
     }
 
     let table = resolve_direct_table(&from[0], catalog, "DELETE")?;
-    let selection = delete.selection.as_ref().ok_or_else(|| {
-        Error::ConstraintViolation(
-            "DELETE requires a WHERE clause in the current SQL version".to_string(),
-        )
-    })?;
+
+    // Unbounded DELETE is intentionally outside the currently supported SQL
+    // surface. Requiring a predicate prevents accidental full-table deletion until
+    // explicit unbounded-DML semantics and operational safeguards are implemented.
+    let selection = delete
+        .selection
+        .as_ref()
+        .ok_or_else(|| unsupported("DELETE requires a WHERE clause in the current SQL version"))?;
 
     let filter = bind_boolean_filter(selection, table.as_ref())?;
 
@@ -2255,5 +2258,136 @@ mod tests {
         let error = analyze(&statement, &catalog).unwrap_err();
 
         assert!(error.to_string().contains("statement type"));
+    }
+
+    #[test]
+    fn select_binds_stable_table_and_column_identity() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT name FROM users WHERE id = 1");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound SELECT");
+        };
+
+        assert_eq!(select.table.table_id, TableId(1));
+        assert_eq!(select.table.schema_version, 1);
+
+        assert_eq!(select.projection.len(), 1);
+        assert_eq!(select.projection[0].column_id, ColumnId(2));
+        assert_eq!(select.projection[0].ordinal, 1);
+        assert_eq!(select.projection[0].name, "name");
+        assert_eq!(select.projection[0].data_type, DataType::Text);
+        assert!(select.projection[0].nullable);
+    }
+
+    #[test]
+    fn select_wildcard_expands_in_catalog_order() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound SELECT");
+        };
+
+        let ids = select
+            .projection
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+
+        let ordinals = select
+            .projection
+            .iter()
+            .map(|column| column.ordinal)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bound_filter_contains_resolved_column_reference() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id = 1");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound SELECT");
+        };
+
+        let Some(BoundExpr {
+            kind: BoundExprKind::Binary { left, .. },
+            data_type: ExpressionType::Bool,
+            ..
+        }) = select.filter
+        else {
+            panic!("expected bound Boolean filter");
+        };
+
+        let BoundExprKind::Column(column) = left.kind else {
+            panic!("expected bound column reference");
+        };
+
+        assert_eq!(column.table_id, TableId(1));
+        assert_eq!(column.column_id, ColumnId(1));
+        assert_eq!(column.ordinal, 0);
+    }
+
+    #[test]
+    fn insert_targets_are_fully_bound() {
+        let catalog = make_catalog();
+        let statement = parse(
+            "INSERT INTO users (id, name)
+         VALUES (1, 'Ada')",
+        );
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Insert(insert) = bound else {
+            panic!("expected bound INSERT");
+        };
+
+        assert_eq!(insert.table.table_id, TableId(1));
+        assert_eq!(
+            insert
+                .target_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2)]
+        );
+        assert_eq!(
+            insert
+                .target_columns
+                .iter()
+                .map(|column| column.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn update_without_where_is_rejected() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'Ada'");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedSql(_)));
+    }
+
+    #[test]
+    fn delete_without_where_is_rejected() {
+        let catalog = make_catalog();
+        let statement = parse("DELETE FROM users");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedSql(_)));
     }
 }

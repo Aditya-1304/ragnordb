@@ -1,23 +1,35 @@
 //! Crate root for the SQL layer.
 //!
-//! Re-exports the two public APIs:
-//!   parse_one(&str) -> Result<Statement>
-//!   analyze(&Statement, &dyn Catalog) -> Result<AnalyzedStatement>
+//! SQL parsing, binding, and logical planning.
 //!
-//! Also re-exports the core types:
-//!   Statement            — parsed SQL (raw + AST)
-//!   AnalyzedStatement    — analyzed statement with resolved names & types
-//!
-//! This is the only public surface other crates (ragnordb-server)
-//! should use
+//! ```text
+//! parse_one(sql)
+//!     -> parser-owned Statement
+//! analyze(statement, catalog)
+//!     -> RagnorDB-owned BoundStatement
+//! plan(bound)
+//!     -> RagnorDB-owned Plan
+//! ```
 
 pub mod analyzer;
 pub mod bound;
 pub mod parser;
+pub mod planner;
 
 pub use analyzer::analyze;
-pub use bound::BoundStatement;
+
+pub use bound::{
+    BoundAssignment, BoundBinaryOperator, BoundColumnRef, BoundCreateTable, BoundDelete, BoundExpr,
+    BoundExprKind, BoundInsert, BoundSelect, BoundStatement, BoundTableRef, BoundUnaryOperator,
+    BoundUpdate, ExpressionType,
+};
+
 pub use parser::{Statement, parse_one};
+
+pub use planner::{
+    CreateTablePlan, DeletePlan, InsertPlan, Plan, SelectPlan, UpdateAssignmentPlan, UpdatePlan,
+    plan,
+};
 
 #[cfg(test)]
 mod tests {
