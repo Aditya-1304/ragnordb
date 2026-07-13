@@ -426,6 +426,7 @@ mod tests {
     use super::super::catalog_codec::{ColumnDefinition, DataType};
     use super::*;
     use crate::codec::{TxnStatus, WriteKind};
+    use crate::ids::ColumnId;
 
     #[test]
     fn prewrite_command_roundtrip() {
@@ -528,12 +529,12 @@ mod tests {
                 table_id: 100,
                 name: "users".to_string(),
                 columns: vec![ColumnDefinition {
-                    column_id: 1,
+                    column_id: ColumnId(1),
                     name: "id".to_string(),
                     ty: DataType::Int,
                     nullable: false,
                 }],
-                primary_key_column_ids: vec![1],
+                primary_key_column_ids: vec![ColumnId(1)],
                 schema_version: 1,
                 tablet_count: 4,
             },
@@ -552,7 +553,7 @@ mod tests {
                     table_id: 200,
                     name: "orders".to_string(),
                     columns: vec![],
-                    primary_key_column_ids: vec![1],
+                    primary_key_column_ids: vec![ColumnId(1)],
                     schema_version: 1,
                     tablet_count: 2,
                 },

@@ -13,6 +13,10 @@ message TableId {
     uint64 id = 1;
 }
 
+message ColumnId {
+    uint64 id = 1;
+}
+
 message TxnId {
     uint64 id = 1;
 }

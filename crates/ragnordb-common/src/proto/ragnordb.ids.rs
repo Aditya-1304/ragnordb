@@ -15,6 +15,11 @@ pub struct TableId {
     pub id: u64,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ColumnId {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct TxnId {
     #[prost(uint64, tag = "1")]
     pub id: u64,

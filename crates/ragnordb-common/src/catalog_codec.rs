@@ -1,6 +1,7 @@
 //! this file uses r#type in multiple places
 //! The protobuf field `type` is Rust keyword, so prost generates it as `r#type`. The codec uses `self.ty.to_proto() as i32` for the prost field
 
+use crate::ids::ColumnId;
 use crate::proto::catalog;
 
 /// This describes a single column in a table schema, used in
@@ -10,7 +11,7 @@ use crate::proto::catalog;
 /// the in-memory equivalent is ragnordb_catalog::ColumnSchema
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefinition {
-    pub column_id: u64,
+    pub column_id: ColumnId,
     pub name: String,
     pub ty: DataType,
     pub nullable: bool,
@@ -47,7 +48,7 @@ impl DataType {
 impl ColumnDefinition {
     pub fn to_proto(&self) -> catalog::ColumnDefinition {
         catalog::ColumnDefinition {
-            column_id: self.column_id,
+            column_id: self.column_id.0,
             name: self.name.clone(),
             r#type: self.ty.to_proto() as i32, //this is required by prost, to change type to r#type and cast it to i32
             nullable: self.nullable,
@@ -56,7 +57,7 @@ impl ColumnDefinition {
 
     pub fn from_proto(proto: catalog::ColumnDefinition) -> Result<Self, &'static str> {
         Ok(ColumnDefinition {
-            column_id: proto.column_id,
+            column_id: ColumnId(proto.column_id),
             name: proto.name,
             ty: DataType::from_proto(
                 catalog::DataType::try_from(proto.r#type).map_err(|_| "invalid enum")?,
@@ -77,7 +78,7 @@ pub struct TableDefinition {
     pub table_id: u64,
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
-    pub primary_key_column_ids: Vec<u64>,
+    pub primary_key_column_ids: Vec<ColumnId>,
     pub schema_version: u64,
     pub tablet_count: u32,
 }
@@ -88,7 +89,11 @@ impl TableDefinition {
             table_id: self.table_id,
             name: self.name.clone(),
             columns: self.columns.iter().map(|c| c.to_proto()).collect(),
-            primary_key_column_ids: self.primary_key_column_ids.clone(),
+            primary_key_column_ids: self
+                .primary_key_column_ids
+                .iter()
+                .map(|column_id| column_id.0)
+                .collect(),
             schema_version: self.schema_version,
             tablet_count: self.tablet_count,
         }
@@ -104,7 +109,11 @@ impl TableDefinition {
             table_id: proto.table_id,
             name: proto.name,
             columns,
-            primary_key_column_ids: proto.primary_key_column_ids,
+            primary_key_column_ids: proto
+                .primary_key_column_ids
+                .into_iter()
+                .map(ColumnId)
+                .collect(),
             schema_version: proto.schema_version,
             tablet_count: proto.tablet_count,
         })
@@ -118,7 +127,7 @@ mod tests {
     #[test]
     fn column_def_roundtrip() {
         let col = ColumnDefinition {
-            column_id: 1,
+            column_id: ColumnId(1),
             name: "name".to_string(),
             ty: DataType::Text,
             nullable: false,
@@ -127,7 +136,7 @@ mod tests {
         let proto = col.to_proto();
         let decoded = ColumnDefinition::from_proto(proto).unwrap();
 
-        assert_eq!(decoded.column_id, 1);
+        assert_eq!(decoded.column_id, ColumnId(1));
         assert_eq!(decoded.name, "name");
         assert!(matches!(decoded.ty, DataType::Text));
         assert!(!decoded.nullable);
@@ -140,19 +149,19 @@ mod tests {
             name: "users".to_string(),
             columns: vec![
                 ColumnDefinition {
-                    column_id: 1,
+                    column_id: ColumnId(1),
                     name: "id".to_string(),
                     ty: DataType::Int,
                     nullable: false,
                 },
                 ColumnDefinition {
-                    column_id: 2,
+                    column_id: ColumnId(1),
                     name: "name".to_string(),
                     ty: DataType::Text,
                     nullable: true,
                 },
             ],
-            primary_key_column_ids: vec![1],
+            primary_key_column_ids: vec![ColumnId(1)],
             schema_version: 1,
             tablet_count: 4,
         };
@@ -163,7 +172,7 @@ mod tests {
         assert_eq!(decoded.table_id, 100);
         assert_eq!(decoded.name, "users");
         assert_eq!(decoded.columns.len(), 2);
-        assert_eq!(decoded.primary_key_column_ids, vec![1]);
+        assert_eq!(decoded.primary_key_column_ids, vec![ColumnId(1)]);
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.tablet_count, 4);
     }

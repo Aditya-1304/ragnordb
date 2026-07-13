@@ -66,6 +66,25 @@ impl TableId {
     }
 }
 
+/// this is the stable identifier for one column within a table schema
+///
+/// Column Ids are assinged when a table is created and are never reused within
+/// that table. A column Id is distint from its ordinal: the Id remain stable
+/// across the schema versions, while the ordinal identifies its position in the
+/// encoded row representation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ColumnId(pub u64);
+
+impl ColumnId {
+    pub fn to_proto(&self) -> ids::ColumnId {
+        ids::ColumnId { id: self.0 }
+    }
+
+    pub fn from_proto(proto: ids::ColumnId) -> Self {
+        Self(proto.id)
+    }
+}
+
 /// This identifies a distributed transaction globally.
 ///
 /// Assigned by the timestamp oracle (also called metadata Raft group) during the start/begining of a transaction
@@ -282,5 +301,13 @@ mod tests {
 
         assert!(a < b);
         assert_eq!(Timestamp::from_proto(a.to_proto()), a);
+    }
+
+    #[test]
+    fn column_id_roundtrip() {
+        let id = ColumnId(42);
+        let decoded = ColumnId::from_proto(id.to_proto());
+
+        assert_eq!(decoded, id);
     }
 }
