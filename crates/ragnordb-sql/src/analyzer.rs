@@ -1,103 +1,120 @@
+//! Semantic analysis and binding for RagnorDB SQL statements.
+//!
+//! This module is the only layer after parsing that understands `sqlparser`
+//! statement and expression types. It validates RagnorDB's supported SQL
+//! subset, resolves catalog objects, performs type checking, and lowers parser
+//! values into fully owned types defined in `bound.rs`.
+//!
+//! The resulting `BoundStatement` contains stable table and column identities,
+//! schema versions, row ordinals, resolved expression types, and nullability.
+//! Neither the planner nor any future executor should perform name resolution
+//! or depend directly on `sqlparser`.
+
 use std::collections::HashSet;
 
 use ragnordb_catalog::{Catalog, ColumnSchema, TableSchema};
 use ragnordb_common::catalog_codec::DataType;
 use ragnordb_common::codec::Value;
+use ragnordb_common::ids::ColumnId;
 use ragnordb_common::{Error, Result};
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, DataType as SqlDataType, Expr, GroupByExpr,
-    HiveDistributionStyle, Ident, ObjectName, Query, SelectItem, SetExpr,
-    Statement as SqlStatement, TableConstraint, TableFactor, UnaryOperator, Value as SqlValue,
-    WildcardAdditionalOptions,
+    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType as SqlDataType, Delete,
+    Expr, FromTable, GroupByExpr, HiveDistributionStyle, Ident, ObjectName, Query, SelectItem,
+    SetExpr, ShowStatementOptions, Statement as SqlStatement, TableConstraint, TableFactor,
+    TableWithJoins, UnaryOperator, Value as SqlValue, WildcardAdditionalOptions,
 };
 
+use crate::bound::{
+    BoundAssignment, BoundBinaryOperator, BoundColumnRef, BoundCreateTable, BoundDelete, BoundExpr,
+    BoundExprKind, BoundInsert, BoundSelect, BoundStatement, BoundTableRef, BoundUnaryOperator,
+    BoundUpdate, ExpressionType,
+};
 use crate::parser::Statement;
-
-/// Result of resolving and type-checking one parsed statement.
-///
-/// The enum temporarily stores the validated `WHERE` AST until the planner
-/// introduces RagnorDB-owned expression nodes
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum AnalyzedStatement {
-    CreateTable(AnalyzedCreateTable),
-    Insert(AnalyzedInsert),
-    Select(AnalyzedSelect),
-}
-
-/// Validated information required to create a table schema.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnalyzedCreateTable {
-    pub table_name: String,
-    pub columns: Vec<ColumnSchema>,
-    pub primary_key_column_ids: Vec<u64>,
-}
-
-/// Validated literal rows for an `INSERT ... VALUES` statement.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnalyzedInsert {
-    pub table_name: String,
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
-}
-
-/// Validated simple-table `SELECT`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnalyzedSelect {
-    pub table_name: String,
-    pub columns: Vec<SelectColumn>,
-    pub selection: Option<Expr>,
-}
-
-/// Projection supported by the first local executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelectColumn {
-    Wildcard,
-    Named(String),
-}
-
-/// Internal type returned while validating SQL expressions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpressionType {
-    Int,
-    Text,
-    Bool,
-    Null,
-}
-
-impl std::fmt::Display for ExpressionType {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Self::Int => "INT",
-            Self::Text => "TEXT",
-            Self::Bool => "BOOL",
-            Self::Null => "NULL",
-        };
-
-        formatter.write_str(name)
-    }
-}
 
 /// Resolve and type-check one parsed SQL statement.
 ///
-/// for now this supports only `CREATE TABLE`, `INSERT ... VALUES`, and simple
-/// single-table `SELECT`. Other statement kinds are rejected here rather than
-/// being silently discarded by the planner.
-pub fn analyze(statement: &Statement, catalog: &dyn Catalog) -> Result<AnalyzedStatement> {
+/// The analyzer is the enforcement boundary for RagnorDB's supported SQL
+/// surface. Every unsupported parser feature is rejected explicitly so that
+/// syntax is never accepted and then silently discarded during planning.
+///
+/// Successful analysis returns a fully RagnorDB-owned bound statement. The
+/// returned value contains no `sqlparser` statements, expressions, operators,
+/// identifiers, or literal values.
+pub fn analyze(statement: &Statement, catalog: &dyn Catalog) -> Result<BoundStatement> {
     match &statement.ast {
         SqlStatement::CreateTable(create) => analyze_create_table(create, catalog),
         SqlStatement::Insert(insert) => analyze_insert(insert, catalog),
         SqlStatement::Query(query) => analyze_select(query, catalog),
+        SqlStatement::Update {
+            table,
+            assignments,
+            from,
+            selection,
+            returning,
+            or,
+        } => analyze_update(
+            table,
+            assignments,
+            from,
+            selection.as_ref(),
+            returning,
+            or,
+            catalog,
+        ),
+        SqlStatement::Delete(delete) => analyze_delete(delete, catalog),
+        SqlStatement::StartTransaction {
+            modes, modifier, ..
+        } => {
+            if !modes.is_empty() || modifier.is_some() {
+                return Err(unsupported(
+                    "transaction modes, isolation levels, access modes, and BEGIN modifiers are not supported yet",
+                ));
+            }
+
+            Ok(BoundStatement::Begin)
+        }
+        SqlStatement::Commit { chain } => {
+            if *chain {
+                return Err(unsupported("COMMIT AND CHAIN is not supported yet"));
+            }
+
+            Ok(BoundStatement::Commit)
+        }
+        SqlStatement::Rollback { chain, savepoint } => {
+            if *chain {
+                return Err(unsupported("ROLLBACK AND CHAIN is not supported yet"));
+            }
+
+            if savepoint.is_some() {
+                return Err(unsupported("ROLLBACK TO SAVEPOINT is not supported yet"));
+            }
+
+            Ok(BoundStatement::Rollback)
+        }
+        SqlStatement::ShowTables {
+            terse,
+            history,
+            extended,
+            full,
+            external,
+            show_options,
+        } => analyze_show_tables(*terse, *history, *extended, *full, *external, show_options),
         other => Err(unsupported(format!(
             "statement type is not supported yet: {other}"
         ))),
     }
 }
 
+/// Validate and bind a `CREATE TABLE` statement.
+///
+/// The analyzer assigns stable nonzero column IDs because column order and
+/// primary-key membership are known during binding. The catalog remains the
+/// authority responsible for allocating the final `TableId`, initializing the
+/// schema version, setting the local tablet count, and publishing the schema.
 fn analyze_create_table(
     create: &sqlparser::ast::CreateTable,
     catalog: &dyn Catalog,
-) -> Result<AnalyzedStatement> {
+) -> Result<BoundStatement> {
     reject_create_table_features(create)?;
 
     let table_name = simple_name(&create.name)?;
@@ -134,7 +151,7 @@ fn analyze_create_table(
             )));
         }
 
-        let mut explicit_nullability: Option<bool> = None;
+        let mut explicit_nullability = None;
         let mut inline_primary_key = false;
 
         for option in &column.options {
@@ -181,12 +198,20 @@ fn analyze_create_table(
             register_primary_key(&mut primary_key_definition, vec![name.clone()])?;
         }
 
+        let column_number = index.checked_add(1).ok_or_else(|| {
+            Error::ConstraintViolation(
+                "table contains too many columns to assign stable IDs".to_string(),
+            )
+        })?;
+
+        let column_id = u64::try_from(column_number).map_err(|_| {
+            Error::ConstraintViolation(
+                "table contains too many columns to assign stable IDs".to_string(),
+            )
+        })?;
+
         columns.push(ColumnSchema {
-            id: u64::try_from(index + 1).map_err(|_| {
-                Error::ConstraintViolation(
-                    "table contains too many columns to assign stable IDs".to_string(),
-                )
-            })?,
+            id: ColumnId(column_id),
             name,
             ty: analyze_data_type(&column.data_type)?,
             nullable: if inline_primary_key {
@@ -265,17 +290,22 @@ fn analyze_create_table(
         primary_key_column_ids.push(column.id);
     }
 
-    Ok(AnalyzedStatement::CreateTable(AnalyzedCreateTable {
+    Ok(BoundStatement::CreateTable(BoundCreateTable {
         table_name,
         columns,
         primary_key_column_ids,
     }))
 }
 
+/// Bind and validate an `INSERT ... VALUES` statement.
+///
+/// Target columns are resolved to stable identities before row values are
+/// validated. Defaults are not supported yet, so every primary-key and
+/// non-nullable column must be supplied explicitly.
 fn analyze_insert(
     insert: &sqlparser::ast::Insert,
     catalog: &dyn Catalog,
-) -> Result<AnalyzedStatement> {
+) -> Result<BoundStatement> {
     reject_insert_features(insert)?;
 
     let table_name = simple_name(&insert.table_name)?;
@@ -296,7 +326,7 @@ fn analyze_insert(
         .collect::<Vec<_>>();
 
     let mut seen_columns = HashSet::new();
-    let mut insert_columns = Vec::with_capacity(column_names.len());
+    let mut target_columns = Vec::with_capacity(column_names.len());
 
     for column_name in &column_names {
         if !seen_columns.insert(column_name.clone()) {
@@ -311,11 +341,11 @@ fn analyze_insert(
             ))
         })?;
 
-        insert_columns.push(column);
+        target_columns.push(bind_column_ref(table.as_ref(), column)?);
     }
 
-    // Resolve primary-key columns first so missing primary-key errors remain
-    // specific and actionable for the client.
+    // Resolve primary-key columns first so missing-primary-key errors remain
+    // specific and actionable to SQL clients.
     for primary_key_column in table.primary_key_columns()? {
         if !column_names.contains(&primary_key_column.name) {
             return Err(Error::ConstraintViolation(format!(
@@ -325,9 +355,8 @@ fn analyze_insert(
         }
     }
 
-    // Once primary-key presence has been established, validate every remaining
-    // required column. Defaults are not supported yet, so all non-nullable
-    // columns must appear explicitly in the INSERT column list.
+    // Defaults are not supported yet. Every non-nullable column must therefore
+    // be supplied explicitly by the client.
     for column in &table.columns {
         if !column.nullable && !column_names.contains(&column.name) {
             return Err(Error::ConstraintViolation(format!(
@@ -364,33 +393,38 @@ fn analyze_insert(
     let mut rows = Vec::with_capacity(values.rows.len());
 
     for row in &values.rows {
-        if row.len() != insert_columns.len() {
+        if row.len() != target_columns.len() {
             return Err(Error::ConstraintViolation(format!(
                 "INSERT row has {} values for {} columns",
                 row.len(),
-                insert_columns.len()
+                target_columns.len()
             )));
         }
 
-        let mut analyzed_row = Vec::with_capacity(row.len());
+        let mut bound_row = Vec::with_capacity(row.len());
 
-        for (expression, column) in row.iter().zip(insert_columns.iter()) {
+        for (expression, target_column) in row.iter().zip(target_columns.iter()) {
             let value = analyze_insert_literal(expression)?;
-            validate_insert_value(&value, column)?;
-            analyzed_row.push(value);
+            validate_value_for_bound_column(&value, target_column)?;
+            bound_row.push(value);
         }
 
-        rows.push(analyzed_row);
+        rows.push(bound_row);
     }
 
-    Ok(AnalyzedStatement::Insert(AnalyzedInsert {
-        table_name,
-        columns: column_names,
+    Ok(BoundStatement::Insert(BoundInsert {
+        table: bind_table_ref(table.as_ref()),
+        target_columns,
         rows,
     }))
 }
 
-fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<AnalyzedStatement> {
+/// Bind a single-table `SELECT` statement.
+///
+/// Wildcards are expanded during binding so downstream layers always receive a
+/// concrete ordered projection. Catalog order is preserved because that order
+/// defines the schema-version-specific row layout.
+fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<BoundStatement> {
     reject_query_clauses(query)?;
 
     let select = match query.body.as_ref() {
@@ -404,13 +438,227 @@ fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<AnalyzedStatem
         return Err(unsupported("SELECT must read from exactly one table"));
     }
 
-    let from = &select.from[0];
+    let table = resolve_direct_table(&select.from[0], catalog, "SELECT")?;
+    let mut projection = Vec::new();
 
-    if !from.joins.is_empty() {
-        return Err(unsupported("JOIN is not supported yet"));
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(options) if wildcard_options_are_empty(options) => {
+                for column in &table.columns {
+                    projection.push(bind_column_ref(table.as_ref(), column)?);
+                }
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
+                let column_name = normalize_identifier(identifier);
+                let column = table.column_by_name(&column_name).ok_or_else(|| {
+                    Error::SchemaMismatch(format!(
+                        "unknown column {column_name} on table {}",
+                        table.name
+                    ))
+                })?;
+
+                projection.push(bind_column_ref(table.as_ref(), column)?);
+            }
+            other => {
+                return Err(unsupported(format!(
+                    "unsupported SELECT projection: {other}"
+                )));
+            }
+        }
     }
 
-    let table_name = match &from.relation {
+    let filter = select
+        .selection
+        .as_ref()
+        .map(|selection| bind_boolean_filter(selection, table.as_ref()))
+        .transpose()?;
+
+    Ok(BoundStatement::Select(BoundSelect {
+        table: bind_table_ref(table.as_ref()),
+        projection,
+        filter,
+    }))
+}
+
+/// Bind and validate a single-table `UPDATE`.
+///
+/// Requiring a `WHERE` clause is a deliberate initial safety boundary. Full
+/// table updates can be introduced later behind explicit syntax or policy once
+/// execution, authorization, and observability behavior are established.
+fn analyze_update(
+    table: &TableWithJoins,
+    assignments: &[Assignment],
+    from: &Option<TableWithJoins>,
+    selection: Option<&Expr>,
+    returning: &Option<Vec<SelectItem>>,
+    conflict_action: &Option<sqlparser::ast::SqliteOnConflict>,
+    catalog: &dyn Catalog,
+) -> Result<BoundStatement> {
+    if from.is_some() {
+        return Err(unsupported("UPDATE ... FROM is not supported yet"));
+    }
+
+    if returning.is_some() {
+        return Err(unsupported("UPDATE ... RETURNING is not supported yet"));
+    }
+
+    if conflict_action.is_some() {
+        return Err(unsupported(
+            "SQLite UPDATE conflict modifiers are not supported yet",
+        ));
+    }
+
+    if assignments.is_empty() {
+        return Err(Error::InvalidArgument(
+            "UPDATE must contain at least one assignment".to_string(),
+        ));
+    }
+
+    let table = resolve_direct_table(table, catalog, "UPDATE")?;
+    let selection = selection.ok_or_else(|| {
+        Error::ConstraintViolation(
+            "UPDATE requires a WHERE clause in the current SQL version".to_string(),
+        )
+    })?;
+
+    let mut seen_columns = HashSet::new();
+    let mut bound_assignments = Vec::with_capacity(assignments.len());
+
+    for assignment in assignments {
+        let column_name = assignment_column_name(&assignment.target)?;
+        let column = table.column_by_name(&column_name).ok_or_else(|| {
+            Error::SchemaMismatch(format!(
+                "unknown column {column_name} on table {}",
+                table.name
+            ))
+        })?;
+
+        if !seen_columns.insert(column.id) {
+            return Err(Error::ConstraintViolation(format!(
+                "duplicate UPDATE assignment for column: {column_name}"
+            )));
+        }
+
+        if table.primary_key_column_ids.contains(&column.id) {
+            return Err(Error::ConstraintViolation(format!(
+                "updating primary key column {column_name} is not supported"
+            )));
+        }
+
+        let bound_column = bind_column_ref(table.as_ref(), column)?;
+        let value = bind_expression(&assignment.value, table.as_ref())?;
+
+        validate_assignment_expression(&value, &bound_column)?;
+
+        bound_assignments.push(BoundAssignment {
+            column: bound_column,
+            value,
+        });
+    }
+
+    let filter = bind_boolean_filter(selection, table.as_ref())?;
+
+    Ok(BoundStatement::Update(BoundUpdate {
+        table: bind_table_ref(table.as_ref()),
+        assignments: bound_assignments,
+        filter,
+    }))
+}
+
+/// Bind and validate a single-table `DELETE`.
+///
+/// A `WHERE` clause is mandatory in this initial implementation to prevent
+/// accidental unbounded deletion before explicit full-table DML semantics and
+/// operational safeguards exist.
+fn analyze_delete(delete: &Delete, catalog: &dyn Catalog) -> Result<BoundStatement> {
+    if !delete.tables.is_empty() {
+        return Err(unsupported("multi-table DELETE is not supported yet"));
+    }
+
+    if delete.using.is_some() {
+        return Err(unsupported("DELETE ... USING is not supported yet"));
+    }
+
+    if delete.returning.is_some() {
+        return Err(unsupported("DELETE ... RETURNING is not supported yet"));
+    }
+
+    if !delete.order_by.is_empty() {
+        return Err(unsupported("DELETE ... ORDER BY is not supported yet"));
+    }
+
+    if delete.limit.is_some() {
+        return Err(unsupported("DELETE ... LIMIT is not supported yet"));
+    }
+
+    let from = match &delete.from {
+        FromTable::WithFromKeyword(from) => from,
+        FromTable::WithoutKeyword(_) => {
+            return Err(unsupported("DELETE requires an explicit FROM keyword"));
+        }
+    };
+
+    if from.len() != 1 {
+        return Err(unsupported("DELETE must target exactly one direct table"));
+    }
+
+    let table = resolve_direct_table(&from[0], catalog, "DELETE")?;
+    let selection = delete.selection.as_ref().ok_or_else(|| {
+        Error::ConstraintViolation(
+            "DELETE requires a WHERE clause in the current SQL version".to_string(),
+        )
+    })?;
+
+    let filter = bind_boolean_filter(selection, table.as_ref())?;
+
+    Ok(BoundStatement::Delete(BoundDelete {
+        table: bind_table_ref(table.as_ref()),
+        filter,
+    }))
+}
+
+/// Validate a plain `SHOW TABLES` statement.
+///
+/// Filters and dialect-specific modifiers are rejected because the bound
+/// statement intentionally represents only deterministic enumeration of the
+/// current catalog snapshot.
+fn analyze_show_tables(
+    terse: bool,
+    history: bool,
+    extended: bool,
+    full: bool,
+    external: bool,
+    options: &ShowStatementOptions,
+) -> Result<BoundStatement> {
+    let has_options = options.show_in.is_some()
+        || options.starts_with.is_some()
+        || options.limit.is_some()
+        || options.limit_from.is_some()
+        || options.filter_position.is_some();
+
+    if terse || history || extended || full || external || has_options {
+        return Err(unsupported(
+            "SHOW TABLES modifiers, filters, prefixes, scopes, history, and limits are not supported yet",
+        ));
+    }
+
+    Ok(BoundStatement::ShowTables)
+}
+
+/// Resolve one direct table reference and reject aliases, joins, functions,
+/// hints, schema versions, partitions, and dialect-specific table features.
+fn resolve_direct_table(
+    table: &TableWithJoins,
+    catalog: &dyn Catalog,
+    statement_name: &str,
+) -> Result<std::sync::Arc<TableSchema>> {
+    if !table.joins.is_empty() {
+        return Err(unsupported(format!(
+            "{statement_name} does not support JOIN"
+        )));
+    }
+
+    let table_name = match &table.relation {
         TableFactor::Table {
             name,
             alias,
@@ -429,68 +677,91 @@ fn analyze_select(query: &Query, catalog: &dyn Catalog) -> Result<AnalyzedStatem
                 || !partitions.is_empty()
                 || json_path.is_some()
             {
-                return Err(unsupported(
-                    "table aliases, functions, hints, versions, partitions, and JSON paths are not supported yet",
-                ));
+                return Err(unsupported(format!(
+                    "{statement_name} supports only direct, unaliased table references"
+                )));
             }
 
             simple_name(name)?
         }
         _ => {
-            return Err(unsupported(
-                "only direct table references are supported in SELECT",
-            ));
+            return Err(unsupported(format!(
+                "{statement_name} supports only direct table references"
+            )));
         }
     };
 
-    let table = catalog
+    catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| Error::SchemaMismatch(format!("unknown table: {table_name}")))?;
-
-    let mut columns = Vec::with_capacity(select.projection.len());
-
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(options) if wildcard_options_are_empty(options) => {
-                columns.push(SelectColumn::Wildcard);
-            }
-            SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
-                let column_name = normalize_identifier(identifier);
-
-                if table.column_by_name(&column_name).is_none() {
-                    return Err(Error::SchemaMismatch(format!(
-                        "unknown column {column_name} on table {table_name}"
-                    )));
-                }
-
-                columns.push(SelectColumn::Named(column_name));
-            }
-            other => {
-                return Err(unsupported(format!(
-                    "unsupported SELECT projection: {other}"
-                )));
-            }
-        }
-    }
-
-    if let Some(selection) = &select.selection {
-        let selection_type = infer_expression_type(selection, table)?;
-
-        if selection_type != ExpressionType::Bool {
-            return Err(Error::SchemaMismatch(format!(
-                "WHERE expression must evaluate to BOOL, found {selection_type}"
-            )));
-        }
-    }
-
-    Ok(AnalyzedStatement::Select(AnalyzedSelect {
-        table_name,
-        columns,
-        selection: select.selection.clone(),
-    }))
+        .ok_or_else(|| Error::SchemaMismatch(format!("unknown table: {table_name}")))
 }
 
-fn infer_expression_type(expression: &Expr, table: &TableSchema) -> Result<ExpressionType> {
+/// Extract an UPDATE assignment target.
+///
+/// Tuple assignment and qualified assignment targets are intentionally rejected
+/// until their evaluation and ownership semantics are represented explicitly in
+/// the internal bound statement.
+fn assignment_column_name(target: &AssignmentTarget) -> Result<String> {
+    match target {
+        AssignmentTarget::ColumnName(name) => simple_name(name),
+        AssignmentTarget::Tuple(_) => Err(unsupported(
+            "tuple assignment targets are not supported in UPDATE",
+        )),
+    }
+}
+
+/// Construct the immutable table identity retained by bound statements.
+fn bind_table_ref(table: &TableSchema) -> BoundTableRef {
+    BoundTableRef {
+        table_id: table.id,
+        name: table.name.clone(),
+        schema_version: table.schema_version,
+    }
+}
+
+/// Resolve a catalog column into its stable identity and row-layout position.
+///
+/// `column_id` survives schema evolution, while `ordinal` identifies the value
+/// position in rows encoded using this exact schema version. Keeping both
+/// prevents the executor from incorrectly treating column ID as row position.
+fn bind_column_ref(table: &TableSchema, column: &ColumnSchema) -> Result<BoundColumnRef> {
+    let ordinal = table.column_ordinal(column.id).ok_or_else(|| {
+        Error::SchemaMismatch(format!(
+            "column {} with ID {} is not part of table {}",
+            column.name, column.id.0, table.name
+        ))
+    })?;
+
+    Ok(BoundColumnRef {
+        table_id: table.id,
+        column_id: column.id,
+        ordinal,
+        name: column.name.clone(),
+        data_type: column.ty,
+        nullable: column.nullable,
+    })
+}
+
+/// Bind and validate a predicate used by SELECT, UPDATE, or DELETE.
+fn bind_boolean_filter(expression: &Expr, table: &TableSchema) -> Result<BoundExpr> {
+    let expression = bind_expression(expression, table)?;
+
+    if expression.data_type != ExpressionType::Bool {
+        return Err(Error::SchemaMismatch(format!(
+            "WHERE expression must evaluate to BOOL, found {}",
+            expression.data_type
+        )));
+    }
+
+    Ok(expression)
+}
+
+/// Bind an SQL expression into a fully owned RagnorDB expression tree.
+///
+/// Every identifier is resolved against an immutable table schema snapshot.
+/// The returned tree contains no parser nodes and records the result type and
+/// nullability of every expression.
+fn bind_expression(expression: &Expr, table: &TableSchema) -> Result<BoundExpr> {
     match expression {
         Expr::Identifier(identifier) => {
             let column_name = normalize_identifier(identifier);
@@ -501,95 +772,230 @@ fn infer_expression_type(expression: &Expr, table: &TableSchema) -> Result<Expre
                 ))
             })?;
 
-            Ok(expression_type_for_column(column))
+            let column = bind_column_ref(table, column)?;
+
+            Ok(BoundExpr {
+                data_type: expression_type_for_data_type(column.data_type),
+                nullable: column.nullable,
+                kind: BoundExprKind::Column(column),
+            })
         }
-        Expr::Value(value) => expression_type_for_literal(value),
-        Expr::Nested(inner) => infer_expression_type(inner, table),
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            infer_expression_type(inner, table)?;
-            Ok(ExpressionType::Bool)
-        }
-        Expr::UnaryOp { op, expr } => infer_unary_expression_type(op, expr, table),
-        Expr::BinaryOp { left, op, right } => infer_binary_expression_type(left, op, right, table),
+        Expr::Value(value) => bind_literal(value),
+        Expr::Nested(inner) => bind_expression(inner, table),
+        Expr::IsNull(inner) => bind_is_null_expression(inner, false, table),
+        Expr::IsNotNull(inner) => bind_is_null_expression(inner, true, table),
+        Expr::UnaryOp { op, expr } => bind_unary_expression(op, expr, table),
+        Expr::BinaryOp { left, op, right } => bind_binary_expression(left, op, right, table),
         other => Err(unsupported(format!("unsupported expression: {other}"))),
     }
 }
 
-fn infer_unary_expression_type(
+/// Bind `IS NULL` and `IS NOT NULL`.
+///
+/// These predicates always produce a non-null Boolean, even if their operand
+/// evaluates to SQL NULL.
+fn bind_is_null_expression(
+    expression: &Expr,
+    negated: bool,
+    table: &TableSchema,
+) -> Result<BoundExpr> {
+    let expression = bind_expression(expression, table)?;
+
+    Ok(BoundExpr {
+        kind: BoundExprKind::IsNull {
+            expression: Box::new(expression),
+            negated,
+        },
+        data_type: ExpressionType::Bool,
+        nullable: false,
+    })
+}
+
+/// Bind a scalar literal and validate integer range boundaries.
+fn bind_literal(value: &SqlValue) -> Result<BoundExpr> {
+    let (value, data_type, nullable) = match value {
+        SqlValue::Number(value, _) => (
+            Value::Int(parse_integer_literal(value, false)?),
+            ExpressionType::Int,
+            false,
+        ),
+        SqlValue::SingleQuotedString(value) => {
+            (Value::Text(value.clone()), ExpressionType::Text, false)
+        }
+        SqlValue::Boolean(value) => (Value::Bool(*value), ExpressionType::Bool, false),
+        SqlValue::Null => (Value::Null, ExpressionType::Null, true),
+        other => return Err(unsupported(format!("unsupported literal: {other}"))),
+    };
+
+    Ok(BoundExpr {
+        kind: BoundExprKind::Literal(value),
+        data_type,
+        nullable,
+    })
+}
+
+/// Bind a unary expression and enforce operator-specific operand types.
+fn bind_unary_expression(
     operator: &UnaryOperator,
     expression: &Expr,
     table: &TableSchema,
-) -> Result<ExpressionType> {
-    // Validate the complete signed integer boundary, including i64::MIN.
+) -> Result<BoundExpr> {
+    // Parse a signed numeric literal as one value so the complete i64 domain,
+    // including i64::MIN, remains representable.
     if let Expr::Value(SqlValue::Number(value, _)) = expression {
         match operator {
             UnaryOperator::Minus => {
-                parse_integer_literal(value, true)?;
-                return Ok(ExpressionType::Int);
+                return Ok(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Int(parse_integer_literal(value, true)?)),
+                    data_type: ExpressionType::Int,
+                    nullable: false,
+                });
             }
             UnaryOperator::Plus => {
-                parse_integer_literal(value, false)?;
-                return Ok(ExpressionType::Int);
+                return Ok(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Int(parse_integer_literal(value, false)?)),
+                    data_type: ExpressionType::Int,
+                    nullable: false,
+                });
             }
             _ => {}
         }
     }
 
-    let operand_type = infer_expression_type(expression, table)?;
+    let expression = bind_expression(expression, table)?;
 
-    match operator {
-        UnaryOperator::Plus | UnaryOperator::Minus if operand_type == ExpressionType::Int => {
-            Ok(ExpressionType::Int)
+    let (operator, data_type) = match operator {
+        UnaryOperator::Plus if expression.data_type == ExpressionType::Int => {
+            (BoundUnaryOperator::Positive, ExpressionType::Int)
         }
-        UnaryOperator::Not if operand_type == ExpressionType::Bool => Ok(ExpressionType::Bool),
-        UnaryOperator::Plus | UnaryOperator::Minus => Err(Error::SchemaMismatch(format!(
-            "unary {operator} requires INT, found {operand_type}"
-        ))),
-        UnaryOperator::Not => Err(Error::SchemaMismatch(format!(
-            "NOT requires BOOL, found {operand_type}"
-        ))),
-        _ => Err(unsupported(format!(
-            "unsupported unary operator: {operator}"
-        ))),
-    }
+        UnaryOperator::Minus if expression.data_type == ExpressionType::Int => {
+            (BoundUnaryOperator::Negative, ExpressionType::Int)
+        }
+        UnaryOperator::Not if expression.data_type == ExpressionType::Bool => {
+            (BoundUnaryOperator::Not, ExpressionType::Bool)
+        }
+        UnaryOperator::Plus | UnaryOperator::Minus => {
+            return Err(Error::SchemaMismatch(format!(
+                "unary {operator} requires INT, found {}",
+                expression.data_type
+            )));
+        }
+        UnaryOperator::Not => {
+            return Err(Error::SchemaMismatch(format!(
+                "NOT requires BOOL, found {}",
+                expression.data_type
+            )));
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "unsupported unary operator: {operator}"
+            )));
+        }
+    };
+
+    let nullable = expression.nullable;
+
+    Ok(BoundExpr {
+        kind: BoundExprKind::Unary {
+            operator,
+            expression: Box::new(expression),
+        },
+        data_type,
+        nullable,
+    })
 }
 
-fn infer_binary_expression_type(
+/// Bind a binary expression and convert the parser operator into RagnorDB's
+/// internal operator representation.
+fn bind_binary_expression(
     left: &Expr,
     operator: &BinaryOperator,
     right: &Expr,
     table: &TableSchema,
-) -> Result<ExpressionType> {
-    let left_type = infer_expression_type(left, table)?;
-    let right_type = infer_expression_type(right, table)?;
+) -> Result<BoundExpr> {
+    let left = bind_expression(left, table)?;
+    let right = bind_expression(right, table)?;
 
-    match operator {
-        BinaryOperator::And | BinaryOperator::Or => {
+    let left_type = left.data_type;
+    let right_type = right.data_type;
+
+    let (operator, data_type) = match operator {
+        BinaryOperator::And => {
             require_types(operator, left_type, right_type, ExpressionType::Bool)?;
-            Ok(ExpressionType::Bool)
+            (BoundBinaryOperator::And, ExpressionType::Bool)
         }
-        BinaryOperator::Plus
-        | BinaryOperator::Minus
-        | BinaryOperator::Multiply
-        | BinaryOperator::Divide
-        | BinaryOperator::Modulo => {
+        BinaryOperator::Or => {
+            require_types(operator, left_type, right_type, ExpressionType::Bool)?;
+            (BoundBinaryOperator::Or, ExpressionType::Bool)
+        }
+        BinaryOperator::Plus => {
             require_types(operator, left_type, right_type, ExpressionType::Int)?;
-            Ok(ExpressionType::Int)
+            (BoundBinaryOperator::Add, ExpressionType::Int)
         }
-        BinaryOperator::Eq | BinaryOperator::NotEq => {
+        BinaryOperator::Minus => {
+            require_types(operator, left_type, right_type, ExpressionType::Int)?;
+            (BoundBinaryOperator::Subtract, ExpressionType::Int)
+        }
+        BinaryOperator::Multiply => {
+            require_types(operator, left_type, right_type, ExpressionType::Int)?;
+            (BoundBinaryOperator::Multiply, ExpressionType::Int)
+        }
+        BinaryOperator::Divide => {
+            require_types(operator, left_type, right_type, ExpressionType::Int)?;
+            (BoundBinaryOperator::Divide, ExpressionType::Int)
+        }
+        BinaryOperator::Modulo => {
+            require_types(operator, left_type, right_type, ExpressionType::Int)?;
+            (BoundBinaryOperator::Modulo, ExpressionType::Int)
+        }
+        BinaryOperator::Eq => {
             require_comparable_types(operator, left_type, right_type, false)?;
-            Ok(ExpressionType::Bool)
+            (BoundBinaryOperator::Equal, ExpressionType::Bool)
         }
-        BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq => {
+        BinaryOperator::NotEq => {
+            require_comparable_types(operator, left_type, right_type, false)?;
+            (BoundBinaryOperator::NotEqual, ExpressionType::Bool)
+        }
+        BinaryOperator::Gt => {
             require_comparable_types(operator, left_type, right_type, true)?;
-            Ok(ExpressionType::Bool)
+            (BoundBinaryOperator::GreaterThan, ExpressionType::Bool)
         }
-        _ => Err(unsupported(format!(
-            "unsupported binary operator: {operator}"
-        ))),
-    }
+        BinaryOperator::GtEq => {
+            require_comparable_types(operator, left_type, right_type, true)?;
+            (
+                BoundBinaryOperator::GreaterThanOrEqual,
+                ExpressionType::Bool,
+            )
+        }
+        BinaryOperator::Lt => {
+            require_comparable_types(operator, left_type, right_type, true)?;
+            (BoundBinaryOperator::LessThan, ExpressionType::Bool)
+        }
+        BinaryOperator::LtEq => {
+            require_comparable_types(operator, left_type, right_type, true)?;
+            (BoundBinaryOperator::LessThanOrEqual, ExpressionType::Bool)
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "unsupported binary operator: {operator}"
+            )));
+        }
+    };
+
+    let nullable = left.nullable || right.nullable;
+
+    Ok(BoundExpr {
+        kind: BoundExprKind::Binary {
+            left: Box::new(left),
+            operator,
+            right: Box::new(right),
+        },
+        data_type,
+        nullable,
+    })
 }
 
+/// Require both operands to have an exact operator-specific type.
 fn require_types(
     operator: &BinaryOperator,
     left: ExpressionType,
@@ -605,6 +1011,8 @@ fn require_types(
     )))
 }
 
+/// Require operands to be comparable under RagnorDB's currently supported SQL
+/// type system.
 fn require_comparable_types(
     operator: &BinaryOperator,
     left: ExpressionType,
@@ -632,27 +1040,55 @@ fn require_comparable_types(
     Ok(())
 }
 
-fn expression_type_for_column(column: &ColumnSchema) -> ExpressionType {
-    match column.ty {
+/// Validate that an UPDATE expression is assignable to its target column.
+fn validate_assignment_expression(expression: &BoundExpr, column: &BoundColumnRef) -> Result<()> {
+    if expression.data_type == ExpressionType::Null {
+        if column.nullable {
+            return Ok(());
+        }
+
+        return Err(Error::ConstraintViolation(format!(
+            "column {} cannot be assigned NULL",
+            column.name
+        )));
+    }
+
+    let expected = expression_type_for_data_type(column.data_type);
+
+    if expression.data_type != expected {
+        return Err(Error::SchemaMismatch(format!(
+            "assignment for column {} requires {}, found {}",
+            column.name, expected, expression.data_type
+        )));
+    }
+
+    // A nullable expression can produce NULL even when it is not a literal
+    // NULL. Rejecting it here ensures non-nullability is enforced before the
+    // statement reaches an executor without runtime constraint handling.
+    if expression.nullable && !column.nullable {
+        return Err(Error::ConstraintViolation(format!(
+            "assignment for non-nullable column {} may evaluate to NULL",
+            column.name
+        )));
+    }
+
+    Ok(())
+}
+
+/// Map a catalog type into the scalar expression type system.
+fn expression_type_for_data_type(data_type: DataType) -> ExpressionType {
+    match data_type {
         DataType::Int => ExpressionType::Int,
         DataType::Text => ExpressionType::Text,
         DataType::Bool => ExpressionType::Bool,
     }
 }
 
-fn expression_type_for_literal(value: &SqlValue) -> Result<ExpressionType> {
-    match value {
-        SqlValue::Number(value, _) => {
-            parse_integer_literal(value, false)?;
-            Ok(ExpressionType::Int)
-        }
-        SqlValue::SingleQuotedString(_) => Ok(ExpressionType::Text),
-        SqlValue::Boolean(_) => Ok(ExpressionType::Bool),
-        SqlValue::Null => Ok(ExpressionType::Null),
-        other => Err(unsupported(format!("unsupported literal: {other}"))),
-    }
-}
-
+/// Convert an INSERT expression into a stored scalar value.
+///
+/// INSERT currently supports literal VALUES only. General expression evaluation
+/// remains an executor responsibility and must not be introduced implicitly in
+/// this phase.
 fn analyze_insert_literal(expression: &Expr) -> Result<Value> {
     match expression {
         Expr::Value(SqlValue::Number(value, _)) => {
@@ -689,6 +1125,11 @@ fn analyze_insert_literal(expression: &Expr) -> Result<Value> {
     }
 }
 
+/// Parse an integer literal across the complete signed i64 range.
+///
+/// The parser exposes the sign as a separate unary operator. Parsing the
+/// unsigned magnitude into i128 first allows `-9223372036854775808` to be
+/// accepted even though its positive magnitude is greater than `i64::MAX`.
 fn parse_integer_literal(value: &str, negative: bool) -> Result<i64> {
     let magnitude = value
         .parse::<i128>()
@@ -704,29 +1145,32 @@ fn parse_integer_literal(value: &str, negative: bool) -> Result<i64> {
 
     i64::try_from(signed).map_err(|_| {
         let prefix = if negative { "-" } else { "" };
+
         Error::SchemaMismatch(format!(
             "INT literal is outside the i64 range: {prefix}{value}"
         ))
     })
 }
 
-fn validate_insert_value(value: &Value, column: &ColumnSchema) -> Result<()> {
+/// Validate a stored INSERT value against its resolved target column.
+fn validate_value_for_bound_column(value: &Value, column: &BoundColumnRef) -> Result<()> {
     match value {
         Value::Null if column.nullable => Ok(()),
         Value::Null => Err(Error::ConstraintViolation(format!(
             "column {} cannot be NULL",
             column.name
         ))),
-        Value::Int(_) if column.ty == DataType::Int => Ok(()),
-        Value::Text(_) if column.ty == DataType::Text => Ok(()),
-        Value::Bool(_) if column.ty == DataType::Bool => Ok(()),
+        Value::Int(_) if column.data_type == DataType::Int => Ok(()),
+        Value::Text(_) if column.data_type == DataType::Text => Ok(()),
+        Value::Bool(_) if column.data_type == DataType::Bool => Ok(()),
         _ => Err(Error::SchemaMismatch(format!(
             "value for column {} does not match type {:?}",
-            column.name, column.ty
+            column.name, column.data_type
         ))),
     }
 }
 
+/// Convert one supported SQL DDL type into RagnorDB's catalog type.
 fn analyze_data_type(data_type: &SqlDataType) -> Result<DataType> {
     match data_type {
         SqlDataType::Int(_) | SqlDataType::Integer(_) => Ok(DataType::Int),
@@ -736,6 +1180,10 @@ fn analyze_data_type(data_type: &SqlDataType) -> Result<DataType> {
     }
 }
 
+/// Record an explicit NULL or NOT NULL declaration.
+///
+/// Duplicate declarations are rejected even if they agree because silently
+/// accepting redundant constraints can conceal generated or malformed DDL.
 fn set_nullability(current: &mut Option<bool>, nullable: bool, column_name: &str) -> Result<()> {
     if let Some(previous) = current {
         if *previous != nullable {
@@ -753,6 +1201,7 @@ fn set_nullability(current: &mut Option<bool>, nullable: bool, column_name: &str
     Ok(())
 }
 
+/// Register the table's single primary-key definition.
 fn register_primary_key(current: &mut Option<Vec<String>>, columns: Vec<String>) -> Result<()> {
     if current.is_some() {
         return Err(Error::ConstraintViolation(
@@ -764,6 +1213,7 @@ fn register_primary_key(current: &mut Option<Vec<String>>, columns: Vec<String>)
     Ok(())
 }
 
+/// Reject CREATE TABLE syntax that the bound representation cannot preserve.
 fn reject_create_table_features(create: &sqlparser::ast::CreateTable) -> Result<()> {
     if create.if_not_exists {
         return Err(unsupported(
@@ -837,6 +1287,7 @@ fn has_hive_format_options(hive_formats: &Option<sqlparser::ast::HiveFormat>) ->
     })
 }
 
+/// Reject INSERT syntax that cannot be represented by `BoundInsert`.
 fn reject_insert_features(insert: &sqlparser::ast::Insert) -> Result<()> {
     if insert.or.is_some()
         || insert.ignore
@@ -860,6 +1311,7 @@ fn reject_insert_features(insert: &sqlparser::ast::Insert) -> Result<()> {
     Ok(())
 }
 
+/// Reject query clauses that the current logical representation cannot retain.
 fn reject_query_clauses(query: &Query) -> Result<()> {
     if query.with.is_some()
         || query.order_by.is_some()
@@ -880,6 +1332,7 @@ fn reject_query_clauses(query: &Query) -> Result<()> {
     Ok(())
 }
 
+/// Reject SELECT clauses that the current bound representation cannot retain.
 fn reject_select_features(select: &sqlparser::ast::Select) -> Result<()> {
     let has_group_by = match &select.group_by {
         GroupByExpr::All(_) => true,
@@ -913,6 +1366,7 @@ fn reject_select_features(select: &sqlparser::ast::Select) -> Result<()> {
     Ok(())
 }
 
+/// Determine whether an unqualified wildcard has no parser-level modifiers.
 fn wildcard_options_are_empty(options: &WildcardAdditionalOptions) -> bool {
     options.opt_ilike.is_none()
         && options.opt_exclude.is_none()
@@ -921,11 +1375,11 @@ fn wildcard_options_are_empty(options: &WildcardAdditionalOptions) -> bool {
         && options.opt_rename.is_none()
 }
 
-/// Convert an SQL identifier to its catalog form.
+/// Convert an SQL identifier into its canonical catalog form.
 ///
-/// Unquoted names are folded to lowercase. Quoted names preserve their exact
-/// spelling, giving predictable case-insensitive behavior for ordinary SQL and
-/// case-sensitive behavior when explicitly requested by the client.
+/// Unquoted names are folded to lowercase. Quoted identifiers preserve their
+/// exact spelling, providing case-insensitive ordinary SQL identifiers and
+/// explicit case sensitivity when requested by the client.
 fn normalize_identifier(identifier: &Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
@@ -934,6 +1388,7 @@ fn normalize_identifier(identifier: &Ident) -> String {
     }
 }
 
+/// Resolve a currently supported unqualified object name.
 fn simple_name(name: &ObjectName) -> Result<String> {
     if name.0.len() != 1 {
         return Err(unsupported(format!(
@@ -944,6 +1399,7 @@ fn simple_name(name: &ObjectName) -> Result<String> {
     Ok(normalize_identifier(&name.0[0]))
 }
 
+/// Construct a consistent unsupported-SQL error.
 fn unsupported(message: impl Into<String>) -> Error {
     Error::UnsupportedSql(message.into())
 }
@@ -951,38 +1407,41 @@ fn unsupported(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ragnordb_catalog::{ColumnSchema, MemoryCatalog};
-    use ragnordb_common::catalog_codec::DataType;
-    use ragnordb_common::codec::Value;
 
+    use ragnordb_catalog::MemoryCatalog;
+    use ragnordb_common::ids::TableId;
+
+    /// Build the deterministic schema shared by analyzer tests.
     fn make_catalog() -> MemoryCatalog {
         let mut catalog = MemoryCatalog::new();
+
         catalog
             .add_table(
                 "users",
                 vec![
                     ColumnSchema {
-                        id: 1,
+                        id: ColumnId(1),
                         name: "id".into(),
                         ty: DataType::Int,
                         nullable: false,
                     },
                     ColumnSchema {
-                        id: 2,
+                        id: ColumnId(2),
                         name: "name".into(),
                         ty: DataType::Text,
                         nullable: true,
                     },
                     ColumnSchema {
-                        id: 3,
+                        id: ColumnId(3),
                         name: "active".into(),
                         ty: DataType::Bool,
                         nullable: true,
                     },
                 ],
-                vec![1],
+                vec![ColumnId(1)],
             )
             .unwrap();
+
         catalog
     }
 
@@ -993,278 +1452,438 @@ mod tests {
     #[test]
     fn analyze_create_table() {
         let catalog = MemoryCatalog::new();
-        let stmt = parse("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)");
-        let analyzed = analyze(&stmt, &catalog).unwrap();
-        match analyzed {
-            AnalyzedStatement::CreateTable(t) => {
-                assert_eq!(t.table_name, "items");
-                assert_eq!(t.columns.len(), 2);
-                assert_eq!(t.primary_key_column_ids, vec![1]);
-            }
-            _ => panic!("expected CreateTable"),
-        }
+        let statement = parse("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::CreateTable(table) = bound else {
+            panic!("expected CREATE TABLE");
+        };
+
+        assert_eq!(table.table_name, "items");
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.primary_key_column_ids, vec![ColumnId(1)]);
+    }
+
+    #[test]
+    fn ordinary_create_table_is_not_treated_as_hive_ddl() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+                id INT PRIMARY KEY,
+                name TEXT
+            )",
+        );
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::CreateTable(table) = bound else {
+            panic!("expected CREATE TABLE");
+        };
+
+        assert_eq!(table.table_name, "items");
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.primary_key_column_ids, vec![ColumnId(1)]);
     }
 
     #[test]
     fn reject_create_duplicate_table() {
-        let mut catalog = MemoryCatalog::new();
-        catalog
-            .add_table(
-                "items",
-                vec![ColumnSchema {
-                    id: 1,
-                    name: "id".into(),
-                    ty: DataType::Int,
-                    nullable: false,
-                }],
-                vec![1],
-            )
-            .unwrap();
-        let stmt = parse("CREATE TABLE items (id INT PRIMARY KEY)");
-        let error = analyze(&stmt, &catalog).unwrap_err();
-        match error {
-            Error::ConstraintViolation(message) => {
-                assert!(message.contains("table already exists"));
-            }
-            other => {
-                panic!("expected ConstraintViolation, got {other:?}");
-            }
-        }
+        let catalog = make_catalog();
+        let statement = parse("CREATE TABLE users (id INT PRIMARY KEY)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("table already exists"));
     }
 
     #[test]
-    fn reject_create_no_pk() {
+    fn reject_create_without_primary_key() {
         let catalog = MemoryCatalog::new();
-        let stmt = parse("CREATE TABLE items (id INT)");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("primary key"));
+        let statement = parse("CREATE TABLE items (id INT)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("primary key"));
     }
 
     #[test]
     fn reject_unsupported_data_type() {
         let catalog = MemoryCatalog::new();
-        let stmt = parse("CREATE TABLE items (id FLOAT PRIMARY KEY)");
-        let error = analyze(&stmt, &catalog).unwrap_err();
-        match error {
-            Error::UnsupportedSql(message) => {
-                assert!(message.contains("unsupported data type"));
-            }
-            other => panic!("expected UnsupportedSql, got {other:?}"),
-        }
+        let statement = parse("CREATE TABLE items (id FLOAT PRIMARY KEY)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported data type"));
+    }
+
+    #[test]
+    fn rejects_create_table_if_not_exists() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("CREATE TABLE IF NOT EXISTS items (id INT PRIMARY KEY)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn rejects_multiple_primary_key_definitions() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+                id INT PRIMARY KEY,
+                name TEXT,
+                PRIMARY KEY (name)
+            )",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("more than one primary key"));
+    }
+
+    #[test]
+    fn rejects_duplicate_columns_inside_composite_primary_key() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+                tenant_id INT,
+                id INT,
+                PRIMARY KEY (tenant_id, tenant_id)
+            )",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("primary key contains duplicate column")
+        );
+    }
+
+    #[test]
+    fn rejects_create_table_with_hive_storage_format() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse(
+            "CREATE TABLE items (
+                id INT PRIMARY KEY
+            ) STORED AS PARQUET",
+        );
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedSql(_)));
     }
 
     #[test]
     fn analyze_insert_success() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)");
-        let analyzed = analyze(&stmt, &catalog).unwrap();
-        match analyzed {
-            AnalyzedStatement::Insert(ins) => {
-                assert_eq!(ins.table_name, "users");
-                assert_eq!(ins.rows.len(), 1);
-                assert_eq!(ins.rows[0][0], Value::Int(1));
-                assert_eq!(ins.rows[0][1], Value::Text("Ada".into()));
-                assert_eq!(ins.rows[0][2], Value::Bool(true));
-            }
-            _ => panic!("expected Insert"),
-        }
+        let statement = parse("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Insert(insert) = bound else {
+            panic!("expected INSERT");
+        };
+
+        assert_eq!(insert.table.table_id, TableId(1));
+        assert_eq!(insert.table.name, "users");
+        assert_eq!(insert.table.schema_version, 1);
+
+        assert_eq!(
+            insert
+                .target_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "active"]
+        );
+
+        assert_eq!(insert.target_columns[0].column_id, ColumnId(1));
+        assert_eq!(insert.target_columns[0].ordinal, 0);
+        assert_eq!(insert.rows[0][0], Value::Int(1));
+        assert_eq!(insert.rows[0][1], Value::Text("Ada".into()));
+        assert_eq!(insert.rows[0][2], Value::Bool(true));
     }
 
     #[test]
     fn reject_insert_unknown_table() {
         let catalog = MemoryCatalog::new();
-        let stmt = parse("INSERT INTO ghost (id) VALUES (1)");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unknown table"));
+        let statement = parse("INSERT INTO ghost (id) VALUES (1)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown table"));
     }
 
     #[test]
-    fn reject_insert_missing_pk() {
+    fn reject_insert_missing_primary_key() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (name) VALUES ('Ada')");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("primary key"));
+        let statement = parse("INSERT INTO users (name) VALUES ('Ada')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("primary key"));
     }
 
     #[test]
     fn reject_insert_unknown_column() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unknown column"));
+        let statement = parse("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown column"));
+    }
+
+    #[test]
+    fn reject_insert_duplicate_column() {
+        let catalog = make_catalog();
+        let statement = parse("INSERT INTO users (id, id) VALUES (1, 2)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate INSERT column"));
     }
 
     #[test]
     fn reject_insert_wrong_type() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (id, name) VALUES ('abc', 'Ada')");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("type"));
+        let statement = parse("INSERT INTO users (id, name) VALUES ('abc', 'Ada')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("type"));
     }
 
     #[test]
-    fn reject_insert_null_into_not_null_column() {
+    fn reject_insert_null_into_non_nullable_column() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (id, name) VALUES (NULL, 'Ada')");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("NULL"));
+        let statement = parse("INSERT INTO users (id, name) VALUES (NULL, 'Ada')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("NULL"));
     }
 
     #[test]
     fn reject_insert_wrong_value_count() {
         let catalog = make_catalog();
-        let stmt = parse("INSERT INTO users (id, name) VALUES (1, 'Ada', true)");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("values"));
+        let statement = parse("INSERT INTO users (id, name) VALUES (1, 'Ada', true)");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("values"));
     }
 
     #[test]
-    fn analyze_select_wildcard() {
+    fn accepts_minimum_signed_integer_literal() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users");
-        let analyzed = analyze(&stmt, &catalog).unwrap();
-        match analyzed {
-            AnalyzedStatement::Select(s) => {
-                assert_eq!(s.table_name, "users");
-                assert_eq!(s.columns, vec![SelectColumn::Wildcard]);
-            }
-            _ => panic!("expected Select"),
-        }
+        let statement = parse("INSERT INTO users (id, name) VALUES (-9223372036854775808, 'Ada')");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Insert(insert) = bound else {
+            panic!("expected INSERT");
+        };
+
+        assert_eq!(insert.rows[0][0], Value::Int(i64::MIN));
+    }
+
+    #[test]
+    fn rejects_integer_literal_above_i64_maximum() {
+        let catalog = make_catalog();
+        let statement = parse("INSERT INTO users (id, name) VALUES (9223372036854775808, 'Ada')");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("outside the i64 range"));
+    }
+
+    #[test]
+    fn analyze_select_wildcard_expands_catalog_columns() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+
+        assert_eq!(select.table.table_id, TableId(1));
+        assert_eq!(select.table.schema_version, 1);
+
+        assert_eq!(
+            select
+                .projection
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "active"]
+        );
+
+        assert_eq!(select.projection[0].column_id, ColumnId(1));
+        assert_eq!(select.projection[0].ordinal, 0);
+        assert_eq!(select.projection[1].column_id, ColumnId(2));
+        assert_eq!(select.projection[1].ordinal, 1);
+        assert_eq!(select.projection[2].column_id, ColumnId(3));
+        assert_eq!(select.projection[2].ordinal, 2);
     }
 
     #[test]
     fn analyze_select_named_columns() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT id, name FROM users");
-        let analyzed = analyze(&stmt, &catalog).unwrap();
-        match analyzed {
-            AnalyzedStatement::Select(s) => {
-                assert_eq!(s.table_name, "users");
-                assert_eq!(
-                    s.columns,
-                    vec![
-                        SelectColumn::Named("id".into()),
-                        SelectColumn::Named("name".into())
-                    ]
-                );
-            }
-            _ => panic!("expected Select"),
-        }
+        let statement = parse("SELECT id, name FROM users");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+
+        assert_eq!(
+            select
+                .projection
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
     }
 
     #[test]
-    fn analyze_select_with_where() {
+    fn select_filter_retains_resolved_column_identity() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users WHERE id = 1");
-        analyze(&stmt, &catalog).unwrap();
+        let statement = parse("SELECT name FROM users WHERE id = 42");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+
+        let filter = select.filter.expect("WHERE clause must be bound");
+
+        let BoundExprKind::Binary {
+            left,
+            operator,
+            right,
+        } = filter.kind
+        else {
+            panic!("expected a bound binary predicate");
+        };
+
+        assert_eq!(operator, BoundBinaryOperator::Equal);
+        assert_eq!(filter.data_type, ExpressionType::Bool);
+        assert!(!filter.nullable);
+
+        let BoundExprKind::Column(column) = left.kind else {
+            panic!("expected a resolved column reference");
+        };
+
+        assert_eq!(column.table_id, select.table.table_id);
+        assert_eq!(column.column_id, ColumnId(1));
+        assert_eq!(column.ordinal, 0);
+        assert_eq!(column.name, "id");
+        assert_eq!(right.kind, BoundExprKind::Literal(Value::Int(42)));
     }
 
     #[test]
     fn reject_select_unknown_table() {
         let catalog = MemoryCatalog::new();
-        let stmt = parse("SELECT * FROM ghost");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unknown table"));
+        let statement = parse("SELECT * FROM ghost");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown table"));
     }
 
     #[test]
     fn reject_select_unknown_column() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT nonexistent FROM users");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        assert!(err.to_string().contains("unknown column"));
+        let statement = parse("SELECT nonexistent FROM users");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown column"));
     }
 
     #[test]
-    fn reject_select_where_wrong_type_int_vs_text() {
+    fn reject_select_where_type_mismatch() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users WHERE id = 'abc'");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        match err {
-            Error::SchemaMismatch(message) => {
-                assert!(
-                    message.contains("cannot compare INT with TEXT"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => {
-                panic!("expected SchemaMismatch, got {other:?}");
-            }
-        }
+        let statement = parse("SELECT * FROM users WHERE id = 'abc'");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("cannot compare INT with TEXT"));
     }
 
     #[test]
-    fn reject_select_where_wrong_type_text_vs_int() {
+    fn reject_non_boolean_where_expression() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users WHERE name = 123");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        match err {
-            Error::SchemaMismatch(message) => {
-                assert!(message.contains("cannot compare TEXT with INT"));
-            }
-            other => panic!("expected SchemaMismatch, got {other:?}"),
-        }
+        let statement = parse("SELECT * FROM users WHERE id");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("WHERE expression must evaluate to BOOL")
+        );
     }
 
     #[test]
-    fn reject_select_where_wrong_type_bool() {
+    fn supports_is_null_without_conflating_column_nullability() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users WHERE active = 42");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        match err {
-            Error::SchemaMismatch(message) => {
-                assert!(message.contains("cannot compare BOOL with INT"));
-            }
-            other => panic!("expected SchemaMismatch, got {other:?}"),
-        }
+        let statement = parse("SELECT * FROM users WHERE name IS NULL");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+
+        let filter = select.filter.expect("expected bound filter");
+
+        assert_eq!(filter.data_type, ExpressionType::Bool);
+        assert!(!filter.nullable);
     }
 
     #[test]
-    fn reject_unsupported_statement() {
-        let catalog = MemoryCatalog::new();
-        let stmt = parse("DROP TABLE users");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        match err {
-            Error::UnsupportedSql(message) => {
-                assert!(message.contains("statement type"));
-            }
-            other => panic!("expected UnsupportedSql, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reject_select_with_order_by() {
+    fn rejects_equality_comparison_with_null() {
         let catalog = make_catalog();
-        let stmt = parse("SELECT * FROM users ORDER BY id");
-        let err = analyze(&stmt, &catalog).unwrap_err();
-        match err {
-            Error::UnsupportedSql(message) => {
-                assert!(message.contains("ORDER BY"));
-            }
-            other => panic!("expected UnsupportedSql, got {other:?}"),
-        }
+        let statement = parse("SELECT * FROM users WHERE id = NULL");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("use IS NULL"));
     }
 
     #[test]
-    fn unquoted_identifiers_are_case_insensitive() {
+    fn accepts_boolean_predicate_composition() {
         let catalog = make_catalog();
-        let statement = parse("SELECT ID, NAME FROM USERS");
+        let statement = parse(
+            "SELECT * FROM users
+             WHERE id >= 1 AND active = true",
+        );
 
-        let analyzed = analyze(&statement, &catalog).unwrap();
+        analyze(&statement, &catalog).unwrap();
+    }
 
-        match analyzed {
-            AnalyzedStatement::Select(select) => {
-                assert_eq!(select.table_name, "users");
-                assert_eq!(
-                    select.columns,
-                    vec![
-                        SelectColumn::Named("id".into()),
-                        SelectColumn::Named("name".into()),
-                    ]
-                );
-            }
-            _ => panic!("expected SELECT"),
-        }
+    #[test]
+    fn rejects_arithmetic_as_final_where_result() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT * FROM users WHERE id + 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("WHERE expression must evaluate to BOOL")
+        );
     }
 
     #[test]
@@ -1288,9 +1907,159 @@ mod tests {
     }
 
     #[test]
-    fn rejects_insert_returning_instead_of_discarding_it() {
+    fn reject_select_with_order_by() {
         let catalog = make_catalog();
-        let statement = parse("INSERT INTO users (id, name) VALUES (1, 'Ada') RETURNING id");
+        let statement = parse("SELECT * FROM users ORDER BY id");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("ORDER BY"));
+    }
+
+    #[test]
+    fn unquoted_identifiers_are_case_insensitive() {
+        let catalog = make_catalog();
+        let statement = parse("SELECT ID, NAME FROM USERS");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+
+        assert_eq!(
+            select
+                .projection
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+    }
+
+    #[test]
+    fn analyze_update_success() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'Grace', active = false WHERE id = 1");
+
+        let bound = analyze(&statement, &catalog).unwrap();
+
+        let BoundStatement::Update(update) = bound else {
+            panic!("expected UPDATE");
+        };
+
+        assert_eq!(update.table.table_id, TableId(1));
+        assert_eq!(update.table.schema_version, 1);
+        assert_eq!(update.assignments.len(), 2);
+
+        assert_eq!(update.assignments[0].column.column_id, ColumnId(2));
+        assert_eq!(update.assignments[0].column.ordinal, 1);
+        assert_eq!(update.assignments[0].column.name, "name");
+        assert_eq!(
+            update.assignments[0].value.kind,
+            BoundExprKind::Literal(Value::Text("Grace".into()))
+        );
+
+        assert_eq!(update.assignments[1].column.column_id, ColumnId(3));
+        assert_eq!(update.assignments[1].column.ordinal, 2);
+        assert_eq!(update.filter.data_type, ExpressionType::Bool);
+    }
+
+    #[test]
+    fn reject_update_without_where() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'Grace'");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("requires a WHERE clause"));
+    }
+
+    #[test]
+    fn reject_update_primary_key_assignment() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET id = 2 WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn reject_duplicate_update_assignment() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'A', name = 'B' WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate UPDATE assignment"));
+    }
+
+    #[test]
+    fn reject_update_unknown_column() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET missing = 1 WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown column"));
+    }
+
+    #[test]
+    fn reject_update_assignment_type_mismatch() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 42 WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("requires TEXT"));
+    }
+
+    #[test]
+    fn reject_update_null_for_non_nullable_column() {
+        let mut catalog = MemoryCatalog::new();
+
+        catalog
+            .add_table(
+                "accounts",
+                vec![
+                    ColumnSchema {
+                        id: ColumnId(1),
+                        name: "id".into(),
+                        ty: DataType::Int,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        id: ColumnId(2),
+                        name: "enabled".into(),
+                        ty: DataType::Bool,
+                        nullable: false,
+                    },
+                ],
+                vec![ColumnId(1)],
+            )
+            .unwrap();
+
+        let statement = parse("UPDATE accounts SET enabled = NULL WHERE id = 1");
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("cannot be assigned NULL"));
+    }
+
+    #[test]
+    fn reject_update_from() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'Grace' FROM users AS source WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("UPDATE ... FROM"));
+    }
+
+    #[test]
+    fn reject_update_returning() {
+        let catalog = make_catalog();
+        let statement = parse("UPDATE users SET name = 'Grace' WHERE id = 1 RETURNING name");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
@@ -1298,80 +2067,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_create_table_if_not_exists() {
-        let catalog = MemoryCatalog::new();
-        let statement = parse("CREATE TABLE IF NOT EXISTS items (id INT PRIMARY KEY)");
-
-        let error = analyze(&statement, &catalog).unwrap_err();
-
-        assert!(error.to_string().contains("IF NOT EXISTS"));
-    }
-
-    #[test]
-    fn rejects_multiple_primary_key_definitions() {
-        let catalog = MemoryCatalog::new();
-        let statement = parse(
-            "CREATE TABLE items (
-            id INT PRIMARY KEY,
-            name TEXT,
-            PRIMARY KEY (name)
-        )",
-        );
-
-        let error = analyze(&statement, &catalog).unwrap_err();
-
-        assert!(error.to_string().contains("more than one primary key"));
-    }
-
-    #[test]
-    fn rejects_duplicate_columns_inside_composite_primary_key() {
-        let catalog = MemoryCatalog::new();
-        let statement = parse(
-            "CREATE TABLE items (
-            tenant_id INT,
-            id INT,
-            PRIMARY KEY (tenant_id, tenant_id)
-        )",
-        );
-
-        let error = analyze(&statement, &catalog).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("primary key contains duplicate column")
-        );
-    }
-
-    #[test]
-    fn accepts_minimum_signed_integer_literal() {
+    fn analyze_delete_success() {
         let catalog = make_catalog();
-        let statement = parse("INSERT INTO users (id, name) VALUES (-9223372036854775808, 'Ada')");
+        let statement = parse("DELETE FROM users WHERE id = 1");
 
-        let analyzed = analyze(&statement, &catalog).unwrap();
+        let bound = analyze(&statement, &catalog).unwrap();
 
-        match analyzed {
-            AnalyzedStatement::Insert(insert) => {
-                assert_eq!(insert.rows[0][0], Value::Int(i64::MIN));
-            }
-            _ => panic!("expected INSERT"),
-        }
+        let BoundStatement::Delete(delete) = bound else {
+            panic!("expected DELETE");
+        };
+
+        assert_eq!(delete.table.table_id, TableId(1));
+        assert_eq!(delete.table.name, "users");
+        assert_eq!(delete.table.schema_version, 1);
+        assert_eq!(delete.filter.data_type, ExpressionType::Bool);
     }
 
     #[test]
-    fn rejects_integer_literal_above_i64_maximum() {
+    fn reject_delete_without_where() {
         let catalog = make_catalog();
-        let statement = parse("INSERT INTO users (id, name) VALUES (9223372036854775808, 'Ada')");
+        let statement = parse("DELETE FROM users");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
-        assert!(error.to_string().contains("outside the i64 range"));
+        assert!(error.to_string().contains("requires a WHERE clause"));
     }
 
     #[test]
-    fn rejects_non_boolean_where_expression() {
+    fn reject_delete_unknown_table() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("DELETE FROM ghost WHERE id = 1");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("unknown table"));
+    }
+
+    #[test]
+    fn reject_delete_non_boolean_filter() {
         let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id");
+        let statement = parse("DELETE FROM users WHERE id + 1");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
@@ -1383,100 +2118,142 @@ mod tests {
     }
 
     #[test]
-    fn rejects_column_to_column_type_mismatch() {
+    fn reject_delete_returning() {
         let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id = name");
+        let statement = parse("DELETE FROM users WHERE id = 1 RETURNING id");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
-        assert!(error.to_string().contains("cannot compare INT with TEXT"));
+        assert!(error.to_string().contains("RETURNING"));
     }
 
     #[test]
-    fn rejects_nested_arithmetic_type_mismatch() {
+    fn reject_delete_order_by() {
         let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id = 1 + 'invalid'");
+        let statement = parse("DELETE FROM users WHERE id = 1 ORDER BY id");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
-        assert!(error.to_string().contains("requires INT operands"));
+        assert!(error.to_string().contains("ORDER BY"));
     }
 
     #[test]
-    fn supports_is_null_without_conflating_column_nullability() {
+    fn reject_delete_limit() {
         let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id IS NULL");
-
-        analyze(&statement, &catalog).unwrap();
-    }
-
-    #[test]
-    fn rejects_equality_comparison_with_null() {
-        let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id = NULL");
+        let statement = parse("DELETE FROM users WHERE id = 1 LIMIT 1");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
-        assert!(error.to_string().contains("use IS NULL"));
+        assert!(error.to_string().contains("LIMIT"));
     }
 
     #[test]
-    fn accepts_boolean_predicate_composition() {
-        let catalog = make_catalog();
-        let statement = parse(
-            "SELECT * FROM users
-         WHERE id >= 1 AND active = true",
-        );
-
-        analyze(&statement, &catalog).unwrap();
-    }
-
-    #[test]
-    fn rejects_arithmetic_as_final_where_result() {
-        let catalog = make_catalog();
-        let statement = parse("SELECT * FROM users WHERE id + 1");
-
-        let error = analyze(&statement, &catalog).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("WHERE expression must evaluate to BOOL")
-        );
-    }
-    #[test]
-    fn ordinary_create_table_is_not_treated_as_hive_ddl() {
+    fn analyze_plain_begin() {
         let catalog = MemoryCatalog::new();
-        let statement = parse(
-            "CREATE TABLE items (
-            id INT PRIMARY KEY,
-            name TEXT
-        )",
-        );
 
-        let analyzed = analyze(&statement, &catalog).unwrap();
-
-        match analyzed {
-            AnalyzedStatement::CreateTable(table) => {
-                assert_eq!(table.table_name, "items");
-                assert_eq!(table.columns.len(), 2);
-                assert_eq!(table.primary_key_column_ids, vec![1]);
-            }
-            other => panic!("expected CREATE TABLE analysis, got {other:?}"),
-        }
+        assert!(matches!(
+            analyze(&parse("BEGIN"), &catalog).unwrap(),
+            BoundStatement::Begin
+        ));
     }
 
     #[test]
-    fn rejects_create_table_with_hive_storage_format() {
+    fn analyze_start_transaction() {
         let catalog = MemoryCatalog::new();
-        let statement = parse(
-            "CREATE TABLE items (
-            id INT PRIMARY KEY
-        ) STORED AS PARQUET",
-        );
+
+        assert!(matches!(
+            analyze(&parse("START TRANSACTION"), &catalog).unwrap(),
+            BoundStatement::Begin
+        ));
+    }
+
+    #[test]
+    fn reject_transaction_modes() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("START TRANSACTION READ ONLY");
 
         let error = analyze(&statement, &catalog).unwrap_err();
 
-        assert!(matches!(error, Error::UnsupportedSql(_)));
+        assert!(error.to_string().contains("transaction modes"));
+    }
+
+    #[test]
+    fn analyze_plain_commit() {
+        let catalog = MemoryCatalog::new();
+
+        assert!(matches!(
+            analyze(&parse("COMMIT"), &catalog).unwrap(),
+            BoundStatement::Commit
+        ));
+    }
+
+    #[test]
+    fn reject_commit_and_chain() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("COMMIT AND CHAIN");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("AND CHAIN"));
+    }
+
+    #[test]
+    fn analyze_plain_rollback() {
+        let catalog = MemoryCatalog::new();
+
+        assert!(matches!(
+            analyze(&parse("ROLLBACK"), &catalog).unwrap(),
+            BoundStatement::Rollback
+        ));
+    }
+
+    #[test]
+    fn reject_rollback_and_chain() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("ROLLBACK AND CHAIN");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("AND CHAIN"));
+    }
+
+    #[test]
+    fn reject_rollback_to_savepoint() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("ROLLBACK TO SAVEPOINT checkpoint");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("SAVEPOINT"));
+    }
+
+    #[test]
+    fn analyze_plain_show_tables() {
+        let catalog = MemoryCatalog::new();
+
+        assert!(matches!(
+            analyze(&parse("SHOW TABLES"), &catalog).unwrap(),
+            BoundStatement::ShowTables
+        ));
+    }
+
+    #[test]
+    fn reject_show_tables_filter() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("SHOW TABLES LIKE 'user%'");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("SHOW TABLES modifiers"));
+    }
+
+    #[test]
+    fn reject_unsupported_statement() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("DROP TABLE users");
+
+        let error = analyze(&statement, &catalog).unwrap_err();
+
+        assert!(error.to_string().contains("statement type"));
     }
 }

@@ -12,9 +12,11 @@
 //! should use
 
 pub mod analyzer;
+pub mod bound;
 pub mod parser;
 
-pub use analyzer::{AnalyzedStatement, analyze};
+pub use analyzer::analyze;
+pub use bound::BoundStatement;
 pub use parser::{Statement, parse_one};
 
 #[cfg(test)]

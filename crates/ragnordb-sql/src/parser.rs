@@ -12,7 +12,7 @@ use sqlparser::parser::Parser;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub raw: String,
-    pub ast: SqlStatement,
+    pub(crate) ast: SqlStatement,
 }
 
 /// Parse exactly one SQL statement from a client request.
