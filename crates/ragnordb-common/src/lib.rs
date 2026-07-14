@@ -11,6 +11,7 @@
 pub mod catalog_codec;
 pub mod codec;
 pub mod command_codec;
+pub mod encoding;
 pub mod ids;
 pub mod protocol;
 pub mod result;

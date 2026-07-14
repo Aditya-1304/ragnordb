@@ -155,7 +155,7 @@ mod tests {
                     nullable: false,
                 },
                 ColumnDefinition {
-                    column_id: ColumnId(1),
+                    column_id: ColumnId(2),
                     name: "name".to_string(),
                     ty: DataType::Text,
                     nullable: true,
