@@ -26,6 +26,10 @@
 //! ```
 //!
 //! the namespace byte leaves room for future index and metadeta key spaces
+//! `RowKey::to_proto()` is message serialization and currently represents its
+//! table ID with little-endian bytes. That protobuf representation is separate
+//! from `encode_row_key()`, which deliberately uses big-endian table IDs to
+//! preserve numeric ordering in the storage engine.
 
 use ragnordb_common::{
     Error, Result,
@@ -95,14 +99,17 @@ pub fn make_row_key(table_id: TableId, primary_key_values: &[Value]) -> Result<R
 
 /// Encode a complete row key into ordered storage bytes.
 ///
-/// Big-endian table IDs ensure bytewise table ordering matches numeric
-/// `TableId` ordering.
+/// Because `RowKey` has public fields, this function validates externally
+/// constructed values before accepting them. Invalid caller-provided `RowKey`
+/// values return `InvalidArgument`, not `CorruptData`.
 pub fn encode_row_key(row_key: &RowKey) -> Result<Vec<u8>> {
     validate_table_id(row_key.table_id)?;
 
-    // Validate externally constructed RowKey values before accepting their
-    // primary-key bytes as canonical storage input.
-    decode_primary_key(&row_key.primary_key_bytes)?;
+    decode_primary_key(&row_key.primary_key_bytes).map_err(|error| {
+        invalid_key(format!(
+            "RowKey contains noncanonical primary-key bytes: {error}"
+        ))
+    })?;
 
     let mut output = Vec::with_capacity(ROW_KEY_HEADER_LENGTH + row_key.primary_key_bytes.len());
 
@@ -114,13 +121,16 @@ pub fn encode_row_key(row_key: &RowKey) -> Result<Vec<u8>> {
 }
 
 /// Decode and validate a complete ordered row key.
+///
+/// unknown namespaces, truncated keysmm zero table IDs and malformed
+/// primary key components indicate corrupt stored bytes
 pub fn decode_row_key(bytes: &[u8]) -> Result<RowKey> {
     if bytes.len() <= ROW_KEY_HEADER_LENGTH {
-        return Err(invalid_key("row key is missing its encoded primary key"));
+        return Err(corrupt_key("row key is missing its encoded primary key"));
     }
 
     if bytes[0] != ROW_KEY_NAMESPACE {
-        return Err(invalid_key(format!(
+        return Err(corrupt_key(format!(
             "unknown row-key namespace 0x{:02x}",
             bytes[0]
         )));
@@ -132,7 +142,9 @@ pub fn decode_row_key(bytes: &[u8]) -> Result<RowKey> {
 
     let table_id = TableId(u64::from_be_bytes(table_id_bytes));
 
-    validate_table_id(table_id)?;
+    if table_id.0 == 0 {
+        return Err(corrupt_key("decoded row key contains reserved table ID 0"));
+    }
 
     let primary_key_bytes = bytes[ROW_KEY_HEADER_LENGTH..].to_vec();
 
@@ -304,6 +316,10 @@ fn invalid_key(message: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("invalid storage key: {message}"))
 }
 
+fn corrupt_key(message: impl std::fmt::Display) -> Error {
+    Error::CorruptData(format!("invalid storage key encoding: {message}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,12 +339,52 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_encoding_is_deterministic() {
-        let values = vec![Value::Int(42), Value::Text("Ada".to_string())];
+    fn signed_integer_keys_have_stable_bytes() {
+        assert_eq!(
+            encode_primary_key(&[Value::Int(0)]).unwrap(),
+            vec![KEY_TAG_INT, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,]
+        );
 
         assert_eq!(
-            encode_primary_key(&values).unwrap(),
-            encode_primary_key(&values).unwrap()
+            encode_primary_key(&[Value::Int(-1)]).unwrap(),
+            vec![KEY_TAG_INT, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,]
+        );
+    }
+
+    #[test]
+    fn escaped_text_key_has_stable_bytes() {
+        assert_eq!(
+            encode_primary_key(&[Value::Text("a\0".to_string()),]).unwrap(),
+            vec![KEY_TAG_TEXT, b'a', 0x00, 0xff, 0x00, 0x00,]
+        );
+    }
+
+    #[test]
+    fn complete_row_key_has_stable_bytes() {
+        let row_key = make_row_key(TableId(1), &[Value::Int(0)]).unwrap();
+
+        assert_eq!(
+            encode_row_key(&row_key).unwrap(),
+            vec![
+                ROW_KEY_NAMESPACE,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                KEY_TAG_INT,
+                0x80,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+            ]
         );
     }
 
@@ -410,58 +466,91 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_primary_key() {
+    fn rejects_empty_primary_key_as_invalid_argument() {
         let error = encode_primary_key(&[]).unwrap_err();
 
+        assert!(matches!(error, Error::InvalidArgument(_)));
         assert!(error.to_string().contains("at least one value"));
     }
 
     #[test]
-    fn rejects_null_primary_key_component() {
+    fn rejects_null_primary_key_as_invalid_argument() {
         let error = encode_primary_key(&[Value::Null]).unwrap_err();
 
+        assert!(matches!(error, Error::InvalidArgument(_)));
         assert!(error.to_string().contains("NULL cannot be encoded"));
     }
 
     #[test]
-    fn rejects_zero_table_id() {
+    fn rejects_zero_table_id_as_invalid_argument() {
         let error = make_row_key(TableId(0), &[Value::Int(1)]).unwrap_err();
 
+        assert!(matches!(error, Error::InvalidArgument(_)));
         assert!(error.to_string().contains("table ID 0"));
     }
 
     #[test]
-    fn rejects_unknown_primary_key_tag() {
+    fn rejects_noncanonical_external_row_key_as_invalid_argument() {
+        let row_key = RowKey {
+            table_id: TableId(1),
+            primary_key_bytes: vec![0xff],
+        };
+
+        let error = encode_row_key(&row_key).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(error.to_string().contains("noncanonical primary-key bytes"));
+    }
+
+    #[test]
+    fn rejects_unknown_primary_key_tag_as_corruption() {
         let error = decode_primary_key(&[0xff]).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("unknown primary-key tag"));
     }
 
     #[test]
-    fn rejects_truncated_integer_key() {
+    fn rejects_truncated_integer_key_as_corruption() {
         let error = decode_primary_key(&[KEY_TAG_INT, 0, 1]).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("truncated"));
     }
 
     #[test]
-    fn rejects_invalid_text_escape() {
+    fn rejects_invalid_text_escape_as_corruption() {
         let bytes = [KEY_TAG_TEXT, b'a', TEXT_ESCAPE, 0x01];
 
         let error = decode_primary_key(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("invalid TEXT escape sequence"));
     }
 
     #[test]
-    fn rejects_unknown_row_key_namespace() {
-        let mut row_key =
+    fn rejects_unknown_row_namespace_as_corruption() {
+        let mut bytes =
             encode_row_key(&make_row_key(TableId(1), &[Value::Int(1)]).unwrap()).unwrap();
 
-        row_key[0] = 0xff;
+        bytes[0] = 0xff;
 
-        let error = decode_row_key(&row_key).unwrap_err();
+        let error = decode_row_key(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("unknown row-key namespace"));
+    }
+
+    #[test]
+    fn rejects_decoded_zero_table_id_as_corruption() {
+        let mut bytes =
+            encode_row_key(&make_row_key(TableId(1), &[Value::Int(1)]).unwrap()).unwrap();
+
+        bytes[1..ROW_KEY_HEADER_LENGTH].fill(0);
+
+        let error = decode_row_key(&bytes).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+        assert!(error.to_string().contains("table ID 0"));
     }
 }

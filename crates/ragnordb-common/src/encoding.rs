@@ -22,6 +22,8 @@
 //!
 //! Decoders reject trailing, truncated and non canonical input so corrupted
 //! storage bytes cannot silently produce a different logical row
+//! Encoding errors represent invalid caller input. Decoding errors represent
+//! corrupt internal bytes and therefore return `Error::CorruptData`.
 
 use crate::codec::{Row, Value};
 use crate::{Error, Result};
@@ -84,6 +86,20 @@ pub fn decode_row(bytes: &[u8]) -> Result<Row> {
         ));
     }
     let value_count = decoder.read_u32()? as usize;
+
+    // Every encoded value requires at least one tag byte. Validate the count
+    // before reserving memory so corrupt input cannot request an allocation
+    // larger than the encoded payload could possibly contain.
+    if value_count > decoder.remaining() {
+        return Err(corrupt_encoding(
+            "row",
+            format!(
+                "value count {value_count} exceeds remaining encoded bytes {}",
+                decoder.remaining()
+            ),
+        ));
+    }
+
     let mut values = Vec::with_capacity(value_count);
 
     for _ in 0..value_count {
@@ -187,6 +203,11 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// Return the number of unread bytes.
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.position
+    }
+
     fn read_u8(&mut self) -> Result<u8> {
         Ok(self.read_exact(1)?[0])
     }
@@ -242,6 +263,10 @@ fn invalid_encoding(context: &str, message: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("invalid {context} encoding: {message}"))
 }
 
+fn corrupt_encoding(context: &str, message: impl std::fmt::Display) -> Error {
+    Error::CorruptData(format!("invalid {context} encoding: {message}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,10 +297,72 @@ mod tests {
     }
 
     #[test]
-    fn value_encoding_is_deterministic() {
-        let value = Value::Text("deterministic".to_string());
+    fn integer_value_has_stable_bytes() {
+        assert_eq!(
+            encode_value(&Value::Int(1)).unwrap(),
+            vec![
+                VALUE_TAG_INT,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+            ]
+        );
+    }
 
-        assert_eq!(encode_value(&value).unwrap(), encode_value(&value).unwrap());
+    #[test]
+    fn text_value_has_stable_bytes() {
+        assert_eq!(
+            encode_value(&Value::Text("Ada".to_string())).unwrap(),
+            vec![VALUE_TAG_TEXT, 0x00, 0x00, 0x00, 0x03, b'A', b'd', b'a',]
+        );
+    }
+
+    #[test]
+    fn mixed_row_has_stable_bytes() {
+        let row = Row {
+            values: vec![
+                Value::Int(-42),
+                Value::Text("Ada".to_string()),
+                Value::Bool(true),
+                Value::Null,
+            ],
+        };
+
+        assert_eq!(
+            encode_row(&row).unwrap(),
+            vec![
+                ROW_FORMAT_VERSION,
+                0x00,
+                0x00,
+                0x00,
+                0x04,
+                VALUE_TAG_INT,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xd6,
+                VALUE_TAG_TEXT,
+                0x00,
+                0x00,
+                0x00,
+                0x03,
+                b'A',
+                b'd',
+                b'a',
+                VALUE_TAG_BOOL,
+                0x01,
+                VALUE_TAG_NULL,
+            ]
+        );
     }
 
     #[test]
@@ -306,15 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn row_encoding_is_deterministic() {
-        let row = Row {
-            values: sample_values(),
-        };
-
-        assert_eq!(encode_row(&row).unwrap(), encode_row(&row).unwrap());
-    }
-
-    #[test]
     fn different_row_orders_produce_different_bytes() {
         let first = Row {
             values: vec![Value::Int(1), Value::Int(2)],
@@ -328,61 +406,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_row_version() {
+    fn rejects_impossible_row_value_count() {
+        let bytes = [ROW_FORMAT_VERSION, 0xff, 0xff, 0xff, 0xff];
+
+        let error = decode_row(&bytes).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+        assert!(error.to_string().contains("value count"));
+    }
+
+    #[test]
+    fn rejects_unknown_row_version_as_corruption() {
         let bytes = [99, 0, 0, 0, 0];
 
         let error = decode_row(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("unsupported format version 99"));
     }
 
     #[test]
-    fn rejects_unknown_value_tag() {
+    fn rejects_unknown_value_tag_as_corruption() {
         let error = decode_value(&[0xff]).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("unknown value tag"));
     }
 
     #[test]
-    fn rejects_non_canonical_bool_payload() {
+    fn rejects_noncanonical_bool_as_corruption() {
         let error = decode_value(&[VALUE_TAG_BOOL, 2]).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("invalid BOOL payload"));
     }
 
     #[test]
-    fn rejects_truncated_integer() {
+    fn rejects_truncated_integer_as_corruption() {
         let error = decode_value(&[VALUE_TAG_INT, 0, 0]).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("truncated input"));
     }
 
     #[test]
-    fn rejects_invalid_utf8_text() {
+    fn rejects_invalid_utf8_as_corruption() {
         let bytes = [VALUE_TAG_TEXT, 0, 0, 0, 1, 0xff];
 
         let error = decode_value(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("not valid UTF-8"));
     }
 
     #[test]
-    fn rejects_value_trailing_bytes() {
+    fn rejects_value_trailing_bytes_as_corruption() {
         let mut bytes = encode_value(&Value::Int(1)).unwrap();
         bytes.push(0xff);
 
         let error = decode_value(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("trailing bytes"));
     }
 
     #[test]
-    fn rejects_row_trailing_bytes() {
+    fn rejects_row_trailing_bytes_as_corruption() {
         let mut bytes = encode_row(&Row { values: vec![] }).unwrap();
         bytes.push(0xff);
 
         let error = decode_row(&bytes).unwrap_err();
 
+        assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("trailing bytes"));
     }
 }

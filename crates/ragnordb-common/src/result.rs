@@ -17,6 +17,11 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Stored, recovered, or received internal bytes violate their canonical
+    /// encoding contract
+    #[error("corrupt data: {0}")]
+    CorruptData(String),
+
     /// The SQL parser could not construct an AST from the client input
     #[error("SQL parse error: {0}")]
     SqlParse(String),
