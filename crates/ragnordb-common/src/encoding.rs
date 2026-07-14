@@ -80,7 +80,7 @@ pub fn decode_row(bytes: &[u8]) -> Result<Row> {
     let version = decoder.read_u8()?;
 
     if version != ROW_FORMAT_VERSION {
-        return Err(invalid_encoding(
+        return Err(corrupt_encoding(
             "row",
             format!("unsupported format version {version}"),
         ));
@@ -158,7 +158,7 @@ fn decode_value_from(decoder: &mut Decoder<'_>) -> Result<Value> {
             let bytes = decoder.read_exact(length)?;
 
             let text = std::str::from_utf8(bytes).map_err(|error| {
-                invalid_encoding(
+                corrupt_encoding(
                     decoder.context,
                     format!("TEXT value is not valid UTF-8: {error}"),
                 )
@@ -173,14 +173,14 @@ fn decode_value_from(decoder: &mut Decoder<'_>) -> Result<Value> {
             match encoded {
                 0 => Ok(Value::Bool(false)),
                 1 => Ok(Value::Bool(true)),
-                other => Err(invalid_encoding(
+                other => Err(corrupt_encoding(
                     decoder.context,
                     format!("invalid BOOL payload {other}"),
                 )),
             }
         }
 
-        tag => Err(invalid_encoding(
+        tag => Err(corrupt_encoding(
             decoder.context,
             format!("unknown value tag 0x{tag:02x}"),
         )),
@@ -225,10 +225,10 @@ impl<'a> Decoder<'a> {
         let end = self
             .position
             .checked_add(length)
-            .ok_or_else(|| invalid_encoding(self.context, "encoded length overflow"))?;
+            .ok_or_else(|| corrupt_encoding(self.context, "encoded length overflow"))?;
 
         if end > self.bytes.len() {
-            return Err(invalid_encoding(
+            return Err(corrupt_encoding(
                 self.context,
                 format!(
                     "truncated input at byte {}, needed {} more bytes",
@@ -246,7 +246,7 @@ impl<'a> Decoder<'a> {
 
     fn finish(&self) -> Result<()> {
         if self.position != self.bytes.len() {
-            return Err(invalid_encoding(
+            return Err(corrupt_encoding(
                 self.context,
                 format!(
                     "{} trailing bytes after encoded value",
@@ -257,10 +257,6 @@ impl<'a> Decoder<'a> {
 
         Ok(())
     }
-}
-
-fn invalid_encoding(context: &str, message: impl std::fmt::Display) -> Error {
-    Error::InvalidArgument(format!("invalid {context} encoding: {message}"))
 }
 
 fn corrupt_encoding(context: &str, message: impl std::fmt::Display) -> Error {

@@ -228,7 +228,7 @@ fn decode_primary_key_value(decoder: &mut KeyDecoder<'_>) -> Result<Value> {
             }
         }
 
-        tag => Err(invalid_key(format!("unknown primary-key tag 0x{tag:02x}"))),
+        tag => Err(corrupt_key(format!("unknown primary-key tag 0x{tag:02x}"))),
     }
 }
 
@@ -251,7 +251,7 @@ fn decode_text_key(decoder: &mut KeyDecoder<'_>) -> Result<Value> {
                 text_bytes.push(TEXT_ESCAPE);
             }
             other => {
-                return Err(invalid_key(format!(
+                return Err(corrupt_key(format!(
                     "invalid TEXT escape sequence 0x00 0x{other:02x}"
                 )));
             }
@@ -259,7 +259,7 @@ fn decode_text_key(decoder: &mut KeyDecoder<'_>) -> Result<Value> {
     }
 
     let text = String::from_utf8(text_bytes)
-        .map_err(|error| invalid_key(format!("TEXT primary key is not valid UTF-8: {error}")))?;
+        .map_err(|error| corrupt_key(format!("TEXT primary key is not valid UTF-8: {error}")))?;
 
     Ok(Value::Text(text))
 }
@@ -295,10 +295,10 @@ impl<'a> KeyDecoder<'a> {
         let end = self
             .position
             .checked_add(length)
-            .ok_or_else(|| invalid_key("encoded key length overflow"))?;
+            .ok_or_else(|| corrupt_key("encoded key length overflow"))?;
 
         if end > self.bytes.len() {
-            return Err(invalid_key(format!(
+            return Err(corrupt_key(format!(
                 "truncated primary key at byte {}, needed {} more bytes",
                 self.position,
                 end - self.bytes.len()
@@ -312,12 +312,12 @@ impl<'a> KeyDecoder<'a> {
     }
 }
 
-fn invalid_key(message: impl std::fmt::Display) -> Error {
-    Error::InvalidArgument(format!("invalid storage key: {message}"))
-}
-
 fn corrupt_key(message: impl std::fmt::Display) -> Error {
     Error::CorruptData(format!("invalid storage key encoding: {message}"))
+}
+
+fn invalid_key(message: impl std::fmt::Display) -> Error {
+    Error::InvalidArgument(format!("invalid storage key: {message}"))
 }
 
 #[cfg(test)]
