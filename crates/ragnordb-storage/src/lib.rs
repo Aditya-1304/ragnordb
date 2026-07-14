@@ -1,5 +1,7 @@
 use ragnordb_common::Result;
 
+pub mod key;
+
 /// Abstract key-value storage engine.
 ///
 /// Currently a stub. Will be implemented by:

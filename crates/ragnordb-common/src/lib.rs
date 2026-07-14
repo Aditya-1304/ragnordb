@@ -1,12 +1,14 @@
-//! root file of this crate, used to re-export Error and Result so other crates can use it
+//! Shared domain types, durable codecs, storage encodings, and errors.
 //!
-//! also maps protos sub-module to:
-//!  ids          - domain ID newtypes (NodeId, TxnId, etc.)
-//!  codec        - row values + MVCC record types + proto roundtrips
-//!  catalog_codec– catalog-specific codecs (ColumnDef, TableDef, DataType)
-//!  command_codec– TabletCommand variants + proto roundtrips
-//!  rpc_codec    - inter-node frame + metadata request/response codecs
-//!  protocol     - V1 TCP frame reading/writing
+//! Modules:
+//!
+//! - `ids`: stable domain identifier types.
+//! - `codec`: row values and MVCC protobuf conversions.
+//! - `encoding`: deterministic row and value storage bytes.
+//! - `catalog_codec`: durable catalog definitions.
+//! - `command_codec`: replicated tablet command conversions.
+//! - `rpc_codec`: inter-node request and response conversions.
+//! - `protocol`: V1 client frame reading and writing.
 
 pub mod catalog_codec;
 pub mod codec;
