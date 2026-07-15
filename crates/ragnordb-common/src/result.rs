@@ -22,6 +22,11 @@ pub enum Error {
     #[error("corrupt data: {0}")]
     CorruptData(String),
 
+    /// A transaction encountered a comitted version, rollback marker, or unresolved
+    /// lock that conflicts with its snapshot
+    #[error("write conflict: {0}")]
+    WriteConflict(String),
+
     /// The SQL parser could not construct an AST from the client input
     #[error("SQL parse error: {0}")]
     SqlParse(String),

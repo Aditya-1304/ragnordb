@@ -70,11 +70,12 @@ pub fn encode_primary_key(values: &[Value]) -> Result<Vec<u8>> {
 
 /// this decide a complete primary key tuple
 ///
-/// Decoding is primarly required for validation, diagnostics and future
-/// range boundary inspection. Point lookups may compare encoded bytes directly
+/// Unlike `encode_primary_key()`, this function consumes persisted or received
+/// storage bytes. Malformed input therefore represents corrupted encoded data,
+/// not invalid logical input from a caller.
 pub fn decode_primary_key(bytes: &[u8]) -> Result<Vec<Value>> {
     if bytes.is_empty() {
-        return Err(invalid_key("encoded primary key cannot be empty"));
+        return Err(corrupt_key("encoded primary key cannot be empty"));
     }
 
     let mut decoder = KeyDecoder::new(bytes);
@@ -224,7 +225,7 @@ fn decode_primary_key_value(decoder: &mut KeyDecoder<'_>) -> Result<Value> {
             match encoded {
                 0 => Ok(Value::Bool(false)),
                 1 => Ok(Value::Bool(true)),
-                other => Err(invalid_key(format!("invalid BOOL key payload {other}"))),
+                other => Err(corrupt_key(format!("invalid BOOL key payload {other}"))),
             }
         }
 
@@ -552,5 +553,27 @@ mod tests {
 
         assert!(matches!(error, Error::CorruptData(_)));
         assert!(error.to_string().contains("table ID 0"));
+    }
+
+    #[test]
+    fn rejects_empty_encoded_primary_key_as_corruption() {
+        let error = decode_primary_key(&[]).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("encoded primary key cannot be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_boolean_payload_as_corruption() {
+        let bytes = [KEY_TAG_BOOL, 2];
+
+        let error = decode_primary_key(&bytes).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+        assert!(error.to_string().contains("invalid BOOL key payload"));
     }
 }

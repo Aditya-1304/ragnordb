@@ -1306,6 +1306,7 @@ name = "ragnordb-txn"
 version = "0.1.0"
 dependencies = [
  "ragnordb-common",
+ "ragnordb-storage",
 ]
 
 [[package]]
