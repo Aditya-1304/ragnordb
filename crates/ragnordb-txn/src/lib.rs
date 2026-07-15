@@ -83,23 +83,33 @@ impl Transaction {
     /// Rewriting the same key replaces its previous pending mutation, so the
     /// write set always represents the transaction's final intended state.
     pub fn buffer_put(&mut self, key: Vec<u8>, row: Vec<u8>) -> Result<()> {
-        validate_buffered_key(&key)?;
-
-        decode_row(&row).map_err(|error| {
-            Error::InvalidArgument(format!(
-                "transaction Put does not contain a canonical encoded row: \
-                 {error}"
-            ))
-        })?;
-
-        self.writes.insert(key, Mutation::Put(row));
+        let mutation = Mutation::Put(row);
+        validate_buffered_mutation(&key, &mutation)?;
+        self.writes.insert(key, mutation);
         Ok(())
     }
 
     /// Buffer a row deletion.
     pub fn buffer_delete(&mut self, key: Vec<u8>) -> Result<()> {
-        validate_buffered_key(&key)?;
-        self.writes.insert(key, Mutation::Delete);
+        let mutation = Mutation::Delete;
+        validate_buffered_mutation(&key, &mutation)?;
+        self.writes.insert(key, mutation);
+        Ok(())
+    }
+
+    /// Atomically merge one validated mutation batch into the write set.
+    ///
+    /// Every key and row is validated before the transaction is modified. If
+    /// validation fails, both mutations from earlier statements and the write
+    /// set visible before this call remain unchanged. A mutation for a key that
+    /// was already buffered by an earlier statement replaces that mutation,
+    /// preserving the transaction's final-write-wins semantics.
+    pub fn buffer_batch(&mut self, writes: BTreeMap<Vec<u8>, Mutation>) -> Result<()> {
+        for (key, mutation) in &writes {
+            validate_buffered_mutation(key, mutation)?;
+        }
+
+        self.writes.extend(writes);
         Ok(())
     }
 
@@ -112,13 +122,24 @@ impl Transaction {
     }
 }
 
-fn validate_buffered_key(key: &[u8]) -> Result<()> {
+fn validate_buffered_mutation(key: &[u8], mutation: &Mutation) -> Result<()> {
     decode_row_key(key).map(|_| ()).map_err(|error| {
         Error::InvalidArgument(format!(
             "transaction mutation key is not a canonical encoded row key: \
              {error}"
         ))
-    })
+    })?;
+
+    if let Mutation::Put(row) = mutation {
+        decode_row(row).map_err(|error| {
+            Error::InvalidArgument(format!(
+                "transaction Put does not contain a canonical encoded row: \
+                 {error}"
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -200,5 +221,36 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidArgument(_)));
         assert!(transaction.is_empty());
+    }
+
+    #[test]
+    fn invalid_batch_is_atomic_and_preserves_earlier_writes() {
+        let existing_key = encoded_key(1);
+        let valid_batch_key = encoded_key(2);
+        let invalid_batch_key = encoded_key(3);
+        let existing_row = encoded_row(1, "existing");
+        let mut transaction = Transaction::new(TxnId(1), Timestamp(1)).unwrap();
+
+        transaction
+            .buffer_put(existing_key.clone(), existing_row.clone())
+            .unwrap();
+
+        let mut batch = BTreeMap::new();
+        batch.insert(
+            valid_batch_key.clone(),
+            Mutation::Put(encoded_row(2, "valid")),
+        );
+        batch.insert(invalid_batch_key.clone(), Mutation::Put(vec![0xff]));
+
+        let error = transaction.buffer_batch(batch).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(
+            transaction.pending_write(&existing_key),
+            Some(&Mutation::Put(existing_row))
+        );
+        assert_eq!(transaction.pending_write(&valid_batch_key), None);
+        assert_eq!(transaction.pending_write(&invalid_batch_key), None);
+        assert_eq!(transaction.len(), 1);
     }
 }

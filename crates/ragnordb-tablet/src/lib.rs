@@ -23,6 +23,20 @@ use ragnordb_storage::{
 };
 use ragnordb_txn::Transaction;
 
+/// One logical row mutation waiting to be added to a transaction.
+///
+/// Keys and rows remain in their domain representation until the owning
+/// tablet validates ownership and converts the complete statement batch into
+/// canonical storage bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowMutation {
+    /// Insert a new row or replace a row already visible to the transaction.
+    Put { key: RowKey, row: Row },
+
+    /// Make a row absent from the transaction's view.
+    Delete { key: RowKey },
+}
+
 /// A logical tablet backed by an MVCC storage implementation.
 #[derive(Debug)]
 pub struct Tablet<S = InMemoryMvcc> {
@@ -84,6 +98,41 @@ impl<S: MvccStorage> Tablet<S> {
             .transpose()
     }
 
+    /// Validate, encode, and atomically buffer one statement's row mutations.
+    ///
+    /// No transaction state is changed until every row key has passed tablet
+    /// ownership validation and every row has been encoded successfully. The
+    /// batch also rejects duplicate keys so affected-row counts cannot diverge
+    /// from the number of distinct buffered mutations.
+    pub fn buffer_batch<I>(&self, transaction: &mut Transaction, mutations: I) -> Result<()>
+    where
+        I: IntoIterator<Item = RowMutation>,
+    {
+        let mut writes = BTreeMap::new();
+
+        for mutation in mutations {
+            let (key, mutation) = match mutation {
+                RowMutation::Put { key, row } => {
+                    self.validate_row_key(&key)?;
+                    (encode_row_key(&key)?, Mutation::Put(encode_row(&row)?))
+                }
+
+                RowMutation::Delete { key } => {
+                    self.validate_row_key(&key)?;
+                    (encode_row_key(&key)?, Mutation::Delete)
+                }
+            };
+
+            if writes.insert(key, mutation).is_some() {
+                return Err(Error::InvalidArgument(
+                    "tablet mutation batch contains a duplicate row key".to_string(),
+                ));
+            }
+        }
+
+        transaction.buffer_batch(writes)
+    }
+
     /// Buffer a row insertion.
     ///
     /// A concurrent insert after the transaction's start timestamp is detected
@@ -97,7 +146,13 @@ impl<S: MvccStorage> Tablet<S> {
             ));
         }
 
-        transaction.buffer_put(encode_row_key(key)?, encode_row(row)?)
+        self.buffer_batch(
+            transaction,
+            std::iter::once(RowMutation::Put {
+                key: key.clone(),
+                row: row.clone(),
+            }),
+        )
     }
 
     /// Buffer an update when the row exists in the transaction's view.
@@ -110,7 +165,13 @@ impl<S: MvccStorage> Tablet<S> {
             return Ok(false);
         }
 
-        transaction.buffer_put(encode_row_key(key)?, encode_row(row)?)?;
+        self.buffer_batch(
+            transaction,
+            std::iter::once(RowMutation::Put {
+                key: key.clone(),
+                row: row.clone(),
+            }),
+        )?;
 
         Ok(true)
     }
@@ -125,7 +186,10 @@ impl<S: MvccStorage> Tablet<S> {
             return Ok(false);
         }
 
-        transaction.buffer_delete(encode_row_key(key)?)?;
+        self.buffer_batch(
+            transaction,
+            std::iter::once(RowMutation::Delete { key: key.clone() }),
+        )?;
 
         Ok(true)
     }
@@ -593,5 +657,42 @@ mod tests {
         let reader = transaction(2, 2);
 
         assert!(tablet.scan(&reader, None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_row_mutation_batch_preserves_transaction_state() {
+        let tablet = tablet();
+        let existing_key = key(1);
+        let batch_key = key(2);
+        let foreign_key = key_for_table(TableId(2), 3);
+        let mut txn = transaction(1, 1);
+
+        tablet
+            .insert(&mut txn, &existing_key, &row(1, "existing"))
+            .unwrap();
+
+        let error = tablet
+            .buffer_batch(
+                &mut txn,
+                vec![
+                    RowMutation::Put {
+                        key: batch_key.clone(),
+                        row: row(2, "valid"),
+                    },
+                    RowMutation::Put {
+                        key: foreign_key,
+                        row: row(3, "foreign"),
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(
+            tablet.get(&txn, &existing_key).unwrap(),
+            Some(row(1, "existing"))
+        );
+        assert_eq!(tablet.get(&txn, &batch_key).unwrap(), None);
+        assert_eq!(txn.len(), 1);
     }
 }
