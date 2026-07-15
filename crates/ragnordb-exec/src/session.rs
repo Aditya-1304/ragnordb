@@ -1,14 +1,12 @@
-//! the file handles the autocommit and transaction session behaviour
+//! Autocommit and explicit SQL transaction behavior.
 //!
-//! a session owns the complete active `Transaction` and not merly its identifier
-//! this keeps the transaction's snapshot timestamp and pending write set
-//! attached to the same connection level state
+//! `SqlSession` owns only SQL transaction policy and the complete active
+//! `Transaction`. Connection identity, statement deadlines, cancellation, and
+//! client transport state remain server-layer responsibilities.
 //!
-//! new session will use autocommit. standalone DML and SELECT statements recieve
-//! \and implicit transaction, while BEGIN attaches an explicit transaction that
-//! remains active until COMMIT or ROLLBACK
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! New SQL sessions use autocommit. Standalone DML and SELECT statements receive
+//! an implicit transaction. BEGIN attaches an explicit transaction that remains
+//! active until COMMIT or ROLLBACK.
 
 use ragnordb_common::{
     Error, Result,
@@ -19,57 +17,32 @@ use ragnordb_txn::{Transaction, TransactionManager};
 
 use crate::{ExecutionResult, LocalExecutor};
 
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-/// process-local identifier for one client sesssion
+/// SQL transaction policy and state for one client connection.
 ///
-/// session IDs are diagnostic identities and are not durable transactions IDs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(pub u64);
-
-/// conncetion level SQL transaction state
+/// The caller must share exactly one transaction manager between every SQL
+/// session operating on the same local executor. The executor owns database
+/// state, while the shared manager provides database-wide transaction IDs and
+/// timestamps.
 #[derive(Debug)]
-pub struct Session {
-    session_id: SessionId,
+pub struct SqlSession {
     current_transaction: Option<Transaction>,
-    autocommit: bool,
-    statement_timeout_ms: u64,
 }
 
-impl Session {
-    /// construct session using v1 defaults
-    ///
-    /// autocommit begins enabled, no explicit transaction is attached,
-    /// and the default statement timeout is thirty seconds
+impl SqlSession {
+    /// Construct a SQL session with autocommit enabled and no active explicit
+    /// transaction.
     pub fn new() -> Self {
-        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-
-        assert_ne!(
-            session_id, 0,
-            "process local session ID allocator exhausted and wrapped to zero"
-        );
-
         Self {
-            session_id: SessionId(session_id),
             current_transaction: None,
-            autocommit: true,
-            statement_timeout_ms: 30_000,
         }
     }
 
-    /// Return the process-local session identifier.
-    pub fn id(&self) -> SessionId {
-        self.session_id
-    }
-
     /// Return whether standalone data statements use implicit transactions.
+    ///
+    /// Until SQL `SET autocommit` support exists, autocommit state is derived
+    /// entirely from whether BEGIN has attached an explicit transaction.
     pub fn autocommit(&self) -> bool {
-        self.autocommit
-    }
-
-    /// Return the configured statement timeout in milliseconds.
-    pub fn statement_timeout_ms(&self) -> u64 {
-        self.statement_timeout_ms
+        self.current_transaction.is_none()
     }
 
     /// Return whether BEGIN has attached an explicit transaction.
@@ -85,8 +58,8 @@ impl Session {
     /// Parse, analyze, plan, and execute one SQL statement.
     ///
     /// Parse and analysis failures occur before an implicit transaction is
-    /// created. When an explicit transaction is active, such failures leave the
-    /// transaction attached because no execution-side state was changed.
+    /// created. When an explicit transaction is active, these failures leave
+    /// the transaction attached because no execution state was changed.
     pub fn execute_sql<M: TransactionManager>(
         &mut self,
         sql: &str,
@@ -114,9 +87,9 @@ impl Session {
 
             Plan::Rollback => self.rollback(executor),
 
-            // CREATE TABLE remains autocommit-only. Passing the attached
-            // transaction preserves the executor's existing DDL boundary and
-            // produces a clear error without changing session state.
+            // CREATE TABLE remains autocommit-only. Passing an attached
+            // transaction preserves the executor's DDL validation boundary
+            // without changing the session transaction.
             plan @ Plan::CreateTable(_) => {
                 executor.execute(plan, self.current_transaction.as_mut())
             }
@@ -137,7 +110,7 @@ impl Session {
     ) -> Result<ExecutionResult> {
         if self.current_transaction.is_some() {
             return Err(Error::InvalidArgument(
-                "BEGIN cannot start a nested transaction; the session already has an active transaction"
+                "BEGIN cannot start a nested transaction; the SQL session already has an active transaction"
                     .to_string(),
             ));
         }
@@ -159,8 +132,8 @@ impl Session {
         executor: &mut LocalExecutor,
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
-        // Taking the transaction first guarantees that COMMIT clears session
-        // state on both success and failure.
+        // Taking the transaction first guarantees that COMMIT clears SQL
+        // session state on both success and failure.
         let transaction = self.current_transaction.take().ok_or_else(|| {
             Error::InvalidArgument(
                 "COMMIT requires an active transaction; execute BEGIN first".to_string(),
@@ -182,6 +155,10 @@ impl Session {
             }
         };
 
+        // LocalExecutor currently accepts a concrete Timestamp. Timestamp(0)
+        // represents the absence of an allocated commit timestamp only for an
+        // empty transaction. LocalExecutor::commit_transaction returns before
+        // timestamp validation when the transaction has no buffered writes.
         let committed_writes =
             executor.commit_transaction(transaction, commit_ts.unwrap_or(Timestamp(0)))?;
 
@@ -215,16 +192,11 @@ impl Session {
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
         if let Some(transaction) = self.current_transaction.as_mut() {
-            // Explicit transactions keep their successfully buffered writes
-            // after a later statement error. Phase 2.7 guarantees statement
-            // preparation is atomic before changing the write set.
+            // Explicit transactions remain active after statement errors.
+            // Phase 2.7 prepares complete statement batches before adding them
+            // to the write set, so a failed statement contributes no partial
+            // mutations while earlier successful statements remain available.
             return executor.execute(plan, Some(transaction));
-        }
-
-        if !self.autocommit {
-            return Err(Error::InvalidArgument(
-                "the session has autocommit disabled but no active transaction".to_string(),
-            ));
         }
 
         self.execute_implicit(plan, executor, transaction_manager)
@@ -242,17 +214,18 @@ impl Session {
             Ok(result) => result,
 
             Err(error) => {
-                // Implicit transaction errors discard the complete write set,
-                // including any state prepared before the executor reported the
-                // failure.
+                // A failed implicit statement discards its complete transaction
+                // and cannot leave buffered writes attached to the session.
                 executor.rollback_transaction(transaction);
                 return Err(error);
             }
         };
 
         if transaction.is_empty() {
-            // Snapshot-only statements require a start timestamp but do not
-            // create an MVCC version and therefore need no commit timestamp.
+            // Snapshot-only implicit transactions need a start timestamp but no
+            // commit timestamp. Timestamp(0) is safe here only because the
+            // current executor returns before commit-timestamp validation for
+            // an empty transaction.
             executor.commit_transaction(transaction, Timestamp(0))?;
             return Ok(result);
         }
@@ -267,16 +240,16 @@ impl Session {
             }
         };
 
-        // Local tablet commit validates the complete write batch before applying
-        // anything. A commit error therefore consumes and aborts the implicit
-        // transaction without exposing a partial result.
+        // The tablet validates the complete write batch before applying it. A
+        // commit failure therefore consumes and aborts the implicit transaction
+        // without exposing a partially committed result.
         executor.commit_transaction(transaction, commit_ts)?;
 
         Ok(result)
     }
 }
 
-impl Default for Session {
+impl Default for SqlSession {
     fn default() -> Self {
         Self::new()
     }

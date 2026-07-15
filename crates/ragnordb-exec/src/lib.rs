@@ -9,9 +9,11 @@
 //! - one in-memory tablet for every locally created table,
 //! - physical access-path selection between point lookup and table scan.
 //!
-//! The `session` module owns implicit and explicit transaction lifecycles. The
-//! lower-level `LocalExecutor` still receives an active `Transaction`, keeping
-//! transaction policy separate from physical plan execution.
+//! The `session` module owns implicit and explicit SQL transaction lifecycles.
+//! `SqlSession` contains only transaction policy and active transaction state;
+//! connection identity, deadlines, and transport concerns remain in the server
+//! crate. The lower-level `LocalExecutor` receives an active `Transaction` and
+//! remains independent from connection-level state.
 //!
 //! The executor never depends directly on `sqlparser`. Unsupported SQL clauses
 //! remain the analyzer's responsibility and cannot reach this layer as a Plan.
@@ -42,7 +44,7 @@ use ragnordb_tablet::{RowMutation, Tablet};
 use ragnordb_txn::Transaction;
 
 pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
-pub use session::{Session, SessionId};
+pub use session::SqlSession;
 
 /// Local single-node executor for Milestone 2.
 ///

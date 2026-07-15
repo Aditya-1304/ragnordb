@@ -3,11 +3,11 @@ use ragnordb_common::{
     codec::{Row, Value},
     ids::{Timestamp, TxnId},
 };
-use ragnordb_exec::{ExecutionResult, LocalExecutor, ResultSet, Session};
+use ragnordb_exec::{ExecutionResult, LocalExecutor, ResultSet, SqlSession};
 use ragnordb_txn::LocalTransactionManager;
 
 fn create_users(
-    session: &mut Session,
+    session: &mut SqlSession,
     executor: &mut LocalExecutor,
     manager: &mut LocalTransactionManager,
 ) {
@@ -32,20 +32,47 @@ fn result_set(result: ExecutionResult) -> ResultSet {
 }
 
 #[test]
-fn new_sessions_start_with_autocommit_enabled() {
-    let session = Session::new();
+fn autocommit_tracks_explicit_transaction_state() {
+    let mut executor = LocalExecutor::new();
+    let mut manager = LocalTransactionManager::new();
+    let mut session = SqlSession::new();
 
     assert!(session.autocommit());
     assert!(!session.has_active_transaction());
-    assert_eq!(session.current_transaction_id(), None);
-    assert_eq!(session.statement_timeout_ms(), 30_000);
+
+    session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(!session.autocommit());
+    assert!(session.has_active_transaction());
+
+    session
+        .execute_sql("COMMIT", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(session.autocommit());
+    assert!(!session.has_active_transaction());
+
+    session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(!session.autocommit());
+
+    session
+        .execute_sql("ROLLBACK", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(session.autocommit());
+    assert!(!session.has_active_transaction());
 }
 
 #[test]
 fn standalone_dml_commits_automatically() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     create_users(&mut session, &mut executor, &mut manager);
 
@@ -57,6 +84,7 @@ fn standalone_dml_commits_automatically() {
         )
         .unwrap();
 
+    assert!(session.autocommit());
     assert!(!session.has_active_transaction());
 
     let rows = result_set(
@@ -74,10 +102,10 @@ fn standalone_dml_commits_automatically() {
 }
 
 #[test]
-fn failed_implicit_statement_rolls_back_automatically() {
+fn failed_implicit_statement_leaves_no_visible_writes() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     create_users(&mut session, &mut executor, &mut manager);
 
@@ -91,6 +119,7 @@ fn failed_implicit_statement_rolls_back_automatically() {
         .unwrap_err();
 
     assert!(matches!(error, Error::ConstraintViolation(_)));
+    assert!(session.autocommit());
     assert!(!session.has_active_transaction());
 
     let rows = result_set(
@@ -106,8 +135,8 @@ fn failed_implicit_statement_rolls_back_automatically() {
 fn explicit_transaction_supports_read_your_writes_and_commit() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut writer = Session::new();
-    let mut reader = Session::new();
+    let mut writer = SqlSession::new();
+    let mut reader = SqlSession::new();
 
     create_users(&mut writer, &mut executor, &mut manager);
 
@@ -164,7 +193,7 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
             committed_writes: 1,
         }
     ));
-    assert!(!writer.has_active_transaction());
+    assert!(writer.autocommit());
 
     let committed_rows = result_set(
         reader
@@ -181,10 +210,46 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
 }
 
 #[test]
+fn explicit_read_only_commit_does_not_allocate_commit_timestamp() {
+    let mut executor = LocalExecutor::new();
+    let mut manager = LocalTransactionManager::new();
+    let mut session = SqlSession::new();
+
+    create_users(&mut session, &mut executor, &mut manager);
+
+    session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+
+    session
+        .execute_sql("SELECT id FROM users", &mut executor, &mut manager)
+        .unwrap();
+
+    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+
+    let committed = session
+        .execute_sql("COMMIT", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(matches!(
+        committed,
+        ExecutionResult::TransactionCommitted {
+            transaction_id: TxnId(1),
+            commit_ts: None,
+            committed_writes: 0,
+        }
+    ));
+    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+    assert!(session.autocommit());
+}
+
+#[test]
 fn rollback_clears_explicit_transaction_and_discards_writes() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     create_users(&mut session, &mut executor, &mut manager);
 
@@ -211,7 +276,7 @@ fn rollback_clears_explicit_transaction_and_discards_writes() {
             discarded_writes: 1,
         }
     ));
-    assert!(!session.has_active_transaction());
+    assert!(session.autocommit());
 
     let rows = result_set(
         session
@@ -226,7 +291,7 @@ fn rollback_clears_explicit_transaction_and_discards_writes() {
 fn explicit_statement_error_preserves_earlier_successful_statements() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     create_users(&mut session, &mut executor, &mut manager);
 
@@ -253,6 +318,7 @@ fn explicit_statement_error_preserves_earlier_successful_statements() {
 
     assert!(matches!(error, Error::ConstraintViolation(_)));
     assert!(session.has_active_transaction());
+    assert!(!session.autocommit());
 
     session
         .execute_sql("COMMIT", &mut executor, &mut manager)
@@ -273,10 +339,154 @@ fn explicit_statement_error_preserves_earlier_successful_statements() {
 }
 
 #[test]
+fn analysis_error_preserves_explicit_transaction() {
+    let mut executor = LocalExecutor::new();
+    let mut manager = LocalTransactionManager::new();
+    let mut session = SqlSession::new();
+
+    create_users(&mut session, &mut executor, &mut manager);
+
+    session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    session
+        .execute_sql(
+            "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+            &mut executor,
+            &mut manager,
+        )
+        .unwrap();
+
+    let error = session
+        .execute_sql(
+            "SELECT missing_column FROM users",
+            &mut executor,
+            &mut manager,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, Error::SchemaMismatch(_)));
+    assert!(session.has_active_transaction());
+
+    session
+        .execute_sql("COMMIT", &mut executor, &mut manager)
+        .unwrap();
+
+    let rows = result_set(
+        session
+            .execute_sql("SELECT id FROM users", &mut executor, &mut manager)
+            .unwrap(),
+    );
+
+    assert_eq!(
+        rows.rows,
+        vec![Row {
+            values: vec![Value::Int(1)],
+        }]
+    );
+}
+
+#[test]
+fn write_conflict_during_commit_clears_losing_session() {
+    let mut executor = LocalExecutor::new();
+    let mut manager = LocalTransactionManager::new();
+    let mut losing_session = SqlSession::new();
+    let mut winning_session = SqlSession::new();
+
+    create_users(&mut losing_session, &mut executor, &mut manager);
+
+    losing_session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    losing_session
+        .execute_sql(
+            "INSERT INTO users (id, name) VALUES (1, 'Losing writer')",
+            &mut executor,
+            &mut manager,
+        )
+        .unwrap();
+
+    winning_session
+        .execute_sql(
+            "INSERT INTO users (id, name) VALUES (1, 'Winning writer')",
+            &mut executor,
+            &mut manager,
+        )
+        .unwrap();
+
+    let error = losing_session
+        .execute_sql("COMMIT", &mut executor, &mut manager)
+        .unwrap_err();
+
+    assert!(matches!(error, Error::WriteConflict(_)));
+    assert!(!losing_session.has_active_transaction());
+    assert!(losing_session.autocommit());
+
+    let rows = result_set(
+        winning_session
+            .execute_sql(
+                "SELECT name FROM users WHERE id = 1",
+                &mut executor,
+                &mut manager,
+            )
+            .unwrap(),
+    );
+
+    assert_eq!(
+        rows.rows,
+        vec![Row {
+            values: vec![Value::Text("Winning writer".to_string())],
+        }]
+    );
+}
+
+#[test]
+fn shared_manager_allocates_unique_metadata_across_sessions() {
+    let mut executor = LocalExecutor::new();
+    let mut manager = LocalTransactionManager::new();
+    let mut first_session = SqlSession::new();
+    let mut second_session = SqlSession::new();
+
+    let first = first_session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    let second = second_session
+        .execute_sql("BEGIN", &mut executor, &mut manager)
+        .unwrap();
+
+    assert!(matches!(
+        first,
+        ExecutionResult::TransactionStarted {
+            transaction_id: TxnId(1),
+            start_ts: Timestamp(1),
+        }
+    ));
+
+    assert!(matches!(
+        second,
+        ExecutionResult::TransactionStarted {
+            transaction_id: TxnId(2),
+            start_ts: Timestamp(2),
+        }
+    ));
+
+    first_session
+        .execute_sql("ROLLBACK", &mut executor, &mut manager)
+        .unwrap();
+
+    second_session
+        .execute_sql("ROLLBACK", &mut executor, &mut manager)
+        .unwrap();
+}
+
+#[test]
 fn transaction_control_requires_valid_session_state() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     let commit_error = session
         .execute_sql("COMMIT", &mut executor, &mut manager)
@@ -306,7 +516,7 @@ fn transaction_control_requires_valid_session_state() {
 fn create_table_is_rejected_inside_explicit_transaction() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     session
         .execute_sql("BEGIN", &mut executor, &mut manager)
@@ -335,7 +545,7 @@ fn create_table_is_rejected_inside_explicit_transaction() {
 fn read_only_implicit_transaction_does_not_allocate_commit_timestamp() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
-    let mut session = Session::new();
+    let mut session = SqlSession::new();
 
     create_users(&mut session, &mut executor, &mut manager);
 

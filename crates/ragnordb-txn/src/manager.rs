@@ -1,6 +1,6 @@
 //! local transaction identity and timestamp allocation
 //!
-//! session code depends on the `TransctionManager` boundary instead of
+//! SQL session code depends on the `TransctionManager` boundary instead of
 //! allocating transction metadata itself. we currently use the in-memory
 //! implementation; later metadata raft timestamp service can implement
 //! the same boundary without changing session transaction semantics
@@ -28,9 +28,13 @@ pub trait TransactionManager {
 
 /// In-memory transaction manager for local Milestone 2 execution.
 ///
-/// Allocation begins at one because zero is reserved by the shared ID and
-/// timestamp contracts. This state is intentionally not durable; durable,
-/// replicated timestamp allocation belongs to the metadata Raft group in a
+/// Exactly one `LocalTransactionManager` must be shared by every `SqlSession`
+/// operating against the same `LocalExecutor`. Constructing one manager per
+/// session would reuse transaction IDs and timestamps.
+///
+/// This allocator is intentionally not durable. The future metadata timestamp
+/// authority will replace it without changing the `TransactionManager`
+/// interface used by SQL sessions.
 /// later milestone.
 #[derive(Debug, Default)]
 pub struct LocalTransactionManager {
@@ -58,17 +62,6 @@ impl LocalTransactionManager {
         Timestamp(self.last_timestamp)
     }
 
-    fn allocate_transaction_id(&mut self) -> Result<TxnId> {
-        let next = self.last_transaction_id.checked_add(1).ok_or_else(|| {
-            Error::Configuration(
-                "local transaction ID allocator has exhausted the u64 ID space".to_string(),
-            )
-        })?;
-
-        self.last_transaction_id = next;
-        Ok(TxnId(next))
-    }
-
     fn allocate_timestamp_after(&mut self, minimum_exclusive: Timestamp) -> Result<Timestamp> {
         let allocation_floor = self.last_timestamp.max(minimum_exclusive.0);
 
@@ -85,10 +78,27 @@ impl LocalTransactionManager {
 
 impl TransactionManager for LocalTransactionManager {
     fn begin_transaction(&mut self) -> Result<Transaction> {
-        let transaction_id = self.allocate_transaction_id()?;
-        let start_ts = self.allocate_timestamp_after(Timestamp(0))?;
+        // Calculate the complete next state before publishing either counter.
+        // If any validation or allocation step fails, both counters remain
+        // unchanged.
+        let next_transaction_id = self.last_transaction_id.checked_add(1).ok_or_else(|| {
+            Error::Configuration(
+                "local transaction ID allocator has exhausted the u64 ID space".to_string(),
+            )
+        })?;
 
-        Transaction::new(transaction_id, start_ts)
+        let next_timestamp = self.last_timestamp.checked_add(1).ok_or_else(|| {
+            Error::Configuration(
+                "local timestamp allocator has exhausted the u64 timestamp space".to_string(),
+            )
+        })?;
+
+        let transaction = Transaction::new(TxnId(next_transaction_id), Timestamp(next_timestamp))?;
+
+        self.last_transaction_id = next_transaction_id;
+        self.last_timestamp = next_timestamp;
+
+        Ok(transaction)
     }
 
     fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
@@ -152,5 +162,19 @@ mod tests {
 
         assert!(matches!(error, Error::Configuration(_)));
         assert_eq!(manager.last_allocated_timestamp(), Timestamp(0));
+    }
+
+    #[test]
+    fn failed_begin_leaves_allocator_state_unchanged() {
+        let mut manager = LocalTransactionManager {
+            last_transaction_id: 41,
+            last_timestamp: u64::MAX,
+        };
+
+        let error = manager.begin_transaction().unwrap_err();
+
+        assert!(matches!(error, Error::Configuration(_)));
+        assert_eq!(manager.last_allocated_transaction_id(), TxnId(41));
+        assert_eq!(manager.last_allocated_timestamp(), Timestamp(u64::MAX));
     }
 }
