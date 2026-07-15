@@ -5,7 +5,11 @@
 //! from JSON allows future protocol implementations to reuse the same execution
 //! layer
 
-use ragnordb_common::{catalog_codec::DataType, codec::Row, ids::TableId};
+use ragnordb_common::{
+    catalog_codec::DataType,
+    codec::Row,
+    ids::{TableId, Timestamp, TxnId},
+};
 
 /// Metadata for one returned result column
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,4 +57,25 @@ pub enum ExecutionResult {
 
     /// A SELECT or SHOW statement returned rows
     Query(ResultSet),
+
+    /// BEGIN attached a new transaction to the session.
+    TransactionStarted {
+        transaction_id: TxnId,
+        start_ts: Timestamp,
+    },
+
+    /// COMMIT cleared the session and committed its buffered mutations.
+    ///
+    /// Read-only transactions do not allocate a commit timestamp.
+    TransactionCommitted {
+        transaction_id: TxnId,
+        commit_ts: Option<Timestamp>,
+        committed_writes: usize,
+    },
+
+    /// ROLLBACK cleared the session and discarded its buffered mutations.
+    TransactionRolledBack {
+        transaction_id: TxnId,
+        discarded_writes: usize,
+    },
 }
