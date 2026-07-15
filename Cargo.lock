@@ -1245,6 +1245,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ragnordb-exec"
+version = "0.1.0"
+dependencies = [
+ "ragnordb-catalog",
+ "ragnordb-common",
+ "ragnordb-sql",
+ "ragnordb-storage",
+ "ragnordb-tablet",
+ "ragnordb-txn",
+]
+
+[[package]]
 name = "ragnordb-multiraft"
 version = "0.1.0"
 dependencies = [

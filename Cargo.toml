@@ -9,6 +9,7 @@ members = [
     "crates/ragnordb-txn",
     "crates/ragnordb-tablet",
     "crates/ragnordb-storage",
+    "crates/ragnordb-exec",
     "crates/ragnordb-multiraft",
     "crates/ragnordb-server",
     "crates/ragnordb-cli",
