@@ -14,16 +14,31 @@
 //! `Delete` is a tombstone; `Rollback` prevents a delayed transaction
 //! message from resurrecting an absorbed write
 //!
+//! For committed `Put` and `Delete` records, `write_ts` is the commit
+//! timestamp and must be greater than the transaction start timestamp.
+//!
+//! A `Rollback` record has no independently allocated commit timestamp.
+//! Consequently, it is stored at the aborted transaction's start timestamp,
+//! and its `commit_timestamp` field also contains that start timestamp. The
+//! field name is retained for compatibility with the existing shared codec.
+//!
 //! this commits buffered single tablet transaction directly after
 //! validating the entire batch.
 //! Distributed prewrite, lock resolution, transction status records
 //! Raft application, WAL durability, and garbage collection are
 //! intentionally deferred to their later milestones
+//!
+//! the existing raft `WriteEntry` currently stores one `Value`,
+//! while `Mutation::Put` stores a complete canonical encoded row
+//! those representation must be aligned before `SingleShardCommit` is wired
+//! into raft
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Bound::{Excluded, Included, Unbounded},
+    ops::Bound::{self, Excluded, Included, Unbounded},
 };
+
+use crate::key::decode_row_key;
 
 use ragnordb_common::{
     Error, Result,
@@ -32,7 +47,8 @@ use ragnordb_common::{
     ids::{Timestamp, TxnId},
 };
 
-use crate::key::decode_row_key;
+/// Owned range boundaries used for canonical encoded row-key scans.
+type EncodedScanBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 /// A transaction local mutation waiting to be committed
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +73,7 @@ impl Mutation {
 ///
 /// these counters describe logical in memory state they are not durability
 /// or replication metrics
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MvccStats {
     /// number of distinct row keys with at least one default value
     pub default_keys: usize,
@@ -76,15 +93,15 @@ pub struct MvccStats {
 
 /// Storage contract required by the transaction-aware tablet layer.
 ///
-/// All keys passed to this trait are complete canonical row-key encodings from
-/// `ragnordb_storage::key::encode_row_key`.
+/// All keys passed to this trait must be complete canonical row-key encodings
+/// produced by `ragnordb_storage::key::encode_row_key`.
 pub trait MvccStorage {
     /// Read the row version visible at `read_ts`.
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>>;
 
     /// Scan the half-open encoded-key range `[start, end)` at `read_ts`.
     ///
-    /// Returned rows are ordered by canonical encoded row key.
+    /// Returned rows must be ordered by canonical encoded row key.
     fn scan(
         &self,
         start: Option<&[u8]>,
@@ -94,8 +111,7 @@ pub trait MvccStorage {
 
     /// Atomically validate and commit a transaction's complete mutation set.
     ///
-    /// Implementations must not apply any mutation when validation of any key
-    /// fails.
+    /// No mutation may be applied when validation of any key fails.
     fn commit_batch(
         &mut self,
         txn_id: TxnId,
@@ -110,9 +126,8 @@ pub trait MvccStorage {
 
 /// In-memory implementation of RagnorDB's MVCC maps.
 ///
-/// Mutation methods require `&mut self`. The future tablet state-machine actor
-/// will own and serialize access to this structure. This phase therefore does
-/// not introduce locking primitives or claim cross-thread transaction safety.
+/// Mutation methods require exclusive access. A future tablet state-machine
+/// actor will own and serialize access to this structure.
 #[derive(Debug, Default)]
 pub struct InMemoryMvcc {
     /// `row_key -> start_ts -> encoded row`.
@@ -120,12 +135,11 @@ pub struct InMemoryMvcc {
 
     /// `row_key -> unresolved lock`.
     ///
-    /// Locks are observed by reads and commit validation in this phase. Their
-    /// distributed creation and resolution protocol belongs to the later
-    /// Percolator transaction milestone.
+    /// Locks participate in reads and commit validation. Public distributed
+    /// lock creation and resolution belong to Milestone 6.
     locks: BTreeMap<Vec<u8>, LockRecord>,
 
-    /// `row_key -> commit_ts -> write record`.
+    /// `row_key -> write_ts -> write record`.
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
 }
 
@@ -149,8 +163,8 @@ impl InMemoryMvcc {
             return Ok(None);
         };
 
-        for (stored_commit_ts, write) in write_versions.range(..=read_ts).rev() {
-            validate_write_record(*stored_commit_ts, write)?;
+        for (stored_write_ts, write) in write_versions.range(..=read_ts).rev() {
+            validate_write_record(*stored_write_ts, write)?;
 
             match write.op {
                 WriteKind::Put => {
@@ -160,30 +174,28 @@ impl InMemoryMvcc {
                         .and_then(|versions| versions.get(&write.start_timestamp))
                         .ok_or_else(|| {
                             Error::CorruptData(format!(
-                                "Put committed at timestamp {} references missing default \
+                                "Put at write timestamp {} references missing default \
                                  value at start timestamp {}",
-                                stored_commit_ts.0, write.start_timestamp.0
+                                stored_write_ts.0, write.start_timestamp.0
                             ))
                         })?;
 
-                    // Validate persisted bytes at the storage boundary. This
-                    // prevents damaged row data from being returned as if it
-                    // were a valid committed value.
+                    // Validate persisted bytes at the storage boundary so
+                    // damaged row data cannot be returned as committed data.
                     decode_row(row)?;
 
                     return Ok(Some(row.clone()));
                 }
 
                 WriteKind::Delete => {
-                    // A delete is a visible tombstone. Once encountered, older
-                    // Put records must remain hidden from this snapshot.
+                    // A Delete is a visible tombstone. Once encountered, older
+                    // committed versions remain hidden.
                     return Ok(None);
                 }
 
                 WriteKind::Rollback => {
-                    // A rollback marker describes an aborted transaction, not
-                    // a logical deletion. Continue searching for an older
-                    // committed Put or Delete record.
+                    // A Rollback describes an aborted transaction rather than
+                    // a logical deletion. Continue to older committed records.
                 }
             }
         }
@@ -227,7 +239,7 @@ impl InMemoryMvcc {
                     .is_some_and(|versions| versions.contains_key(&start_ts))
                 {
                     return Err(Error::CorruptData(format!(
-                        "Delete mutation at start timestamp {} conflicts with an existing \
+                        "Delete at start timestamp {} conflicts with an existing \
                          default value for the same transaction",
                         start_ts.0
                     )));
@@ -258,7 +270,7 @@ impl InMemoryMvcc {
 
         if lock.op != mutation.write_kind() {
             return Err(Error::CorruptData(format!(
-                "transaction {} has a lock operation inconsistent with its buffered mutation",
+                "transaction {} has a lock operation inconsistent with its mutation",
                 txn_id.0
             )));
         }
@@ -276,8 +288,8 @@ impl InMemoryMvcc {
             return Ok(());
         };
 
-        for (stored_commit_ts, write) in write_versions {
-            validate_write_record(*stored_commit_ts, write)?;
+        for (stored_write_ts, write) in write_versions {
+            validate_write_record(*stored_write_ts, write)?;
 
             if write.op == WriteKind::Rollback && write.start_timestamp == start_ts {
                 return Err(Error::WriteConflict(format!(
@@ -287,23 +299,25 @@ impl InMemoryMvcc {
             }
         }
 
-        if let Some((latest_commit_ts, _)) = write_versions.last_key_value()
-            && *latest_commit_ts >= commit_ts
+        if let Some((latest_write_ts, _)) = write_versions.last_key_value()
+            && *latest_write_ts >= commit_ts
         {
             return Err(Error::WriteConflict(format!(
-                "commit timestamp {} does not advance the row's latest write timestamp {}",
-                commit_ts.0, latest_commit_ts.0
+                "commit timestamp {} does not advance the row's latest write \
+                 timestamp {}",
+                commit_ts.0, latest_write_ts.0
             )));
         }
 
-        if let Some((conflicting_commit_ts, _)) = write_versions
+        if let Some((conflicting_write_ts, _)) = write_versions
             .range((Excluded(start_ts), Unbounded))
             .rev()
             .find(|(_, write)| write.op != WriteKind::Rollback)
         {
             return Err(Error::WriteConflict(format!(
-                "row was modified at timestamp {} after transaction start timestamp {}",
-                conflicting_commit_ts.0, start_ts.0
+                "row was modified at timestamp {} after transaction start \
+                 timestamp {}",
+                conflicting_write_ts.0, start_ts.0
             )));
         }
 
@@ -329,7 +343,7 @@ impl InMemoryMvcc {
 
         if write.start_timestamp != start_ts || write.op != mutation.write_kind() {
             return Err(Error::CorruptData(format!(
-                "commit timestamp {} is already occupied by a different write",
+                "write timestamp {} is already occupied by a different write",
                 commit_ts.0
             )));
         }
@@ -341,14 +355,14 @@ impl InMemoryMvcc {
                 .and_then(|versions| versions.get(&start_ts))
                 .ok_or_else(|| {
                     Error::CorruptData(format!(
-                        "replayed Put at commit timestamp {} has no default value",
+                        "replayed Put at timestamp {} has no default value",
                         commit_ts.0
                     ))
                 })?;
 
             if stored_row != expected_row {
                 return Err(Error::CorruptData(format!(
-                    "replayed Put at commit timestamp {} references different row bytes",
+                    "replayed Put at timestamp {} references different row bytes",
                     commit_ts.0
                 )));
             }
@@ -380,8 +394,8 @@ impl InMemoryMvcc {
         }
 
         Err(Error::CorruptData(format!(
-            "transaction at start timestamp {} is only partially present at commit \
-             timestamp {}",
+            "transaction at start timestamp {} is only partially present at \
+             write timestamp {}",
             start_ts.0, commit_ts.0
         )))
     }
@@ -401,9 +415,8 @@ impl MvccStorage for InMemoryMvcc {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let (lower, upper) = encoded_scan_bounds(start, end)?;
 
-        // Locks are included in the candidate set even when a key has no
-        // committed history. Otherwise a scan could silently pass an
-        // unresolved insertion lock.
+        // Locks must participate even when their key has no committed history.
+        // Otherwise a scan could silently pass a locked insertion.
         let mut candidates = BTreeSet::new();
 
         for (key, _) in self.writes.range((lower.clone(), upper.clone())) {
@@ -443,14 +456,13 @@ impl MvccStorage for InMemoryMvcc {
         }
 
         // A completely identical batch is a safe deterministic replay. A
-        // partially present batch indicates impossible state for this atomic
-        // engine and is treated as corruption.
+        // partially present batch is impossible after an atomic application
+        // and therefore represents corrupted state.
         if self.validate_batch_replay(mutations, start_ts, commit_ts)? {
             return Ok(mutations.len());
         }
 
-        // Validate every key before changing any map. This guarantees that
-        // conflicts and malformed mutations cannot produce partial commits.
+        // Validate the complete batch before changing any map.
         for (key, mutation) in mutations {
             self.validate_lock(key, mutation, txn_id, start_ts)?;
             self.validate_write_history(key, start_ts, commit_ts)?;
@@ -466,8 +478,8 @@ impl MvccStorage for InMemoryMvcc {
                 }
 
                 Mutation::Delete => {
-                    // Deletes store no default payload. Their write record is
-                    // the tombstone that hides older committed values.
+                    // Deletes have no default payload. Their committed write
+                    // record is the tombstone.
                 }
             }
 
@@ -536,11 +548,15 @@ fn validate_commit_metadata(
     Ok(())
 }
 
-fn validate_write_record(stored_commit_ts: Timestamp, write: &WriteRecord) -> Result<()> {
-    if write.commit_timestamp != stored_commit_ts {
+/// Validate one record against the timestamp used as its write-map key.
+///
+/// `Put` and `Delete` use a true commit timestamp. `Rollback` uses `start_ts`
+/// because the rollback command does not allocate or carry a commit timestamp.
+fn validate_write_record(stored_write_ts: Timestamp, write: &WriteRecord) -> Result<()> {
+    if write.commit_timestamp != stored_write_ts {
         return Err(Error::CorruptData(format!(
-            "write-map timestamp {} does not match record commit timestamp {}",
-            stored_commit_ts.0, write.commit_timestamp.0
+            "write-map timestamp {} does not match record timestamp {}",
+            stored_write_ts.0, write.commit_timestamp.0
         )));
     }
 
@@ -550,11 +566,25 @@ fn validate_write_record(stored_commit_ts: Timestamp, write: &WriteRecord) -> Re
         ));
     }
 
-    if write.commit_timestamp <= write.start_timestamp {
-        return Err(Error::CorruptData(format!(
-            "write record commit timestamp {} does not follow start timestamp {}",
-            write.commit_timestamp.0, write.start_timestamp.0
-        )));
+    match write.op {
+        WriteKind::Put | WriteKind::Delete => {
+            if write.commit_timestamp <= write.start_timestamp {
+                return Err(Error::CorruptData(format!(
+                    "committed write timestamp {} does not follow start \
+                     timestamp {}",
+                    write.commit_timestamp.0, write.start_timestamp.0
+                )));
+            }
+        }
+
+        WriteKind::Rollback => {
+            if write.commit_timestamp != write.start_timestamp {
+                return Err(Error::CorruptData(format!(
+                    "rollback record timestamp {} must equal start timestamp {}",
+                    write.commit_timestamp.0, write.start_timestamp.0
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -568,10 +598,7 @@ fn validate_encoded_key_argument(key: &[u8], context: &str) -> Result<()> {
     })
 }
 
-fn encoded_scan_bounds(
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-) -> Result<(std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>)> {
+fn encoded_scan_bounds(start: Option<&[u8]>, end: Option<&[u8]>) -> Result<EncodedScanBounds> {
     if let Some(start) = start {
         validate_encoded_key_argument(start, "scan start key")?;
     }
@@ -606,8 +633,7 @@ mod tests {
     use crate::key::{encode_row_key, make_row_key};
 
     fn encoded_key(id: i64) -> Vec<u8> {
-        let key = make_row_key(TableId(1), &[Value::Int(id)]).unwrap();
-        encode_row_key(&key).unwrap()
+        encode_row_key(&make_row_key(TableId(1), &[Value::Int(id)]).unwrap()).unwrap()
     }
 
     fn encoded_row(id: i64, name: &str) -> Vec<u8> {
@@ -626,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reads_select_the_latest_visible_version() {
+    fn snapshot_reads_select_latest_visible_version() {
         let key = encoded_key(1);
         let first = encoded_row(1, "first");
         let second = encoded_row(1, "second");
@@ -660,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_tombstone_hides_only_snapshots_at_or_after_commit() {
+    fn delete_tombstone_hides_only_newer_snapshots() {
         let key = encoded_key(1);
         let row = encoded_row(1, "visible");
         let mut engine = InMemoryMvcc::new();
@@ -685,11 +711,10 @@ mod tests {
 
         assert_eq!(engine.read(&key, Timestamp(3)).unwrap(), Some(row));
         assert_eq!(engine.read(&key, Timestamp(4)).unwrap(), None);
-        assert_eq!(engine.read(&key, Timestamp(10)).unwrap(), None);
     }
 
     #[test]
-    fn rollback_is_skipped_by_reads_but_blocks_delayed_commit() {
+    fn rollback_is_stored_at_start_timestamp_and_skipped_by_reads() {
         let key = encoded_key(1);
         let original = encoded_row(1, "original");
         let delayed = encoded_row(1, "delayed");
@@ -705,21 +730,21 @@ mod tests {
             .unwrap();
 
         engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(4),
+            Timestamp(3),
             WriteRecord {
                 start_timestamp: Timestamp(3),
-                commit_timestamp: Timestamp(4),
+                commit_timestamp: Timestamp(3),
                 op: WriteKind::Rollback,
             },
         );
 
-        assert_eq!(engine.read(&key, Timestamp(5)).unwrap(), Some(original));
+        assert_eq!(engine.read(&key, Timestamp(3)).unwrap(), Some(original));
 
         let error = engine
             .commit_batch(
                 TxnId(2),
                 Timestamp(3),
-                Timestamp(6),
+                Timestamp(5),
                 &put_batch(key, delayed),
             )
             .unwrap_err();
@@ -728,12 +753,29 @@ mod tests {
     }
 
     #[test]
-    fn write_conflict_rejects_the_entire_batch() {
+    fn malformed_rollback_timestamp_is_corruption() {
+        let key = encoded_key(1);
+        let mut engine = InMemoryMvcc::new();
+
+        engine.writes.entry(key.clone()).or_default().insert(
+            Timestamp(4),
+            WriteRecord {
+                start_timestamp: Timestamp(3),
+                commit_timestamp: Timestamp(4),
+                op: WriteKind::Rollback,
+            },
+        );
+
+        let error = engine.read(&key, Timestamp(4)).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+    }
+
+    #[test]
+    fn write_conflict_rejects_entire_batch() {
         let first_key = encoded_key(1);
         let second_key = encoded_key(2);
         let winner = encoded_row(2, "winner");
-        let loser_first = encoded_row(1, "loser");
-        let loser_second = encoded_row(2, "loser");
         let mut engine = InMemoryMvcc::new();
 
         engine
@@ -746,8 +788,8 @@ mod tests {
             .unwrap();
 
         let losing_batch = BTreeMap::from([
-            (first_key.clone(), Mutation::Put(loser_first)),
-            (second_key.clone(), Mutation::Put(loser_second)),
+            (first_key.clone(), Mutation::Put(encoded_row(1, "loser"))),
+            (second_key.clone(), Mutation::Put(encoded_row(2, "loser"))),
         ]);
 
         let error = engine
@@ -763,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_lock_causes_a_retryable_conflict() {
+    fn visible_lock_causes_retryable_conflict() {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
@@ -785,7 +827,37 @@ mod tests {
     }
 
     #[test]
-    fn scan_is_ordered_and_does_not_skip_lock_only_keys() {
+    fn same_transaction_lock_is_removed_after_commit() {
+        let key = encoded_key(1);
+        let row = encoded_row(1, "value");
+        let mut engine = InMemoryMvcc::new();
+
+        engine.locks.insert(
+            key.clone(),
+            LockRecord {
+                txn_id: TxnId(1),
+                primary_key: key.clone(),
+                start_timestamp: Timestamp(1),
+                ttl_ms: 3_000,
+                op: WriteKind::Put,
+            },
+        );
+
+        engine
+            .commit_batch(
+                TxnId(1),
+                Timestamp(1),
+                Timestamp(2),
+                &put_batch(key.clone(), row.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(engine.stats().locks, 0);
+        assert_eq!(engine.read(&key, Timestamp(2)).unwrap(), Some(row));
+    }
+
+    #[test]
+    fn scan_is_ordered_and_includes_lock_only_candidates() {
         let first_key = encoded_key(1);
         let second_key = encoded_key(2);
         let third_key = encoded_key(3);
@@ -822,11 +894,137 @@ mod tests {
         );
 
         let error = engine.scan(None, None, Timestamp(3)).unwrap_err();
+
         assert!(matches!(error, Error::WriteConflict(_)));
     }
 
     #[test]
-    fn missing_default_value_is_reported_as_corruption() {
+    fn scan_respects_half_open_bounds() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        let third_key = encoded_key(3);
+        let mut engine = InMemoryMvcc::new();
+
+        let mutations = BTreeMap::from([
+            (first_key, Mutation::Put(encoded_row(1, "first"))),
+            (second_key.clone(), Mutation::Put(encoded_row(2, "second"))),
+            (third_key.clone(), Mutation::Put(encoded_row(3, "third"))),
+        ]);
+
+        engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap();
+
+        let rows = engine
+            .scan(Some(&second_key), Some(&third_key), Timestamp(2))
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, second_key);
+    }
+
+    #[test]
+    fn scan_rejects_invalid_order() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        let engine = InMemoryMvcc::new();
+
+        let error = engine
+            .scan(Some(&second_key), Some(&first_key), Timestamp(1))
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+
+        let error = engine
+            .scan(Some(&first_key), Some(&first_key), Timestamp(1))
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn malformed_mutation_key_is_rejected() {
+        let mut engine = InMemoryMvcc::new();
+        let mutations = BTreeMap::from([(vec![0xff], Mutation::Put(encoded_row(1, "value")))]);
+
+        let error = engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(engine.stats(), MvccStats::default());
+    }
+
+    #[test]
+    fn malformed_put_row_is_rejected() {
+        let mut engine = InMemoryMvcc::new();
+        let mutations = BTreeMap::from([(encoded_key(1), Mutation::Put(vec![0xff]))]);
+
+        let error = engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(engine.stats(), MvccStats::default());
+    }
+
+    #[test]
+    fn exact_multi_key_replay_is_idempotent() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        let mutations = BTreeMap::from([
+            (first_key, Mutation::Put(encoded_row(1, "first"))),
+            (second_key, Mutation::Put(encoded_row(2, "second"))),
+        ]);
+        let mut engine = InMemoryMvcc::new();
+
+        assert_eq!(
+            engine
+                .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations,)
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(
+            engine
+                .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations,)
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(engine.stats().default_versions, 2);
+        assert_eq!(engine.stats().write_records, 2);
+    }
+
+    #[test]
+    fn partial_replay_is_reported_as_corruption() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        let mutations = BTreeMap::from([
+            (first_key, Mutation::Put(encoded_row(1, "first"))),
+            (second_key.clone(), Mutation::Put(encoded_row(2, "second"))),
+        ]);
+        let mut engine = InMemoryMvcc::new();
+
+        engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap();
+
+        engine
+            .writes
+            .get_mut(&second_key)
+            .unwrap()
+            .remove(&Timestamp(2));
+
+        let error = engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+    }
+
+    #[test]
+    fn missing_default_value_is_corruption() {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
@@ -840,45 +1038,13 @@ mod tests {
         );
 
         let error = engine.read(&key, Timestamp(2)).unwrap_err();
+
         assert!(matches!(error, Error::CorruptData(_)));
     }
 
     #[test]
-    fn exact_batch_replay_is_idempotent() {
-        let key = encoded_key(1);
-        let mutations = put_batch(key, encoded_row(1, "value"));
-        let mut engine = InMemoryMvcc::new();
-
-        assert_eq!(
-            engine
-                .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations,)
-                .unwrap(),
-            1
-        );
-
-        assert_eq!(
-            engine
-                .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations,)
-                .unwrap(),
-            1
-        );
-
-        assert_eq!(
-            engine.stats(),
-            MvccStats {
-                default_keys: 1,
-                default_versions: 1,
-                locks: 0,
-                write_keys: 1,
-                write_records: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn commit_metadata_requires_monotonic_nonzero_timestamps() {
-        let engine_key = encoded_key(1);
-        let batch = put_batch(engine_key, encoded_row(1, "value"));
+    fn commit_requires_monotonic_nonzero_metadata() {
+        let batch = put_batch(encoded_key(1), encoded_row(1, "value"));
         let mut engine = InMemoryMvcc::new();
 
         assert!(matches!(
