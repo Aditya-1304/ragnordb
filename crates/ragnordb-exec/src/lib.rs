@@ -9,15 +9,16 @@
 //! - one in-memory tablet for every locally created table,
 //! - physical access-path selection between point lookup and table scan.
 //!
-//! It does not own session state or allocate transaction timestamps. we
-//! will create implicit and explicit transactions, then call this crate with the
-//! active `Transaction`.
+//! The `session` module owns implicit and explicit transaction lifecycles. The
+//! lower-level `LocalExecutor` still receives an active `Transaction`, keeping
+//! transaction policy separate from physical plan execution.
 //!
 //! The executor never depends directly on `sqlparser`. Unsupported SQL clauses
 //! remain the analyzer's responsibility and cannot reach this layer as a Plan.
 
 mod expression;
 mod result;
+mod session;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -41,6 +42,7 @@ use ragnordb_tablet::{RowMutation, Tablet};
 use ragnordb_txn::Transaction;
 
 pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
+pub use session::{Session, SessionId};
 
 /// Local single-node executor for Milestone 2.
 ///
