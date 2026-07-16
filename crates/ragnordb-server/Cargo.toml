@@ -8,9 +8,11 @@ repository.workspace = true
 [dependencies]
 ragnordb-catalog = { path = "../ragnordb-catalog" }
 ragnordb-common = { path = "../ragnordb-common" }
+ragnordb-exec = { path = "../ragnordb-exec" }
 ragnordb-multiraft = { path = "../ragnordb-multiraft" }
 ragnordb-sql = { path = "../ragnordb-sql" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
+ragnordb-txn = { path = "../ragnordb-txn" }
 serde_json.workspace = true
 serde.workspace = true
 tokio = { version = "1", features = ["full"] }
