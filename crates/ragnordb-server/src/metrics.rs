@@ -14,30 +14,49 @@ pub fn init_metrics() {
             let _ = PROMETHEUS_HANDLE.set(handle);
             describe_metrics();
         }
-        Err(e) => warn!(error = %e, "metrics recorder already installed or unavailable"),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "metrics recorder already installed or unavailable"
+            );
+        }
     }
 }
 
 fn describe_metrics() {
     metrics::describe_counter!(
         "RagnorDB_connections_accepted_total",
-        "Total connections accepted"
+        "Total client connections accepted"
     );
+
     metrics::describe_gauge!(
         "RagnorDB_connections_active",
-        "Currently active connections"
+        "Currently active client connections"
     );
+
     metrics::describe_counter!(
         "RagnorDB_requests_received_total",
         "Total SQL requests received"
     );
+
     metrics::describe_counter!(
-        "RagnorDB_requests_ok_total",
-        "Requests that returned success"
+        "RagnorDB_requests_success_total",
+        "SQL requests that completed successfully"
     );
+
     metrics::describe_counter!(
         "RagnorDB_requests_error_total",
-        "Requests that returned an error"
+        "SQL requests that returned an error"
+    );
+
+    metrics::describe_counter!(
+        "RagnorDB_response_rows_read_total",
+        "Rows reported as read across successful SQL responses"
+    );
+
+    metrics::describe_counter!(
+        "RagnorDB_response_rows_written_total",
+        "Rows reported as written across successful SQL responses"
     );
 }
 
@@ -49,7 +68,11 @@ pub fn render_metrics() -> String {
 }
 
 pub fn counter_inc(name: &'static str) {
-    metrics::counter!(name).increment(1);
+    counter_add(name, 1);
+}
+
+pub fn counter_add(name: &'static str, value: u64) {
+    metrics::counter!(name).increment(value);
 }
 
 pub fn gauge_set(name: &'static str, value: f64) {

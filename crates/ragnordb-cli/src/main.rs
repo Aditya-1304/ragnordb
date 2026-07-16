@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "ragnordb", about = "Distributed OLTP SQL Database")]
@@ -135,36 +135,33 @@ async fn send_frame(
     Ok(())
 }
 
+/// Run the interactive V1 SQL shell.
+///
+/// The V1 connection policy permits one in-flight statement per connection.
+/// The shell therefore follows a strict request-response cycle:
+///
+/// 1. display the prompt,
+/// 2. read one statement,
+/// 3. send one request frame,
+/// 4. wait for exactly one response frame,
+/// 5. print the response,
+/// 6. display the next prompt.
+///
+/// Waiting for the response before drawing the next prompt prevents asynchronous
+/// server output from overwriting or visually displacing the prompt.
 async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(addr).await?;
+
     info!(%addr, "connected to RagnorDB");
     info!("type 'exit' or 'quit' to disconnect");
 
     let (mut reader, mut writer) = stream.into_split();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-
-    // reads the server responses concurrently so the interactive shell remains
-    // responsive while a statement is being processed.
-    let server_task = tokio::spawn(async move {
-        while let Ok(response) = read_frame(&mut reader).await {
-            match serde_json::from_str::<serde_json::Value>(&response) {
-                Ok(json) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json)
-                            .expect("serializing serde_json::Value cannot fail")
-                    );
-                }
-                Err(_) => println!("{response}"),
-            }
-        }
-
-        warn!("connection closed by server");
-    });
-
     let mut line = String::new();
+
     loop {
         line.clear();
+
         print!("ragnordb> ");
 
         use std::io::Write;
@@ -175,14 +172,17 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
                 println!();
                 break;
             }
-            Err(e) => {
-                error!(error = %e, "stdin read error");
+
+            Ok(_) => {}
+
+            Err(error) => {
+                error!(error = %error, "stdin read error");
                 break;
             }
-            Ok(_) => {}
         }
 
         let trimmed = line.trim();
+
         if trimmed.is_empty() {
             continue;
         }
@@ -193,9 +193,26 @@ async fn run_sql(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         send_frame(&mut writer, trimmed).await?;
-    }
 
-    server_task.abort();
+        // V1 guarantees one response for every request. Reading the response in
+        // this loop preserves statement ordering and ensures the next prompt is
+        // rendered only after the complete response has been printed.
+        let response = read_frame(&mut reader).await?;
+
+        match serde_json::from_str::<serde_json::Value>(&response) {
+            Ok(json) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json)
+                        .expect("serializing serde_json::Value cannot fail")
+                );
+            }
+
+            Err(_) => {
+                println!("{response}");
+            }
+        }
+    }
 
     Ok(())
 }

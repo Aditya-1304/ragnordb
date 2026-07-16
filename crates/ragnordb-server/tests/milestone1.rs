@@ -1,5 +1,6 @@
 use ragnordb_common::protocol::read_frame;
 use ragnordb_server::admin::AdminState;
+use ragnordb_server::database::LocalDatabase;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -46,11 +47,15 @@ async fn sql_connection_returns_framed_json_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let database = LocalDatabase::shared();
+
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        ragnordb_server::handle_connection(stream).await.unwrap();
-    });
 
+        ragnordb_server::handle_connection(stream, database)
+            .await
+            .unwrap();
+    });
     let stream = TcpStream::connect(addr).await.unwrap();
     let (mut reader, mut writer) = stream.into_split();
 
@@ -140,9 +145,14 @@ async fn empty_sql_frame_receives_a_framed_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
 
+    let database = LocalDatabase::shared();
+
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        ragnordb_server::handle_connection(stream).await.unwrap();
+
+        ragnordb_server::handle_connection(stream, database)
+            .await
+            .unwrap();
     });
 
     let stream = TcpStream::connect(address).await.unwrap();
@@ -154,7 +164,7 @@ async fn empty_sql_frame_receives_a_framed_error() {
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
     assert_eq!(response["ok"], false);
-    assert_eq!(response["error"]["code"], "UNSUPPORTED_SQL");
+    assert_eq!(response["error"]["code"], "INVALID_ARGUMENT");
     assert_eq!(response["error"]["retryable"], false);
 
     drop(writer);

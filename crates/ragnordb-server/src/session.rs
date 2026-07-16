@@ -1,36 +1,62 @@
-use ragnordb_common::ids::TxnId;
+//! Connection-level client session state.
+//!
+//! The server session owns connection identity and request-level configuration.
+//! SQL transaction state is delegated exclusively to `SqlSession`, preventing
+//! the server and executor layers from maintaining competing transaction state.
+
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use ragnordb_common::ids::TxnId;
+use ragnordb_exec::SqlSession;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Process-local diagnostic identity for one client connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
-#[derive(Debug, Clone)]
+/// Connection-level state for one SQL client.
+///
+/// `statement_timeout_ms` records the configured V1 default. Actual deadline
+/// enforcement requires request cancellation and asynchronous execution support
+/// and remains a later server-runtime integration.
+#[derive(Debug)]
 pub struct Session {
     pub session_id: SessionId,
-    pub current_txn: Option<TxnId>,
-    pub autocommit: bool,
+    pub sql: SqlSession,
     pub statement_timeout_ms: u64,
 }
 
 impl Session {
+    /// Construct a connection session using the V1 defaults.
     pub fn new() -> Self {
-        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        Session {
-            session_id: SessionId(id),
-            current_txn: None,
-            autocommit: true,
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+
+        assert_ne!(
+            session_id, 0,
+            "process-local session ID allocator exhausted and wrapped to zero"
+        );
+
+        Self {
+            session_id: SessionId(session_id),
+            sql: SqlSession::new(),
             statement_timeout_ms: 30_000,
         }
     }
 
-    pub fn begin_txn(&mut self, txn_id: TxnId) {
-        self.current_txn = Some(txn_id);
+    /// Return whether standalone data statements use implicit transactions.
+    pub fn autocommit(&self) -> bool {
+        self.sql.autocommit()
     }
 
-    pub fn end_txn(&mut self) {
-        self.current_txn = None;
+    /// Return whether BEGIN has attached an explicit transaction.
+    pub fn has_active_transaction(&self) -> bool {
+        self.sql.has_active_transaction()
+    }
+
+    /// Return the active transaction identifier, if one exists.
+    pub fn current_transaction_id(&self) -> Option<TxnId> {
+        self.sql.current_transaction_id()
     }
 }
 
@@ -45,23 +71,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_session_uses_v1_defaults() {
+    fn new_session_uses_connection_and_sql_defaults() {
         let session = Session::new();
 
-        assert!(session.autocommit);
-        assert_eq!(session.current_txn, None);
+        assert!(session.autocommit());
+        assert!(!session.has_active_transaction());
+        assert_eq!(session.current_transaction_id(), None);
         assert_eq!(session.statement_timeout_ms, 30_000);
-    }
-
-    #[test]
-    fn session_transaction_lifecycle_is_explicit() {
-        let mut session = Session::new();
-
-        session.begin_txn(TxnId(42));
-        assert_eq!(session.current_txn, Some(TxnId(42)));
-
-        session.end_txn();
-        assert_eq!(session.current_txn, None);
     }
 
     #[test]
