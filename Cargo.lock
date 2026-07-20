@@ -1303,6 +1303,7 @@ version = "0.1.0"
 dependencies = [
  "bloom-bloom",
  "prost",
+ "ragnordb-catalog",
  "ragnordb-common",
  "wal",
 ]

@@ -3,6 +3,7 @@ syntax = "proto3";
 package ragnordb.wal;
 
 import "ids.proto";
+import "command.proto";
 
 // Durable record for one transaction committed by the single node engine
 //
@@ -48,4 +49,23 @@ message WalWrite {
 // An empty marker avoids boolean default-value ambiguity while keeping Put and
 // Delete structurally exclusive through protobuf's `oneof`
 message DeleteMarker {
+}
+
+// durable envelope for one catalog state transition
+//
+// the enclosed CatalogCommand is shared with the later replicated catalog path
+// the envelope adds single node recovery metadata without creating a second
+// representation for catalog operations
+message CatalogUpdate {
+    // Version of this payload schema
+    uint32 version = 1;
+
+    // Timestamp assigned to this catalog state transition
+    ragnordb.ids.Timestamp update_timestamp = 2;
+
+    // Table affected by the enclosed catalog operation
+    ragnordb.ids.TableId table_id = 3;
+
+    // Complete catalog operation applied during replay
+    ragnordb.command.CatalogCommand command = 4;
 }

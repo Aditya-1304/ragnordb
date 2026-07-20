@@ -52,3 +52,23 @@ pub mod wal_write {
 /// Delete structurally exclusive through protobuf's `oneof`
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DeleteMarker {}
+/// durable envelope for one catalog state transition
+///
+/// the enclosed CatalogCommand is shared with the later replicated catalog path
+/// the envelope adds single node recovery metadata without creating a second
+/// representation for catalog operations
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CatalogUpdate {
+    /// Version of this payload schema
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// Timestamp assigned to this catalog state transition
+    #[prost(message, optional, tag = "2")]
+    pub update_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    /// Table affected by the enclosed catalog operation
+    #[prost(message, optional, tag = "3")]
+    pub table_id: ::core::option::Option<super::ids::TableId>,
+    /// Complete catalog operation applied during replay
+    #[prost(message, optional, tag = "4")]
+    pub command: ::core::option::Option<super::command::CatalogCommand>,
+}

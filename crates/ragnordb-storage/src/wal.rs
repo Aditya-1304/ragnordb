@@ -10,8 +10,11 @@
 //! another playload
 
 use prost::Message;
+use ragnordb_catalog::TableSchema;
 use ragnordb_common::{
     Error, Result,
+    catalog_codec::TableDefinition,
+    command_codec::{CatalogCommand, CatalogOperation},
     encoding::decode_row,
     ids::{TableId, Timestamp, TxnId},
     proto::wal as wal_proto,
@@ -23,6 +26,9 @@ use crate::key::decode_row_key;
 
 /// current durable schema version for `SingleNodeTxnCommit`
 pub const SINGLE_NODE_TXN_COMMIT_VERSION: u32 = 1;
+
+/// current durable schema version for `CatalogUpdate`
+pub const CATALOG_UPDATE_VERSION: u32 = 1;
 
 /// snapshot pointer identifier
 const SNAPSHOT_POINTER_ID: u16 = USER_MIN + 3;
@@ -302,6 +308,132 @@ impl SingleNodeTxnCommit {
                 })?;
             }
         }
+
+        Ok(())
+    }
+}
+
+/// Versioned durable envelope for one catalog state transition
+///
+/// The operation reuses `CatalogCommand`, ensuring that single-node recovery and
+/// the later replicated metadata path share one operation representation
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogUpdate {
+    /// Stable identity of the table affected by the operation
+    pub table_id: TableId,
+
+    /// Nonzero timestamp assigned to the catalog transition
+    pub update_timestamp: Timestamp,
+
+    /// Complete catalog command applied during recovery
+    pub command: CatalogCommand,
+}
+
+impl CatalogUpdate {
+    /// Validate and encode this catalog update for A-WAL
+    ///
+    /// Invalid wrapper metadata or an invalid table definition is rejected
+    /// before it can become durable history
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate().map_err(|message| {
+            Error::InvalidArgument(format!("invalid CatalogUpdate: {message}"))
+        })?;
+
+        Ok(self.to_proto().encode_to_vec())
+    }
+
+    /// Decode and validate a catalog update read from A-WAL
+    ///
+    /// Missing fields, unsupported versions, invalid catalog commands, and
+    /// schema violations are corrupt durable data during recovery
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let proto = wal_proto::CatalogUpdate::decode(bytes).map_err(|error| {
+            Error::CorruptData(format!("failed to decode CatalogUpdate protobuf: {error}"))
+        })?;
+
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> wal_proto::CatalogUpdate {
+        wal_proto::CatalogUpdate {
+            version: CATALOG_UPDATE_VERSION,
+            update_timestamp: Some(self.update_timestamp.to_proto()),
+            table_id: Some(self.table_id.to_proto()),
+            command: Some(self.command.to_proto()),
+        }
+    }
+
+    fn from_proto(proto: wal_proto::CatalogUpdate) -> Result<Self> {
+        if proto.version != CATALOG_UPDATE_VERSION {
+            return Err(Error::CorruptData(format!(
+                "unsupported CatalogUpdate version {}; expected {}",
+                proto.version, CATALOG_UPDATE_VERSION
+            )));
+        }
+
+        let update_timestamp = proto.update_timestamp.ok_or_else(|| {
+            Error::CorruptData("CatalogUpdate is missing its update timestamp".to_string())
+        })?;
+
+        let table_id = proto.table_id.ok_or_else(|| {
+            Error::CorruptData("CatalogUpdate is missing its table identifier".to_string())
+        })?;
+
+        let command = proto.command.ok_or_else(|| {
+            Error::CorruptData("CatalogUpdate is missing its catalog command".to_string())
+        })?;
+
+        let command = CatalogCommand::from_proto(command).map_err(|message| {
+            Error::CorruptData(format!("invalid CatalogUpdate command: {message}"))
+        })?;
+
+        let update = Self {
+            table_id: TableId::from_proto(table_id),
+            update_timestamp: Timestamp::from_proto(update_timestamp),
+            command,
+        };
+
+        update.validate().map_err(|message| {
+            Error::CorruptData(format!("invalid durable CatalogUpdate: {message}"))
+        })?;
+
+        Ok(update)
+    }
+
+    fn table_definition(&self) -> &TableDefinition {
+        match &self.command.operation {
+            CatalogOperation::CreateTable(operation) => &operation.table_def,
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.table_id.0 == 0 {
+            return Err("table ID 0 is reserved".to_string());
+        }
+
+        if self.update_timestamp.0 == 0 {
+            return Err("update timestamp 0 is reserved".to_string());
+        }
+
+        let definition = self.table_definition();
+        let operation_table_id = TableId(definition.table_id);
+
+        if operation_table_id.0 == 0 {
+            return Err("catalog operation table ID 0 is reserved".to_string());
+        }
+
+        if operation_table_id != self.table_id {
+            return Err(format!(
+                "catalog operation table {} does not match update table {}",
+                operation_table_id.0, self.table_id.0
+            ));
+        }
+
+        // Reuse the catalog's canonical validator instead of maintaining a
+        // second, potentially divergent set of schema invariants in WAL code
+        TableSchema::from_definition(definition.clone()).map_err(|error| {
+            format!("catalog operation contains an invalid table definition: {error}")
+        })?;
 
         Ok(())
     }
