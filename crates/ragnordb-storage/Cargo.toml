@@ -9,3 +9,4 @@ repository.workspace = true
 ragnordb-common = { path = "../ragnordb-common" }
 wal.workspace = true
 bloom-bloom.workspace = true
+prost.workspace = true

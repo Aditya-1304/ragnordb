@@ -38,6 +38,9 @@ pub mod proto {
     pub mod rpc {
         include!("proto/ragnordb.rpc.rs");
     }
+    pub mod wal {
+        include!("proto/ragnordb.wal.rs");
+    }
 }
 
 pub use result::{Error, Result};

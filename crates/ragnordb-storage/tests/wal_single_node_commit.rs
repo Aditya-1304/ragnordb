@@ -161,12 +161,12 @@ fn zero_and_unsupported_versions_are_rejected() {
 }
 
 /// Ensures reserved identities and impossible timestamp orderings cannot enter
-/// or be reconstructed from durable history.
+/// or be reconstructed from durable history
 ///
 /// Realistic bug caught:
 ///
 /// Recovery could accept a commit that the live MVCC path could never create,
-/// including versions whose commit timestamp is not newer than their snapshot.
+/// including versions whose commit timestamp is not newer than their snapshot
 #[test]
 fn invalid_transaction_metadata_is_rejected_on_encode_and_decode() {
     assert_encode_rejected(
@@ -191,12 +191,12 @@ fn invalid_transaction_metadata_is_rejected_on_encode_and_decode() {
 
     assert_encode_rejected(
         |record| record.commit_timestamp = record.start_timestamp,
-        "commit timestamp must be greater than start timestamp",
+        "must be greater than start timestamp",
     );
 
     assert_encode_rejected(
         |record| record.commit_timestamp = Timestamp(record.start_timestamp.0 - 1),
-        "commit timestamp must be greater than start timestamp",
+        "must be greater than start timestamp",
     );
 
     assert_decode_rejected(
@@ -221,21 +221,21 @@ fn invalid_transaction_metadata_is_rejected_on_encode_and_decode() {
 
     assert_decode_rejected(
         |proto| proto.commit_timestamp = Some(Timestamp(11).to_proto()),
-        "commit timestamp must be greater than start timestamp",
+        "must be greater than start timestamp",
     );
 
     assert_decode_rejected(
         |proto| proto.commit_timestamp = Some(Timestamp(10).to_proto()),
-        "commit timestamp must be greater than start timestamp",
+        "must be greater than start timestamp",
     );
 }
 
-/// Ensures read-only transactions and lost-write commits are not serialized.
+/// Ensures read-only transactions and lost-write commits are not serialized
 ///
 /// Realistic bug caught:
 ///
 /// A commit-path bug could append durable history for a transaction with no
-/// state transition, despite read-only commits being explicit no-ops.
+/// state transition, despite read-only commits being explicit no-ops
 #[test]
 fn empty_write_batch_is_rejected_on_encode_and_decode() {
     assert_encode_rejected(
@@ -250,12 +250,12 @@ fn empty_write_batch_is_rejected_on_encode_and_decode() {
 }
 
 /// Ensures recovery never silently applies only one of two serialized
-/// mutations for the same row.
+/// mutations for the same row
 ///
 /// Realistic bug caught:
 ///
 /// Collecting repeated protobuf writes directly into a map could silently make
-/// the final duplicate win, changing the meaning of the durable transaction.
+/// the final duplicate win, changing the meaning of the durable transaction
 #[test]
 fn duplicate_encoded_row_key_is_rejected_during_decode() {
     assert_decode_rejected(
@@ -267,12 +267,12 @@ fn duplicate_encoded_row_key_is_rejected_during_decode() {
     );
 }
 
-/// Ensures malformed row bytes cannot be persisted or reconstructed as a Put.
+/// Ensures malformed row bytes cannot be persisted or reconstructed as a Put
 ///
 /// Realistic bug caught:
 ///
 /// Corrupt row bytes could become committed MVCC state and fail later during a
-/// read, far away from the WAL record that introduced the corruption.
+/// read, far away from the WAL record that introduced the corruption
 #[test]
 fn malformed_put_row_is_rejected_on_encode_and_decode() {
     assert_encode_rejected(
@@ -293,12 +293,12 @@ fn malformed_put_row_is_rejected_on_encode_and_decode() {
     );
 }
 
-/// Ensures arbitrary byte strings cannot enter the ordered row-key namespace.
+/// Ensures arbitrary byte strings cannot enter the ordered row-key namespace
 ///
 /// Realistic bug caught:
 ///
 /// A malformed key could bypass table routing and make deterministic scans or
-/// replay fail after the WAL record had already been accepted.
+/// replay fail after the WAL record had already been accepted
 #[test]
 fn noncanonical_row_key_is_rejected_on_encode_and_decode() {
     assert_encode_rejected(
@@ -341,12 +341,12 @@ fn foreign_table_key_is_rejected_on_encode_and_decode() {
 }
 
 /// Ensures recovery cannot guess the operation represented by an incomplete
-/// protobuf write.
+/// protobuf write
 ///
 /// Realistic bug caught:
 ///
 /// A missing `oneof` could otherwise be treated as an implicit deletion or an
-/// empty Put.
+/// empty Put
 #[test]
 fn write_without_mutation_is_rejected() {
     assert_decode_rejected(
