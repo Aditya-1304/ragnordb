@@ -19,13 +19,19 @@ use ragnordb_common::{
     ids::{TableId, Timestamp, TxnId},
     proto::wal as wal_proto,
 };
-use std::collections::BTreeMap;
-use wal::types::{RecordType, record_types::USER_MIN};
+use std::collections::{BTreeMap, BTreeSet};
+use wal::{
+    lsn::Lsn,
+    types::{RecordType, record_types::USER_MIN},
+};
 
 use crate::key::decode_row_key;
 
 /// current durable schema version for `SingleNodeTxnCommit`
 pub const SINGLE_NODE_TXN_COMMIT_VERSION: u32 = 1;
+
+/// Current durable schema version for `SnapshotPointer`.
+pub const SNAPSHOT_POINTER_VERSION: u32 = 1;
 
 /// current durable schema version for `CatalogUpdate`
 pub const CATALOG_UPDATE_VERSION: u32 = 1;
@@ -437,4 +443,180 @@ impl CatalogUpdate {
 
         Ok(())
     }
+}
+
+/// durable pointer to a published database snapshot
+///
+/// this type contains only self-contained snapshot metadata; file publication,
+/// checksum verification, replay-boundary validation against an open A-WAL, and
+/// retention advancement will be done later !TODO
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPointer {
+    /// Stable, nonzero identity referenced by checkpoint metadata
+    pub snapshot_id: u64,
+
+    /// highest MVCC timestamp represented by the snapshot
+    pub snapshot_timestamp: Timestamp,
+
+    /// first logical WAL position not represented by the snapshot
+    ///
+    /// recovery must replay records at or after this position. `Lsn::ZERO`
+    /// remains valid and prevents the snapshot from skipping WAL history
+    pub replay_from_lsn: Lsn,
+
+    /// portable path beneath the configured database snapshot directory
+    pub relative_path: String,
+
+    /// deterministically ordered, unique table identities in the snapshot
+    ///
+    /// an empty set is valid for a snapshot of an empty catalog
+    pub table_ids: BTreeSet<TableId>,
+}
+
+impl SnapshotPointer {
+    /// validate and encode this snapshot pointer for A-WAL
+    ///
+    /// invalid in-memory metadata is rejected before it can direct recovery to
+    /// an unsafe path or ambiguous snapshot
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate().map_err(|message| {
+            Error::InvalidArgument(format!("invalid SnapshotPointer: {message}"))
+        })?;
+
+        Ok(self.to_proto().encode_to_vec())
+    }
+
+    /// decode and validate snapshot metadata read from A-WAL
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let proto = wal_proto::SnapshotPointer::decode(bytes).map_err(|error| {
+            Error::CorruptData(format!(
+                "failed to decode SnapshotPointer protobuf: {error}"
+            ))
+        })?;
+
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> wal_proto::SnapshotPointer {
+        wal_proto::SnapshotPointer {
+            version: SNAPSHOT_POINTER_VERSION,
+            snapshot_id: self.snapshot_id,
+            snapshot_timestamp: Some(self.snapshot_timestamp.to_proto()),
+            replay_from_lsn: self.replay_from_lsn.as_u64(),
+            relative_path: self.relative_path.clone(),
+            table_ids: self.table_ids.iter().map(TableId::to_proto).collect(),
+        }
+    }
+
+    fn from_proto(proto: wal_proto::SnapshotPointer) -> Result<Self> {
+        if proto.version != SNAPSHOT_POINTER_VERSION {
+            return Err(Error::CorruptData(format!(
+                "unsupported SnapshotPointer version {}; expected {}",
+                proto.version, SNAPSHOT_POINTER_VERSION
+            )));
+        }
+
+        let snapshot_timestamp = proto.snapshot_timestamp.ok_or_else(|| {
+            Error::CorruptData("SnapshotPointer is missing its snapshot timestamp".to_string())
+        })?;
+
+        let mut table_ids = BTreeSet::new();
+
+        for proto_table_id in proto.table_ids {
+            let table_id = TableId::from_proto(proto_table_id);
+
+            if table_id.0 == 0 {
+                return Err(Error::CorruptData(
+                    "SnapshotPointer contains reserved table ID 0".to_string(),
+                ));
+            }
+
+            if !table_ids.insert(table_id) {
+                return Err(Error::CorruptData(format!(
+                    "SnapshotPointer contains duplicate table ID {}",
+                    table_id.0
+                )));
+            }
+        }
+
+        let pointer = Self {
+            snapshot_id: proto.snapshot_id,
+            snapshot_timestamp: Timestamp::from_proto(snapshot_timestamp),
+            replay_from_lsn: Lsn::new(proto.replay_from_lsn),
+            relative_path: proto.relative_path,
+            table_ids,
+        };
+
+        pointer.validate().map_err(|message| {
+            Error::CorruptData(format!("invalid durable SnapshotPointer: {message}"))
+        })?;
+
+        Ok(pointer)
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.snapshot_id == 0 {
+            return Err("snapshot ID 0 is reserved".to_string());
+        }
+
+        if self.snapshot_timestamp.0 == 0 {
+            return Err("snapshot timestamp 0 is reserved".to_string());
+        }
+
+        validate_relative_snapshot_path(&self.relative_path)?;
+
+        for table_id in &self.table_ids {
+            if table_id.0 == 0 {
+                return Err("SnapshotPointer contains reserved table ID 0".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// validates the platform-independent relative path stored in a snapshot pointer
+///
+/// Snapshot paths use `/` separators regardless of the host platform. Absolute
+/// paths, parent traversal, empty components, Windows separators, drive-style
+/// prefixes, and NUL bytes are rejected before filesystem access occurs
+fn validate_relative_snapshot_path(path: &str) -> std::result::Result<(), String> {
+    if path.is_empty() {
+        return Err("invalid relative snapshot path: path cannot be empty".to_string());
+    }
+
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err("invalid relative snapshot path: absolute paths are forbidden".to_string());
+    }
+
+    if path.contains('\\') {
+        return Err(
+            "invalid relative snapshot path: backslash separators are forbidden".to_string(),
+        );
+    }
+
+    if path.contains('\0') {
+        return Err("invalid relative snapshot path: NUL bytes are forbidden".to_string());
+    }
+
+    for component in path.split('/') {
+        if component.is_empty() {
+            return Err("invalid relative snapshot path: empty path component".to_string());
+        }
+
+        if component == "." || component == ".." {
+            return Err(format!(
+                "invalid relative snapshot path: component {component:?} is forbidden"
+            ));
+        }
+
+        if component.contains(':') {
+            return Err(
+                "invalid relative snapshot path: drive-style path components are forbidden"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
 }

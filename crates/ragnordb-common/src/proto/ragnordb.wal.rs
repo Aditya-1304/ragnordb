@@ -72,3 +72,32 @@ pub struct CatalogUpdate {
     #[prost(message, optional, tag = "4")]
     pub command: ::core::option::Option<super::command::CatalogCommand>,
 }
+/// durable pointer to a database snapshot file
+///
+/// the snapshot represents every relevant database WAL transition strictly before
+/// `replay_from_lsn` recovery loads the referenced snapshot and then replays WAL
+/// records starting at that logical position
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotPointer {
+    /// Version of this payload schema
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// Stable, nonzero snapshot identity.
+    #[prost(uint64, tag = "2")]
+    pub snapshot_id: u64,
+    /// Highest MVCC timestamp represented by the snapshot.
+    #[prost(message, optional, tag = "3")]
+    pub snapshot_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    /// First logical WAL position not represented by the snapshot.
+    ///
+    /// LSN zero is valid and means that the snapshot does not permit skipping any
+    /// WAL history.
+    #[prost(uint64, tag = "4")]
+    pub replay_from_lsn: u64,
+    /// Portable path relative to the configured database snapshot directory.
+    #[prost(string, tag = "5")]
+    pub relative_path: ::prost::alloc::string::String,
+    /// Deterministically ordered set of table states represented by the snapshot.
+    #[prost(message, repeated, tag = "6")]
+    pub table_ids: ::prost::alloc::vec::Vec<super::ids::TableId>,
+}

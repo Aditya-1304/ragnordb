@@ -69,3 +69,31 @@ message CatalogUpdate {
     // Complete catalog operation applied during replay
     ragnordb.command.CatalogCommand command = 4;
 }
+
+// durable pointer to a database snapshot file
+//
+// the snapshot represents every relevant database WAL transition strictly before
+// `replay_from_lsn` recovery loads the referenced snapshot and then replays WAL
+// records starting at that logical position
+message SnapshotPointer {
+    // Version of this payload schema
+    uint32 version = 1;
+
+    // Stable, nonzero snapshot identity.
+    uint64 snapshot_id = 2;
+
+    // Highest MVCC timestamp represented by the snapshot.
+    ragnordb.ids.Timestamp snapshot_timestamp = 3;
+
+    // First logical WAL position not represented by the snapshot.
+    //
+    // LSN zero is valid and means that the snapshot does not permit skipping any
+    // WAL history.
+    uint64 replay_from_lsn = 4;
+
+    // Portable path relative to the configured database snapshot directory.
+    string relative_path = 5;
+
+    // Deterministically ordered set of table states represented by the snapshot.
+    repeated ragnordb.ids.TableId table_ids = 6;
+}
