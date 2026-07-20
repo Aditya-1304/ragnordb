@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package ragnordb.wal;
+
+import "ids.proto";
+
+// Durable record for one transaction committed by the single node engine
+//
+// A-WAL provides record framing, checksums, ordering, and durability.
+// this message contains the database state transition required for 
+// deterministic MVCC reconstruction during startup recovery
+message SingleNodeTxnCommit {
+    // Version of this payload schema
+    uint32 version = 1;
+
+    // Table owned by the local tablet that accepted the mutation batch
+    ragnordb.ids.TableId table_id = 2;
+
+    // Stable identity of the transaction that produced this commit
+    ragnordb.ids.TxnId txn_id = 3;
+
+    // Snapshot timestamp used for transaction conflict validation
+    ragnordb.ids.Timestamp start_timestamp = 4;
+
+    // Timestamp at which the entire mutation batch became visible
+    ragnordb.ids.Timestamp commit_timestamp = 5;
+
+    // Complete transaction mutation batch in deterministic key order
+    repeated WalWrite writes = 6;
+}
+
+// One encoded row mutation within a committed transaction batch
+message WalWrite {
+    // Canonical encoded row key, including the table namespace.
+    bytes key = 1;
+
+    oneof mutation {
+        // Complete canonical encoded row for an insert or update.
+        bytes put_row = 2;
+
+        // Explicit row-deletion marker.
+        DeleteMarker delete = 3;
+    }
+}
+
+// Presence of this message represents a deletion
+//
+// An empty marker avoids boolean default-value ambiguity while keeping Put and
+// Delete structurally exclusive through protobuf's `oneof`
+message DeleteMarker {
+}
