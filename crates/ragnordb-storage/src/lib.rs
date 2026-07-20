@@ -2,6 +2,7 @@ use ragnordb_common::Result;
 
 pub mod key;
 pub mod mvcc;
+pub mod wal;
 
 /// Abstract key-value storage engine.
 ///
