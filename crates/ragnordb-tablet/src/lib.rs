@@ -260,11 +260,36 @@ impl<S: MvccStorage> Tablet<S> {
             .collect()
     }
 
-    /// Atomically commit the transaction's complete write set.
+    /// validate a non empty transaction write set against tablet ownership and
+    /// mvcc conflict state without consuming or applying the transaction
     ///
-    /// Every key is ownership-validated before MVCC storage is called. The
-    /// transaction is consumed even when validation or commit fails, so callers
-    /// must begin a new transaction before retrying.
+    /// commit cooridnator calls this method before allocating the final commit
+    /// timestamp or appending transaction record to WAL
+    pub fn validate_commit(&self, transaction: &Transaction) -> Result<()> {
+        if transaction.is_empty() {
+            return Err(Error::InvalidArgument(
+                "tablet write commit requires at least one mutation".to_string(),
+            ));
+        }
+
+        for key in transaction.write_set().keys() {
+            let row_key = decode_transaction_row_key(key)?;
+            self.validate_row_key(&row_key)?;
+        }
+
+        self.storage.validate_commit_batch(
+            transaction.id(),
+            transaction.start_ts(),
+            transaction.write_set(),
+        )
+    }
+
+    /// Atomically apply a previouslly validated transaction write set
+    ///
+    /// The method repeats preflight validation defensively because it remains a
+    /// public storage boundary. durable coordinator will serialize
+    /// preflight, WAL synchronization, and this application step so no second
+    /// writer can invalidate the checked MVCC history between those operations
     pub fn commit(&mut self, transaction: Transaction, commit_ts: Timestamp) -> Result<usize> {
         for key in transaction.write_set().keys() {
             let row_key = decode_transaction_row_key(key)?;

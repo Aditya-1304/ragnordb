@@ -120,6 +120,22 @@ pub trait MvccStorage {
         mutations: &BTreeMap<Vec<u8>, Mutation>,
     ) -> Result<usize>;
 
+    /// validate a transactions complete mutatin set without changing MVCC state
+    ///
+    /// this boundary intentionally does not accept a commit timestamp. conflict
+    /// validation must finish before the durable commit coordinator allocates
+    /// the final visibility timestamp and appends the transction to WAL
+    ///
+    /// an empty mutation set is valid at this generic storage boundary
+    /// the tablet or commit coordinator rejects empty write commits while
+    /// handling read only transaction without entering the durable write path
+    fn validate_commit_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<()>;
+
     /// Return current diagnostic counters.
     fn stats(&self) -> MvccStats;
 }
@@ -278,12 +294,7 @@ impl InMemoryMvcc {
         Ok(())
     }
 
-    fn validate_write_history(
-        &self,
-        key: &[u8],
-        start_ts: Timestamp,
-        commit_ts: Timestamp,
-    ) -> Result<()> {
+    fn validate_write_history(&self, key: &[u8], start_ts: Timestamp) -> Result<()> {
         let Some(write_versions) = self.writes.get(key) else {
             return Ok(());
         };
@@ -299,16 +310,6 @@ impl InMemoryMvcc {
             }
         }
 
-        if let Some((latest_write_ts, _)) = write_versions.last_key_value()
-            && *latest_write_ts >= commit_ts
-        {
-            return Err(Error::WriteConflict(format!(
-                "commit timestamp {} does not advance the row's latest write \
-                 timestamp {}",
-                commit_ts.0, latest_write_ts.0
-            )));
-        }
-
         if let Some((conflicting_write_ts, _)) = write_versions
             .range((Excluded(start_ts), Unbounded))
             .rev()
@@ -316,8 +317,32 @@ impl InMemoryMvcc {
         {
             return Err(Error::WriteConflict(format!(
                 "row was modified at timestamp {} after transaction start \
-                 timestamp {}",
+             timestamp {}",
                 conflicting_write_ts.0, start_ts.0
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// the finalized commit timestamp can be inserted after every existing
+    /// write map entry
+    ///
+    /// snapshot conflicts are checked by `validate_write_history` before timestamp
+    /// allocation. This second check protects the physical MVCC ordering invariant
+    /// when applying an already finalized durable commit
+    fn validate_commit_timestamp(&self, key: &[u8], commit_ts: Timestamp) -> Result<()> {
+        let Some(write_versions) = self.writes.get(key) else {
+            return Ok(());
+        };
+
+        if let Some((latest_write_ts, _)) = write_versions.last_key_value()
+            && *latest_write_ts >= commit_ts
+        {
+            return Err(Error::WriteConflict(format!(
+                "commit timestamp {} does not advance the row's latest write \
+             timestamp {}",
+                commit_ts.0, latest_write_ts.0
             )));
         }
 
@@ -438,6 +463,27 @@ impl MvccStorage for InMemoryMvcc {
         Ok(rows)
     }
 
+    fn validate_commit_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<()> {
+        validate_commit_preflight_metadata(txn_id, start_ts)?;
+
+        // this will validate the entire representation before consulting conflict state
+        for (key, mutation) in mutations {
+            self.validate_mutation(key, mutation, start_ts)?;
+        }
+
+        for (key, mutation) in mutations {
+            self.validate_lock(key, mutation, txn_id, start_ts)?;
+            self.validate_write_history(key, start_ts)?;
+        }
+
+        Ok(())
+    }
+
     fn commit_batch(
         &mut self,
         txn_id: TxnId,
@@ -447,6 +493,9 @@ impl MvccStorage for InMemoryMvcc {
     ) -> Result<usize> {
         validate_commit_metadata(txn_id, start_ts, commit_ts)?;
 
+        // validate persisted representations before considering an idempotent
+        // replay; corrupt replay input must never be accepted merely because a
+        // matching timestamp exists in the write map
         for (key, mutation) in mutations {
             self.validate_mutation(key, mutation, start_ts)?;
         }
@@ -455,19 +504,24 @@ impl MvccStorage for InMemoryMvcc {
             return Ok(0);
         }
 
-        // A completely identical batch is a safe deterministic replay. A
-        // partially present batch is impossible after an atomic application
-        // and therefore represents corrupted state.
+        // identical batch is a safe deterministic replay A
+        // partially present batch is impossible after atomic application and
+        // therefore represents corrupted state
         if self.validate_batch_replay(mutations, start_ts, commit_ts)? {
             return Ok(mutations.len());
         }
 
-        // Validate the complete batch before changing any map.
-        for (key, mutation) in mutations {
-            self.validate_lock(key, mutation, txn_id, start_ts)?;
-            self.validate_write_history(key, start_ts, commit_ts)?;
+        self.validate_commit_batch(txn_id, start_ts, mutations)?;
+
+        // commit timestamps are finalized only after snapshot-conflict
+        // preflight; Validate their insertion position before changing any map
+        for key in mutations.keys() {
+            self.validate_commit_timestamp(key, commit_ts)?;
         }
 
+        // Every fallible validation step has completed. The following section
+        // performs the complete in-memory state transition without exposing a
+        // partially applied mutation batch.
         for (key, mutation) in mutations {
             match mutation {
                 Mutation::Put(row) => {
@@ -515,11 +569,7 @@ impl MvccStorage for InMemoryMvcc {
     }
 }
 
-fn validate_commit_metadata(
-    txn_id: TxnId,
-    start_ts: Timestamp,
-    commit_ts: Timestamp,
-) -> Result<()> {
+fn validate_commit_preflight_metadata(txn_id: TxnId, start_ts: Timestamp) -> Result<()> {
     if txn_id.0 == 0 {
         return Err(Error::InvalidArgument(
             "transaction ID 0 is reserved".to_string(),
@@ -531,6 +581,16 @@ fn validate_commit_metadata(
             "transaction start timestamp 0 is reserved".to_string(),
         ));
     }
+
+    Ok(())
+}
+
+fn validate_commit_metadata(
+    txn_id: TxnId,
+    start_ts: Timestamp,
+    commit_ts: Timestamp,
+) -> Result<()> {
+    validate_commit_preflight_metadata(txn_id, start_ts)?;
 
     if commit_ts.0 == 0 {
         return Err(Error::InvalidArgument(
@@ -1060,5 +1120,72 @@ mod tests {
                 .unwrap_err(),
             Error::InvalidArgument(_)
         ));
+    }
+
+    /// Ensures an unresolved lock owned by another transaction is discovered
+    /// during the mutation-free commit preflight.
+    ///
+    /// Realistic bug caught:
+    ///
+    /// Deferring lock validation until MVCC application could leave a durable WAL
+    /// record for a transaction that must lose to an existing lock owner.
+    #[test]
+    fn preflight_rejects_conflicting_lock_without_mutating_state() {
+        let key = encoded_key(1);
+        let row = encoded_row(1, "pending");
+        let mut engine = InMemoryMvcc::new();
+
+        engine.locks.insert(
+            key.clone(),
+            LockRecord {
+                txn_id: TxnId(9),
+                primary_key: key.clone(),
+                start_timestamp: Timestamp(1),
+                ttl_ms: 3_000,
+                op: WriteKind::Put,
+            },
+        );
+
+        let mutations = put_batch(key, row);
+        let stats_before = engine.stats();
+
+        let error = engine
+            .validate_commit_batch(TxnId(1), Timestamp(1), &mutations)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::WriteConflict(_)));
+        assert_eq!(engine.stats(), stats_before);
+    }
+
+    /// Ensures a durable rollback marker prevents the corresponding transaction
+    /// from being accepted during commit preflight.
+    ///
+    /// Realistic bug caught:
+    ///
+    /// A delayed commit request could otherwise be appended after recovery had
+    /// already established that the transaction was rolled back.
+    #[test]
+    fn preflight_rejects_transaction_with_rollback_record() {
+        let key = encoded_key(1);
+        let mut engine = InMemoryMvcc::new();
+
+        engine.writes.entry(key.clone()).or_default().insert(
+            Timestamp(1),
+            WriteRecord {
+                start_timestamp: Timestamp(1),
+                commit_timestamp: Timestamp(1),
+                op: WriteKind::Rollback,
+            },
+        );
+
+        let mutations = put_batch(key, encoded_row(1, "delayed"));
+        let stats_before = engine.stats();
+
+        let error = engine
+            .validate_commit_batch(TxnId(1), Timestamp(1), &mutations)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::WriteConflict(_)));
+        assert_eq!(engine.stats(), stats_before);
     }
 }
