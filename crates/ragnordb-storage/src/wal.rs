@@ -19,7 +19,10 @@ use ragnordb_common::{
     ids::{TableId, Timestamp, TxnId},
     proto::wal as wal_proto,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    format,
+};
 use wal::{
     lsn::Lsn,
     types::{RecordType, record_types::USER_MIN},
@@ -35,6 +38,9 @@ pub const SNAPSHOT_POINTER_VERSION: u32 = 1;
 
 /// current durable schema version for `CatalogUpdate`
 pub const CATALOG_UPDATE_VERSION: u32 = 1;
+
+/// current duarable schema version for `CheckpointMarker`
+pub const CHECKPOINT_MARKER_VERSION: u32 = 1;
 
 /// snapshot pointer identifier
 const SNAPSHOT_POINTER_ID: u16 = USER_MIN + 3;
@@ -619,4 +625,108 @@ fn validate_relative_snapshot_path(path: &str) -> std::result::Result<(), String
     }
 
     Ok(())
+}
+
+/// durable publication marker for completed database snapshot
+///
+/// `CheckpointMarker` is deliberately smaller than `snapshotPointer`. it
+/// repeats only the recovery critical metadata needed to identify the snapshot
+/// and establish the wal replay boundary
+///
+/// this codec validates one marker in isolation. this path remains responsible for:
+///
+/// - the snapshot file has been safely published
+/// - the corresponding `SnapshotPointer` is durable
+/// - the marker fields match that pointer exactly
+/// - WAL retention advances only after the marker is durable
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointMarker {
+    /// stable, nonzero identity of the snapshot being published
+    pub snapshot_id: u64,
+
+    /// highest MVCC timestamp represented by the published snapshot
+    pub snapshot_timestamp: Timestamp,
+
+    /// first logical WAL position not represented by the snapshot
+    ///
+    /// recovery must replay records at or afyer this postion. `Lsn::ZERO` is
+    /// valid and means that the checkpoint does not permit skipping any WAL
+    /// history
+    pub replay_from_lsn: Lsn,
+}
+
+impl CheckpointMarker {
+    /// validates and encodes this checkpoint marker for storage in A-WAL
+    ///
+    /// invalid in memory metadata is classified as caller input rather than
+    /// durable corruption because it has not yet crossed the WAL boundary
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate().map_err(|message| {
+            Error::InvalidArgument(format!("invalid CheckpointMarker: {message}"))
+        })?;
+
+        Ok(self.to_proto().encode_to_vec())
+    }
+
+    /// decodes and validates checkpoint metadata read from A-WAL
+    ///
+    /// malformed protobuf bytes and invalid durable field values are reported
+    /// as corruption because recovery obtained them from persisted storage
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let proto = wal_proto::CheckpointMarker::decode(bytes).map_err(|error| {
+            Error::CorruptData(format!(
+                "failed to decode CheckpointMarker protobuf: {error}"
+            ))
+        })?;
+
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> wal_proto::CheckpointMarker {
+        wal_proto::CheckpointMarker {
+            version: CHECKPOINT_MARKER_VERSION,
+            snapshot_id: self.snapshot_id,
+            snapshot_timestamp: Some(self.snapshot_timestamp.to_proto()),
+            replay_from_lsn: self.replay_from_lsn.as_u64(),
+        }
+    }
+
+    fn from_proto(proto: wal_proto::CheckpointMarker) -> Result<Self> {
+        if proto.version != CHECKPOINT_MARKER_VERSION {
+            return Err(Error::CorruptData(format!(
+                "unsupported CheckpointMarker version {}; expected {}",
+                proto.version, CHECKPOINT_MARKER_VERSION
+            )));
+        }
+
+        let snapshot_timestamp = proto.snapshot_timestamp.ok_or_else(|| {
+            Error::CorruptData("CheckpointMarker is missing its snapshot timestamp".to_string())
+        })?;
+
+        let marker = Self {
+            snapshot_id: proto.snapshot_id,
+            snapshot_timestamp: Timestamp::from_proto(snapshot_timestamp),
+            replay_from_lsn: Lsn::new(proto.replay_from_lsn),
+        };
+
+        marker.validate().map_err(|message| {
+            Error::CorruptData(format!("invalid durable CheckpointMarker: {message}"))
+        })?;
+
+        Ok(marker)
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.snapshot_id == 0 {
+            return Err("snapshot ID 0 is reserved".to_string());
+        }
+
+        if self.snapshot_timestamp.0 == 0 {
+            return Err("snapshot timestamp 0 is reserved".to_string());
+        }
+
+        // Every u64 value is representable as an A-WAL LSN. In particular,
+        // LSN zero is an intentional replay boundary rather than missing data.
+        Ok(())
+    }
 }

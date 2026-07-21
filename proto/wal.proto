@@ -97,3 +97,25 @@ message SnapshotPointer {
     // Deterministically ordered set of table states represented by the snapshot.
     repeated ragnordb.ids.TableId table_ids = 6;
 }
+
+// durable publication marker for completed database snapshot
+//
+// the marker repeats the recovery critical identity, timestamp and replay 
+// boundary from SnapshotPointer. checkpoint publication must verify that 
+// these fields match the referenced pointer before the marker is appended
+message CheckpointMarker {
+    // version of this payload schema
+    uint32 version = 1;
+
+    // stable identity of the snapshot published by this checkpoint
+    uint64 snapshot_id = 2;
+
+    // highest MVCC timestamp represented by the published snapshot
+    ragnordb.ids.Timestamp snapshot_timestamp = 3;
+
+    // first logical WAL partition not represented by the snapshot
+    //
+    // LSN zero is valid and means recovery must replay from the beginning of 
+    // the retainde WAL
+    uint64 replay_from_lsn = 4;
+}

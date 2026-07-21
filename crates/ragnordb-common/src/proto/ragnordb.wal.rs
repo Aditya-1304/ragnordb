@@ -101,3 +101,26 @@ pub struct SnapshotPointer {
     #[prost(message, repeated, tag = "6")]
     pub table_ids: ::prost::alloc::vec::Vec<super::ids::TableId>,
 }
+/// durable publication marker for completed database snapshot
+///
+/// the marker repeats the recovery critical identity, timestamp and replay
+/// boundary from SnapshotPointer. checkpoint publication must verify that
+/// these fields match the referenced pointer before the marker is appended
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct CheckpointMarker {
+    /// version of this payload schema
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// stable identity of the snapshot published by this checkpoint
+    #[prost(uint64, tag = "2")]
+    pub snapshot_id: u64,
+    /// highest MVCC timestamp represented by the published snapshot
+    #[prost(message, optional, tag = "3")]
+    pub snapshot_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    /// first logical WAL partition not represented by the snapshot
+    ///
+    /// LSN zero is valid and means recovery must replay from the beginning of
+    /// the retainde WAL
+    #[prost(uint64, tag = "4")]
+    pub replay_from_lsn: u64,
+}
