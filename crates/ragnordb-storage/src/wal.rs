@@ -24,8 +24,11 @@ use std::{
     format,
 };
 use wal::{
+    error::AppendFailure,
+    io::directory::SegmentDirectory,
     lsn::Lsn,
     types::{RecordType, record_types::USER_MIN},
+    wal::WalHandle,
 };
 
 use crate::key::decode_row_key;
@@ -325,9 +328,89 @@ impl SingleNodeTxnCommit {
     }
 }
 
-/// Versioned durable envelope for one catalog state transition
+/// storage owned logical extent of one durably appended RagnorDB record
 ///
-/// The operation reuses `CatalogCommand`, ensuring that single-node recovery and
+/// The adapter returns logical WAL positions for diagnostics and future
+/// checkpoint accounting without exposing A-WAL headers, checksums, alignment,
+/// compression, segment seals, or any other physical framing details
+#[must_use = "the durable WAL extent is required for diagnostics and checkpoint accounting"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableWalExtent {
+    /// logical position at which the RagnorDB record begins
+    pub start_lsn: Lsn,
+
+    /// first logical position after the complete RagnorDB record
+    pub end_lsn: Lsn,
+}
+
+/// durable storage adapter between RagnorDB records and A-WAL
+///
+/// transaction and SQL layers provide semantic RagnorDB records. This adapter
+/// owns protobuf encoding, permanent record-type selection, synchronous WAL
+/// durability, and conversion into canonical database errors
+pub struct RagnorDbWalAdapter<D, C>
+where
+    D: SegmentDirectory,
+{
+    wal: WalHandle<D, C>,
+}
+
+impl<D, C> RagnorDbWalAdapter<D, C>
+where
+    D: SegmentDirectory + Clone,
+{
+    /// construct an adapter around the node's serialized A-WAL writer
+    pub fn new(wal: WalHandle<D, C>) -> Self {
+        Self { wal }
+    }
+
+    /// encode and append one atomic single node transaction commit
+    ///
+    /// success is returned only after A-WAL confirms that the complete logical
+    /// record extent is durable. Encoding failures occur before WAL admission
+    /// and therefore retain their existing canonical validation error
+    pub fn append_single_node_commit(
+        &self,
+        commit: &SingleNodeTxnCommit,
+    ) -> Result<DurableWalExtent> {
+        let payload = commit.encode()?;
+        let record_type = RagnorDbWalRecordType::SingleNodeTxnCommit.as_wal_record_type();
+
+        let extent = self
+            .wal
+            .append_and_sync(record_type, &payload)
+            .map_err(map_commit_append_failure)?;
+
+        Ok(DurableWalExtent {
+            start_lsn: extent.start_lsn,
+            end_lsn: extent.end_lsn,
+        })
+    }
+}
+
+/// preserve A-WAL's staging boundary while converting it into canonical
+/// database errors
+///
+/// this conversion intentionally matches `AppendFailure` directly. Converting
+/// only its underlying `WalError` would discard whether the commit definitely
+/// received no extent or may already exist in the recovered durable prefix
+fn map_commit_append_failure(failure: AppendFailure) -> Error {
+    match failure {
+        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
+            reason: source.to_string(),
+        },
+
+        AppendFailure::OutcomeUnknown { extent, source } => Error::CommitOutcomeUnknown {
+            start_lsn: extent.start_lsn.as_u64(),
+            end_lsn: extent.end_lsn.as_u64(),
+            reason: source.to_string(),
+        },
+    }
+}
+
+/// versioned durable envelope for one catalog state transition
+///
+/// the operation reuses `CatalogCommand`, ensuring that single-node recovery and
 /// the later replicated metadata path share one operation representation
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogUpdate {

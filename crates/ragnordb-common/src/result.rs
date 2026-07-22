@@ -46,6 +46,32 @@ pub enum Error {
     /// Node or cluster configuration could not be loaded or validated
     #[error("configuration error: {0}")]
     Configuration(String),
+
+    /// A-WAL rejected the database record before assigning it a logical extent.
+    ///
+    /// The logical operation was definitely not staged. The underlying WAL may
+    /// still be fail-stopped when rollover metadata or another mutating internal
+    /// operation failed before the database record itself was assigned space.
+    #[error("WAL append was definitely not staged: {reason}")]
+    WalAppendNotStaged { reason: String },
+
+    /// A commit record acquired a WAL extent, but its durable outcome cannot be
+    /// determined without reopen and recovery.
+    ///
+    /// This error is deliberately non-retryable until RagnorDB has durable
+    /// request-identity deduplication. Retrying immediately could apply the same
+    /// logical transaction twice if recovery retains the original record.
+    #[error("commit outcome is unknown for WAL extent [{start_lsn}, {end_lsn}): {reason}")]
+    CommitOutcomeUnknown {
+        /// First logical WAL position occupied by the staged commit record
+        start_lsn: u64,
+
+        /// First logical WAL position after the complete staged commit record
+        end_lsn: u64,
+
+        /// Diagnostic description of the durability failure
+        reason: String,
+    },
 }
 
 /// Standard result type used throughout RagnorDB

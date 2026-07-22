@@ -189,9 +189,17 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
 
         Error::NotImplemented(_) => error_response("UNSUPPORTED_SQL", &error.to_string(), false),
 
-        Error::CorruptData(_) | Error::Configuration(_) => error_response(
-            "INTERNAL_ERROR",
-            "an internal database error occurred",
+        Error::CorruptData(_) | Error::Configuration(_) | Error::WalAppendNotStaged { .. } => {
+            error_response(
+                "INTERNAL_ERROR",
+                "an internal database error occurred",
+                false,
+            )
+        }
+
+        Error::CommitOutcomeUnknown { .. } => error_response(
+            "COMMIT_OUTCOME_UNKNOWN",
+            "commit outcome is unknown; reopen and recovery are required before retrying",
             false,
         ),
     }
@@ -306,5 +314,31 @@ mod tests {
 
         assert_eq!(response["error"]["code"], "WRITE_CONFLICT");
         assert_eq!(response["error"]["retryable"], true);
+    }
+
+    /// verifies that an indeterminate durable commit is never advertised as
+    /// automatically retryable
+    ///
+    /// Realistic bug caught:
+    ///
+    /// A client retry after an unknown commit outcome could durably execute the
+    /// same logical transaction twice because request-ID deduplication does not
+    /// exist yet
+    #[test]
+    fn commit_outcome_unknown_is_non_retryable() {
+        let response = internal_error_response(&Error::CommitOutcomeUnknown {
+            start_lsn: 128,
+            end_lsn: 256,
+            reason: "injected synchronization failure".to_string(),
+        });
+
+        assert_eq!(response["error"]["code"], "COMMIT_OUTCOME_UNKNOWN");
+        assert_eq!(response["error"]["retryable"], false);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .expect("error message must be a string")
+                .contains("outcome is unknown")
+        );
     }
 }

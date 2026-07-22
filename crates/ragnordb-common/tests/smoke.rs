@@ -72,7 +72,10 @@ fn wal_open_append_sync_read_shutdown() {
     let payload = b"hello ragnordb";
     let record_type = RecordType::new(1024);
 
-    let lsn = handle.append(record_type, payload).expect("append failed");
+    let lsn = handle
+        .append(record_type, payload)
+        .expect("append failed")
+        .start_lsn;
 
     handle.sync().expect("sync failed");
 
