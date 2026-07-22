@@ -343,6 +343,17 @@ pub struct DurableWalExtent {
     pub end_lsn: Lsn,
 }
 
+/// semantic durable log boundary used by the transaction coordinator
+///
+/// the transaction layer supplies a validated RagnorDB commit record and
+/// receives only its logical durable extent. A-WAL record identifiers, framing,
+/// checksums, alignment, and synchronization mechanics remain owned by the
+/// storage adapter
+pub trait DurableCommitLog {
+    /// append and synchronize one complete single-node transaction commit
+    fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent>;
+}
+
 /// durable storage adapter between RagnorDB records and A-WAL
 ///
 /// transaction and SQL layers provide semantic RagnorDB records. This adapter
@@ -385,6 +396,15 @@ where
             start_lsn: extent.start_lsn,
             end_lsn: extent.end_lsn,
         })
+    }
+}
+
+impl<D, C> DurableCommitLog for RagnorDbWalAdapter<D, C>
+where
+    D: SegmentDirectory + Clone,
+{
+    fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent> {
+        RagnorDbWalAdapter::append_single_node_commit(self, commit)
     }
 }
 

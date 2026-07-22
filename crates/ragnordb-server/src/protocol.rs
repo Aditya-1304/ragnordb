@@ -189,13 +189,14 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
 
         Error::NotImplemented(_) => error_response("UNSUPPORTED_SQL", &error.to_string(), false),
 
-        Error::CorruptData(_) | Error::Configuration(_) | Error::WalAppendNotStaged { .. } => {
-            error_response(
-                "INTERNAL_ERROR",
-                "an internal database error occurred",
-                false,
-            )
-        }
+        Error::CorruptData(_)
+        | Error::Configuration(_)
+        | Error::WalAppendNotStaged { .. }
+        | Error::RecoveryRequired { .. } => error_response(
+            "INTERNAL_ERROR",
+            "an internal database error occurred",
+            false,
+        ),
 
         Error::CommitOutcomeUnknown { .. } => error_response(
             "COMMIT_OUTCOME_UNKNOWN",

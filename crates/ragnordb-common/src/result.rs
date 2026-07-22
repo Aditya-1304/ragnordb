@@ -72,6 +72,14 @@ pub enum Error {
         /// Diagnostic description of the durability failure
         reason: String,
     },
+
+    /// the local write path has stopped and cannot safely accept another write
+    /// until authorative durable state is replayed
+    ///
+    /// this includes a durable commit that failed during MVCC application and
+    /// coordinator whose preceding commit outcome requires recovery
+    #[error("local write path requires recovery: {reason}")]
+    RecoveryRequired { reason: String },
 }
 
 /// Standard result type used throughout RagnorDB

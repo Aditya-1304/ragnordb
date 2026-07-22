@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-storage = { path = "../ragnordb-storage"}
+
+[dev-dependencies]
+wal.workspace = true

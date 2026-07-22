@@ -7,8 +7,10 @@
 //!
 //! Distributed participants, heartbeats, transaction status records and
 //! coordinator retry state belong to later implementation for now
+mod coordinator;
 mod manager;
 
+pub use coordinator::{SingleNodeCommitCoordinator, SingleNodeCommitOutcome};
 pub use manager::{LocalTransactionManager, TransactionManager};
 
 use std::collections::BTreeMap;
