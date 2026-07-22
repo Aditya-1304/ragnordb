@@ -22,6 +22,7 @@ use ragnordb_common::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     format,
+    sync::Arc,
 };
 use wal::{
     error::AppendFailure,
@@ -343,6 +344,19 @@ pub struct DurableWalExtent {
     pub end_lsn: Lsn,
 }
 
+impl DurableWalExtent {
+    /// a storage owned extent from raw logical WAL positions
+    ///
+    /// this constructor supports semantic commit log implementations without
+    /// requiring transaction or executor crates to import A-WAL's `Lsn` type
+    pub const fn from_raw(start_lsn: u64, end_lsn: u64) -> Self {
+        Self {
+            start_lsn: Lsn::new(start_lsn),
+            end_lsn: Lsn::new(end_lsn),
+        }
+    }
+}
+
 /// semantic durable log boundary used by the transaction coordinator
 ///
 /// the transaction layer supplies a validated RagnorDB commit record and
@@ -354,6 +368,14 @@ pub trait DurableCommitLog {
     fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent>;
 }
 
+impl<T> DurableCommitLog for Arc<T>
+where
+    T: DurableCommitLog + ?Sized,
+{
+    fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent> {
+        (**self).append_single_node_commit(commit)
+    }
+}
 /// durable storage adapter between RagnorDB records and A-WAL
 ///
 /// transaction and SQL layers provide semantic RagnorDB records. This adapter

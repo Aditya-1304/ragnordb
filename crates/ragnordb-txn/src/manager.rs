@@ -76,6 +76,31 @@ impl LocalTransactionManager {
     }
 }
 
+/// commit timestamp source invoked inside the serialized commit boundary
+///
+/// production sessions use a shared `TransactionManager`. A pre-finalized
+/// timestamp remains supported for lower-level deterministic executor tests and
+/// future recovery application, but it is not consulted until MVCC preflight
+/// has completed
+pub trait CommitTimestampAllocator {
+    fn finalize_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp>;
+}
+
+impl<M> CommitTimestampAllocator for &mut M
+where
+    M: TransactionManager + ?Sized,
+{
+    fn finalize_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.allocate_commit_timestamp(start_ts)
+    }
+}
+
+impl CommitTimestampAllocator for Timestamp {
+    fn finalize_commit_timestamp(&mut self, _start_ts: Timestamp) -> Result<Timestamp> {
+        Ok(*self)
+    }
+}
+
 impl TransactionManager for LocalTransactionManager {
     fn begin_transaction(&mut self) -> Result<Transaction> {
         // Calculate the complete next state before publishing either counter.

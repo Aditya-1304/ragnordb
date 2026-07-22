@@ -10,8 +10,11 @@
 mod coordinator;
 mod manager;
 
-pub use coordinator::{SingleNodeCommitCoordinator, SingleNodeCommitOutcome};
-pub use manager::{LocalTransactionManager, TransactionManager};
+pub use coordinator::{
+    OwnedMvccParticipant, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
+    SingleNodeCommitParticipant,
+};
+pub use manager::{CommitTimestampAllocator, LocalTransactionManager, TransactionManager};
 
 use std::collections::BTreeMap;
 

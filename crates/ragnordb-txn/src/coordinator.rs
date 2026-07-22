@@ -1,9 +1,8 @@
-//! ordered single-node durable commit coordination
+//! ordered single node durable commit coordination
 //!
-//! one coordinator owns one table's mutable MVCC store and semantic durable
-//! commit log. Its mutable commit method forms the serialized correctness
-//! boundary from complete preflight through durable WAL append and atomic MVCC
-//! application
+//! one coordinator owns one commit participant and one semantic durable log
+//! Its mutable commit method forms the serialized correctness boundary from
+//! complete preflight through durable append and atomic MVCC application
 
 use std::collections::BTreeMap;
 
@@ -17,112 +16,195 @@ use ragnordb_storage::{
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit, WalMutation},
 };
 
-use crate::{Transaction, TransactionManager};
+use crate::{CommitTimestampAllocator, Transaction};
 
-/// published outcome of one completed local commit operation
+/// storage participant controlled by the ordered commit coordinator
 ///
-/// Write commits include both their visibility timestamp and exact durable WAL
-/// extent. Read only commits contain neither because they do not enter the
-/// durable write path
-#[must_use = "commit outcomes contain the published transaction state"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SingleNodeCommitOutcome {
-    /// Transaction whose state was consumed by this commit attempt
-    pub transaction_id: TxnId,
+/// implementations must perform complete mutation-free validation in
+/// `validate_commit` and atomically apply the same immutable transaction in
+/// `apply_commit`
+pub trait SingleNodeCommitParticipant {
+    /// Return the single table owned by this participant.
+    fn table_id(&self) -> TableId;
 
-    /// Final visibility timestamp, or `None` for a read-only transaction
-    pub commit_timestamp: Option<Timestamp>,
+    /// Validate the complete transaction without changing visible state.
+    fn validate_commit(&self, transaction: &Transaction) -> Result<()>;
 
-    /// Number of mutations atomically installed in MVCC
-    pub committed_writes: usize,
-
-    /// Exact durable commit-record extent, or `None` for a read-only transaction
-    pub wal_extent: Option<DurableWalExtent>,
+    /// Atomically apply a transaction whose commit record is already durable.
+    fn apply_commit(
+        &mut self,
+        transaction: &Transaction,
+        commit_timestamp: Timestamp,
+    ) -> Result<usize>;
 }
 
-/// Serialized writer for one table's local MVCC and WAL commit boundary
+/// Direct MVCC participant retained for storage-level coordinator use.
 ///
-/// The coordinator is intentionally not cloneable and exposes only immutable
-/// access to its storage. Requiring `&mut self` for `commit` prevents another
-/// local writer from changing MVCC state between preflight and application.
-/// A concurrent owner may place the complete coordinator behind one mutex or
-/// actor without splitting the ordered operation
-pub struct SingleNodeCommitCoordinator<S, W>
+/// Executor integration uses `Tablet` as the participant so reads, statement
+/// buffering, preflight, and durable application all observe one MVCC store.
+pub struct OwnedMvccParticipant<S>
 where
     S: MvccStorage,
-    W: DurableCommitLog,
 {
     table_id: TableId,
     storage: S,
+}
+
+impl<S> OwnedMvccParticipant<S>
+where
+    S: MvccStorage,
+{
+    fn new(table_id: TableId, storage: S) -> Result<Self> {
+        if table_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "commit participant table ID 0 is reserved".to_string(),
+            ));
+        }
+
+        Ok(Self { table_id, storage })
+    }
+
+    /// Borrow the underlying MVCC store for reads and diagnostics.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+}
+
+impl<S> SingleNodeCommitParticipant for OwnedMvccParticipant<S>
+where
+    S: MvccStorage,
+{
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn validate_commit(&self, transaction: &Transaction) -> Result<()> {
+        for encoded_key in transaction.write_set().keys() {
+            let row_key = decode_row_key(encoded_key).map_err(|error| {
+                Error::InvalidArgument(format!(
+                    "transaction contains a noncanonical row key: {error}"
+                ))
+            })?;
+
+            if row_key.table_id != self.table_id {
+                return Err(Error::InvalidArgument(format!(
+                    "transaction row belongs to table {}, but commit \
+                     participant owns table {}",
+                    row_key.table_id.0, self.table_id.0
+                )));
+            }
+        }
+
+        self.storage.validate_commit_batch(
+            transaction.id(),
+            transaction.start_ts(),
+            transaction.write_set(),
+        )
+    }
+
+    fn apply_commit(
+        &mut self,
+        transaction: &Transaction,
+        commit_timestamp: Timestamp,
+    ) -> Result<usize> {
+        self.storage.commit_batch(
+            transaction.id(),
+            transaction.start_ts(),
+            commit_timestamp,
+            transaction.write_set(),
+        )
+    }
+}
+
+/// Published outcome of one completed local commit operation.
+#[must_use = "commit outcomes contain the published transaction state"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleNodeCommitOutcome {
+    pub transaction_id: TxnId,
+    pub commit_timestamp: Option<Timestamp>,
+    pub committed_writes: usize,
+    pub wal_extent: Option<DurableWalExtent>,
+}
+
+/// Serialized writer for one table's commit participant and durable log.
+///
+/// The coordinator is intentionally not cloneable and exposes no mutable
+/// participant access. Requiring `&mut self` for `commit` prevents another
+/// writer from modifying MVCC state between preflight and application.
+pub struct SingleNodeCommitCoordinator<P, W>
+where
+    P: SingleNodeCommitParticipant,
+    W: DurableCommitLog,
+{
+    participant: P,
     commit_log: W,
     recovery_required_reason: Option<String>,
 }
 
-impl<S, W> SingleNodeCommitCoordinator<S, W>
+impl<S, W> SingleNodeCommitCoordinator<OwnedMvccParticipant<S>, W>
 where
     S: MvccStorage,
     W: DurableCommitLog,
 {
-    /// coordinator for one nonzero table identity
+    /// Construct a coordinator directly around an MVCC implementation.
+    ///
+    /// This preserves the storage-level Phase 3.2.5 API.
     pub fn new(table_id: TableId, storage: S, commit_log: W) -> Result<Self> {
-        if table_id.0 == 0 {
+        Self::with_participant(OwnedMvccParticipant::new(table_id, storage)?, commit_log)
+    }
+
+    /// Borrow the directly owned MVCC store.
+    pub fn storage(&self) -> &S {
+        self.participant.storage()
+    }
+}
+
+impl<P, W> SingleNodeCommitCoordinator<P, W>
+where
+    P: SingleNodeCommitParticipant,
+    W: DurableCommitLog,
+{
+    /// Construct a coordinator around a semantic commit participant.
+    pub fn with_participant(participant: P, commit_log: W) -> Result<Self> {
+        if participant.table_id().0 == 0 {
             return Err(Error::InvalidArgument(
                 "commit coordinator table ID 0 is reserved".to_string(),
             ));
         }
 
         Ok(Self {
-            table_id,
-            storage,
+            participant,
             commit_log,
             recovery_required_reason: None,
         })
     }
 
-    /// return the table exclusively owned by this coordinator
     pub fn table_id(&self) -> TableId {
-        self.table_id
+        self.participant.table_id()
     }
 
-    /// borrow the MVCC store for reads and diagnostics
+    /// Borrow the participant for reads and transaction buffering.
     ///
-    /// mutable storage access is deliberately not exposed because it would let
-    /// callers bypass the serialized preflight-through-apply boundary
-    pub fn storage(&self) -> &S {
-        &self.storage
+    /// Mutable access remains private to the commit coordinator.
+    pub fn participant(&self) -> &P {
+        &self.participant
     }
 
-    /// return whether the local write path has been stopped for recovery
     pub fn requires_recovery(&self) -> bool {
         self.recovery_required_reason.is_some()
     }
 
-    /// this commits one local transaction using the required durable ordering
-    ///
-    /// The operation performs:
-    ///
-    /// 1. transaction and table-ownership validation
-    /// 2. complete mutation-free MVCC preflight
-    /// 3. final commit timestamp allocation
-    /// 4. semantic commit-record construction
-    /// 5. synchronous durable-log append
-    /// 6. atomic MVCC batch application
-    /// 7. publication of the completed commit outcome
-    ///
-    /// the transaction is consumed on every result so an unknown outcome cannot
-    /// accidentally reuse its write set
-    pub fn commit<M>(
+    /// Commit one local transaction through the complete ordered boundary.
+    pub fn commit<A>(
         &mut self,
         transaction: Transaction,
-        transaction_manager: &mut M,
+        mut timestamp_allocator: A,
     ) -> Result<SingleNodeCommitOutcome>
     where
-        M: TransactionManager,
+        A: CommitTimestampAllocator,
     {
         self.validate_transaction_metadata(&transaction)?;
 
-        // read only work does not interact with the stopped write path, allocate
-        // a commit timestamp, append a WAL record, or mutate MVCC state
         if transaction.is_empty() {
             return Ok(SingleNodeCommitOutcome {
                 transaction_id: transaction.id(),
@@ -134,16 +216,10 @@ where
 
         self.ensure_write_path_available()?;
 
-        // the coordinator owns the mutable storage, so this validated state
-        // cannot be changed by another writer before the apply step below
-        self.storage.validate_commit_batch(
-            transaction.id(),
-            transaction.start_ts(),
-            transaction.write_set(),
-        )?;
+        self.participant.validate_commit(&transaction)?;
 
         let commit_timestamp =
-            transaction_manager.allocate_commit_timestamp(transaction.start_ts())?;
+            timestamp_allocator.finalize_commit_timestamp(transaction.start_ts())?;
 
         self.validate_allocated_commit_timestamp(transaction.start_ts(), commit_timestamp)?;
 
@@ -165,12 +241,10 @@ where
 
         let expected_writes = transaction.len();
 
-        let applied_writes = match self.storage.commit_batch(
-            transaction.id(),
-            transaction.start_ts(),
-            commit_timestamp,
-            transaction.write_set(),
-        ) {
+        let applied_writes = match self
+            .participant
+            .apply_commit(&transaction, commit_timestamp)
+        {
             Ok(applied_writes) => applied_writes,
 
             Err(source) => {
@@ -219,22 +293,6 @@ where
             ));
         }
 
-        for encoded_key in transaction.write_set().keys() {
-            let row_key = decode_row_key(encoded_key).map_err(|error| {
-                Error::InvalidArgument(format!(
-                    "transaction contains a noncanonical row key: {error}"
-                ))
-            })?;
-
-            if row_key.table_id != self.table_id {
-                return Err(Error::InvalidArgument(format!(
-                    "transaction row belongs to table {}, but commit \
-                     coordinator owns table {}",
-                    row_key.table_id.0, self.table_id.0
-                )));
-            }
-        }
-
         Ok(())
     }
 
@@ -245,8 +303,7 @@ where
     ) -> Result<()> {
         if commit_timestamp.0 == 0 || commit_timestamp <= start_timestamp {
             return Err(Error::Configuration(format!(
-                "transaction manager returned commit timestamp {}, which \
-                 does not advance start timestamp {}",
+                "commit timestamp {} does not advance start timestamp {}",
                 commit_timestamp.0, start_timestamp.0
             )));
         }
@@ -263,18 +320,18 @@ where
             .write_set()
             .iter()
             .map(|(key, mutation)| {
-                let durable_mutation = match mutation {
+                let mutation = match mutation {
                     Mutation::Put(row) => WalMutation::Put(row.clone()),
 
                     Mutation::Delete => WalMutation::Delete,
                 };
 
-                (key.clone(), durable_mutation)
+                (key.clone(), mutation)
             })
             .collect::<BTreeMap<_, _>>();
 
         SingleNodeTxnCommit {
-            table_id: self.table_id,
+            table_id: self.participant.table_id(),
             txn_id: transaction.id(),
             start_timestamp: transaction.start_ts(),
             commit_timestamp,

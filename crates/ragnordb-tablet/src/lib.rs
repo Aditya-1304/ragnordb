@@ -21,7 +21,7 @@ use ragnordb_storage::{
     key::{decode_row_key, encode_row_key},
     mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
-use ragnordb_txn::Transaction;
+use ragnordb_txn::{SingleNodeCommitParticipant, Transaction};
 
 /// One logical row mutation waiting to be added to a transaction.
 ///
@@ -327,6 +327,37 @@ impl<S: MvccStorage> Tablet<S> {
         }
 
         Ok(())
+    }
+}
+
+impl<S> SingleNodeCommitParticipant for Tablet<S>
+where
+    S: MvccStorage,
+{
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn validate_commit(&self, transaction: &Transaction) -> Result<()> {
+        Tablet::validate_commit(self, transaction)
+    }
+
+    fn apply_commit(
+        &mut self,
+        transaction: &Transaction,
+        commit_timestamp: Timestamp,
+    ) -> Result<usize> {
+        for key in transaction.write_set().keys() {
+            let row_key = decode_transaction_row_key(key)?;
+            self.validate_row_key(&row_key)?;
+        }
+
+        self.storage.commit_batch(
+            transaction.id(),
+            transaction.start_ts(),
+            commit_timestamp,
+            transaction.write_set(),
+        )
     }
 }
 

@@ -24,7 +24,7 @@ mod session;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use expression::evaluate;
@@ -33,28 +33,78 @@ use ragnordb_common::{
     Error, Result,
     catalog_codec::DataType,
     codec::{Row, Value},
-    ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
+    ids::{ColumnId, RowKey, TableId, TabletId},
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
     DeletePlan, ExpressionType, InsertPlan, Plan, SelectPlan, UpdateAssignmentPlan, UpdatePlan,
 };
-use ragnordb_storage::key::{decode_row_key, make_row_key};
+use ragnordb_storage::{
+    key::{decode_row_key, make_row_key},
+    wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit},
+};
 use ragnordb_tablet::{RowMutation, Tablet};
-use ragnordb_txn::Transaction;
+use ragnordb_txn::{
+    CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
+};
 
 pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
 pub use session::SqlSession;
+
+type SharedCommitLog = Arc<dyn DurableCommitLog + Send + Sync>;
+
+type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
+
+/// In-memory semantic commit log used by executor unit tests
+///
+/// production node construction should inject `RagnorDbWalAdapter`. This
+/// implementation exists so parser, planner, and executor tests remain
+/// independent from filesystem setup while still exercising the exact same
+/// coordinator path
+#[derive(Default)]
+struct InMemoryCommitLog {
+    next_lsn: Mutex<u64>,
+}
+
+impl DurableCommitLog for InMemoryCommitLog {
+    fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent> {
+        commit.encode()?;
+
+        let mut next_lsn = self
+            .next_lsn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let start_lsn = *next_lsn;
+        let end_lsn = start_lsn.checked_add(1).ok_or_else(|| {
+            Error::Configuration("in-memory commit-log LSN space is exhausted".to_string())
+        })?;
+
+        *next_lsn = end_lsn;
+
+        Ok(DurableWalExtent::from_raw(start_lsn, end_lsn))
+    }
+}
 
 /// Local single-node executor for Milestone 2.
 ///
 /// Every locally created table receives one dedicated tablet. Using a separate
 /// tablet per table preserves the ownership boundary introduced in Phase 2.6,
 /// even though distributed routing is not implemented yet.
-#[derive(Debug)]
 pub struct LocalExecutor {
     catalog: MemoryCatalog,
-    tablets: BTreeMap<TableId, Tablet>,
+    tablets: BTreeMap<TableId, LocalTablet>,
+    commit_log: SharedCommitLog,
+}
+
+impl std::fmt::Debug for LocalExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalExecutor")
+            .field("catalog", &self.catalog)
+            .field("tablet_count", &self.tablets.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for LocalExecutor {
@@ -64,11 +114,20 @@ impl Default for LocalExecutor {
 }
 
 impl LocalExecutor {
-    /// Construct an empty local database executor.
+    /// an in-memory executor for unit and local semantic tests
     pub fn new() -> Self {
+        Self::with_commit_log(Arc::new(InMemoryCommitLog::default()))
+    }
+
+    /// an executor using the supplied durable commit log
+    ///
+    /// A running database node supplies one shared `RagnorDbWalAdapter`, while
+    /// tests may inject deterministic success and failure implementations
+    pub fn with_commit_log(commit_log: SharedCommitLog) -> Self {
         Self {
             catalog: MemoryCatalog::new(),
             tablets: BTreeMap::new(),
+            commit_log,
         }
     }
 
@@ -129,24 +188,40 @@ impl LocalExecutor {
         }
     }
 
-    /// Commit a transaction after the caller allocates its commit timestamp.
+    /// commit a transaction through its table's durable coordinator
     ///
-    /// currently it supports only transactions whose writes belong to one tablet.
-    /// Read-only transactions commit as no-ops. Cross-table transactions remain
-    /// unsupported until distributed transaction coordination is implemented.
-    pub fn commit_transaction(
+    /// this compatibility method returns only the affected-row count. Session
+    /// integration uses `commit_transaction_outcome` to publish the coordinator's
+    /// timestamp and WAL diagnostics
+    pub fn commit_transaction<A>(
         &mut self,
         transaction: Transaction,
-        commit_ts: Timestamp,
-    ) -> Result<usize> {
-        // A read-only transaction has no storage-side commit to timestamp.
-        // Returning before validation lets the session layer avoid allocating
-        // a commit timestamp for snapshot-only work.
-        if transaction.is_empty() {
-            return Ok(0);
-        }
+        timestamp_allocator: A,
+    ) -> Result<usize>
+    where
+        A: CommitTimestampAllocator,
+    {
+        self.commit_transaction_outcome(transaction, timestamp_allocator)
+            .map(|outcome| outcome.committed_writes)
+    }
 
-        validate_commit_timestamp(transaction.start_ts(), commit_ts)?;
+    /// commit a transaction and return its complete published outcome
+    pub fn commit_transaction_outcome<A>(
+        &mut self,
+        transaction: Transaction,
+        timestamp_allocator: A,
+    ) -> Result<SingleNodeCommitOutcome>
+    where
+        A: CommitTimestampAllocator,
+    {
+        if transaction.is_empty() {
+            return Ok(SingleNodeCommitOutcome {
+                transaction_id: transaction.id(),
+                commit_timestamp: None,
+                committed_writes: 0,
+                wal_extent: None,
+            });
+        }
 
         let mut table_ids = BTreeSet::new();
 
@@ -165,8 +240,8 @@ impl LocalExecutor {
 
         if table_ids.len() != 1 {
             return Err(Error::UnsupportedSql(
-                "a Phase 2.7 transaction may write only one local \
-                 tablet; cross-table transactions are introduced later"
+                "a local transaction may write only one tablet; \
+                 cross-table transactions require distributed coordination"
                     .to_string(),
             ));
         }
@@ -175,11 +250,14 @@ impl LocalExecutor {
             .first()
             .expect("non-empty table-ID set was checked above");
 
-        let tablet = self.tablets.get_mut(&table_id).ok_or_else(|| {
-            Error::CorruptData(format!("catalog table {} has no local tablet", table_id.0))
+        let coordinator = self.tablets.get_mut(&table_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "catalog table {} has no local commit coordinator",
+                table_id.0
+            ))
         })?;
 
-        tablet.commit(transaction, commit_ts)
+        coordinator.commit(transaction, timestamp_allocator)
     }
 
     /// Abort an uncommitted transaction by discarding its buffered mutations.
@@ -203,7 +281,10 @@ impl LocalExecutor {
         // metadata allocation will assign independent tablet identities.
         let tablet = Tablet::new(TabletId(table_id.0), table_id)?;
 
-        self.tablets.insert(table_id, tablet);
+        let coordinator =
+            SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
+
+        self.tablets.insert(table_id, coordinator);
 
         Ok(ExecutionResult::CreatedTable { table_id })
     }
@@ -477,9 +558,12 @@ impl LocalExecutor {
     }
 
     fn tablet_for(&self, table_id: TableId) -> Result<&Tablet> {
-        self.tablets.get(&table_id).ok_or_else(|| {
-            Error::CorruptData(format!("catalog table {} has no local tablet", table_id.0))
-        })
+        self.tablets
+            .get(&table_id)
+            .map(SingleNodeCommitCoordinator::participant)
+            .ok_or_else(|| {
+                Error::CorruptData(format!("catalog table {} has no local tablet", table_id.0))
+            })
     }
 }
 
@@ -492,24 +576,6 @@ fn require_transaction<'a>(
             "{statement} requires an active transaction context"
         ))
     })
-}
-
-fn validate_commit_timestamp(start_ts: Timestamp, commit_ts: Timestamp) -> Result<()> {
-    if commit_ts.0 == 0 {
-        return Err(Error::InvalidArgument(
-            "commit timestamp 0 is reserved".to_string(),
-        ));
-    }
-
-    if commit_ts <= start_ts {
-        return Err(Error::InvalidArgument(format!(
-            "commit timestamp {} must be greater than start \
-             timestamp {}",
-            commit_ts.0, start_ts.0
-        )));
-    }
-
-    Ok(())
 }
 
 /// One row and its stable primary-key identity.

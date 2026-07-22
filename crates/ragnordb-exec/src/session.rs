@@ -8,10 +8,7 @@
 //! an implicit transaction. BEGIN attaches an explicit transaction that remains
 //! active until COMMIT or ROLLBACK.
 
-use ragnordb_common::{
-    Error, Result,
-    ids::{Timestamp, TxnId},
-};
+use ragnordb_common::{Error, Result, ids::TxnId};
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_txn::{Transaction, TransactionManager};
 
@@ -132,40 +129,23 @@ impl SqlSession {
         executor: &mut LocalExecutor,
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
-        // Taking the transaction first guarantees that COMMIT clears SQL
-        // session state on both success and failure.
+        // taking the transaction before entering the coordinator guarantees
+        // that success, preflight failure, outcome unknown, and fatal recovery
+        // errors all terminate the explicit SQL transaction.
         let transaction = self.current_transaction.take().ok_or_else(|| {
             Error::InvalidArgument(
-                "COMMIT requires an active transaction; execute BEGIN first".to_string(),
+                "COMMIT requires an active transaction; \
+                     execute BEGIN first"
+                    .to_string(),
             )
         })?;
 
-        let transaction_id = transaction.id();
-
-        let commit_ts = if transaction.is_empty() {
-            None
-        } else {
-            match transaction_manager.allocate_commit_timestamp(transaction.start_ts()) {
-                Ok(commit_ts) => Some(commit_ts),
-
-                Err(error) => {
-                    executor.rollback_transaction(transaction);
-                    return Err(error);
-                }
-            }
-        };
-
-        // LocalExecutor currently accepts a concrete Timestamp. Timestamp(0)
-        // represents the absence of an allocated commit timestamp only for an
-        // empty transaction. LocalExecutor::commit_transaction returns before
-        // timestamp validation when the transaction has no buffered writes.
-        let committed_writes =
-            executor.commit_transaction(transaction, commit_ts.unwrap_or(Timestamp(0)))?;
+        let outcome = executor.commit_transaction_outcome(transaction, transaction_manager)?;
 
         Ok(ExecutionResult::TransactionCommitted {
-            transaction_id,
-            commit_ts,
-            committed_writes,
+            transaction_id: outcome.transaction_id,
+            commit_ts: outcome.commit_timestamp,
+            committed_writes: outcome.committed_writes,
         })
     }
 
@@ -214,36 +194,18 @@ impl SqlSession {
             Ok(result) => result,
 
             Err(error) => {
-                // A failed implicit statement discards its complete transaction
-                // and cannot leave buffered writes attached to the session.
+                // Statement preparation and buffering are atomic. Consuming
+                // the implicit transaction discards every pending mutation.
                 executor.rollback_transaction(transaction);
                 return Err(error);
             }
         };
 
-        if transaction.is_empty() {
-            // Snapshot-only implicit transactions need a start timestamp but no
-            // commit timestamp. Timestamp(0) is safe here only because the
-            // current executor returns before commit-timestamp validation for
-            // an empty transaction.
-            executor.commit_transaction(transaction, Timestamp(0))?;
-            return Ok(result);
-        }
-
-        let commit_ts = match transaction_manager.allocate_commit_timestamp(transaction.start_ts())
-        {
-            Ok(commit_ts) => commit_ts,
-
-            Err(error) => {
-                executor.rollback_transaction(transaction);
-                return Err(error);
-            }
-        };
-
-        // The tablet validates the complete write batch before applying it. A
-        // commit failure therefore consumes and aborts the implicit transaction
-        // without exposing a partially committed result.
-        executor.commit_transaction(transaction, commit_ts)?;
+        // The implicit statement already has its client-facing result. The
+        // commit outcome is consumed here as the required durability and MVCC
+        // publication gate before that statement result can be acknowledged.
+        let _commit_outcome =
+            executor.commit_transaction_outcome(transaction, transaction_manager)?;
 
         Ok(result)
     }
