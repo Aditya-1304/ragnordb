@@ -9,6 +9,12 @@
 //! providing the bootstrap boundary later required by recovery and metadata
 //! replication without implementing those later phases here.
 
+mod durable;
+
+pub use durable::{
+    CatalogCreateOutcome, CatalogLogExtent, CatalogLogRecord, DurableCatalog, DurableCatalogLog,
+};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -215,18 +221,36 @@ impl MemoryCatalog {
         }
     }
 
-    /// Allocate a table identifier and publish a local schema snapshot.
+    /// Allocate, validate, and publish one in-memory table.
     ///
-    /// Milestone 2 supports one local tablet only. Consequently, locally
-    /// created tables always receive schema version one and tablet count one.
-    /// Multi-tablet assignment remains the responsibility of the future
-    /// metadata authority.
+    /// Durable single-node creation uses `prepare_table` and
+    /// `publish_prepared_table` separately so WAL synchronization can occur
+    /// between validation and publication.
     pub fn add_table(
         &mut self,
         name: impl Into<String>,
         columns: Vec<ColumnSchema>,
         primary_key_column_ids: Vec<ColumnId>,
     ) -> Result<TableId> {
+        let schema = self.prepare_table(name, columns, primary_key_column_ids)?;
+
+        let table_id = schema.id;
+        self.publish_prepared_table(schema)?;
+
+        Ok(table_id)
+    }
+
+    /// Construct and validate the next local table without publishing it.
+    ///
+    /// This method does not advance the table-ID allocator or change catalog
+    /// lookup results. The durable coordinator calls it before allocating the
+    /// catalog timestamp or appending a WAL record.
+    pub(crate) fn prepare_table(
+        &self,
+        name: impl Into<String>,
+        columns: Vec<ColumnSchema>,
+        primary_key_column_ids: Vec<ColumnId>,
+    ) -> Result<TableSchema> {
         let name = name.into();
 
         if self.table_ids_by_name.contains_key(&name) {
@@ -250,14 +274,44 @@ impl MemoryCatalog {
 
         validate_table_schema(&schema)?;
 
-        let snapshot = Arc::new(schema);
+        Ok(schema)
+    }
 
-        self.table_ids_by_name
-            .insert(snapshot.name.clone(), snapshot.id);
-        self.tables_by_id.insert(snapshot.id, snapshot);
-        self.next_table_id = table_id.0.checked_add(1);
+    /// Publish the exact schema previously returned by `prepare_table`.
+    ///
+    /// The durable coordinator owns exclusive mutable access between these
+    /// operations. Any mismatch at publication is therefore an internal
+    /// invariant failure requiring recovery from the authoritative log.
+    pub(crate) fn publish_prepared_table(
+        &mut self,
+        schema: TableSchema,
+    ) -> Result<Arc<TableSchema>> {
+        let expected_table_id = TableId(self.next_table_id.ok_or_else(|| {
+            Error::CorruptData(
+                "catalog table-ID allocator was exhausted between \
+                     validation and publication"
+                    .to_string(),
+            )
+        })?);
 
-        Ok(table_id)
+        if schema.id != expected_table_id {
+            return Err(Error::CorruptData(format!(
+                "prepared table ID {} does not match the next publishable \
+                 table ID {}",
+                schema.id.0, expected_table_id.0
+            )));
+        }
+
+        if self.table_ids_by_name.contains_key(&schema.name)
+            || self.tables_by_id.contains_key(&schema.id)
+        {
+            return Err(Error::CorruptData(format!(
+                "prepared table {} became occupied before publication",
+                schema.name
+            )));
+        }
+
+        self.install_table(schema)
     }
 
     /// Install a fully assigned schema from an authoritative external source.

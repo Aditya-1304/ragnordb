@@ -10,7 +10,7 @@
 //! another playload
 
 use prost::Message;
-use ragnordb_catalog::TableSchema;
+use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog, TableSchema};
 use ragnordb_common::{
     Error, Result,
     catalog_codec::TableDefinition,
@@ -419,6 +419,28 @@ where
             end_lsn: extent.end_lsn,
         })
     }
+
+    /// Encode and durably append one catalog state transition.
+    pub fn append_catalog_update(&self, record: &CatalogLogRecord) -> Result<CatalogLogExtent> {
+        let update = CatalogUpdate {
+            table_id: record.table_id,
+            update_timestamp: record.update_timestamp,
+            command: record.command.clone(),
+        };
+
+        let payload = update.encode()?;
+        let record_type = RagnorDbWalRecordType::CatalogUpdate.as_wal_record_type();
+
+        let extent = self
+            .wal
+            .append_and_sync(record_type, &payload)
+            .map_err(map_catalog_append_failure)?;
+
+        Ok(CatalogLogExtent {
+            start_lsn: extent.start_lsn.as_u64(),
+            end_lsn: extent.end_lsn.as_u64(),
+        })
+    }
 }
 
 impl<D, C> DurableCommitLog for RagnorDbWalAdapter<D, C>
@@ -427,6 +449,15 @@ where
 {
     fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent> {
         RagnorDbWalAdapter::append_single_node_commit(self, commit)
+    }
+}
+
+impl<D, C> DurableCatalogLog for RagnorDbWalAdapter<D, C>
+where
+    D: SegmentDirectory + Clone,
+{
+    fn append_catalog_update(&self, update: &CatalogLogRecord) -> Result<CatalogLogExtent> {
+        RagnorDbWalAdapter::append_catalog_update(self, update)
     }
 }
 
@@ -443,6 +474,20 @@ fn map_commit_append_failure(failure: AppendFailure) -> Error {
         },
 
         AppendFailure::OutcomeUnknown { extent, source } => Error::CommitOutcomeUnknown {
+            start_lsn: extent.start_lsn.as_u64(),
+            end_lsn: extent.end_lsn.as_u64(),
+            reason: source.to_string(),
+        },
+    }
+}
+
+fn map_catalog_append_failure(failure: AppendFailure) -> Error {
+    match failure {
+        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
+            reason: source.to_string(),
+        },
+
+        AppendFailure::OutcomeUnknown { extent, source } => Error::CatalogOutcomeUnknown {
             start_lsn: extent.start_lsn.as_u64(),
             end_lsn: extent.end_lsn.as_u64(),
             reason: source.to_string(),

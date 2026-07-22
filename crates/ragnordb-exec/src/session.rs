@@ -87,8 +87,13 @@ impl SqlSession {
             // CREATE TABLE remains autocommit-only. Passing an attached
             // transaction preserves the executor's DDL validation boundary
             // without changing the session transaction.
-            plan @ Plan::CreateTable(_) => {
-                executor.execute(plan, self.current_transaction.as_mut())
+            Plan::CreateTable(plan) => {
+                if self.current_transaction.is_some() {
+                    return executor
+                        .execute(Plan::CreateTable(plan), self.current_transaction.as_mut());
+                }
+
+                executor.execute_create_table_durable(plan, transaction_manager)
             }
 
             // SHOW TABLES reads catalog metadata and does not require an MVCC

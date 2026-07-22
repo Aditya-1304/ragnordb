@@ -28,12 +28,15 @@ use std::{
 };
 
 use expression::evaluate;
-use ragnordb_catalog::{Catalog, ColumnSchema, MemoryCatalog, TableSchema};
+use ragnordb_catalog::{
+    Catalog, CatalogCreateOutcome, CatalogLogExtent, CatalogLogRecord, ColumnSchema,
+    DurableCatalog, DurableCatalogLog, MemoryCatalog, TableSchema,
+};
 use ragnordb_common::{
     Error, Result,
     catalog_codec::DataType,
     codec::{Row, Value},
-    ids::{ColumnId, RowKey, TableId, TabletId},
+    ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
@@ -46,6 +49,7 @@ use ragnordb_storage::{
 use ragnordb_tablet::{RowMutation, Tablet};
 use ragnordb_txn::{
     CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
+    TransactionManager,
 };
 
 pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
@@ -54,6 +58,33 @@ pub use session::SqlSession;
 type SharedCommitLog = Arc<dyn DurableCommitLog + Send + Sync>;
 
 type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
+
+type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
+
+type LocalCatalog = DurableCatalog<SharedCatalogLog>;
+
+#[derive(Default)]
+struct InMemoryCatalogLog {
+    next_lsn: Mutex<u64>,
+}
+
+impl DurableCatalogLog for InMemoryCatalogLog {
+    fn append_catalog_update(&self, _update: &CatalogLogRecord) -> Result<CatalogLogExtent> {
+        let mut next_lsn = self
+            .next_lsn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let start_lsn = *next_lsn;
+        let end_lsn = start_lsn.checked_add(1).ok_or_else(|| {
+            Error::Configuration("in-memory catalog-log LSN space is exhausted".to_string())
+        })?;
+
+        *next_lsn = end_lsn;
+
+        Ok(CatalogLogExtent { start_lsn, end_lsn })
+    }
+}
 
 /// In-memory semantic commit log used by executor unit tests
 ///
@@ -92,16 +123,20 @@ impl DurableCommitLog for InMemoryCommitLog {
 /// tablet per table preserves the ownership boundary introduced in Phase 2.6,
 /// even though distributed routing is not implemented yet.
 pub struct LocalExecutor {
-    catalog: MemoryCatalog,
+    catalog: LocalCatalog,
     tablets: BTreeMap<TableId, LocalTablet>,
     commit_log: SharedCommitLog,
+    next_local_catalog_timestamp: u64,
 }
 
 impl std::fmt::Debug for LocalExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LocalExecutor")
-            .field("catalog", &self.catalog)
+            .field(
+                "catalog_table_count",
+                &self.catalog.catalog().list_tables().len(),
+            )
             .field("tablet_count", &self.tablets.len())
             .finish_non_exhaustive()
     }
@@ -116,7 +151,10 @@ impl Default for LocalExecutor {
 impl LocalExecutor {
     /// an in-memory executor for unit and local semantic tests
     pub fn new() -> Self {
-        Self::with_commit_log(Arc::new(InMemoryCommitLog::default()))
+        Self::with_logs(
+            Arc::new(InMemoryCommitLog::default()),
+            Arc::new(InMemoryCatalogLog::default()),
+        )
     }
 
     /// an executor using the supplied durable commit log
@@ -124,10 +162,15 @@ impl LocalExecutor {
     /// A running database node supplies one shared `RagnorDbWalAdapter`, while
     /// tests may inject deterministic success and failure implementations
     pub fn with_commit_log(commit_log: SharedCommitLog) -> Self {
+        Self::with_logs(commit_log, Arc::new(InMemoryCatalogLog::default()))
+    }
+
+    pub fn with_logs(commit_log: SharedCommitLog, catalog_log: SharedCatalogLog) -> Self {
         Self {
-            catalog: MemoryCatalog::new(),
+            catalog: DurableCatalog::new(catalog_log),
             tablets: BTreeMap::new(),
             commit_log,
+            next_local_catalog_timestamp: 0,
         }
     }
 
@@ -136,7 +179,7 @@ impl LocalExecutor {
     /// The mutable catalog remains private so table creation cannot bypass
     /// corresponding tablet creation.
     pub fn catalog(&self) -> &MemoryCatalog {
-        &self.catalog
+        self.catalog.catalog()
     }
 
     /// Execute one logical plan.
@@ -228,7 +271,12 @@ impl LocalExecutor {
         for encoded_key in transaction.write_set().keys() {
             let row_key = decode_row_key(encoded_key)?;
 
-            if self.catalog.table_by_id(row_key.table_id).is_none() {
+            if self
+                .catalog
+                .catalog()
+                .table_by_id(row_key.table_id)
+                .is_none()
+            {
                 return Err(Error::SchemaMismatch(format!(
                     "transaction references unknown table ID {}",
                     row_key.table_id.0
@@ -266,23 +314,82 @@ impl LocalExecutor {
     }
 
     fn execute_create_table(&mut self, plan: CreateTablePlan) -> Result<ExecutionResult> {
-        let table_id =
+        let CreateTablePlan {
+            table_name,
+            columns,
+            primary_key_column_ids,
+        } = plan;
+
+        let outcome = {
+            let catalog = &mut self.catalog;
+            let timestamp = &mut self.next_local_catalog_timestamp;
+
+            catalog.create_table(table_name, columns, primary_key_column_ids, || {
+                let next = timestamp.checked_add(1).ok_or_else(|| {
+                    Error::Configuration("local catalog timestamp space is exhausted".to_string())
+                })?;
+
+                *timestamp = next;
+                Ok(Timestamp(next))
+            })?
+        };
+
+        self.install_catalog_table(outcome)
+    }
+
+    /// Execute CREATE TABLE using the shared database timestamp authority.
+    pub fn execute_create_table_durable<M>(
+        &mut self,
+        plan: CreateTablePlan,
+        transaction_manager: &mut M,
+    ) -> Result<ExecutionResult>
+    where
+        M: TransactionManager,
+    {
+        let CreateTablePlan {
+            table_name,
+            columns,
+            primary_key_column_ids,
+        } = plan;
+
+        let outcome =
             self.catalog
-                .add_table(plan.table_name, plan.columns, plan.primary_key_column_ids)?;
+                .create_table(table_name, columns, primary_key_column_ids, || {
+                    transaction_manager.allocate_commit_timestamp(Timestamp(0))
+                })?;
+
+        self.install_catalog_table(outcome)
+    }
+
+    fn install_catalog_table(&mut self, outcome: CatalogCreateOutcome) -> Result<ExecutionResult> {
+        let table_id = outcome.schema.id;
 
         if self.tablets.contains_key(&table_id) {
-            return Err(Error::CorruptData(format!(
-                "newly allocated table ID {} already has a tablet",
+            let error = self.catalog.stop_for_recovery(format!(
+                "durable catalog table {} already has a local tablet",
                 table_id.0
-            )));
+            ));
+
+            return Err(error);
         }
 
-        // Local Milestone 2 tablet IDs mirror their owning table IDs. Future
-        // metadata allocation will assign independent tablet identities.
-        let tablet = Tablet::new(TabletId(table_id.0), table_id)?;
+        let tablet = Tablet::new(TabletId(table_id.0), table_id).map_err(|source| {
+            self.catalog.stop_for_recovery(format!(
+                "durable catalog table {} could not create its \
+                         local tablet: {}",
+                table_id.0, source
+            ))
+        })?;
 
         let coordinator =
-            SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
+            SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())
+                .map_err(|source| {
+                    self.catalog.stop_for_recovery(format!(
+                        "durable catalog table {} could not create its \
+                     commit coordinator: {}",
+                        table_id.0, source
+                    ))
+                })?;
 
         self.tablets.insert(table_id, coordinator);
 
@@ -292,6 +399,7 @@ impl LocalExecutor {
     fn execute_show_tables(&self) -> Result<ExecutionResult> {
         let rows = self
             .catalog
+            .catalog()
             .list_tables()
             .into_iter()
             .map(|table| Row {
@@ -524,12 +632,16 @@ impl LocalExecutor {
     }
 
     fn resolve_table(&self, table: &BoundTableRef) -> Result<Arc<TableSchema>> {
-        let schema = self.catalog.table_by_id(table.table_id).ok_or_else(|| {
-            Error::SchemaMismatch(format!(
-                "plan references unknown table ID {}",
-                table.table_id.0
-            ))
-        })?;
+        let schema = self
+            .catalog
+            .catalog()
+            .table_by_id(table.table_id)
+            .ok_or_else(|| {
+                Error::SchemaMismatch(format!(
+                    "plan references unknown table ID {}",
+                    table.table_id.0
+                ))
+            })?;
 
         if schema.name != table.name {
             return Err(Error::SchemaMismatch(format!(

@@ -138,6 +138,8 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
     let mut writer = SqlSession::new();
     let mut reader = SqlSession::new();
 
+    // Durable catalog creation consumes timestamp 1 from the shared database
+    // timestamp authority before the first user transaction begins.
     create_users(&mut writer, &mut executor, &mut manager);
 
     let started = writer
@@ -148,7 +150,7 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
         started,
         ExecutionResult::TransactionStarted {
             transaction_id: TxnId(1),
-            start_ts: Timestamp(1),
+            start_ts: Timestamp(2),
         }
     ));
 
@@ -160,6 +162,8 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
         )
         .unwrap();
 
+    // This implicit read-only transaction consumes timestamp 3 as its start
+    // timestamp, but it must not allocate a separate commit timestamp.
     let outside_rows = result_set(
         reader
             .execute_sql("SELECT id FROM users", &mut executor, &mut manager)
@@ -189,7 +193,7 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
         committed,
         ExecutionResult::TransactionCommitted {
             transaction_id: TxnId(1),
-            commit_ts: Some(Timestamp(3)),
+            commit_ts: Some(Timestamp(4)),
             committed_writes: 1,
         }
     ));
@@ -210,24 +214,29 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
 }
 
 #[test]
+#[test]
 fn explicit_read_only_commit_does_not_allocate_commit_timestamp() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();
     let mut session = SqlSession::new();
 
+    // Catalog durability consumes timestamp 1.
     create_users(&mut session, &mut executor, &mut manager);
 
     session
         .execute_sql("BEGIN", &mut executor, &mut manager)
         .unwrap();
 
-    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+    // BEGIN consumes timestamp 2 as the transaction start timestamp.
+    let timestamp_after_begin = manager.last_allocated_timestamp();
+    assert_eq!(timestamp_after_begin, Timestamp(2));
 
     session
         .execute_sql("SELECT id FROM users", &mut executor, &mut manager)
         .unwrap();
 
-    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+    // Reads inside an explicit transaction must not allocate timestamps.
+    assert_eq!(manager.last_allocated_timestamp(), timestamp_after_begin);
 
     let committed = session
         .execute_sql("COMMIT", &mut executor, &mut manager)
@@ -241,7 +250,9 @@ fn explicit_read_only_commit_does_not_allocate_commit_timestamp() {
             committed_writes: 0,
         }
     ));
-    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+
+    // A read-only commit must complete without allocating a commit timestamp.
+    assert_eq!(manager.last_allocated_timestamp(), timestamp_after_begin);
     assert!(session.autocommit());
 }
 
@@ -547,11 +558,16 @@ fn read_only_implicit_transaction_does_not_allocate_commit_timestamp() {
     let mut manager = LocalTransactionManager::new();
     let mut session = SqlSession::new();
 
+    // Catalog durability consumes timestamp 1.
     create_users(&mut session, &mut executor, &mut manager);
+    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
 
     session
         .execute_sql("SELECT id FROM users", &mut executor, &mut manager)
         .unwrap();
 
-    assert_eq!(manager.last_allocated_timestamp(), Timestamp(1));
+    // The implicit transaction consumes timestamp 2 as its start timestamp.
+    // If the read-only completion incorrectly allocated a commit timestamp,
+    // the allocator would have advanced to timestamp 3.
+    assert_eq!(manager.last_allocated_timestamp(), Timestamp(2));
 }

@@ -203,6 +203,13 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
             "commit outcome is unknown; reopen and recovery are required before retrying",
             false,
         ),
+
+        Error::CatalogOutcomeUnknown { .. } => error_response(
+            "CATALOG_OUTCOME_UNKNOWN",
+            "catalog outcome is unknown; reopen and recovery are \
+             required before retrying",
+            false,
+        ),
     }
 }
 

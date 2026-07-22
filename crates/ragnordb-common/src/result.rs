@@ -80,6 +80,23 @@ pub enum Error {
     /// coordinator whose preceding commit outcome requires recovery
     #[error("local write path requires recovery: {reason}")]
     RecoveryRequired { reason: String },
+
+    /// catalog record acquired a WAL extent, but recovery is required to
+    /// determine whether that metadata operation became durable
+    #[error(
+        "catalog outcome is unknown for WAL extent \
+         [{start_lsn}, {end_lsn}): {reason}"
+    )]
+    CatalogOutcomeUnknown {
+        /// First logical WAL position assigned to the catalog record
+        start_lsn: u64,
+
+        /// First logical WAL position after the complete catalog record
+        end_lsn: u64,
+
+        /// Diagnostic description of the durability failure
+        reason: String,
+    },
 }
 
 /// Standard result type used throughout RagnorDB
