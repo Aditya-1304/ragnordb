@@ -192,7 +192,8 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
         Error::CorruptData(_)
         | Error::Configuration(_)
         | Error::WalAppendNotStaged { .. }
-        | Error::RecoveryRequired { .. } => error_response(
+        | Error::RecoveryRequired { .. }
+        | Error::RecoveryFailed { .. } => error_response(
             "INTERNAL_ERROR",
             "an internal database error occurred",
             false,

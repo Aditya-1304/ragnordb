@@ -97,6 +97,17 @@ pub enum Error {
         /// Diagnostic description of the durability failure
         reason: String,
     },
+
+    /// startup recovery could not read or traverse the physical WAL stream
+    ///
+    /// semantic payload violations remain `CorruptData`. this variant represents
+    /// failures reported by A-WAL itself, including invalid replay boundaries
+    /// segment read failures and physical iterator failures
+    #[error("WAL recovery failed: {reason}")]
+    RecoveryFailed {
+        /// diagnostic description of physical recovery failure
+        reason: String,
+    },
 }
 
 /// Standard result type used throughout RagnorDB
