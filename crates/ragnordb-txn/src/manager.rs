@@ -48,6 +48,29 @@ impl LocalTransactionManager {
         Self::default()
     }
 
+    /// initialize the local allocator from checked recovery floors
+    ///
+    /// Arguments are the first values available for allocation, not the last
+    /// durable values. Internally the manager stores the preceding values so
+    /// its existing allocation path returns these floors exactly once
+    pub fn from_recovered_floors(
+        next_transaction_id: TxnId,
+        next_timestamp: Timestamp,
+    ) -> Result<Self> {
+        let last_transaction_id = next_transaction_id.0.checked_sub(1).ok_or_else(|| {
+            Error::Configuration("recovered next transaction ID must be nonzero".to_string())
+        })?;
+
+        let last_timestamp = next_timestamp.0.checked_sub(1).ok_or_else(|| {
+            Error::Configuration("recovered next timestamp must be nonzero".to_string())
+        })?;
+
+        Ok(Self {
+            last_transaction_id,
+            last_timestamp,
+        })
+    }
+
     /// Return the most recently allocated transaction identifier.
     ///
     /// Zero means no transaction has been allocated yet.

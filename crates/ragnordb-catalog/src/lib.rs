@@ -221,6 +221,27 @@ impl MemoryCatalog {
         }
     }
 
+    /// raise the next table identity to a checked recovery floor.
+    ///
+    /// Recovery floors include historical table IDs that may no longer appear
+    /// in the visible catalog. This method never lowers an allocator already
+    /// advanced by installed schema definitions
+    pub fn restore_table_id_floor(&mut self, next_table_id: TableId) -> Result<()> {
+        if next_table_id.0 == 0 {
+            return Err(Error::Configuration(
+                "recovered next table ID must be nonzero".to_string(),
+            ));
+        }
+
+        let current = self.next_table_id.ok_or_else(|| {
+            Error::Configuration("catalog table-ID allocator is already exhausted".to_string())
+        })?;
+
+        self.next_table_id = Some(current.max(next_table_id.0));
+
+        Ok(())
+    }
+
     /// Allocate, validate, and publish one in-memory table.
     ///
     /// Durable single-node creation uses `prepare_table` and

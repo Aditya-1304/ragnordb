@@ -254,6 +254,29 @@ impl Default for RecoveryHighWaterMarks {
 }
 
 impl RecoveryHighWaterMarks {
+    /// convert durable maxima into checked next allocation values
+    ///
+    /// The complete result is calculated before it is returned. If any
+    /// namespace is exhausted, recovery fails without publishing a partial set
+    /// of allocator floors
+    pub fn checked_allocator_floors(&self) -> Result<RecoveryAllocatorFloors> {
+        let next_transaction_id =
+            checked_recovery_successor("transaction ID", self.max_transaction_id.0)?;
+
+        let next_timestamp = checked_recovery_successor("timestamp", self.max_timestamp.0)?;
+
+        let next_table_id = checked_recovery_successor("table ID", self.max_table_id.0)?;
+
+        let next_snapshot_id = checked_recovery_successor("snapshot ID", self.max_snapshot_id)?;
+
+        Ok(RecoveryAllocatorFloors {
+            next_transaction_id: TxnId(next_transaction_id),
+            next_timestamp: Timestamp(next_timestamp),
+            next_table_id: TableId(next_table_id),
+            next_snapshot_id,
+        })
+    }
+
     fn observe_catalog_update(&mut self, update: &CatalogUpdate) {
         self.observe_table_id(update.table_id);
         self.observe_timestamp(update.update_timestamp);
@@ -290,6 +313,36 @@ impl RecoveryHighWaterMarks {
     fn observe_table_id(&mut self, table_id: TableId) {
         self.max_table_id = TableId(self.max_table_id.0.max(table_id.0));
     }
+}
+
+/// calculate the first reusable value after one durable allocator maximum
+fn checked_recovery_successor(allocator_name: &str, maximum: u64) -> Result<u64> {
+    maximum.checked_add(1).ok_or_else(|| Error::RecoveryFailed {
+        reason: format!(
+            "{allocator_name} allocator is exhausted at recovered \
+                 high-water mark {maximum}"
+        ),
+    })
+}
+
+/// prevalidated first values available for allocation after recovery
+///
+/// every field is exactly one greater than the corresponding durable maximum
+/// Constructing this value performs all overflow checks before any live
+/// allocator is initialized
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryAllocatorFloors {
+    /// first transaction identity available after recovery.
+    pub next_transaction_id: TxnId,
+
+    /// first timestamp available after recovery
+    pub next_timestamp: Timestamp,
+
+    /// first table identity available after recovery
+    pub next_table_id: TableId,
+
+    /// first snapshot identity available after recovery
+    pub next_snapshot_id: u64,
 }
 
 /// private catalog and MVCC state reconstructed during recovery
