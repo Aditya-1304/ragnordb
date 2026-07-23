@@ -9,7 +9,10 @@
 //! Later recovery slices can validate complete history before exposing any
 //! reconstructed database state
 
-use ragnordb_common::{Error, Result};
+use std::collections::BTreeMap;
+
+use ragnordb_catalog::{Catalog, MemoryCatalog};
+use ragnordb_common::{Error, Result, command_codec::CatalogOperation, ids::TableId};
 use wal::{
     error::WalError,
     io::{directory::SegmentDirectory, segment_file::SegmentFile},
@@ -18,8 +21,12 @@ use wal::{
     wal::{WalHandle, iterator::WalIterator},
 };
 
-use crate::wal::{
-    CatalogUpdate, CheckpointMarker, RagnorDbWalRecordType, SingleNodeTxnCommit, SnapshotPointer,
+use crate::{
+    mvcc::{InMemoryMvcc, Mutation, MvccStorage},
+    wal::{
+        CatalogUpdate, CheckpointMarker, RagnorDbWalRecordType, SingleNodeTxnCommit,
+        SnapshotPointer, WalMutation,
+    },
 };
 
 /// validated database payload obtained from one logical A-WAL record
@@ -53,6 +60,142 @@ pub struct DecodedRecoveryRecord {
 
     /// validated semantic payload carried by the record
     pub payload: RecoveryPayload,
+}
+
+/// private catalog and MVCC state reconstructed during recovery
+///
+/// this state is delibrately independent from the running executor. startup
+/// replay and validate the complete selected WAL suffix before transferring
+/// the recovered state to live database components
+///
+/// if any later record is invalid, the caller discards this entire value and
+/// partially reconstructed state becomes visible to sessions
+#[derive(Debug, Default)]
+pub struct RecoveryState {
+    catalog: MemoryCatalog,
+    mvcc_by_table: BTreeMap<TableId, InMemoryMvcc>,
+}
+
+impl RecoveryState {
+    /// an empty recovery staging state
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// returns the catalog reconstructed from durable metadata operations.
+    pub fn catalog(&self) -> &MemoryCatalog {
+        &self.catalog
+    }
+
+    /// return the reconstructed MVCC state for one table
+    ///
+    /// `None` means no durable catalog definition for this table has been
+    /// successfully applied to the recovery state
+    pub fn table_storage(&self, table_id: TableId) -> Option<&InMemoryMvcc> {
+        self.mvcc_by_table.get(&table_id)
+    }
+
+    /// apply one decoded record to private recovery state
+    ///
+    /// catalog updates create the schema and corresponding empty MVCC state
+    /// Transaction commits require that catalog state to exist first. Snapshot
+    /// pointers and checkpoint markers are recovery-planning metadata and do not
+    /// directly mutate catalog or MVCC state
+    pub fn apply_record(&mut self, record: &DecodedRecoveryRecord) -> Result<()> {
+        match &record.payload {
+            RecoveryPayload::CatalogUpdate(update) => self.apply_catalog_update(record.lsn, update),
+
+            RecoveryPayload::SingleNodeTxnCommit(commit) => {
+                self.apply_transaction_commit(record.lsn, commit)
+            }
+
+            RecoveryPayload::SnapshotPointer(_) | RecoveryPayload::CheckpointMarker(_) => {
+                // snapshot selection and allocator high-water tracking are
+                // handled by later recovery slices. These records carry no
+                // direct catalog or MVCC state transition.
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_catalog_update(&mut self, lsn: Lsn, update: &CatalogUpdate) -> Result<()> {
+        let definition = match &update.command.operation {
+            CatalogOperation::CreateTable(operation) => operation.table_def.clone(),
+        };
+
+        let installed = self
+            .catalog
+            .install_definition(definition)
+            .map_err(|source| {
+                recovery_corruption(lsn, "failed to apply durable CatalogUpdate", source)
+            })?;
+
+        if installed.id != update.table_id {
+            return Err(Error::CorruptData(format!(
+                "CatalogUpdate at WAL LSN {} installed table {}, \
+                 but the durable update identifies table {}",
+                lsn.as_u64(),
+                installed.id.0,
+                update.table_id.0
+            )));
+        }
+
+        // identical catalog metadata must preserve any MVCC state
+        // already reconstructed for the table.
+        self.mvcc_by_table.entry(update.table_id).or_default();
+
+        Ok(())
+    }
+
+    fn apply_transaction_commit(&mut self, lsn: Lsn, commit: &SingleNodeTxnCommit) -> Result<()> {
+        if self.catalog.table_by_id(commit.table_id).is_none() {
+            return Err(Error::CorruptData(format!(
+                "SingleNodeTxnCommit at WAL LSN {} references table {} \
+                 before its catalog definition appears in durable history",
+                lsn.as_u64(),
+                commit.table_id.0
+            )));
+        }
+
+        let storage = self
+            .mvcc_by_table
+            .get_mut(&commit.table_id)
+            .ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "recovery catalog contains table {}, but its private \
+                     MVCC state is missing at WAL LSN {}",
+                    commit.table_id.0,
+                    lsn.as_u64()
+                ))
+            })?;
+
+        let mutations = commit
+            .writes
+            .iter()
+            .map(|(key, mutation)| {
+                let mutation = match mutation {
+                    WalMutation::Put(row) => Mutation::Put(row.clone()),
+
+                    WalMutation::Delete => Mutation::Delete,
+                };
+
+                (key.clone(), mutation)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        storage
+            .commit_batch(
+                commit.txn_id,
+                commit.start_timestamp,
+                commit.commit_timestamp,
+                &mutations,
+            )
+            .map_err(|source| {
+                recovery_corruption(lsn, "failed to apply durable SingleNodeTxnCommit", source)
+            })?;
+
+        Ok(())
+    }
 }
 
 /// lazy semantic reader over an immutable A-WAL iterator snapshot
@@ -117,6 +260,25 @@ where
     pub fn current_lsn(&self) -> Lsn {
         self.iterator.current_lsn()
     }
+}
+
+/// replay one complete immutable WAL stream into private recovery state
+///
+/// the state is returned only after the stream reaches its validated end
+/// if phsycisal iteration, semantic decoind catalog installation, dependency
+/// validation or MVCC application fails, the half or partial reconstructed state
+/// dropped and cannot be published accidently
+pub fn replay_recovery_stream<F>(mut stream: RecoveryRecordStream<F>) -> Result<RecoveryState>
+where
+    F: SegmentFile,
+{
+    let mut state = RecoveryState::new();
+
+    while let Some(record) = stream.next_record()? {
+        state.apply_record(&record)?;
+    }
+
+    Ok(state)
 }
 
 /// open a lazy recovery stream at an exact WAL record boundary
