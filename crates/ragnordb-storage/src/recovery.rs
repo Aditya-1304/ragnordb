@@ -66,6 +66,162 @@ pub struct DecodedRecoveryRecord {
     pub payload: RecoveryPayload,
 }
 
+/// durable metadata candidate formed by an exactly matched snapshot pointer and
+/// checkpoint marker
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCheckpointCandidate {
+    /// WAL location of the durable snapshot pointer
+    pub pointer_lsn: Lsn,
+
+    /// WAL location of the marker that published the pointer
+    pub marker_lsn: Lsn,
+
+    /// complete snapshot metadata repeated and confirmed by the marker
+    pub pointer: SnapshotPointer,
+}
+
+/// incremental selector for published RagnorDB checkpoint metadata
+///
+/// pointers remain pending until a later marker repeats the same snapshot ID,
+/// snapshot timestamp, and replay boundary. A pointer without a marker is an
+/// orphan and cannot replace an earlier published checkpoint candidate
+#[derive(Debug, Default)]
+pub struct RecoveryCheckpointSelector {
+    pending_pointers: BTreeMap<u64, PendingSnapshotPointer>,
+    selected: Option<RecoveryCheckpointCandidate>,
+    last_observed_lsn: Option<Lsn>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSnapshotPointer {
+    lsn: Lsn,
+    pointer: SnapshotPointer,
+}
+
+impl RecoveryCheckpointSelector {
+    /// an empty selector.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// observe one decoded record in physical WAL order
+    ///
+    /// Non checkpoint database records participate in LSN-order validation but
+    /// otherwise do not affect snapshot selection
+    pub fn observe_record(&mut self, record: &DecodedRecoveryRecord) -> Result<()> {
+        self.validate_record_order(record.lsn)?;
+
+        match &record.payload {
+            RecoveryPayload::SnapshotPointer(pointer) => self.observe_pointer(record.lsn, pointer),
+
+            RecoveryPayload::CheckpointMarker(marker) => self.observe_marker(record.lsn, marker),
+
+            RecoveryPayload::CatalogUpdate(_) | RecoveryPayload::SingleNodeTxnCommit(_) => Ok(()),
+        }
+    }
+
+    /// return the newest exactly matched checkpoint candidate
+    pub fn selected(&self) -> Option<&RecoveryCheckpointCandidate> {
+        self.selected.as_ref()
+    }
+
+    /// consume the selector and return its selected candidate
+    pub fn into_selected(self) -> Option<RecoveryCheckpointCandidate> {
+        self.selected
+    }
+
+    fn validate_record_order(&mut self, lsn: Lsn) -> Result<()> {
+        if let Some(previous_lsn) = self.last_observed_lsn
+            && lsn <= previous_lsn
+        {
+            return Err(Error::CorruptData(format!(
+                "recovery record at WAL LSN {} does not follow previously \
+                 observed WAL LSN {}",
+                lsn.as_u64(),
+                previous_lsn.as_u64()
+            )));
+        }
+
+        self.last_observed_lsn = Some(lsn);
+        Ok(())
+    }
+
+    fn observe_pointer(&mut self, lsn: Lsn, pointer: &SnapshotPointer) -> Result<()> {
+        if pointer.replay_from_lsn > lsn {
+            return Err(Error::CorruptData(format!(
+                "SnapshotPointer for snapshot {} at WAL LSN {} claims future \
+                 replay boundary {}",
+                pointer.snapshot_id,
+                lsn.as_u64(),
+                pointer.replay_from_lsn.as_u64()
+            )));
+        }
+
+        if let Some(existing) = self.pending_pointers.get(&pointer.snapshot_id)
+            && existing.pointer != *pointer
+        {
+            return Err(Error::CorruptData(format!(
+                "snapshot ID {} has conflicting SnapshotPointer records at \
+                 WAL LSNs {} and {}",
+                pointer.snapshot_id,
+                existing.lsn.as_u64(),
+                lsn.as_u64()
+            )));
+        }
+
+        // repeating identical pointer metadata is harmless. Retaining the most
+        // recent preceding pointer gives the selected candidate the closest
+        // physical publication context
+        self.pending_pointers.insert(
+            pointer.snapshot_id,
+            PendingSnapshotPointer {
+                lsn,
+                pointer: pointer.clone(),
+            },
+        );
+
+        Ok(())
+    }
+
+    fn observe_marker(&mut self, lsn: Lsn, marker: &CheckpointMarker) -> Result<()> {
+        let pending = self
+            .pending_pointers
+            .get(&marker.snapshot_id)
+            .ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "CheckpointMarker for snapshot {} at WAL LSN {} has no \
+                     preceding SnapshotPointer",
+                    marker.snapshot_id,
+                    lsn.as_u64()
+                ))
+            })?;
+
+        if pending.pointer.snapshot_timestamp != marker.snapshot_timestamp
+            || pending.pointer.replay_from_lsn != marker.replay_from_lsn
+        {
+            return Err(Error::CorruptData(format!(
+                "CheckpointMarker for snapshot {} at WAL LSN {} does not match \
+                 its SnapshotPointer timestamp or replay boundary",
+                marker.snapshot_id,
+                lsn.as_u64()
+            )));
+        }
+
+        let pending = self
+            .pending_pointers
+            .remove(&marker.snapshot_id)
+            .expect("pending pointer was validated above");
+
+        self.selected = Some(RecoveryCheckpointCandidate {
+            pointer_lsn: pending.lsn,
+            marker_lsn: lsn,
+            pointer: pending.pointer,
+        });
+
+        Ok(())
+    }
+}
+
 /// maximum durable values observed while reconstructing database state
 ///
 /// zero means no value from that allocator namespace has been observed. These
@@ -370,6 +526,30 @@ where
     }
 
     Ok(state)
+}
+
+/// scan one complete immutable WAL stream and select its newest published
+/// checkpoint metadata candidate
+///
+/// The stream is consumed without applying catalog or MVCC state. Startup opens
+/// a second stream at the selected boundary only after the referenced snapshot
+/// file has been independently validated and loaded.
+///
+/// When no matched pair exists, this returns `Ok(None)` and startup must replay
+/// from `Lsn::ZERO`
+pub fn select_recovery_checkpoint<F>(
+    mut stream: RecoveryRecordStream<F>,
+) -> Result<Option<RecoveryCheckpointCandidate>>
+where
+    F: SegmentFile,
+{
+    let mut selector = RecoveryCheckpointSelector::new();
+
+    while let Some(record) = stream.next_record()? {
+        selector.observe_record(&record)?;
+    }
+
+    Ok(selector.into_selected())
 }
 
 /// open a lazy recovery stream at an exact WAL record boundary
