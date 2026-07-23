@@ -12,7 +12,11 @@
 use std::collections::BTreeMap;
 
 use ragnordb_catalog::{Catalog, MemoryCatalog};
-use ragnordb_common::{Error, Result, command_codec::CatalogOperation, ids::TableId};
+use ragnordb_common::{
+    Error, Result,
+    command_codec::CatalogOperation,
+    ids::{TableId, Timestamp, TxnId},
+};
 use wal::{
     error::WalError,
     io::{directory::SegmentDirectory, segment_file::SegmentFile},
@@ -62,57 +66,144 @@ pub struct DecodedRecoveryRecord {
     pub payload: RecoveryPayload,
 }
 
+/// maximum durable values observed while reconstructing database state
+///
+/// zero means no value from that allocator namespace has been observed. These
+/// values are floors, not the next values to allocate. Allocator restoration
+/// must ensure that every subsequent allocation is strictly greater
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryHighWaterMarks {
+    /// largest durable transaction identity
+    pub max_transaction_id: TxnId,
+
+    /// largest start, commit, catalog update, or snapshot timestamp
+    pub max_timestamp: Timestamp,
+
+    /// largest table identity found in catalog or snapshot metadata
+    pub max_table_id: TableId,
+
+    /// largest durable snapshot identity found in a pointer or marker
+    pub max_snapshot_id: u64,
+}
+
+impl Default for RecoveryHighWaterMarks {
+    fn default() -> Self {
+        Self {
+            max_transaction_id: TxnId(0),
+            max_timestamp: Timestamp(0),
+            max_table_id: TableId(0),
+            max_snapshot_id: 0,
+        }
+    }
+}
+
+impl RecoveryHighWaterMarks {
+    fn observe_catalog_update(&mut self, update: &CatalogUpdate) {
+        self.observe_table_id(update.table_id);
+        self.observe_timestamp(update.update_timestamp);
+    }
+
+    fn observe_transaction_commit(&mut self, commit: &SingleNodeTxnCommit) {
+        self.max_transaction_id = TxnId(self.max_transaction_id.0.max(commit.txn_id.0));
+
+        self.observe_table_id(commit.table_id);
+        self.observe_timestamp(commit.start_timestamp);
+        self.observe_timestamp(commit.commit_timestamp);
+    }
+
+    fn observe_snapshot_pointer(&mut self, pointer: &SnapshotPointer) {
+        self.max_snapshot_id = self.max_snapshot_id.max(pointer.snapshot_id);
+
+        self.observe_timestamp(pointer.snapshot_timestamp);
+
+        for table_id in &pointer.table_ids {
+            self.observe_table_id(*table_id);
+        }
+    }
+
+    fn observe_checkpoint_marker(&mut self, marker: &CheckpointMarker) {
+        self.max_snapshot_id = self.max_snapshot_id.max(marker.snapshot_id);
+
+        self.observe_timestamp(marker.snapshot_timestamp);
+    }
+
+    fn observe_timestamp(&mut self, timestamp: Timestamp) {
+        self.max_timestamp = Timestamp(self.max_timestamp.0.max(timestamp.0));
+    }
+
+    fn observe_table_id(&mut self, table_id: TableId) {
+        self.max_table_id = TableId(self.max_table_id.0.max(table_id.0));
+    }
+}
+
 /// private catalog and MVCC state reconstructed during recovery
 ///
-/// this state is delibrately independent from the running executor. startup
-/// replay and validate the complete selected WAL suffix before transferring
-/// the recovered state to live database components
+/// this state is deliberately independent from the running executor. Startup
+/// must replay and validate the complete selected WAL suffix before transferring
+/// the recovered state and allocator floors to live database components
 ///
-/// if any later record is invalid, the caller discards this entire value and
+/// If any later record is invalid, the caller discards this entire value and no
 /// partially reconstructed state becomes visible to sessions
 #[derive(Debug, Default)]
 pub struct RecoveryState {
     catalog: MemoryCatalog,
     mvcc_by_table: BTreeMap<TableId, InMemoryMvcc>,
+    high_water_marks: RecoveryHighWaterMarks,
 }
 
 impl RecoveryState {
-    /// an empty recovery staging state
+    /// Construct an empty recovery staging state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// returns the catalog reconstructed from durable metadata operations.
+    /// Return the catalog reconstructed from durable metadata operations.
     pub fn catalog(&self) -> &MemoryCatalog {
         &self.catalog
     }
 
     /// return the reconstructed MVCC state for one table
-    ///
-    /// `None` means no durable catalog definition for this table has been
-    /// successfully applied to the recovery state
     pub fn table_storage(&self, table_id: TableId) -> Option<&InMemoryMvcc> {
         self.mvcc_by_table.get(&table_id)
     }
 
+    /// return allocator high-water marks observed during successful replay
+    ///
+    /// the returned value is a copy so callers cannot alter recovery state
+    pub fn high_water_marks(&self) -> RecoveryHighWaterMarks {
+        self.high_water_marks
+    }
+
     /// apply one decoded record to private recovery state
     ///
-    /// catalog updates create the schema and corresponding empty MVCC state
-    /// Transaction commits require that catalog state to exist first. Snapshot
-    /// pointers and checkpoint markers are recovery-planning metadata and do not
-    /// directly mutate catalog or MVCC state
+    /// high water marks advance only after the corresponding semantic operation
+    /// succeeds. A rejected catalog or transaction record therefore cannot
+    /// influence allocator restoration
     pub fn apply_record(&mut self, record: &DecodedRecoveryRecord) -> Result<()> {
         match &record.payload {
-            RecoveryPayload::CatalogUpdate(update) => self.apply_catalog_update(record.lsn, update),
-
-            RecoveryPayload::SingleNodeTxnCommit(commit) => {
-                self.apply_transaction_commit(record.lsn, commit)
+            RecoveryPayload::CatalogUpdate(update) => {
+                self.apply_catalog_update(record.lsn, update)?;
+                self.high_water_marks.observe_catalog_update(update);
+                Ok(())
             }
 
-            RecoveryPayload::SnapshotPointer(_) | RecoveryPayload::CheckpointMarker(_) => {
-                // snapshot selection and allocator high-water tracking are
-                // handled by later recovery slices. These records carry no
-                // direct catalog or MVCC state transition.
+            RecoveryPayload::SingleNodeTxnCommit(commit) => {
+                self.apply_transaction_commit(record.lsn, commit)?;
+                self.high_water_marks.observe_transaction_commit(commit);
+                Ok(())
+            }
+
+            RecoveryPayload::SnapshotPointer(pointer) => {
+                // snapshot file selection and validation are handled by the
+                // replay-planning slice. The metadata still contributes durable
+                // allocator floors even when its pointer is later determined to
+                // be orphaned and cannot be selected for state restoration
+                self.high_water_marks.observe_snapshot_pointer(pointer);
+                Ok(())
+            }
+
+            RecoveryPayload::CheckpointMarker(marker) => {
+                self.high_water_marks.observe_checkpoint_marker(marker);
                 Ok(())
             }
         }
