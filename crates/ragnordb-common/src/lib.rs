@@ -41,6 +41,9 @@ pub mod proto {
     pub mod wal {
         include!("proto/ragnordb.wal.rs");
     }
+    pub mod snapshot {
+        include!("proto/ragnordb.snapshot.rs");
+    }
 }
 
 pub use result::{Error, Result};

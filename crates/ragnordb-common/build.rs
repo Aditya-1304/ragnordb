@@ -1,7 +1,8 @@
-//! This file compiles all six .proto schema files into Rust modules at build time using the proto-build crate.
-//! all the output are stored inside the src/proto/*.rs
+//! compiles RagnorDB's protobuf schemas into Rust modules
 //!
-//! should rerun if the schema files are changed as all other crate uses this protobufs
+//! generated modules are written into `src/proto`. Durable and cross-node
+//! schemas must remain protobuf-backed so recovery does not depend on
+//! process-local Rust layouts
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_dir = "../../proto"; // this is because i am using relative path to crate root
@@ -13,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/command.proto",
         "../../proto/rpc.proto",
         "../../proto/wal.proto",
+        "../../proto/snapshot.proto",
     ];
 
     std::fs::create_dir_all("src/proto")?;

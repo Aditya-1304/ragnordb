@@ -7,7 +7,8 @@ repository.workspace = true
 
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
-ragnordb-catalog = { path = "../ragnordb-catalog"}
+ragnordb-catalog = { path = "../ragnordb-catalog" }
 wal.workspace = true
 bloom-bloom.workspace = true
 prost.workspace = true
+crc32c.workspace = true

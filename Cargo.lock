@@ -1304,6 +1304,7 @@ name = "ragnordb-storage"
 version = "0.1.0"
 dependencies = [
  "bloom-bloom",
+ "crc32c",
  "prost",
  "ragnordb-catalog",
  "ragnordb-common",

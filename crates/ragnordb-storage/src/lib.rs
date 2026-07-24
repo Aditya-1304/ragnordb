@@ -1,5 +1,6 @@
 use ragnordb_common::Result;
 
+pub mod checkpoint;
 pub mod key;
 pub mod mvcc;
 pub mod recovery;
