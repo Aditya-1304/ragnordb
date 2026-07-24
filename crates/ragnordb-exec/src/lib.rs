@@ -42,10 +42,13 @@ use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
     DeletePlan, ExpressionType, InsertPlan, Plan, SelectPlan, UpdateAssignmentPlan, UpdatePlan,
 };
+
 use ragnordb_storage::{
     key::{decode_row_key, make_row_key},
+    mvcc::InMemoryMvcc,
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit},
 };
+
 use ragnordb_tablet::{RowMutation, Tablet};
 use ragnordb_txn::{
     CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
@@ -172,6 +175,79 @@ impl LocalExecutor {
             commit_log,
             next_local_catalog_timestamp: 0,
         }
+    }
+
+    /// constructs the live executor from completely recovered database state
+    ///
+    /// every recovered catalog table must have exactly one corresponding MVCC
+    /// store. The method creates all tablets and durable coordinators before
+    /// returning, so the caller cannot publish a partially initialized
+    /// executor
+    pub fn from_recovered(
+        catalog: MemoryCatalog,
+        mvcc_by_table: BTreeMap<TableId, InMemoryMvcc>,
+        commit_log: SharedCommitLog,
+        catalog_log: SharedCatalogLog,
+        catalog_timestamp_high_water: Timestamp,
+    ) -> Result<Self> {
+        let catalog_table_ids = catalog
+            .list_tables()
+            .into_iter()
+            .map(|schema| {
+                if schema.tablet_count != 1 {
+                    return Err(Error::CorruptData(format!(
+                        "recovered local table {} declares {} tablets; \
+                         single-node recovery requires exactly one",
+                        schema.id.0, schema.tablet_count
+                    )));
+                }
+
+                Ok(schema.id)
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let storage_table_ids = mvcc_by_table.keys().copied().collect::<BTreeSet<_>>();
+
+        if catalog_table_ids != storage_table_ids {
+            return Err(Error::CorruptData(format!(
+                "recovered catalog table set {:?} does not match recovered \
+                 MVCC table set {:?}",
+                catalog_table_ids, storage_table_ids
+            )));
+        }
+
+        let mut tablets = BTreeMap::new();
+
+        for (table_id, storage) in mvcc_by_table {
+            let tablet = Tablet::with_storage(TabletId(table_id.0), table_id, storage).map_err(
+                |source| {
+                    Error::CorruptData(format!(
+                        "failed to construct recovered tablet for table {}: {}",
+                        table_id.0, source
+                    ))
+                },
+            )?;
+
+            let coordinator =
+                SingleNodeCommitCoordinator::with_participant(tablet, commit_log.clone()).map_err(
+                    |source| {
+                        Error::CorruptData(format!(
+                            "failed to construct recovered commit coordinator \
+                         for table {}: {}",
+                            table_id.0, source
+                        ))
+                    },
+                )?;
+
+            tablets.insert(table_id, coordinator);
+        }
+
+        Ok(Self {
+            catalog: DurableCatalog::from_recovered(catalog, catalog_log),
+            tablets,
+            commit_log,
+            next_local_catalog_timestamp: catalog_timestamp_high_water.0,
+        })
     }
 
     /// Return the catalog snapshot used by SQL analysis.

@@ -22,6 +22,8 @@ axum.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 toml.workspace = true
+ragnordb-storage = { path = "../ragnordb-storage" }
+wal.workspace = true
 
 [dev-dependencies]
 tokio-util.workspace = true

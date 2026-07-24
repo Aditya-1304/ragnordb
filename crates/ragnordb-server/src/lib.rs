@@ -76,10 +76,23 @@ impl Server {
             max_connections,
         });
 
-        // One local runtime is shared by every SQL connection. Creating this
-        // state inside a connection task would isolate client-visible data and
-        // reuse transaction IDs and timestamps.
-        let database = LocalDatabase::shared();
+        // recover the complete runtime before binding client facing listeners
+        // no session can allocate identifiers or observe state while physical
+        // WAL recovery, semantic replay, or allocator restoration is incomplete
+        let (database, recovery_report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
+
+        info!(
+            segments_scanned = recovery_report.segments_scanned,
+            records_scanned = recovery_report.records_scanned,
+            corrupt_records_found = recovery_report.corrupt_records_found,
+            truncated_bytes = recovery_report.truncated_bytes,
+            next_lsn = recovery_report.next_lsn.as_u64(),
+            clean_shutdown = recovery_report.clean_shutdown,
+            recovery_skipped = recovery_report.recovery_skipped,
+            "database recovery completed",
+        );
+
+        let database = database.into_shared();
 
         // Bind every required endpoint before starting background work. The node
         // must not report successful startup when either endpoint is unavailable.

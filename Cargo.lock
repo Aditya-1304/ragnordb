@@ -1278,6 +1278,7 @@ dependencies = [
  "ragnordb-exec",
  "ragnordb-multiraft",
  "ragnordb-sql",
+ "ragnordb-storage",
  "ragnordb-tablet",
  "ragnordb-txn",
  "serde",
@@ -1286,6 +1287,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "wal",
 ]
 
 [[package]]

@@ -92,6 +92,19 @@ where
         }
     }
 
+    /// construct the durable writer around a fully recovered catalog
+    ///
+    /// the supplied catalog must come from completed recovery or a validated
+    /// snapshot. No catalog operation can bypass the durable log after this
+    /// ownership transfer
+    pub fn from_recovered(catalog: MemoryCatalog, durable_log: L) -> Self {
+        Self {
+            catalog,
+            durable_log,
+            recovery_required_reason: None,
+        }
+    }
+
     /// Borrow the published catalog snapshot used by SQL analysis and reads.
     pub fn catalog(&self) -> &MemoryCatalog {
         &self.catalog

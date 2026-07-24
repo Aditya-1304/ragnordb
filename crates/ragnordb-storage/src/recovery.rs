@@ -496,6 +496,21 @@ impl RecoveryState {
 
         Ok(())
     }
+
+    /// consume successfully reconstructed state for live runtime publication
+    ///
+    /// this is the only ownership transfer from private recovery state. Startup
+    /// calls it only after the complete selected WAL stream has been decoded
+    /// validated, and applied successfully
+    pub fn into_parts(
+        self,
+    ) -> (
+        MemoryCatalog,
+        BTreeMap<TableId, InMemoryMvcc>,
+        RecoveryHighWaterMarks,
+    ) {
+        (self.catalog, self.mvcc_by_table, self.high_water_marks)
+    }
 }
 
 /// lazy semantic reader over an immutable A-WAL iterator snapshot
