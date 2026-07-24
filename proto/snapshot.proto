@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package ragnordb.snapshot;
+
+import "catalog.proto";
+import "ids.proto";
+import "mvcc.proto";
+
+// logical database state carried by one checksummed snapshot file
+//
+// the fixed width file envelope owns the magic bytes, format version, encoded
+// body length, and checksum. this protobuf body owns database semantics
+message DatabaseSnapshot {
+    uint64 snapshot_id = 1;
+    ragnordb.ids.Timestamp snapshot_timestamp = 2;
+    uint64 replay_from_lsn = 3;
+    AllocatorHighWaterMarks high_water_marks = 4;
+    repeated SnapshotTable tables = 5;
+}
+
+// durable maxima required to prevent allocator reuse after WAL pruning
+message AllocatorHighWaterMarks {
+    ragnordb.ids.TxnId max_transaction_id = 1;
+    ragnordb.ids.Timestamp max_timestamp = 2;
+    ragnordb.ids.TableId max_table_id = 3;
+    uint64 max_snapshot_id = 4;
+}
+
+// complete catalog and MVCC state for one table
+message SnapshotTable {
+    ragnordb.catalog.TableDefinition definition = 1;
+    repeated DefaultValueEntry default_values = 2;
+    repeated LockEntry locks = 3;
+    repeated WriteEntry writes = 4;
+}
+
+// one value from default/{row_key}/{start_timestamp}
+message DefaultValueEntry {
+    bytes key = 1;
+    ragnordb.ids.Timestamp start_timestamp = 2;
+    bytes row = 3;
+}
+
+// one unresolved lock from lock/{row_key}
+message LockEntry {
+    bytes key = 1;
+    ragnordb.mvcc.LockRecord record = 2;
+}
+
+// one write-history record from write/{row_key}/{write_timestamp}
+message WriteEntry {
+    bytes key = 1;
+    ragnordb.ids.Timestamp write_timestamp = 2;
+    ragnordb.mvcc.WriteRecord record = 3;
+}
