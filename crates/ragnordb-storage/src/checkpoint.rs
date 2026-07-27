@@ -23,6 +23,43 @@ pub const SNAPSHOT_FILE_VERSION: u32 = 1;
 /// v1 envelope: magic, version, encoded body length, and body CRC32C
 const SNAPSHOT_HEADER_LENGTH: usize = 8 + 4 + 8 + 4;
 
+/// detached MVCC image captured from one in memory table
+///
+/// all collections preserve the underlying `BTreeMap` order. The value owns
+/// every encoded key, row, lock, and write record, so later commits cannot
+/// mutate a checkpoint image after the serialized capture barrier is released
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedMvccState {
+    default_values: Vec<snapshot_proto::DefaultValueEntry>,
+    locks: Vec<snapshot_proto::LockEntry>,
+    writes: Vec<snapshot_proto::WriteEntry>,
+}
+
+impl CapturedMvccState {
+    /// a detached MVCC image from deterministically ordered entries
+    pub(crate) fn new(
+        default_values: Vec<snapshot_proto::DefaultValueEntry>,
+        locks: Vec<snapshot_proto::LockEntry>,
+        writes: Vec<snapshot_proto::WriteEntry>,
+    ) -> Self {
+        Self {
+            default_values,
+            locks,
+            writes,
+        }
+    }
+
+    /// attach the catalog definition captured under the same database barrier
+    pub fn into_snapshot_table(self, definition: TableDefinition) -> snapshot_proto::SnapshotTable {
+        snapshot_proto::SnapshotTable {
+            definition: Some(definition.to_proto()),
+            default_values: self.default_values,
+            locks: self.locks,
+            writes: self.writes,
+        }
+    }
+}
+
 /// encode one validated snapshot body as a self-identifying checksummed file
 ///
 /// the caller still owns consistent-cut capture. This function only freezes the

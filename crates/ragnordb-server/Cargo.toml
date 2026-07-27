@@ -27,6 +27,7 @@ wal.workspace = true
 
 [dev-dependencies]
 tokio-util.workspace = true
+tempfile = "3"
 
 [build-dependencies]
 toml.workspace = true

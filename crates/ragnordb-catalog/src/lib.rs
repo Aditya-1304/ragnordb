@@ -242,6 +242,17 @@ impl MemoryCatalog {
         Ok(())
     }
 
+    /// return the largest table identity consumed by this catalog allocator
+    ///
+    /// the value includes recovered allocation history even when a future
+    /// DROP TABLE removes the corresponding schema from the visible catlaog
+    pub fn table_id_high_water_mark(&self) -> TableId {
+        match self.next_table_id {
+            Some(next_table_id) => TableId(next_table_id - 1),
+            None => TableId(u64::MAX),
+        }
+    }
+
     /// Allocate, validate, and publish one in-memory table.
     ///
     /// Durable single-node creation uses `prepare_table` and

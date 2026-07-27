@@ -82,6 +82,14 @@ impl<S: MvccStorage> Tablet<S> {
         self.table_id
     }
 
+    /// borrow the tablet's storage for immutable recovery image capture
+    ///
+    /// Mutable access remains private to the tablet and durable commit
+    /// coordinator, so callers cannot bypass commit ordering
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
     /// Read one row using the transaction snapshot and pending write set.
     pub fn get(&self, transaction: &Transaction, key: &RowKey) -> Result<Option<Row>> {
         self.validate_row_key(key)?;

@@ -37,6 +37,7 @@ use ragnordb_common::{
     catalog_codec::DataType,
     codec::{Row, Value},
     ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
+    proto::snapshot as snapshot_proto,
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
@@ -44,6 +45,7 @@ use ragnordb_sql::{
 };
 
 use ragnordb_storage::{
+    checkpoint::CapturedMvccState,
     key::{decode_row_key, make_row_key},
     mvcc::InMemoryMvcc,
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit},
@@ -120,7 +122,7 @@ impl DurableCommitLog for InMemoryCommitLog {
     }
 }
 
-/// Local single-node executor for Milestone 2.
+/// Local single-node executor
 ///
 /// Every locally created table receives one dedicated tablet. Using a separate
 /// tablet per table preserves the ownership boundary introduced in Phase 2.6,
@@ -130,6 +132,7 @@ pub struct LocalExecutor {
     tablets: BTreeMap<TableId, LocalTablet>,
     commit_log: SharedCommitLog,
     next_local_catalog_timestamp: u64,
+    replay_from_end_lsn: u64,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -174,6 +177,7 @@ impl LocalExecutor {
             tablets: BTreeMap::new(),
             commit_log,
             next_local_catalog_timestamp: 0,
+            replay_from_end_lsn: 0,
         }
     }
 
@@ -189,6 +193,7 @@ impl LocalExecutor {
         commit_log: SharedCommitLog,
         catalog_log: SharedCatalogLog,
         catalog_timestamp_high_water: Timestamp,
+        replay_from_end_lsn: u64,
     ) -> Result<Self> {
         let catalog_table_ids = catalog
             .list_tables()
@@ -247,6 +252,7 @@ impl LocalExecutor {
             tablets,
             commit_log,
             next_local_catalog_timestamp: catalog_timestamp_high_water.0,
+            replay_from_end_lsn,
         })
     }
 
@@ -256,6 +262,37 @@ impl LocalExecutor {
     /// corresponding tablet creation.
     pub fn catalog(&self) -> &MemoryCatalog {
         self.catalog.catalog()
+    }
+
+    /// Freeze catalog and MVCC state into detached per-table snapshot messages.
+    ///
+    /// `LocalDatabase` invokes this while it exclusively owns the complete
+    /// runtime, which is the same serialized boundary used by commits and
+    /// catalog publication.
+    pub fn capture_snapshot_tables(&self) -> Result<Vec<snapshot_proto::SnapshotTable>> {
+        self.catalog
+            .catalog()
+            .list_tables()
+            .into_iter()
+            .map(|schema| {
+                let coordinator = self.tablets.get(&schema.id).ok_or_else(|| {
+                    Error::CorruptData(format!(
+                        "catalog table {} has no local commit coordinator",
+                        schema.id.0
+                    ))
+                })?;
+
+                let mvcc: CapturedMvccState =
+                    coordinator.participant().storage().capture_snapshot_state();
+
+                Ok(mvcc.into_snapshot_table(schema.to_definition()))
+            })
+            .collect()
+    }
+
+    /// Return the first WAL position not represented by the current state.
+    pub fn replay_from_end_lsn(&self) -> u64 {
+        self.replay_from_end_lsn
     }
 
     /// Execute one logical plan.
@@ -381,7 +418,13 @@ impl LocalExecutor {
             ))
         })?;
 
-        coordinator.commit(transaction, timestamp_allocator)
+        let outcome = coordinator.commit(transaction, timestamp_allocator)?;
+
+        if let Some(extent) = outcome.wal_extent {
+            self.replay_from_end_lsn = self.replay_from_end_lsn.max(extent.end_lsn.as_u64());
+        }
+
+        Ok(outcome)
     }
 
     /// Abort an uncommitted transaction by discarding its buffered mutations.
@@ -439,6 +482,7 @@ impl LocalExecutor {
 
     fn install_catalog_table(&mut self, outcome: CatalogCreateOutcome) -> Result<ExecutionResult> {
         let table_id = outcome.schema.id;
+        let replay_from_end_lsn = outcome.wal_extent.end_lsn;
 
         if self.tablets.contains_key(&table_id) {
             let error = self.catalog.stop_for_recovery(format!(
@@ -468,6 +512,8 @@ impl LocalExecutor {
                 })?;
 
         self.tablets.insert(table_id, coordinator);
+
+        self.replay_from_end_lsn = self.replay_from_end_lsn.max(replay_from_end_lsn);
 
         Ok(ExecutionResult::CreatedTable { table_id })
     }

@@ -45,7 +45,10 @@ use ragnordb_common::{
     codec::{LockRecord, WriteKind, WriteRecord},
     encoding::decode_row,
     ids::{Timestamp, TxnId},
+    proto::snapshot as snapshot_proto,
 };
+
+use crate::checkpoint::CapturedMvccState;
 
 /// Owned range boundaries used for canonical encoded row-key scans.
 type EncodedScanBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -163,6 +166,53 @@ impl InMemoryMvcc {
     /// Construct an empty in-memory MVCC engine.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// clone the complete logical MVCC maps into an immutable snapshot image
+    ///
+    /// the owning database runtime calls this only while holding its serialized
+    /// commit/catalog barrier. Flattening the ordered maps here fixes both the
+    /// state image and its deterministic protobuf ordering before that barrier
+    /// is released
+    pub fn capture_snapshot_state(&self) -> CapturedMvccState {
+        let default_values = self
+            .default
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions.iter().map(move |(start_timestamp, row)| {
+                    snapshot_proto::DefaultValueEntry {
+                        key: key.clone(),
+                        start_timestamp: Some(start_timestamp.to_proto()),
+                        row: row.clone(),
+                    }
+                })
+            })
+            .collect();
+
+        let locks = self
+            .locks
+            .iter()
+            .map(|(key, record)| snapshot_proto::LockEntry {
+                key: key.clone(),
+                record: Some(record.to_proto()),
+            })
+            .collect();
+
+        let writes = self
+            .writes
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions.iter().map(
+                    move |(write_timestamp, record)| snapshot_proto::WriteEntry {
+                        key: key.clone(),
+                        write_timestamp: Some(write_timestamp.to_proto()),
+                        record: Some(record.to_proto()),
+                    },
+                )
+            })
+            .collect();
+
+        CapturedMvccState::new(default_values, locks, writes)
     }
 
     fn read_visible_version(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
