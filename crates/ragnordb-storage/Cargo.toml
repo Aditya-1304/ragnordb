@@ -12,3 +12,6 @@ wal.workspace = true
 bloom-bloom.workspace = true
 prost.workspace = true
 crc32c.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

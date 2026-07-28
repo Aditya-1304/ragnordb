@@ -2,11 +2,15 @@
 //!
 //! currently snapshots are immutable recovery images. A fixed-width envelope
 //! makes each file self identifying before protobuf decoding and protects the
-//! complete logical body with CRC32C. Filesystem publication, consistent-cut
-//! capture, WAL pointer/marker publication, and retention advancement remain
-//! separate for later implementation
+//! complete logical body with CRC32C. Filesystem publication uses a synchronized
+//! temporary file and atomic rename. Consistent-cut capture remains separate
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 use prost::Message;
 use ragnordb_catalog::TableSchema;
@@ -22,6 +26,20 @@ pub const SNAPSHOT_FILE_VERSION: u32 = 1;
 
 /// v1 envelope: magic, version, encoded body length, and body CRC32C
 const SNAPSHOT_HEADER_LENGTH: usize = 8 + 4 + 8 + 4;
+
+/// Data-directory child containing immutable database snapshot files.
+pub const SNAPSHOT_DIRECTORY_NAME: &str = "snapshots";
+
+/// a snapshot file that completed file sync, atomic rename, and directory sync
+#[must_use = "published snapshot metadata is required by WAL pointer publication"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedSnapshotFile {
+    /// portable path stored in the later `SnapshotPointer` WAL record
+    pub relative_path: String,
+
+    /// complete encoded file length used by diagnostics and restore validation
+    pub file_length: u64,
+}
 
 /// detached MVCC image captured from one in memory table
 ///
@@ -57,6 +75,86 @@ impl CapturedMvccState {
             locks: self.locks,
             writes: self.writes,
         }
+    }
+}
+
+/// durably publish a captured snapshot beneath the database data directory
+///
+/// publication uses a temporary file in the same directory as the final file,
+/// making the rename atomic on the target filesystem. Success means:
+///
+/// 1. every encoded byte was written to the temporary file,
+/// 2. the temporary file was synchronized,
+/// 3. it was atomically renamed to the final path,
+/// 4. the snapshot directory was synchronized
+///
+/// no WAL pointer or checkpoint marker is appended here. A returned value is
+/// only the durable-file prerequisite consumed by the next publication slice
+pub fn publish_snapshot_file(
+    data_dir: impl AsRef<Path>,
+    snapshot: &snapshot_proto::DatabaseSnapshot,
+) -> Result<PublishedSnapshotFile> {
+    // validate and encode before touching the filesystem. Invalid caller state
+    // must not leave a temporary file that resembles publication progress
+    let bytes = encode_snapshot_file(snapshot)?;
+    let file_length = u64::try_from(bytes.len()).map_err(|_| Error::SnapshotPublicationFailed {
+        reason: "encoded snapshot length does not fit in u64".to_string(),
+    })?;
+    let data_dir = data_dir.as_ref();
+    let snapshot_dir = data_dir.join(SNAPSHOT_DIRECTORY_NAME);
+
+    fs::create_dir_all(&snapshot_dir).map_err(|source| {
+        publication_io_error("create snapshot directory", &snapshot_dir, source)
+    })?;
+
+    // persist creation of the snapshot directory itself. This is harmless when
+    // the directory already existed and closes the crash window when it did not
+    sync_directory(data_dir)?;
+
+    let final_name = format!("snapshot-{}.ragnor", snapshot.snapshot_id);
+    let temporary_name = format!(".snapshot-{}.ragnor.tmp", snapshot.snapshot_id);
+    let final_path = snapshot_dir.join(&final_name);
+    let temporary_path = snapshot_dir.join(temporary_name);
+    let mut temporary_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary_path)
+        .map_err(|source| {
+            publication_io_error("open temporary snapshot", &temporary_path, source)
+        })?;
+
+    temporary_file.write_all(&bytes).map_err(|source| {
+        publication_io_error("write temporary snapshot", &temporary_path, source)
+    })?;
+    temporary_file.sync_all().map_err(|source| {
+        publication_io_error("sync temporary snapshot", &temporary_path, source)
+    })?;
+
+    // close the writer before rename so publication behaves consistently on
+    // platforms that do not permit renaming an open file
+    drop(temporary_file);
+
+    fs::rename(&temporary_path, &final_path).map_err(|source| {
+        publication_io_error("rename snapshot into place", &final_path, source)
+    })?;
+    sync_directory(&snapshot_dir)?;
+
+    Ok(PublishedSnapshotFile {
+        relative_path: format!("{SNAPSHOT_DIRECTORY_NAME}/{final_name}"),
+        file_length,
+    })
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| publication_io_error("sync directory", path, source))
+}
+
+fn publication_io_error(operation: &str, path: &Path, source: std::io::Error) -> Error {
+    Error::SnapshotPublicationFailed {
+        reason: format!("{operation} at {}: {source}", path.display()),
     }
 }
 

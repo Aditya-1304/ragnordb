@@ -108,6 +108,16 @@ pub enum Error {
         /// diagnostic description of physical recovery failure
         reason: String,
     },
+
+    /// a database snapshot could not be durably published to its final path
+    ///
+    /// The snapshot has not been referenced by WAL yet. Callers must not append
+    /// a `SnapshotPointer` or `CheckpointMarker` after this error
+    #[error("snapshot publication failed: {reason}")]
+    SnapshotPublicationFailed {
+        /// filesystem operation and path that prevented durable publication
+        reason: String,
+    },
 }
 
 /// Standard result type used throughout RagnorDB
