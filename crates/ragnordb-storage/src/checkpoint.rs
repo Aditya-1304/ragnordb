@@ -15,8 +15,14 @@ use std::{
 use prost::Message;
 use ragnordb_catalog::TableSchema;
 use ragnordb_common::{
-    Error, Result, catalog_codec::TableDefinition, proto::snapshot as snapshot_proto,
+    Error, Result,
+    catalog_codec::TableDefinition,
+    ids::{TableId, Timestamp},
+    proto::snapshot as snapshot_proto,
 };
+use wal::lsn::Lsn;
+
+use crate::wal::{CheckpointMarker, DurableCheckpointLog, DurableWalExtent, SnapshotPointer};
 
 /// stable magic prefix identifying a RagnorDB database snapshot file
 pub const SNAPSHOT_FILE_MAGIC: [u8; 8] = *b"RGNRSNP\0";
@@ -34,13 +40,50 @@ pub const SNAPSHOT_DIRECTORY_NAME: &str = "snapshots";
 #[must_use = "published snapshot metadata is required by WAL pointer publication"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedSnapshotFile {
-    /// portable path stored in the later `SnapshotPointer` WAL record
-    pub relative_path: String,
-
-    /// complete encoded file length used by diagnostics and restore validation
-    pub file_length: u64,
+    snapshot_id: u64,
+    snapshot_timestamp: Timestamp,
+    replay_from_lsn: Lsn,
+    relative_path: String,
+    table_ids: BTreeSet<TableId>,
+    file_length: u64,
 }
 
+impl PublishedSnapshotFile {
+    /// stable snapshot identity represented by the durable file
+    pub const fn snapshot_id(&self) -> u64 {
+        self.snapshot_id
+    }
+
+    /// portable path stored in the subsequent `SnapshotPointer`
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    /// complete encoded file length used by diagnostics and restore validation
+    pub const fn file_length(&self) -> u64 {
+        self.file_length
+    }
+}
+
+/// checkpoint whose snapshot pointer and marker are both durably published
+///
+/// the replay frontier becomes eligible for retention only when this value is
+/// returned. Actual segment pruning remains owned by the later retention phase
+#[must_use = "only a published checkpoint permits WAL retention to advance"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedCheckpoint {
+    /// stable identity shared by the snapshot file and both WAL records
+    pub snapshot_id: u64,
+
+    /// first WAL position that recovery must replay after restoring the file
+    pub replay_from_lsn: Lsn,
+
+    /// durable extent occupied by the snapshot pointer
+    pub pointer_extent: DurableWalExtent,
+
+    /// durable extent occupied by the checkpoint marker
+    pub marker_extent: DurableWalExtent,
+}
 /// detached MVCC image captured from one in memory table
 ///
 /// all collections preserve the underlying `BTreeMap` order. The value owns
@@ -100,6 +143,31 @@ pub fn publish_snapshot_file(
     let file_length = u64::try_from(bytes.len()).map_err(|_| Error::SnapshotPublicationFailed {
         reason: "encoded snapshot length does not fit in u64".to_string(),
     })?;
+
+    let snapshot_timestamp = snapshot
+        .snapshot_timestamp
+        .as_ref()
+        .cloned()
+        .map(Timestamp::from_proto)
+        .ok_or_else(|| {
+            Error::InvalidArgument("invalid snapshot: snapshot timestamp is missing".to_string())
+        })?;
+    let table_ids = snapshot
+        .tables
+        .iter()
+        .map(|table| {
+            table
+                .definition
+                .as_ref()
+                .map(|definition| TableId(definition.table_id))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "invalid snapshot: snapshot table definition is missing".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+
     let data_dir = data_dir.as_ref();
     let snapshot_dir = data_dir.join(SNAPSHOT_DIRECTORY_NAME);
 
@@ -141,8 +209,46 @@ pub fn publish_snapshot_file(
     sync_directory(&snapshot_dir)?;
 
     Ok(PublishedSnapshotFile {
+        snapshot_id: snapshot.snapshot_id,
+        snapshot_timestamp,
+        replay_from_lsn: Lsn::new(snapshot.replay_from_lsn),
         relative_path: format!("{SNAPSHOT_DIRECTORY_NAME}/{final_name}"),
+        table_ids,
         file_length,
+    })
+}
+
+/// publish the WAL metadata that makes one durable snapshot a checkpoint
+///
+/// both records are derived from the immutable metadata captured in
+/// `PublishedSnapshotFile`, so the marker cannot drift from its pointer
+/// `DurableCheckpointLog` guarantees pointer-before-marker synchronization
+pub fn publish_checkpoint<L>(
+    log: &L,
+    snapshot_file: &PublishedSnapshotFile,
+) -> Result<PublishedCheckpoint>
+where
+    L: DurableCheckpointLog + ?Sized,
+{
+    let pointer = SnapshotPointer {
+        snapshot_id: snapshot_file.snapshot_id,
+        snapshot_timestamp: snapshot_file.snapshot_timestamp,
+        replay_from_lsn: snapshot_file.replay_from_lsn,
+        relative_path: snapshot_file.relative_path.clone(),
+        table_ids: snapshot_file.table_ids.clone(),
+    };
+    let marker = CheckpointMarker {
+        snapshot_id: snapshot_file.snapshot_id,
+        snapshot_timestamp: snapshot_file.snapshot_timestamp,
+        replay_from_lsn: snapshot_file.replay_from_lsn,
+    };
+    let durable = log.append_checkpoint_records(&pointer, &marker)?;
+
+    Ok(PublishedCheckpoint {
+        snapshot_id: snapshot_file.snapshot_id,
+        replay_from_lsn: snapshot_file.replay_from_lsn,
+        pointer_extent: durable.pointer_extent,
+        marker_extent: durable.marker_extent,
     })
 }
 

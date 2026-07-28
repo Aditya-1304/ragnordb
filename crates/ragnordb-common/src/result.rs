@@ -118,6 +118,29 @@ pub enum Error {
         /// filesystem operation and path that prevented durable publication
         reason: String,
     },
+
+    /// a checkpoint WAL record acquired an extent, but its durable outcome
+    /// cannot be determined without reopening and recovering A-WAL
+    ///
+    /// The live process must not expose a retention-safe checkpoint after this
+    /// error. Retrying could duplicate a record that recovery ultimately keeps
+    #[error(
+        "checkpoint {stage} outcome is unknown for WAL extent \
+         [{start_lsn}, {end_lsn}): {reason}"
+    )]
+    CheckpointOutcomeUnknown {
+        /// checkpoint publication stage whose durability became uncertain
+        stage: &'static str,
+
+        /// first logical WAL position assigned to the staged record
+        start_lsn: u64,
+
+        /// first logical WAL position after the complete staged record
+        end_lsn: u64,
+
+        /// diagnostic description of the durability failure
+        reason: String,
+    },
 }
 
 /// Standard result type used throughout RagnorDB

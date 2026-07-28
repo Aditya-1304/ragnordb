@@ -376,6 +376,47 @@ where
         (**self).append_single_node_commit(commit)
     }
 }
+
+/// exact durable WAL extents assigned to one checkpoint publication pair
+///
+/// this value is returned only after both the snapshot pointer and its matching
+/// checkpoint marker have reached A-WAL's durable frontier
+#[must_use = "checkpoint WAL extents prove the complete publication boundary"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableCheckpointExtents {
+    /// durable extent assigned to the snapshot pointer
+    pub pointer_extent: DurableWalExtent,
+
+    /// durable extent assigned to the matching checkpoint marker
+    pub marker_extent: DurableWalExtent,
+}
+
+/// semantic durability boundary for publishing checkpoint WAL metadata
+///
+/// implementations must validate both records before WAL admission, append and
+/// synchronize the pointer first, then append and synchronize the marker
+pub trait DurableCheckpointLog {
+    /// durably append one exactly matching pointer and marker pair
+    fn append_checkpoint_records(
+        &self,
+        pointer: &SnapshotPointer,
+        marker: &CheckpointMarker,
+    ) -> Result<DurableCheckpointExtents>;
+}
+
+impl<T> DurableCheckpointLog for Arc<T>
+where
+    T: DurableCheckpointLog + ?Sized,
+{
+    fn append_checkpoint_records(
+        &self,
+        pointer: &SnapshotPointer,
+        marker: &CheckpointMarker,
+    ) -> Result<DurableCheckpointExtents> {
+        (**self).append_checkpoint_records(pointer, marker)
+    }
+}
+
 /// durable storage adapter between RagnorDB records and A-WAL
 ///
 /// transaction and SQL layers provide semantic RagnorDB records. This adapter
@@ -452,6 +493,58 @@ where
     }
 }
 
+impl<D, C> DurableCheckpointLog for RagnorDbWalAdapter<D, C>
+where
+    D: SegmentDirectory + Clone,
+{
+    fn append_checkpoint_records(
+        &self,
+        pointer: &SnapshotPointer,
+        marker: &CheckpointMarker,
+    ) -> Result<DurableCheckpointExtents> {
+        if pointer.snapshot_id != marker.snapshot_id
+            || pointer.snapshot_timestamp != marker.snapshot_timestamp
+            || pointer.replay_from_lsn != marker.replay_from_lsn
+        {
+            return Err(Error::InvalidArgument(
+                "checkpoint marker must exactly match its snapshot pointer identity, \
+                 timestamp, and replay boundary"
+                    .to_string(),
+            ));
+        }
+
+        // encode and validate both records before admitting either record to
+        // A-WAL. Invalid marker metadata must not leave an orphan pointer
+        let pointer_payload = pointer.encode()?;
+        let marker_payload = marker.encode()?;
+        let pointer_extent = self
+            .wal
+            .append_and_sync(
+                RagnorDbWalRecordType::SnapshotPointer.as_wal_record_type(),
+                &pointer_payload,
+            )
+            .map_err(|failure| map_checkpoint_append_failure(failure, "SnapshotPointer"))?;
+        let marker_extent = self
+            .wal
+            .append_and_sync(
+                RagnorDbWalRecordType::CheckpointMarker.as_wal_record_type(),
+                &marker_payload,
+            )
+            .map_err(|failure| map_checkpoint_append_failure(failure, "CheckpointMarker"))?;
+
+        Ok(DurableCheckpointExtents {
+            pointer_extent: DurableWalExtent {
+                start_lsn: pointer_extent.start_lsn,
+                end_lsn: pointer_extent.end_lsn,
+            },
+            marker_extent: DurableWalExtent {
+                start_lsn: marker_extent.start_lsn,
+                end_lsn: marker_extent.end_lsn,
+            },
+        })
+    }
+}
+
 impl<D, C> DurableCatalogLog for RagnorDbWalAdapter<D, C>
 where
     D: SegmentDirectory + Clone,
@@ -488,6 +581,21 @@ fn map_catalog_append_failure(failure: AppendFailure) -> Error {
         },
 
         AppendFailure::OutcomeUnknown { extent, source } => Error::CatalogOutcomeUnknown {
+            start_lsn: extent.start_lsn.as_u64(),
+            end_lsn: extent.end_lsn.as_u64(),
+            reason: source.to_string(),
+        },
+    }
+}
+
+fn map_checkpoint_append_failure(failure: AppendFailure, stage: &'static str) -> Error {
+    match failure {
+        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
+            reason: format!("checkpoint {stage} append failed before staging: {source}"),
+        },
+
+        AppendFailure::OutcomeUnknown { extent, source } => Error::CheckpointOutcomeUnknown {
+            stage,
             start_lsn: extent.start_lsn.as_u64(),
             end_lsn: extent.end_lsn.as_u64(),
             reason: source.to_string(),

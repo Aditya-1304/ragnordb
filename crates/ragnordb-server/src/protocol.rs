@@ -212,6 +212,13 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
              required before retrying",
             false,
         ),
+
+        Error::CheckpointOutcomeUnknown { .. } => error_response(
+            "CHECKPOINT_OUTCOME_UNKNOWN",
+            "checkpoint outcome is unknown; reopen and recovery are \
+             required before retrying or advancing WAL retention",
+            false,
+        ),
     }
 }
 

@@ -49,7 +49,7 @@ fn snapshot_publication_replaces_crash_leftovers_with_complete_final_file() {
     let expected = empty_snapshot(7);
     let published = publish_snapshot_file(data_dir.path(), &expected)
         .expect("snapshot publication must succeed");
-    let final_path = data_dir.path().join(&published.relative_path);
+    let final_path = data_dir.path().join(published.relative_path());
     let final_bytes = fs::read(&final_path).expect("published snapshot must be readable");
     let decoded =
         decode_snapshot_file(&final_bytes).expect("published snapshot must be complete and valid");
@@ -62,8 +62,9 @@ fn snapshot_publication_replaces_crash_leftovers_with_complete_final_file() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(published.relative_path, "snapshots/snapshot-7.ragnor");
-    assert_eq!(published.file_length, final_bytes.len() as u64);
+    assert_eq!(published.snapshot_id(), 7);
+    assert_eq!(published.relative_path(), "snapshots/snapshot-7.ragnor");
+    assert_eq!(published.file_length(), final_bytes.len() as u64);
     assert_eq!(decoded, expected);
     assert_eq!(remaining_names, vec!["snapshot-7.ragnor"]);
 }
