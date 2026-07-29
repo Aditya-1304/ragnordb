@@ -1,13 +1,13 @@
 //! read only operational inspection for persisted RagnorDB artifacts
 //!
-//! A-WAL remains responsible for physical record framing, checksum validation,
-//! and recovery reporting. This module only interprets valid RagnorDB-owned
-//! payloads after A-WAL has established the physically readable WAL prefix
+//! A-WAL owns physical record framing, checksums, and recoverable-prefix
+//! detection. This module prints A-WAL's structured recovery report, then
+//! decodes only RagnorDB-owned user records for operator diagnostics
 
 use std::{error::Error as StdError, io, path::Path};
 
 use ragnordb_common::{command_codec::CatalogOperation, ids::NodeId};
-use ragnordb_storage::recovery::{DecodedRecoveryRecord, RecoveryPayload, scan_recovery_records};
+use ragnordb_storage::recovery::{DecodedRecoveryRecord, RecoveryPayload, decode_recovery_record};
 use wal::{
     config::WalConfig,
     io::directory::FsSegmentDirectory,
@@ -16,13 +16,13 @@ use wal::{
     wal::{WalHandle, report::RecoveryReport},
 };
 
-/// inspects one local node RagnorDB WAL without starting the SQL server
+/// inspect one local node's RagnorDB WAL without starting the SQL server
 ///
-/// The inspector opens A-WAL in read-only mode so running an operational
-/// diagnostic cannot append records, clear a clean-shutdown witness, or repair
-/// a truncatable tail. A-WAL's structured recovery report is printed before
-/// semantic record decoding begins, preserving physical diagnostics when a
-/// later RagnorDB payload is malformed
+/// the inspector opens A-WAL read-only: it cannot append records, clear a
+/// clean-shutdown witness, or repair a truncatable tail. Physical A-WAL
+/// diagnostics are printed before semantic decoding begins. A malformed
+/// RagnorDB payload is reported and contributes to a non-zero process exit,
+/// but does not prevent inspection of later physically valid records
 pub fn run_wal(data_dir: &Path, node_id: NodeId) -> Result<(), Box<dyn StdError>> {
     if node_id.0 == 0 {
         return Err(io::Error::new(
@@ -46,18 +46,67 @@ pub fn run_wal(data_dir: &Path, node_id: NodeId) -> Result<(), Box<dyn StdError>
     print_physical_recovery_report(&recovery_report);
 
     let first_lsn = recovery_report.first_lsn.unwrap_or(Lsn::ZERO);
-    let mut records = scan_recovery_records(&wal, first_lsn)?;
+
+    // A-WAL intentionally rejects retention pins on read-only handles. Keep
+    // this standalone CLI read-only rather than creating a second mutable WAL
+    // owner. Its current operating boundary is offline inspection; a future
+    // online inspector must obtain a pin from the server-owned WAL handle
+    let mut records = wal.iter_from(first_lsn)?;
+    let mut malformed_payloads = 0_usize;
 
     println!("ragnordb_records:");
 
-    while let Some(record) = records.next_record()? {
-        print_database_record(&record);
+    loop {
+        let attempted_lsn = records.current_lsn();
+        let physical_record = records.next().map_err(|source| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "A-WAL physical iteration failed at LSN {}: {source}",
+                    attempted_lsn.as_u64()
+                ),
+            )
+        })?;
+
+        let Some(physical_record) = physical_record else {
+            break;
+        };
+
+        match decode_recovery_record(
+            physical_record.lsn,
+            physical_record.record_type,
+            &physical_record.payload,
+        ) {
+            Ok(Some(record)) => print_database_record(&record),
+
+            // A-WAL internal records are physically valid but have no
+            // RagnorDB semantic meaning, so the CLI deliberately omits them
+            Ok(None) => {}
+
+            Err(error) => {
+                malformed_payloads += 1;
+
+                println!(
+                    "  malformed_database_payload: lsn={} record_type={} error={error}",
+                    physical_record.lsn.as_u64(),
+                    physical_record.record_type.as_u16(),
+                );
+            }
+        }
     }
 
-    Ok(())
+    if malformed_payloads == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WAL inspection found {malformed_payloads} malformed RagnorDB payload(s)"),
+        )
+        .into())
+    }
 }
 
-/// print A-WAL-owned recovery facts without reimplementing physical WAL logic
+/// print A-WAL-owned recovery facts without duplicating physical WAL logic
 fn print_physical_recovery_report(report: &RecoveryReport) {
     println!("physical_recovery:");
     println!("  segments_scanned: {}", report.segments_scanned);
@@ -78,10 +127,7 @@ fn print_physical_recovery_report(report: &RecoveryReport) {
     );
 }
 
-/// render one already-validated RagnorDB payload as a stable single line entry
-///
-/// internal A-WAL records never reach this function: `scan_recovery_records`
-/// deliberately filters them before RagnorDB semantic decoding
+/// render one validated RagnorDB payload as a stable, single-line entry
 fn print_database_record(record: &DecodedRecoveryRecord) {
     let (record_type, commit_timestamp, table_id, summary) = match &record.payload {
         RecoveryPayload::CatalogUpdate(update) => {
