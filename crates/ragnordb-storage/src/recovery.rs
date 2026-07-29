@@ -782,16 +782,29 @@ where
 
 /// replay one complete immutable WAL stream into private recovery state
 ///
-/// the state is returned only after the stream reaches its validated end
-/// if phsycisal iteration, semantic decoind catalog installation, dependency
-/// validation or MVCC application fails, the half or partial reconstructed state
-/// dropped and cannot be published accidently
-pub fn replay_recovery_stream<F>(mut stream: RecoveryRecordStream<F>) -> Result<RecoveryState>
+/// the state is returned only after the stream reaches its validated end. If
+/// physical iteration, semantic decoding, catalog installation, dependency
+/// validation, or MVCC application fails, the partially reconstructed state is
+/// dropped and can never be published
+pub fn replay_recovery_stream<F>(stream: RecoveryRecordStream<F>) -> Result<RecoveryState>
 where
     F: SegmentFile,
 {
-    let mut state = RecoveryState::new();
+    replay_recovery_stream_from_state(stream, RecoveryState::new())
+}
 
+/// replay one complete immutable WAL suffix over private restored state
+///
+/// seed comes from a validated checkpoint. It remains private and
+/// is dropped together with every suffix mutation if decoding or application
+/// fails before the stream reaches its validated end
+pub fn replay_recovery_stream_from_state<F>(
+    mut stream: RecoveryRecordStream<F>,
+    mut state: RecoveryState,
+) -> Result<RecoveryState>
+where
+    F: SegmentFile,
+{
     while let Some(record) = stream.next_record()? {
         state.apply_record(&record)?;
     }

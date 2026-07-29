@@ -16,7 +16,10 @@ use std::{fs, path::Path, sync::Arc};
 use ragnordb_common::{Error, Result, ids::NodeId, proto::snapshot as snapshot_proto};
 use ragnordb_exec::{ExecutionResult, LocalExecutor, SqlSession};
 use ragnordb_storage::{
-    recovery::{replay_recovery_stream, scan_recovery_records, select_recovery_checkpoint},
+    recovery::{
+        RecoveryState, load_recovery_checkpoint, replay_recovery_stream_from_state,
+        scan_recovery_records, select_recovery_checkpoint,
+    },
     wal::RagnorDbWalAdapter,
 };
 use ragnordb_txn::{LocalTransactionManager, TransactionManager};
@@ -63,13 +66,9 @@ impl LocalDatabase {
     /// recover a complete local runtime from the node's A-WAL directory
     ///
     /// A-WAL first establishes and repairs its physically valid prefix. RagnorDB
-    /// then validates checkpoint metadata and replays the complete semantic
-    /// stream into private catalog and MVCC state
-    ///
-    /// i will later implement snapshot-file loading, recovery deliberately
-    /// replays from `Lsn::ZERO` even when a matching checkpoint candidate exists.
-    /// Retention cannot yet prune the covered prefix, making full replay the safe
-    /// and authoritative behavior
+    /// then selects and loads the newest published checkpoint when one exists,
+    /// replays its exact WAL suffix into private state, and publishes the
+    /// reconstructed runtime only after every recovery boundary succeeds
     pub fn recover(data_dir: impl AsRef<Path>, node_id: NodeId) -> Result<(Self, RecoveryReport)> {
         if node_id.0 == 0 {
             return Err(Error::Configuration(
@@ -77,7 +76,8 @@ impl LocalDatabase {
             ));
         }
 
-        let wal_dir = data_dir.as_ref().join("wal");
+        let data_dir = data_dir.as_ref();
+        let wal_dir = data_dir.join("wal");
 
         fs::create_dir_all(&wal_dir).map_err(|source| Error::RecoveryFailed {
             reason: format!(
@@ -100,19 +100,52 @@ impl LocalDatabase {
                 reason: format!("failed to open and physically recover A-WAL: {source}"),
             })?;
 
-        // Validate pointer/marker ordering before any recovered state can be
-        // published. The candidate remains informational until Phase 3.4 loads
-        // and validates its referenced snapshot file.
-        let checkpoint_stream = scan_recovery_records(&wal, Lsn::ZERO)?;
+        // recovery must begin at the first retained record rather than
+        // unconditionally at zero. A published checkpoint may have made older
+        // segments eligible for safe removal before this process restarted
+        let first_retained_lsn = recovery_report.first_lsn.unwrap_or(Lsn::ZERO);
 
-        let _checkpoint_candidate = select_recovery_checkpoint(checkpoint_stream)?;
+        let recovery_pin = wal
+            .acquire_retention_pin("ragnordb-startup-recovery", first_retained_lsn)
+            .map_err(|source| Error::RecoveryFailed {
+                reason: format!(
+                    "failed to pin WAL retention at startup LSN {}: {source}",
+                    first_retained_lsn.as_u64()
+                ),
+            })?;
 
-        let replay_stream = scan_recovery_records(&wal, Lsn::ZERO)?;
+        let checkpoint_stream = scan_recovery_records(&wal, first_retained_lsn)?;
+        let checkpoint_candidate = select_recovery_checkpoint(checkpoint_stream)?;
 
-        let recovered_state = replay_recovery_stream(replay_stream)?;
+        let (recovered_state, replay_from_lsn) = match checkpoint_candidate {
+            Some(candidate) => {
+                // loading validates the referenced file's envelope, identity,
+                // encoded length, checksum, metadata, and replay frontier before
+                // any contained state is accepted
+                let loaded = load_recovery_checkpoint(data_dir, &candidate)?;
+                (loaded.state, loaded.replay_from_lsn)
+            }
+
+            None if first_retained_lsn != Lsn::ZERO => {
+                // full replay is impossible once the retained WAL no longer begins
+                // at zero. Starting without a checkpoint would publish incomplete
+                // catalog or MVCC state
+                return Err(Error::RecoveryFailed {
+                    reason: format!(
+                        "retained WAL begins at LSN {}, but no published \
+                     checkpoint can reconstruct the pruned prefix",
+                        first_retained_lsn.as_u64()
+                    ),
+                });
+            }
+
+            None => (RecoveryState::new(), Lsn::ZERO),
+        };
+
+        let replay_stream = scan_recovery_records(&wal, replay_from_lsn)?;
+        let recovered_state = replay_recovery_stream_from_state(replay_stream, recovered_state)?;
 
         let high_water_marks = recovered_state.high_water_marks();
-
         let floors = high_water_marks.checked_allocator_floors()?;
 
         let (mut catalog, mvcc_by_table, recovered_marks) = recovered_state.into_parts();
@@ -125,6 +158,12 @@ impl LocalDatabase {
         )?;
 
         let replay_from_end_lsn = wal.durable_lsn().as_u64();
+
+        // Every recovery reader has reached the immutable durable frontier.
+        // Release its pin before transferring the WAL handle into live runtime
+        // components, which establish their own retention lifetimes.
+        drop(recovery_pin);
+
         let adapter = Arc::new(RagnorDbWalAdapter::new(wal));
 
         let executor = LocalExecutor::from_recovered(
@@ -136,8 +175,8 @@ impl LocalDatabase {
             replay_from_end_lsn,
         )?;
 
-        // No caller can observe the executor, manager, or WAL handle until every
-        // recovery and construction step above has completed successfully.
+        // No caller can observe the executor, manager, allocator floors, or WAL
+        // handle until every recovery and construction step has succeeded.
         Ok((
             Self {
                 executor,
