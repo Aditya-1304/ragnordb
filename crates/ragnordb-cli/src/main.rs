@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info};
+mod inspect;
 
 #[derive(Parser)]
 #[command(name = "ragnordb", about = "Distributed OLTP SQL Database")]
@@ -63,6 +64,26 @@ enum Commands {
         #[arg(long)]
         admin_addr: Option<SocketAddr>,
     },
+
+    /// inspect persisted RagnorDB state without starting a database server.
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum InspectCommands {
+    /// Inspect the node-local A-WAL and decode RagnorDB-owned records.
+    Wal {
+        /// Directory containing the node's `wal/` directory.
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+
+        /// Stable node identity used to open this node's A-WAL.
+        #[arg(long, default_value = "1")]
+        node_id: u64,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +108,11 @@ async fn main() {
         } => run_node(config, id, &data_dir, listen, admin_listen, max_connections).await,
         Commands::Sql { addr } => run_sql(addr).await,
         Commands::Status { addr, admin_addr } => run_status(addr, admin_addr).await,
+        Commands::Inspect { command } => match command {
+            InspectCommands::Wal { data_dir, node_id } => {
+                inspect::run_wal(&data_dir, NodeId(node_id))
+            }
+        },
     };
 
     if let Err(e) = result {

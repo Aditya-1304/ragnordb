@@ -1221,12 +1221,16 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ragnordb-common",
+ "ragnordb-exec",
  "ragnordb-server",
+ "ragnordb-storage",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wal",
 ]
 
 [[package]]
