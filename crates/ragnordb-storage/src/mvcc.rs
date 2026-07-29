@@ -44,7 +44,7 @@ use ragnordb_common::{
     Error, Result,
     codec::{LockRecord, WriteKind, WriteRecord},
     encoding::decode_row,
-    ids::{Timestamp, TxnId},
+    ids::{TableId, Timestamp, TxnId},
     proto::snapshot as snapshot_proto,
 };
 
@@ -162,6 +162,16 @@ pub struct InMemoryMvcc {
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
 }
 
+/// MVCC state reconstructed from one validated snapshot table
+///
+/// the observed maxima are compared with the snapshot's declared allocator
+/// high-water marks before recovery may publish the restored state
+pub(crate) struct RestoredMvccState {
+    pub(crate) storage: InMemoryMvcc,
+    pub(crate) max_transaction_id: TxnId,
+    pub(crate) max_timestamp: Timestamp,
+}
+
 impl InMemoryMvcc {
     /// Construct an empty in-memory MVCC engine.
     pub fn new() -> Self {
@@ -213,6 +223,166 @@ impl InMemoryMvcc {
             .collect();
 
         CapturedMvccState::new(default_values, locks, writes)
+    }
+
+    /// Reconstruct one table's complete MVCC maps from snapshot entries.
+    ///
+    /// Duplicate map keys, cross-table row keys, malformed rows, invalid
+    /// records, and `Put` writes without their referenced default value are
+    /// rejected before the state can enter recovery staging.
+    pub(crate) fn from_snapshot_table(
+        table_id: TableId,
+        table: &snapshot_proto::SnapshotTable,
+    ) -> Result<RestoredMvccState> {
+        let mut storage = Self::new();
+        let mut max_transaction_id = TxnId(0);
+        let mut max_timestamp = Timestamp(0);
+
+        for entry in &table.default_values {
+            validate_snapshot_row_key(table_id, &entry.key, "default value")?;
+
+            let start_timestamp = entry
+                .start_timestamp
+                .as_ref()
+                .cloned()
+                .map(Timestamp::from_proto)
+                .ok_or_else(|| {
+                    Error::CorruptData(
+                        "snapshot default value is missing its start timestamp".to_string(),
+                    )
+                })?;
+
+            if start_timestamp.0 == 0 {
+                return Err(Error::CorruptData(
+                    "snapshot default value contains reserved timestamp 0".to_string(),
+                ));
+            }
+
+            decode_row(&entry.row).map_err(|source| {
+                Error::CorruptData(format!(
+                    "snapshot default value contains an invalid encoded row: {source}"
+                ))
+            })?;
+
+            let previous = storage
+                .default
+                .entry(entry.key.clone())
+                .or_default()
+                .insert(start_timestamp, entry.row.clone());
+
+            if previous.is_some() {
+                return Err(Error::CorruptData(format!(
+                    "snapshot contains duplicate default value for table {} at \
+                     start timestamp {}",
+                    table_id.0, start_timestamp.0
+                )));
+            }
+
+            max_timestamp = Timestamp(max_timestamp.0.max(start_timestamp.0));
+        }
+
+        for entry in &table.locks {
+            validate_snapshot_row_key(table_id, &entry.key, "lock")?;
+
+            let record = entry
+                .record
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::CorruptData("snapshot lock record is missing".to_string()))
+                .and_then(|record| {
+                    LockRecord::from_proto(record).map_err(|message| {
+                        Error::CorruptData(format!("snapshot lock record is invalid: {message}"))
+                    })
+                })?;
+
+            if record.txn_id.0 == 0 || record.start_timestamp.0 == 0 {
+                return Err(Error::CorruptData(
+                    "snapshot lock contains a reserved transaction ID or timestamp 0".to_string(),
+                ));
+            }
+
+            if storage
+                .locks
+                .insert(entry.key.clone(), record.clone())
+                .is_some()
+            {
+                return Err(Error::CorruptData(format!(
+                    "snapshot contains duplicate lock for table {}",
+                    table_id.0
+                )));
+            }
+
+            max_transaction_id = TxnId(max_transaction_id.0.max(record.txn_id.0));
+            max_timestamp = Timestamp(max_timestamp.0.max(record.start_timestamp.0));
+        }
+
+        for entry in &table.writes {
+            validate_snapshot_row_key(table_id, &entry.key, "write")?;
+
+            let write_timestamp = entry
+                .write_timestamp
+                .as_ref()
+                .cloned()
+                .map(Timestamp::from_proto)
+                .ok_or_else(|| {
+                    Error::CorruptData("snapshot write is missing its write timestamp".to_string())
+                })?;
+            let record = entry
+                .record
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::CorruptData("snapshot write record is missing".to_string()))
+                .and_then(|record| {
+                    WriteRecord::from_proto(record).map_err(|message| {
+                        Error::CorruptData(format!("snapshot write record is invalid: {message}"))
+                    })
+                })?;
+
+            validate_write_record(write_timestamp, &record)?;
+
+            let previous = storage
+                .writes
+                .entry(entry.key.clone())
+                .or_default()
+                .insert(write_timestamp, record.clone());
+
+            if previous.is_some() {
+                return Err(Error::CorruptData(format!(
+                    "snapshot contains duplicate write for table {} at timestamp {}",
+                    table_id.0, write_timestamp.0
+                )));
+            }
+
+            max_timestamp = Timestamp(
+                max_timestamp
+                    .0
+                    .max(record.start_timestamp.0)
+                    .max(write_timestamp.0),
+            );
+        }
+
+        for (key, versions) in &storage.writes {
+            for record in versions.values() {
+                if record.op == WriteKind::Put
+                    && !storage
+                        .default
+                        .get(key)
+                        .is_some_and(|values| values.contains_key(&record.start_timestamp))
+                {
+                    return Err(Error::CorruptData(format!(
+                        "snapshot Put for table {} references missing default value \
+                         at start timestamp {}",
+                        table_id.0, record.start_timestamp.0
+                    )));
+                }
+            }
+        }
+
+        Ok(RestoredMvccState {
+            storage,
+            max_transaction_id,
+            max_timestamp,
+        })
     }
 
     fn read_visible_version(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
@@ -617,6 +787,23 @@ impl MvccStorage for InMemoryMvcc {
             write_records: self.writes.values().map(BTreeMap::len).sum(),
         }
     }
+}
+
+fn validate_snapshot_row_key(table_id: TableId, key: &[u8], context: &str) -> Result<()> {
+    let row_key = decode_row_key(key).map_err(|source| {
+        Error::CorruptData(format!(
+            "snapshot {context} has an invalid row key: {source}"
+        ))
+    })?;
+
+    if row_key.table_id != table_id {
+        return Err(Error::CorruptData(format!(
+            "snapshot {context} row key belongs to table {}, expected table {}",
+            row_key.table_id.0, table_id.0
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_commit_preflight_metadata(txn_id: TxnId, start_ts: Timestamp) -> Result<()> {

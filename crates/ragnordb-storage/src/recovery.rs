@@ -9,13 +9,19 @@
 //! Later recovery slices can validate complete history before exposing any
 //! reconstructed database state
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use ragnordb_catalog::{Catalog, MemoryCatalog};
 use ragnordb_common::{
     Error, Result,
+    catalog_codec::TableDefinition,
     command_codec::CatalogOperation,
     ids::{TableId, Timestamp, TxnId},
+    proto::snapshot as snapshot_proto,
 };
 use wal::{
     error::WalError,
@@ -26,6 +32,7 @@ use wal::{
 };
 
 use crate::{
+    checkpoint::decode_snapshot_file,
     mvcc::{InMemoryMvcc, Mutation, MvccStorage},
     wal::{
         CatalogUpdate, CheckpointMarker, RagnorDbWalRecordType, SingleNodeTxnCommit,
@@ -78,6 +85,23 @@ pub struct RecoveryCheckpointCandidate {
 
     /// complete snapshot metadata repeated and confirmed by the marker
     pub pointer: SnapshotPointer,
+}
+
+/// validated snapshot state and replay boundary selected for startup recovery
+///
+/// construction proves that the referenced file is readable, checksummed,
+/// semantically valid, and exactly matches the selected WAL metadata
+#[must_use = "loaded checkpoint state must seed WAL suffix replay"]
+#[derive(Debug)]
+pub struct LoadedRecoveryCheckpoint {
+    /// stable identity shared by the file, pointer, and marker
+    pub snapshot_id: u64,
+
+    /// first WAL position not represented by the restored snapshot
+    pub replay_from_lsn: Lsn,
+
+    /// private catalog, MVCC, and allocator state reconstructed from the file
+    pub state: RecoveryState,
 }
 
 /// incremental selector for published RagnorDB checkpoint metadata
@@ -366,6 +390,90 @@ impl RecoveryState {
         Self::default()
     }
 
+    /// reconstruct private recovery state from one validated snapshot body
+    ///
+    /// Catalog definitions and MVCC maps are built independently from the live
+    /// executor. The complete value is returned only after every table and all
+    /// allocator high-water marks have been restored successfully
+    pub fn from_snapshot(snapshot: &snapshot_proto::DatabaseSnapshot) -> Result<Self> {
+        let high_water = snapshot.high_water_marks.as_ref().ok_or_else(|| {
+            Error::CorruptData("snapshot allocator high-water marks are missing".to_string())
+        })?;
+        let max_transaction_id = high_water
+            .max_transaction_id
+            .as_ref()
+            .cloned()
+            .map(TxnId::from_proto)
+            .ok_or_else(|| {
+                Error::CorruptData("snapshot maximum transaction ID is missing".to_string())
+            })?;
+        let max_timestamp = high_water
+            .max_timestamp
+            .as_ref()
+            .cloned()
+            .map(Timestamp::from_proto)
+            .ok_or_else(|| {
+                Error::CorruptData("snapshot maximum timestamp is missing".to_string())
+            })?;
+        let max_table_id = high_water
+            .max_table_id
+            .as_ref()
+            .cloned()
+            .map(TableId::from_proto)
+            .ok_or_else(|| {
+                Error::CorruptData("snapshot maximum table ID is missing".to_string())
+            })?;
+        let mut catalog = MemoryCatalog::new();
+        let mut mvcc_by_table = BTreeMap::new();
+
+        for table in &snapshot.tables {
+            let definition = table
+                .definition
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::CorruptData(
+                        "snapshot table definition is missing during restore".to_string(),
+                    )
+                })
+                .and_then(|definition| {
+                    TableDefinition::from_proto(definition).map_err(|message| {
+                        Error::CorruptData(format!(
+                            "snapshot table definition is invalid during restore: {message}"
+                        ))
+                    })
+                })?;
+            let table_id = TableId(definition.table_id);
+
+            catalog.install_definition(definition).map_err(|source| {
+                Error::CorruptData(format!(
+                    "failed to install snapshot definition for table {}: {source}",
+                    table_id.0
+                ))
+            })?;
+
+            let restored = InMemoryMvcc::from_snapshot_table(table_id, table)?;
+
+            if mvcc_by_table.insert(table_id, restored.storage).is_some() {
+                return Err(Error::CorruptData(format!(
+                    "snapshot contains duplicate restored table {}",
+                    table_id.0
+                )));
+            }
+        }
+
+        Ok(Self {
+            catalog,
+            mvcc_by_table,
+            high_water_marks: RecoveryHighWaterMarks {
+                max_transaction_id,
+                max_timestamp,
+                max_table_id,
+                max_snapshot_id: high_water.max_snapshot_id,
+            },
+        })
+    }
+
     /// Return the catalog reconstructed from durable metadata operations.
     pub fn catalog(&self) -> &MemoryCatalog {
         &self.catalog
@@ -511,6 +619,101 @@ impl RecoveryState {
     ) {
         (self.catalog, self.mvcc_by_table, self.high_water_marks)
     }
+}
+
+/// load the snapshot referenced by one selected pointer/marker pair
+///
+/// recovery must not use the candidate replay boundary until this function has
+/// validated the complete file and matched its identity, timestamp, frontier,
+/// and table set against the durable pointer
+pub fn load_recovery_checkpoint(
+    data_dir: impl AsRef<Path>,
+    candidate: &RecoveryCheckpointCandidate,
+) -> Result<LoadedRecoveryCheckpoint> {
+    candidate.pointer.encode().map_err(|source| {
+        Error::CorruptData(format!(
+            "selected SnapshotPointer is invalid during checkpoint loading: {source}"
+        ))
+    })?;
+
+    if candidate.pointer.replay_from_lsn > candidate.pointer_lsn {
+        return Err(Error::CorruptData(format!(
+            "selected SnapshotPointer for snapshot {} claims future replay \
+             boundary {} beyond pointer LSN {}",
+            candidate.pointer.snapshot_id,
+            candidate.pointer.replay_from_lsn.as_u64(),
+            candidate.pointer_lsn.as_u64()
+        )));
+    }
+
+    let snapshot_path = data_dir.as_ref().join(&candidate.pointer.relative_path);
+    let bytes = fs::read(&snapshot_path).map_err(|source| Error::RecoveryFailed {
+        reason: format!(
+            "failed to read selected snapshot {}: {source}",
+            snapshot_path.display()
+        ),
+    })?;
+    let snapshot = decode_snapshot_file(&bytes)?;
+    let snapshot_timestamp = snapshot
+        .snapshot_timestamp
+        .as_ref()
+        .cloned()
+        .map(Timestamp::from_proto)
+        .ok_or_else(|| Error::CorruptData("selected snapshot timestamp is missing".to_string()))?;
+    let snapshot_table_ids = snapshot
+        .tables
+        .iter()
+        .map(|table| {
+            table
+                .definition
+                .as_ref()
+                .map(|definition| TableId(definition.table_id))
+                .ok_or_else(|| {
+                    Error::CorruptData("selected snapshot table definition is missing".to_string())
+                })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+
+    if snapshot.snapshot_id != candidate.pointer.snapshot_id {
+        return Err(Error::CorruptData(format!(
+            "selected SnapshotPointer identifies snapshot ID {}, but file {} \
+             contains snapshot ID {}",
+            candidate.pointer.snapshot_id,
+            snapshot_path.display(),
+            snapshot.snapshot_id
+        )));
+    }
+
+    if snapshot_timestamp != candidate.pointer.snapshot_timestamp {
+        return Err(Error::CorruptData(format!(
+            "selected snapshot {} timestamp {} does not match pointer timestamp {}",
+            snapshot.snapshot_id, snapshot_timestamp.0, candidate.pointer.snapshot_timestamp.0
+        )));
+    }
+
+    if Lsn::new(snapshot.replay_from_lsn) != candidate.pointer.replay_from_lsn {
+        return Err(Error::CorruptData(format!(
+            "selected snapshot {} replay boundary {} does not match pointer boundary {}",
+            snapshot.snapshot_id,
+            snapshot.replay_from_lsn,
+            candidate.pointer.replay_from_lsn.as_u64()
+        )));
+    }
+
+    if snapshot_table_ids != candidate.pointer.table_ids {
+        return Err(Error::CorruptData(format!(
+            "selected snapshot {} table identities do not match its SnapshotPointer",
+            snapshot.snapshot_id
+        )));
+    }
+
+    let state = RecoveryState::from_snapshot(&snapshot)?;
+
+    Ok(LoadedRecoveryCheckpoint {
+        snapshot_id: snapshot.snapshot_id,
+        replay_from_lsn: candidate.pointer.replay_from_lsn,
+        state,
+    })
 }
 
 /// lazy semantic reader over an immutable A-WAL iterator snapshot

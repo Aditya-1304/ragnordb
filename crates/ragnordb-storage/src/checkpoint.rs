@@ -22,7 +22,10 @@ use ragnordb_common::{
 };
 use wal::lsn::Lsn;
 
-use crate::wal::{CheckpointMarker, DurableCheckpointLog, DurableWalExtent, SnapshotPointer};
+use crate::{
+    mvcc::InMemoryMvcc,
+    wal::{CheckpointMarker, DurableCheckpointLog, DurableWalExtent, SnapshotPointer},
+};
 
 /// stable magic prefix identifying a RagnorDB database snapshot file
 pub const SNAPSHOT_FILE_MAGIC: [u8; 8] = *b"RGNRSNP\0";
@@ -395,9 +398,10 @@ fn validate_snapshot(
         .as_ref()
         .ok_or_else(|| invalid("maximum table ID is missing".to_string()))?;
 
-    if high_water.max_transaction_id.is_none() {
-        return Err(invalid("maximum transaction ID is missing".to_string()));
-    }
+    let max_transaction_id = high_water
+        .max_transaction_id
+        .as_ref()
+        .ok_or_else(|| invalid("maximum transaction ID is missing".to_string()))?;
 
     if high_water.max_snapshot_id < snapshot.snapshot_id {
         return Err(invalid(format!(
@@ -436,6 +440,31 @@ fn validate_snapshot(
             return Err(invalid(format!(
                 "table-ID high-water mark {} is below captured table ID {}",
                 max_table_id.id, schema.id.0
+            )));
+        }
+
+        let restored = InMemoryMvcc::from_snapshot_table(schema.id, table)
+            .map_err(|source| invalid(format!("invalid table MVCC state: {source}")))?;
+
+        if max_transaction_id.id < restored.max_transaction_id.0 {
+            return Err(invalid(format!(
+                "transaction-ID high-water mark {} is below captured lock \
+                 transaction ID {}",
+                max_transaction_id.id, restored.max_transaction_id.0
+            )));
+        }
+
+        if max_timestamp.id < restored.max_timestamp.0 {
+            return Err(invalid(format!(
+                "timestamp high-water mark {} is below captured MVCC timestamp {}",
+                max_timestamp.id, restored.max_timestamp.0
+            )));
+        }
+
+        if snapshot_timestamp.id < restored.max_timestamp.0 {
+            return Err(invalid(format!(
+                "snapshot timestamp {} is below captured MVCC timestamp {}",
+                snapshot_timestamp.id, restored.max_timestamp.0
             )));
         }
     }
