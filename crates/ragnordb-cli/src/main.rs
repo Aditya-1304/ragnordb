@@ -74,13 +74,16 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum InspectCommands {
-    /// Inspect the node-local A-WAL and decode RagnorDB-owned records.
+    /// inspect an offline node local A-WAL
+    ///
+    /// Stop the RagnorDB server first. This standalone command is read-only
+    /// and cannot hold the server process's retention pin
     Wal {
-        /// Directory containing the node's `wal/` directory.
+        /// directory containing the node's `wal/` directory
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
 
-        /// Stable node identity used to open this node's A-WAL.
+        /// stable node identity used to open this node's A-WAL
         #[arg(long, default_value = "1")]
         node_id: u64,
     },
