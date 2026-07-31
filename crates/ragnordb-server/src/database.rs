@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::data_directory_lock::DataDirectoryLock;
 use ragnordb_common::{Error, Result, ids::NodeId, proto::snapshot as snapshot_proto};
 use ragnordb_exec::{ExecutionResult, LocalExecutor, SqlSession};
 use ragnordb_storage::{
@@ -78,6 +79,7 @@ pub struct LocalDatabase {
     data_dir: Option<PathBuf>,
     checkpoint_adapter: Option<Arc<LocalWalAdapter>>,
     checkpoint_publication_lock: Arc<Mutex<()>>,
+    data_directory_lock: Option<DataDirectoryLock>,
 }
 
 impl fmt::Debug for LocalDatabase {
@@ -89,6 +91,7 @@ impl fmt::Debug for LocalDatabase {
             .field("next_snapshot_id", &self.next_snapshot_id)
             .field("data_dir", &self.data_dir)
             .field("has_checkpoint_adapter", &self.checkpoint_adapter.is_some())
+            .field("owns_data_directory", &self.data_directory_lock.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -102,6 +105,7 @@ impl Default for LocalDatabase {
             data_dir: None,
             checkpoint_adapter: None,
             checkpoint_publication_lock: Arc::new(Mutex::new(())),
+            data_directory_lock: None,
         }
     }
 }
@@ -126,6 +130,19 @@ impl LocalDatabase {
         }
 
         let data_dir = data_dir.as_ref().to_path_buf();
+
+        // the directory must exist before its persistent lock file can be opened
+        // ownership is acquired before A-WAL is opened, preventing two database
+        // runtimes or an offline inspector from overlapping storage lifetimes
+        fs::create_dir_all(&data_dir).map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to create data directory {}: {}",
+                data_dir.display(),
+                source
+            ),
+        })?;
+
+        let data_directory_lock = DataDirectoryLock::acquire(&data_dir)?;
         let wal_dir = data_dir.join("wal");
 
         fs::create_dir_all(&wal_dir).map_err(|source| Error::RecoveryFailed {
@@ -228,6 +245,7 @@ impl LocalDatabase {
                 data_dir: Some(data_dir),
                 checkpoint_adapter: Some(adapter),
                 checkpoint_publication_lock: Arc::new(Mutex::new(())),
+                data_directory_lock: Some(data_directory_lock),
             },
             recovery_report,
         ))

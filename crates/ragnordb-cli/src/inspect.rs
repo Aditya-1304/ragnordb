@@ -7,6 +7,7 @@
 use std::{error::Error as StdError, io, path::Path};
 
 use ragnordb_common::{command_codec::CatalogOperation, ids::NodeId};
+use ragnordb_server::data_directory_lock::DataDirectoryLock;
 use ragnordb_storage::recovery::{DecodedRecoveryRecord, RecoveryPayload, decode_recovery_record};
 use wal::{
     config::WalConfig,
@@ -31,6 +32,12 @@ pub fn run_wal(data_dir: &Path, node_id: NodeId) -> Result<(), Box<dyn StdError>
         )
         .into());
     }
+
+    // offline inspection requires the same exclusive ownership used by the live
+    // server. The guard remains in scope until physical iteration and semantic
+    // decoding have both completed, so checkpoint retention cannot change the
+    // inspected segment set during this command
+    let _data_directory_lock = DataDirectoryLock::acquire(data_dir)?;
 
     let wal_dir = data_dir.join("wal");
     let wal_config = WalConfig {

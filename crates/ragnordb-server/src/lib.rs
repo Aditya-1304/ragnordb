@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod build_info;
 pub mod config;
+pub mod data_directory_lock;
 pub mod database;
 pub mod metrics;
 pub mod protocol;

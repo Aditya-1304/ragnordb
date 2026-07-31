@@ -27,6 +27,86 @@ fn open_wal_for_write(data_dir: &Path, node_id: NodeId) -> WalHandle<FsSegmentDi
 
 /// Realistic bug caught:
 ///
+/// The standalone inspector could open A-WAL read-only while a live database
+/// owned the same directory. Read-only mode prevents the inspector from mutating
+/// WAL, but it does not prevent the server from advancing retention and removing
+/// segments while inspection is in progress.
+///
+/// The inspector must therefore reject a live data directory and succeed only
+/// after the database owner releases its process-lifetime lock.
+#[test]
+fn inspect_wal_requires_exclusive_offline_data_directory_ownership() {
+    let data_dir = tempfile::tempdir().expect("temporary database directory must be created");
+    let node_id = NodeId(19);
+
+    let (mut database, _) =
+        LocalDatabase::recover(data_dir.path(), node_id).expect("empty database must recover");
+    let mut session = SqlSession::new();
+
+    database
+        .execute_sql(
+            &mut session,
+            "CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+        )
+        .expect("catalog update must become durable");
+
+    let live_output = Command::new(env!("CARGO_BIN_EXE_ragnordb"))
+        .arg("inspect")
+        .arg("wal")
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--node-id")
+        .arg(node_id.0.to_string())
+        .output()
+        .expect("live-directory inspection command must start");
+
+    let live_stdout = String::from_utf8_lossy(&live_output.stdout);
+    let live_stderr = String::from_utf8_lossy(&live_output.stderr);
+    let live_combined = format!("{live_stdout}\n{live_stderr}");
+
+    assert!(
+        !live_output.status.success(),
+        "inspection must reject a directory owned by the live database\n\
+         stdout:\n{live_stdout}\nstderr:\n{live_stderr}"
+    );
+    assert!(
+        live_combined.contains("already owned by another RagnorDB process"),
+        "inspection failure must explain the exclusive ownership conflict\n\
+         stdout:\n{live_stdout}\nstderr:\n{live_stderr}"
+    );
+
+    drop(session);
+    drop(database);
+
+    let offline_output = Command::new(env!("CARGO_BIN_EXE_ragnordb"))
+        .arg("inspect")
+        .arg("wal")
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--node-id")
+        .arg(node_id.0.to_string())
+        .output()
+        .expect("offline inspection command must start");
+
+    let offline_stdout = String::from_utf8_lossy(&offline_output.stdout);
+    let offline_stderr = String::from_utf8_lossy(&offline_output.stderr);
+
+    assert!(
+        offline_output.status.success(),
+        "inspection must succeed after the live database releases ownership\n\
+         stdout:\n{offline_stdout}\nstderr:\n{offline_stderr}"
+    );
+    assert!(
+        offline_stdout.contains("physical_recovery:"),
+        "offline inspection must print A-WAL recovery diagnostics:\n{offline_stdout}"
+    );
+}
+
+/// Realistic bug caught:
+///
 /// A physical WAL record can have valid A-WAL framing and checksum while its
 /// RagnorDB protobuf payload is malformed. Stopping at that record hides both
 /// the useful corruption diagnostic and later records an operator needs to
