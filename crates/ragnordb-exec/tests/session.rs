@@ -214,7 +214,6 @@ fn explicit_transaction_supports_read_your_writes_and_commit() {
 }
 
 #[test]
-#[test]
 fn explicit_read_only_commit_does_not_allocate_commit_timestamp() {
     let mut executor = LocalExecutor::new();
     let mut manager = LocalTransactionManager::new();

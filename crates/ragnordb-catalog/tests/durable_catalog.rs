@@ -175,7 +175,7 @@ fn invalid_catalog_operation_is_rejected_before_timestamp_and_wal() {
     let log = Arc::new(TestCatalogLog::new());
     let mut catalog = DurableCatalog::new(log.clone());
 
-    catalog
+    let _ = catalog
         .create_table("users", columns(), vec![ColumnId(1)], || Ok(Timestamp(11)))
         .expect("first table creation must succeed");
 

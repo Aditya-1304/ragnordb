@@ -10,7 +10,7 @@ use wal::types::{
     },
 };
 
-//// Freezes the durable numeric identifiers used by RagnorDB records.
+/// Freezes the durable numeric identifiers used by RagnorDB records.
 ///
 /// These identifiers are part of the on-disk compatibility contract. Changing
 /// one after a database has written WAL data would make existing records appear
