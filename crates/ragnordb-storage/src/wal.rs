@@ -25,11 +25,11 @@ use std::{
     sync::Arc,
 };
 use wal::{
-    error::AppendFailure,
+    error::{AppendFailure, WalError},
     io::directory::SegmentDirectory,
     lsn::Lsn,
     types::{RecordType, record_types::USER_MIN},
-    wal::WalHandle,
+    wal::{WalHandle, retention_pin::RetentionPinGuard},
 };
 
 use crate::key::decode_row_key;
@@ -391,6 +391,18 @@ pub struct DurableCheckpointExtents {
     pub marker_extent: DurableWalExtent,
 }
 
+/// retention protection held while a captured snapshot is being published
+///
+/// a snapshot is not a recovery source until its file, `SnapshotPointer`, and
+/// matching `CheckpointMarker` are all durable. Keeping this guard alive
+/// prevents another retention operation from removing WAL history needed if
+/// publication fails before that boundary is reached
+#[must_use = "dropping the guard releases checkpoint publication retention protection"]
+#[derive(Debug)]
+pub struct CheckpointRetentionPin {
+    _guard: RetentionPinGuard,
+}
+
 /// semantic durability boundary for publishing checkpoint WAL metadata
 ///
 /// implementations must validate both records before WAL admission, append and
@@ -436,6 +448,44 @@ where
     /// construct an adapter around the node's serialized A-WAL writer
     pub fn new(wal: WalHandle<D, C>) -> Self {
         Self { wal }
+    }
+
+    /// protect the currently retained WAL prefix during checkpoint publication
+    ///
+    /// the conservative zero-LSN pin is intentional. Snapshot publication is
+    /// infrequent, and correctness requires retaining the pre-checkpoint recovery
+    /// path until both checkpoint metadata records are durable. The pin is
+    /// released immediately before the newly published checkpoint advances the
+    /// retention floors
+    pub fn acquire_checkpoint_retention_pin(&self) -> Result<CheckpointRetentionPin> {
+        let guard = self
+            .wal
+            .acquire_retention_pin("ragnordb-checkpoint-publication", Lsn::ZERO)
+            .map_err(|source| {
+                map_checkpoint_retention_failure("acquire checkpoint publication pin", source)
+            })?;
+
+        Ok(CheckpointRetentionPin { _guard: guard })
+    }
+
+    /// advance WAL retention after a complete checkpoint becomes durable
+    ///
+    /// callers must invoke this only after `publish_checkpoint` has durably
+    /// synchronized the matching `CheckpointMarker`. Active A-WAL retention pins
+    /// may delay physical removal, but the configured floor remains the published
+    /// snapshot's exact replay boundary
+    pub fn advance_checkpoint_retention(&self, replay_from_lsn: Lsn) -> Result<usize> {
+        self.wal
+            .set_min_retention_lsn(replay_from_lsn)
+            .map_err(|source| {
+                map_checkpoint_retention_failure("set checkpoint retention floor", source)
+            })?;
+
+        self.wal
+            .truncate_segments_before(replay_from_lsn)
+            .map_err(|source| {
+                map_checkpoint_retention_failure("prune checkpoint-covered WAL segments", source)
+            })
     }
 
     /// encode and append one atomic single node transaction commit
@@ -571,6 +621,17 @@ fn map_commit_append_failure(failure: AppendFailure) -> Error {
             end_lsn: extent.end_lsn.as_u64(),
             reason: source.to_string(),
         },
+    }
+}
+
+/// convert a failed retention operation into a fail-stop database error
+///
+/// retention mutation happens only after checkpoint publication has entered its
+/// serialized ownership boundary. If A-WAL cannot complete that mutation, the
+/// live process must not continue assuming its storage state is healthy
+fn map_checkpoint_retention_failure(operation: &'static str, source: WalError) -> Error {
+    Error::RecoveryRequired {
+        reason: format!("checkpoint retention operation `{operation}` failed: {source}"),
     }
 }
 
