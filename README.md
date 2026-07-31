@@ -7,11 +7,10 @@ transaction-aware tablets, stores rows under ordered keys with MVCC, and is
 being extended toward a Raft-replicated, sharded database with Percolator-style
 distributed transactions.
 
-The working system today is a real single-node SQL database: the server, wire
-protocol, SQL shell, parser, binder, planner, catalog, executor, transaction
-manager, tablet layer, and in-memory MVCC engine are connected end to end.
-Durability and distribution are the next layers, not simulated features hidden
-behind the current API.
+The working system today is a durable single-node SQL database: the server,
+wire protocol, SQL shell, parser, binder, planner, catalog, executor,
+transaction manager, tablet layer, in-memory MVCC engine, A-WAL commit path,
+checkpoint publication, and startup recovery are connected end to end.
 
 ---
 
@@ -19,28 +18,29 @@ behind the current API.
 
 | Crate | Status | What it provides |
 |---|---|---|
-| `ragnordb-common` | working | Stable IDs, the canonical error model, V1 client framing, row/value types, deterministic storage encoding, and `prost` codecs for catalog, MVCC, tablet commands, and RPC messages |
+| `ragnordb-common` | working | Stable IDs, the canonical error model, V1 client framing, row/value types, deterministic storage encoding, and `prost` schemas for catalog, MVCC, tablet commands, RPC messages, database WAL records, and snapshots |
 | `ragnordb-sql` | working | `sqlparser-rs` adapter, semantic analyzer, binder, typed expressions, wildcard expansion, unsupported-SQL rejection, and parser-independent logical planning |
-| `ragnordb-catalog` | working locally | Immutable schema snapshots, stable table and column identities, deterministic table enumeration, primary-key metadata, and durable `TableDefinition` conversion |
-| `ragnordb-txn` | working locally | Monotonic transaction IDs and timestamps, snapshot start timestamps, deterministic ordered write sets, atomic statement-batch buffering, and a replaceable `TransactionManager` boundary |
-| `ragnordb-storage` | working in memory | Canonical ordered row keys plus an in-memory MVCC engine with `default`, `lock`, and `write` maps, snapshot reads, tombstones, rollback records, and atomic conflict validation |
-| `ragnordb-tablet` | working locally | One-table ownership, point reads, ordered scans, read-your-writes overlays, statement-level mutation batches, and atomic single-tablet commits |
-| `ragnordb-exec` | working | Logical-plan execution, expression evaluation, point-lookup versus scan selection, typed result sets, DML execution, and SQL session transaction policy |
-| `ragnordb-server` | working | Shared database runtime, one session per TCP connection, framed SQL execution, stable JSON responses, connection limits, structured logging, `/status`, and `/metrics` |
-| `ragnordb-cli` | working | `node`, `sql`, and `status` commands, including an interactive request-response SQL shell |
+| `ragnordb-catalog` | working durably | Immutable schema snapshots, stable table and column identities, deterministic table enumeration, primary-key metadata, durable `CatalogUpdate` publication, and recovery-safe allocator restoration |
+| `ragnordb-txn` | working durably | Monotonic transaction IDs and timestamps, snapshot start timestamps, deterministic ordered write sets, complete commit preflight, serialized WAL-before-MVCC commit coordination, and recovery-restored allocator floors |
+| `ragnordb-storage` | working durably | Canonical ordered keys, in-memory MVCC, versioned database WAL records, A-WAL adapters, semantic replay, checksummed snapshot files, checkpoint publication, retention pins, and fail-closed recovery validation |
+| `ragnordb-tablet` | working durably | One-table ownership, point reads, ordered scans, read-your-writes overlays, statement-level mutation batches, and atomic single-tablet commits through the durable coordinator |
+| `ragnordb-exec` | working durably | Logical-plan execution, expression evaluation, access-path selection, typed results, autocommit and explicit transactions, and durable commit/failure integration |
+| `ragnordb-server` | working durably | Exclusive data-directory ownership, private startup recovery, shared database state, live checkpoint publication, framed SQL execution, connection limits, structured logging, `/status`, and `/metrics` |
+| `ragnordb-cli` | working | `node`, `sql`, `status`, and offline `inspect wal` commands, including an interactive request-response SQL shell and decoded database WAL diagnostics |
 | `ragnordb-multiraft` | scaffolded | The future process-level host for the metadata Raft group and many tablet Raft groups |
-| A-WAL | dependency proven | Open, append, sync, read, clean shutdown, and restart recovery are smoke-tested; database commits do not use it yet |
+| A-WAL | integrated | Exact append extents, append-and-sync, typed failure outcomes, segmented recovery, retention pins, and pruning are active in the single-node database durability path |
 | Raft | dependency proven | Node construction and real leader election are smoke-tested; SQL operations do not pass through Raft yet |
 | Bloom Bloom | dependency proven | Serialization and deserialization are smoke-tested; filters enter the database read path when immutable storage segments are introduced |
 
-The current workspace has **296 passing tests** across unit, integration, TCP,
-MVCC, transaction, server, and external-infrastructure smoke suites.
+The complete workspace test suite passes across unit, integration, TCP, MVCC,
+transaction, WAL, checkpoint, recovery, inspection, server, and external-
+infrastructure smoke suites.
 
-The following validation is clean:
+The current functional validation is:
 
 ```bash
 cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
 ---
@@ -165,9 +165,23 @@ SQL protocol:  127.0.0.1:7101
 Admin HTTP:    127.0.0.1:7201
 ```
 
-The data directory is created during startup. At the current milestone it is
-reserved for future WAL, snapshot, and storage files; SQL catalog and row state
-remain in memory.
+The data directory is created during startup and is the durable local database
+identity. It contains the process-ownership lock, A-WAL control state and
+segments, and any published snapshot files:
+
+```text
+data/n1/
+├── .ragnordb.lock
+├── wal/
+│   ├── wal.control
+│   └── <segment-id>_<base-lsn>.wal
+└── snapshots/
+    └── snapshot-<snapshot-id>.ragnor
+```
+
+The live catalog and MVCC maps remain in memory for execution speed, but every
+acknowledged catalog change and data mutation is recoverable from A-WAL or from
+a validated checkpoint plus its WAL suffix.
 
 ### Open the SQL shell
 
@@ -225,8 +239,7 @@ Response:
 Insert rows through autocommit:
 
 ```sql
-INSERT INTO users (id, name, active)
-VALUES (1, 'Ada', true), (2, 'Grace', true);
+INSERT INTO users (id, name, active) VALUES (1, 'Adi', true), (2, 'Mandal', true);
 ```
 
 ```json
@@ -263,12 +276,12 @@ SELECT id, name, active FROM users;
   "rows": [
     [
       1,
-      "Ada",
+      "Adi",
       true
     ],
     [
       2,
-      "Grace",
+      "Mandal",
       true
     ]
   ],
@@ -283,7 +296,7 @@ Use an explicit transaction:
 
 ```sql
 BEGIN;
-UPDATE users SET name = 'Ada Lovelace' WHERE id = 1;
+UPDATE users SET name = 'Aditya Mandal' WHERE id = 1;
 SELECT id, name FROM users WHERE id = 1;
 COMMIT;
 ```
@@ -319,7 +332,26 @@ DELETE FROM users WHERE id = 2;
 Every standalone DML or `SELECT` statement receives a real transaction ID and
 snapshot timestamp. Autocommit is session policy around the same transaction
 and tablet APIs used by explicit transactions; it is not a separate shortcut
-around MVCC.
+around MVCC. Successful standalone mutations are acknowledged only after their
+complete commit record is synchronized through its exact A-WAL `end_lsn`.
+
+Stop the node with `Ctrl+C`, restart it with the same node ID and data
+directory, and run the final `SELECT` again. The table and its committed rows
+are reconstructed before the SQL listener accepts another connection.
+
+Inspect the durable history only while the node is stopped:
+
+```bash
+cargo run -p ragnordb-cli --bin ragnordb -- \
+  inspect wal \
+  --data-dir ./data/n1 \
+  --node-id 1
+```
+
+The inspector prints A-WAL's physical recovery report followed by decoded
+`CatalogUpdate`, `SingleNodeTxnCommit`, `SnapshotPointer`, and
+`CheckpointMarker` records. It is deliberately offline-only: the command must
+acquire the same exclusive data-directory lock held by the live server.
 
 ---
 
@@ -462,13 +494,46 @@ panicking or wrapping.
 - Build information for RagnorDB and its infrastructure dependencies.
 - Graceful admin-server shutdown after `Ctrl+C`.
 
+### Durability and recovery
+
+- Versioned `CatalogUpdate`, `SingleNodeTxnCommit`, `SnapshotPointer`, and
+  `CheckpointMarker` protobuf records.
+- Exact half-open A-WAL append extents `[start_lsn, end_lsn)`.
+- Commit acknowledgement only after synchronization through the exact
+  `end_lsn`.
+- Complete MVCC preflight before any transaction record is appended.
+- WAL-before-MVCC publication for autocommit and explicit transactions.
+- Durable catalog publication before a created table becomes visible.
+- Distinct definitely-not-staged and outcome-unknown failure contracts.
+- Sticky recovery-required state after uncertain mutating I/O.
+- Ordered, idempotent semantic replay of catalog and transaction records.
+- Recovery-restored transaction, timestamp, table, and snapshot allocators.
+- Newest-tail repair without hiding sealed-history corruption.
+- Checksummed snapshot files containing catalog, MVCC, and allocator state.
+- Matching pointer-and-marker checkpoint selection.
+- Live checkpoint publication with retention-pin and pruning ownership.
+- Explicit restart proof that an uncommitted transaction never appears.
+
+### Operational storage safety
+
+- One exclusive process lock per data directory.
+- Recovery completes before SQL and admin listeners are bound.
+- Startup recovery holds a retention pin over its required WAL history.
+- Checkpoint publication pins the captured recovery path until its marker is
+  durable.
+- Standalone WAL inspection opens A-WAL read-only and never repairs data.
+- The offline inspector rejects a directory still owned by a running node.
+- Malformed RagnorDB payloads produce precise diagnostics and a nonzero exit
+  without hiding later physically valid records.
+
 ---
 
 ## Current Architecture
 
 Every connection owns its session, but every connection reaches the same local
-database runtime. The shared runtime owns the catalog, tablets, executor, and
-transaction manager.
+database runtime. The shared runtime owns the catalog, tablets, executor,
+transaction manager, live A-WAL adapter, checkpoint coordinator, and
+process-lifetime data-directory lock.
 
 ```mermaid
 flowchart TD
@@ -483,6 +548,7 @@ flowchart TD
 
     SHARED_DB --> TXN_MANAGER["LocalTransactionManager"]
     SHARED_DB --> EXECUTOR["LocalExecutor"]
+    SHARED_DB --> CHECKPOINT["Live Checkpoint Coordinator"]
 
     SESSION --> PARSER["Parser"]
     PARSER --> AST["sqlparser AST"]
@@ -515,7 +581,23 @@ flowchart TD
     EXECUTOR --> TABLETS["TableId → Local Tablet"]
 
     TABLETS --> TABLET["Target Tablet<br/>One Per Table"]
-    TABLET --> MVCC["In-Memory MVCC<br/>Default + Write + Lock Maps"]
+    TABLET --> PREFLIGHT["Complete MVCC Preflight"]
+    PREFLIGHT --> COMMIT["Serialized Commit Coordinator"]
+    COMMIT --> WAL_ADAPTER["RagnorDB WAL Adapter"]
+    WAL_ADAPTER -->|"append + sync through end_lsn"| AWAL["A-WAL Segments"]
+    AWAL -->|"durable extent"| COMMIT
+    COMMIT --> MVCC["In-Memory MVCC<br/>Default + Write + Lock Maps"]
+
+    DDL --> DURABLE_CATALOG["Durable Catalog Publication"]
+    DURABLE_CATALOG --> WAL_ADAPTER
+
+    CHECKPOINT --> SNAPSHOT["Checksummed Snapshot File"]
+    SNAPSHOT --> WAL_ADAPTER
+
+    STARTUP["Server Startup"] --> RECOVERY["Private Recovery State"]
+    AWAL --> RECOVERY
+    SNAPSHOT --> RECOVERY
+    RECOVERY --> SHARED_DB
 
     MVCC --> OUTCOME{"ExecutionResult<br/>or Error"}
     CATALOG --> OUTCOME
@@ -537,13 +619,19 @@ The runtime is protected by one asynchronous mutex. This serializes physical
 statement execution while still allowing explicit transactions from different
 connections to interleave between statements.
 
-That is a deliberate Milestone 2 tradeoff. It makes catalog publication,
-tablet creation, statement execution, and timestamp allocation deterministic
-without pretending that the local executor is already a concurrent distributed
-storage engine.
+That is a deliberate single-node tradeoff. It makes catalog publication,
+tablet creation, transaction preflight, WAL ordering, MVCC application, and
+timestamp allocation deterministic without pretending that the local executor
+is already a concurrent distributed storage engine.
 
 The mutex is released before the server writes the response. A slow client
 cannot hold the entire database runtime merely because its socket is slow.
+
+Checkpoint capture briefly takes the same state barrier to freeze catalog,
+MVCC, allocator maxima, and the exact replay frontier as one consistent cut.
+The detached snapshot file is then written on Tokio's blocking pool after the
+database mutex is released, allowing later SQL commits to proceed while the
+immutable file is synchronized and published.
 
 Later, each tablet becomes an independently driven state machine and the
 process-level runtime routes operations between tablet actors instead of
@@ -1125,6 +1213,12 @@ WriteConflict
 InvalidArgument
 CorruptData
 Configuration
+WalAppendNotStaged
+CommitOutcomeUnknown
+CatalogOutcomeUnknown
+CheckpointOutcomeUnknown
+RecoveryRequired
+RecoveryFailed
 NotImplemented
 ```
 
@@ -1166,6 +1260,88 @@ propose command
 
 A-WAL provides durable local storage underneath Raft. It does not independently
 decide when a replicated command is committed.
+
+Single-node mode already follows the same singular-authority rule. One
+`SingleNodeTxnCommit` record is the durable commit decision; MVCC is the
+reconstructed applied state. Replicated mode replaces that standalone record
+with the tablet's Raft entry rather than retaining two competing commit logs.
+
+### Durable success follows the exact WAL extent
+
+A-WAL returns the exact half-open logical extent of every appended database
+record:
+
+```text
+[start_lsn, end_lsn)
+```
+
+`start_lsn` identifies the record header. `end_lsn` is A-WAL's logical frontier
+immediately after the complete framing, payload, checksum, and alignment of
+that record. RagnorDB never derives the target from protobuf length and never
+synchronizes only through the starting LSN.
+
+The local commit coordinator returns success only after A-WAL proves
+`durable_lsn >= end_lsn`. It then applies the complete mutation batch to MVCC.
+This ordering makes the durable record authoritative if the process stops
+between synchronization and in-memory publication.
+
+### Preflight happens before durable publication
+
+The coordinator validates the entire transaction before allocating its final
+commit timestamp or appending a commit record. Validation covers transaction
+metadata, tablet ownership, canonical keys and rows, conflicting locks,
+rollbacks, and committed versions newer than the transaction snapshot.
+
+A deterministic rejection therefore produces neither a durable commit record
+nor a partial MVCC mutation. The preflight-through-apply interval is serialized
+so another writer cannot invalidate the checked history before the durable
+record is published locally.
+
+### Outcome unknown is not an ordinary rollback
+
+A-WAL distinguishes a record rejected before staging from one that acquired an
+extent but encountered an I/O failure while becoming durable.
+
+The latter returns `COMMIT_OUTCOME_UNKNOWN`. Recovery may retain or discard the
+record depending on the maximal valid durable prefix, so the server cannot
+truthfully report either success or abort. The transaction is removed from the
+session, the writer enters recovery-required state, and the client must not
+retry the operation as a fresh transaction.
+
+### Recovery remains private until validation succeeds
+
+Startup reconstructs catalog, MVCC, replay frontiers, and allocator maxima in
+private state. It does not publish a `LocalDatabase` or bind client-facing
+listeners while physical WAL recovery, snapshot validation, semantic decoding,
+ordered replay, or allocator restoration is incomplete.
+
+This prevents a session from observing a partially rebuilt catalog or
+allocating an identity from the default zero state. Malformed protobufs,
+unsupported versions, transaction records that precede their catalog, corrupt
+selected snapshots, and allocator overflow all fail startup closed.
+
+### A checkpoint is a file plus a matching WAL pair
+
+A snapshot file alone is not a published checkpoint. RagnorDB first writes and
+synchronizes the complete checksummed image, atomically renames it, and
+synchronizes the snapshots directory. It then appends and synchronizes a
+`SnapshotPointer` followed by an exactly matching `CheckpointMarker`.
+
+Recovery ignores an orphan pointer and selects only a pointer-marker pair whose
+snapshot ID, timestamp, and replay boundary match. WAL retention may advance
+only after that pair is durable. The live checkpoint API owns the retention pin,
+publication ordering, floor advancement, and physical pruning sequence.
+
+### Offline inspection owns the storage lifetime
+
+Read-only mode prevents the inspector itself from modifying A-WAL, but it does
+not prevent another process from deleting retained segments. The server and
+standalone inspector therefore acquire the same exclusive data-directory file
+lock for their complete storage lifetimes.
+
+An online inspection path would need to run through the server-owned WAL handle
+and obtain a server-owned retention pin. Until that path exists,
+`ragnordb inspect wal` fails immediately when the node is running.
 
 ---
 
@@ -1219,13 +1395,13 @@ stateDiagram-v2
     [*] --> Autocommit
 
     Autocommit --> ImplicitTxn: DML or SELECT
-    ImplicitTxn --> Autocommit: success and commit
+    ImplicitTxn --> Autocommit: durable success
     ImplicitTxn --> Autocommit: error and rollback
 
     Autocommit --> ExplicitTxn: BEGIN
     ExplicitTxn --> ExplicitTxn: successful statement
     ExplicitTxn --> ExplicitTxn: statement error
-    ExplicitTxn --> Autocommit: COMMIT
+    ExplicitTxn --> Autocommit: durable COMMIT
     ExplicitTxn --> Autocommit: ROLLBACK
     ExplicitTxn --> [*]: connection closes
 ```
@@ -1310,6 +1486,9 @@ Current client-visible codes:
 | `SQL_PARSE_ERROR` | no | The parser could not construct a valid statement |
 | `INVALID_ARGUMENT` | no | Session state or a logical request invariant is invalid |
 | `CONNECTION_LIMIT` | yes | The server has no free connection permit |
+| `COMMIT_OUTCOME_UNKNOWN` | no | A commit acquired a WAL extent but recovery must determine whether it became durable |
+| `CATALOG_OUTCOME_UNKNOWN` | no | A catalog record acquired a WAL extent but recovery must determine its durable outcome |
+| `CHECKPOINT_OUTCOME_UNKNOWN` | no | Checkpoint publication became uncertain and retention must not advance in the live process |
 | `INTERNAL_ERROR` | no | Internal corruption or configuration detail was intentionally hidden |
 
 ---
@@ -1370,6 +1549,46 @@ timestamp allocation, tablet routing, Raft commit/apply lag, WAL append/sync
 latency, recovery duration, snapshots, MVCC version counts, Bloom-filter skips,
 compaction, and garbage-collection metrics.
 
+### Offline WAL inspection
+
+Stop the node before inspecting its WAL:
+
+```bash
+cargo run -p ragnordb-cli --bin ragnordb -- \
+  inspect wal \
+  --data-dir ./data/n1 \
+  --node-id 1
+```
+
+The command first prints A-WAL's structured physical recovery report:
+
+```text
+physical_recovery:
+  segments_scanned: ...
+  sealed_segments: ...
+  records_scanned: ...
+  corrupt_records_found: ...
+  first_lsn: ...
+  last_valid_lsn: ...
+  next_lsn: ...
+  checkpoint_lsn: ...
+  truncated_bytes: ...
+  clean_shutdown: ...
+```
+
+It then prints validated database records with their LSN, type, table identity,
+commit timestamp, and a decoded summary. A-WAL internal records remain visible
+to physical recovery but are omitted from the database-semantic listing.
+
+The inspector opens A-WAL with `read_only = true` and
+`truncate_tail = false`. It cannot append, synchronize, acquire a mutable WAL
+retention pin, clear the clean-shutdown witness, or repair a damaged tail.
+
+If the data directory is still owned by the server, inspection fails before
+opening A-WAL. If one physical record has a malformed RagnorDB protobuf, the
+command reports its exact LSN and record type, continues listing later valid
+records, and exits nonzero after the best-effort diagnostic pass.
+
 ### TOML configuration
 
 A node can be started from validated TOML:
@@ -1423,11 +1642,22 @@ with:
 - fault injection, metrics, and benchmarks.
 
 
-RagnorDB currently proves that it can open the WAL, append and sync data, read
-records, shut down cleanly, and recover after restart.
+RagnorDB now uses A-WAL as the authoritative single-node commit log. The public
+integration provides:
 
-Milestone 3 adds RagnorDB-specific commit records and makes the WAL part of the
-SQL durability boundary.
+- exact `AppendResult { start_lsn, end_lsn }` durability boundaries;
+- append-and-sync through the complete record extent;
+- definitely-not-staged versus outcome-unknown failure classification;
+- sticky fail-stop behavior after uncertain mutating I/O;
+- RagnorDB-owned record-type mapping and protobuf encoding;
+- ordered startup replay from zero or a selected checkpoint frontier;
+- startup and checkpoint retention pins;
+- checkpoint-owned retention-floor advancement and sealed-segment pruning;
+- read-only physical and semantic inspection through the RagnorDB CLI.
+
+A-WAL owns segment framing, checksums, rollover, physical recovery, and
+retention mechanics. RagnorDB owns database record semantics, commit ordering,
+checkpoint validity, replay rules, and client-visible failure classification.
 
 ### Raft
 
@@ -1483,59 +1713,119 @@ A Bloom result is never proof that a row exists.
 
 ### Database durability today
 
-The SQL database is currently memory-resident.
+The execution state is memory-resident, but acknowledged catalog and MVCC
+changes are durable. Single-node mode uses A-WAL as the authoritative commit
+history and optional snapshot files as validated recovery accelerators.
 
-A successful `COMMIT` makes data visible to other sessions in the same running
-process. It does not make the data durable across process restart.
+A successful mutating statement means:
 
-Stopping and restarting the node loses:
+- the complete operation passed deterministic catalog or MVCC validation;
+- its versioned database record acquired an exact A-WAL extent;
+- A-WAL synchronized through that extent's `end_lsn`;
+- the complete catalog change or mutation batch was published in memory;
+- the server returned success only after those boundaries completed.
 
-- created SQL tables;
-- catalog contents;
-- committed MVCC versions;
-- transaction and timestamp allocator state.
+Stopping and restarting the node preserves:
 
-The `data_dir` currently proves configuration and process setup. It does not
-yet contain the authoritative SQL state.
+- created SQL tables and their stable IDs;
+- committed MVCC puts and delete tombstones;
+- transaction and timestamp allocator progress;
+- table and snapshot allocator progress;
+- the exact replay frontier represented by a selected checkpoint.
 
-This limitation is explicit because “commit” and “durable commit” are different
-guarantees. The current transaction layer proves atomic visibility inside the
-running process; Milestone 3 adds the persistence boundary.
+An explicit transaction that never reaches `COMMIT` remains only in its
+connection's `SqlSession`. It produces no `SingleNodeTxnCommit` and does not
+appear after restart.
 
-### Planned single-node commit path
+### Database WAL records
+
+RagnorDB owns four versioned protobuf payloads above A-WAL's user-record
+boundary:
+
+| Record | Durable meaning |
+|---|---|
+| `CatalogUpdate` | One validated table definition, stable table identity, schema version, and catalog publication timestamp |
+| `SingleNodeTxnCommit` | One transaction ID, start timestamp, commit timestamp, owning table ID, and the complete canonical put/delete mutation batch |
+| `SnapshotPointer` | One synchronized snapshot file, its portable relative path, identity, timestamp, length, covered tables, and WAL replay frontier |
+| `CheckpointMarker` | Durable confirmation that the exactly matching snapshot pointer is a published recovery point |
+
+A-WAL owns the physical record header, checksum, logical LSN, alignment,
+segment rollover, segment seals, and durable frontier. RagnorDB's semantic
+recovery decoder maps only the four database record types above and treats an
+unknown user record type as corruption.
+
+The WAL is not a SQL statement transcript. `SELECT`, `SHOW TABLES`, `BEGIN`,
+`ROLLBACK`, failed statements, read-only commits, and abandoned explicit
+transactions do not produce database commit records.
+
+### Implemented single-node commit path
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as SqlSession
-    participant T as TransactionManager
+    participant T as Commit Coordinator
     participant W as A-WAL
     participant M as MVCC
 
     C->>S: COMMIT
-    S->>T: Validate transaction
+    S->>T: Consume transaction
+    T->>M: Preflight complete batch
+    M-->>T: Validated, no mutation
     T->>T: Allocate commit_ts
-    T->>W: Append complete commit record
-    W->>W: Sync durability boundary
-    W-->>T: Durable
-    T->>M: Apply complete batch
+    T->>W: Append SingleNodeTxnCommit
+    W->>W: Sync through exact end_lsn
+    W-->>T: Durable extent
+    T->>M: Atomically apply complete batch
     M-->>S: Applied
     S-->>C: Success
 ```
 
-The commit record will contain the complete transaction write batch. MVCC state
-will be updated only after the WAL confirms the required sync boundary.
+Read-only commits contain no mutations, allocate no commit timestamp, and write
+no transaction record. Catalog creation follows the same validate, append,
+sync, publish, acknowledge ordering with one `CatalogUpdate` record.
 
-Startup recovery will:
+### Implemented startup recovery
 
-1. open A-WAL;
-2. inspect its recovery report;
-3. load any valid checkpoint or snapshot;
-4. replay catalog records;
-5. replay committed transaction records in order;
-6. rebuild MVCC maps;
-7. refuse to hide sealed-history corruption;
-8. report any intentionally repaired active-tail damage.
+The server acquires exclusive ownership of the data directory and completes
+recovery before binding either client-facing listener:
+
+1. open A-WAL and establish its maximal physically valid durable prefix;
+2. retain A-WAL's physical recovery report for diagnostics;
+3. pin the first retained LSN required by startup;
+4. scan for the newest completely published checkpoint;
+5. validate and restore its snapshot into private recovery state, when present;
+6. replay the exact WAL suffix in increasing LSN order;
+7. require catalog state before applying dependent transaction records;
+8. rebuild catalog and MVCC maps idempotently;
+9. compute allocator floors strictly above all recovered maxima;
+10. construct the live executor, transaction manager, and WAL adapter;
+11. release the startup pin and publish the recovered `LocalDatabase`;
+12. bind admin and SQL listeners.
+
+Corrupt newest-tail bytes may be intentionally truncated by writable A-WAL
+recovery. Corruption in sealed history, malformed database protobufs,
+unsupported versions, impossible record order, invalid selected snapshots, and
+allocator overflow fail startup instead of being silently skipped.
+
+### Implemented checkpoint publication
+
+The live database checkpoint API owns the complete publication and retention
+sequence:
+
+1. serialize against another checkpoint publisher;
+2. acquire a WAL retention pin before fixing the recovery frontier;
+3. capture catalog, MVCC, allocator maxima, and `replay_from_lsn` together;
+4. release the database state lock;
+5. write and synchronize a temporary checksummed snapshot file;
+6. atomically rename the file and synchronize its directory;
+7. append and synchronize `SnapshotPointer`;
+8. append and synchronize the exactly matching `CheckpointMarker`;
+9. release the publication retention pin;
+10. advance the WAL retention floor and prune eligible complete segments.
+
+Snapshot publication exists as a server-owned API. Automatic checkpoint
+scheduling and an admin command for requesting one have not been added yet.
 
 ### Planned replicated commit path
 
@@ -1570,8 +1860,8 @@ command according to the selected durability contract.
 
 ## Failure Semantics Today
 
-Even without crash durability, the current system defines several important
-failure boundaries.
+The current system defines failure boundaries across SQL, transaction state,
+durable publication, recovery, checkpoints, and inspection.
 
 ### Failed implicit statement
 
@@ -1585,8 +1875,15 @@ statements remain attached to the explicit transaction.
 
 ### Failed commit
 
-The transaction is consumed and the session is cleared. The client must begin a
-new transaction before retrying.
+A deterministic preflight failure appends nothing, publishes nothing, consumes
+the transaction, and clears the session. A conflict may be retried only as a
+new transaction with a new snapshot.
+
+If the WAL record acquired an extent but synchronization failed, the server
+returns non-retryable `COMMIT_OUTCOME_UNKNOWN`, clears the transaction, and
+fail-stops subsequent writes until recovery. If WAL durability succeeded but
+MVCC application failed, the engine returns recovery-required rather than
+misreporting a normal abort.
 
 ### Duplicate primary key
 
@@ -1604,12 +1901,40 @@ a missing row.
 
 ### Client disconnect
 
-Connection-local uncommitted writes are dropped. Committed process-local state
-remains available to other connections until the node stops.
+Connection-local uncommitted writes are dropped. They were never appended as a
+commit record and cannot appear after restart. Previously acknowledged commits
+remain in shared MVCC state and durable A-WAL history.
 
 ### Server restart
 
-All current SQL state is lost. Durable database recovery begins in Milestone 3.
+The node acquires exclusive directory ownership, recovers A-WAL, restores the
+newest valid checkpoint when present, replays its exact WAL suffix, restores
+allocator floors, and only then accepts clients. Committed catalog and row
+state survives; an explicit transaction that never committed does not.
+
+### Corrupt newest WAL tail
+
+Writable startup recovery may truncate only the corrupt suffix of the newest
+active segment and reports the repaired bytes. Read-only inspection reports the
+condition without modifying it.
+
+### Corrupt sealed history
+
+Corruption in an older sealed segment is not a repairable crash tail. A-WAL
+fails recovery and leaves the history unchanged.
+
+### Incomplete or corrupt checkpoint
+
+An orphan `SnapshotPointer` without a matching durable marker is ignored. A
+mismatched marker is corruption. If recovery selects a published checkpoint
+whose snapshot file fails identity, length, format, checksum, catalog, MVCC, or
+allocator validation, startup fails closed instead of silently trusting its
+replay boundary.
+
+### Inspector overlap
+
+The standalone inspector fails immediately while a live server owns the same
+data directory. It never races retention or opens a second mutable WAL owner.
 
 ---
 
@@ -1722,16 +2047,30 @@ client frame
   -> access path
   -> canonical key
   -> tablet ownership
-  -> MVCC version
+  -> complete commit preflight
+  -> versioned database WAL record
+  -> exact append extent
+  -> synchronized durability frontier
+  -> atomic MVCC publication
   -> typed response
 ```
 
-The next milestones extend the trace:
+A contributor can also trace process restart through:
 
 ```text
-MVCC mutation
-  -> database WAL record
-  -> restart recovery
+physical A-WAL recovery
+  -> checkpoint selection
+  -> checksummed snapshot restore
+  -> ordered semantic WAL replay
+  -> allocator-floor restoration
+  -> private state validation
+  -> live database publication
+```
+
+The next milestones extend the write trace:
+
+```text
+tablet command
   -> Raft proposal
   -> replicated commit
   -> deterministic apply
@@ -1769,17 +2108,30 @@ That gives RagnorDB several concrete engineering themes:
 | Snapshot reads | Stable within a local transaction |
 | Read-your-writes | Pending puts and deletes overlay point reads and scans |
 | Statement atomicity | A failing statement contributes no partial mutation batch |
-| Commit atomicity | One local tablet applies the complete batch or none |
+| Commit preflight | The complete batch is validated before timestamp allocation or WAL append |
+| Commit durability | Success requires A-WAL durability through the commit record's exact `end_lsn` |
+| Commit atomicity | One local tablet durably records and applies the complete batch or none |
 | Conflict detection | Newer committed writes reject stale conflicting commits |
-| Autocommit | Successful standalone writes commit; failed ones rollback |
-| Explicit transactions | `BEGIN`, `COMMIT`, and `ROLLBACK` maintain connection-local state |
+| Unknown outcome | Post-staging I/O uncertainty is non-retryable and fail-stops writes until recovery |
+| Catalog durability | A table becomes visible only after its `CatalogUpdate` is synchronized |
+| Autocommit | Successful standalone writes commit durably; failed ones rollback |
+| Explicit transactions | `BEGIN`, durable `COMMIT`, and `ROLLBACK` maintain connection-local state |
+| Restart recovery | Committed catalog and row state survives; uncommitted explicit writes do not appear |
+| Replay | Catalog and transaction records are decoded, validated, ordered, and applied idempotently |
+| Allocators | Recovered transaction, timestamp, table, and snapshot identities are never reused |
+| Active-tail recovery | Only a repairable newest WAL suffix may be truncated intentionally |
+| Sealed history | Historical WAL corruption fails recovery and is never hidden |
+| Checkpoint files | Snapshot envelopes are versioned, length-checked, and checksummed |
+| Checkpoint publication | Retention advances only after a durable snapshot and matching pointer-marker pair |
+| Checkpoint restore | Recovery validates the selected snapshot and replays only its exact WAL suffix |
+| Storage ownership | One live server or offline inspector exclusively owns a data directory |
+| WAL inspection | Physical diagnostics and decoded database records are available through a read-only offline CLI |
 | Error protocol | Stable semantic code, message, and retryability |
 | Connection sharing | Sessions share catalog, tablets, IDs, and timestamps |
 | Internal safety | Corruption details are not exposed through client JSON |
 
 ### Explicitly not claimed yet
 
-- committed SQL data surviving restart;
 - Raft-replicated SQL writes;
 - automatic leader routing;
 - cross-tablet atomic transactions;
@@ -1792,6 +2144,9 @@ That gives RagnorDB several concrete engineering themes:
 - online schema changes;
 - PostgreSQL wire compatibility;
 - arbitrary SQL support;
+- automatic checkpoint scheduling;
+- an online WAL inspector;
+- backup, archive, or point-in-time recovery;
 - production-ready security;
 - production readiness.
 
@@ -1832,9 +2187,10 @@ quietly omitted part of the client's SQL.
 
 No RagnorDB database benchmark is published yet.
 
-The current global runtime mutex and in-memory state are optimized for
-correctness and architectural validation, not for a credible comparison against
-CockroachDB, TiKV, Cassandra, or PostgreSQL.
+The current global runtime mutex, synchronous per-commit WAL synchronization,
+and in-memory applied state are optimized for correctness and architectural
+validation, not for a credible comparison against CockroachDB, TiKV, Cassandra,
+or PostgreSQL.
 
 A performance number will be published only with enough context to reproduce
 it.
@@ -1896,14 +2252,25 @@ ragnordb/
 ├── Cargo.lock
 ├── LICENSE
 ├── README.md
-├── plan.md
+├── config/
+│   └── node-1.toml
+├── docs/
+│   ├── architecture.md
+│   ├── raft-integration.md
+│   ├── roadmap.md
+│   ├── storage-format.md
+│   ├── testing.md
+│   ├── transaction-model.md
+│   └── wal-integration.md
 ├── proto/
 │   ├── ids.proto
 │   ├── row.proto
 │   ├── catalog.proto
 │   ├── mvcc.proto
 │   ├── command.proto
-│   └── rpc.proto
+│   ├── rpc.proto
+│   ├── snapshot.proto
+│   └── wal.proto
 ├── crates/
 │   ├── ragnordb-common/
 │   ├── ragnordb-sql/
@@ -1915,9 +2282,6 @@ ragnordb/
 │   ├── ragnordb-multiraft/
 │   ├── ragnordb-server/
 │   └── ragnordb-cli/
-├── wal-readme.md
-├── raft-readme.md
-└── bloomfilter-readme.md
 ```
 
 The crate boundaries are intended to survive later milestones.
@@ -2011,7 +2375,9 @@ Examples:
 | Client response shape | `ragnordb-server::protocol` |
 | Connection behavior | `ragnordb-server` |
 | Consensus hosting | `ragnordb-multiraft` |
-| Durable commit/recovery | future WAL integration modules |
+| Durable commit/recovery | `ragnordb-storage`, `ragnordb-txn`, `ragnordb-exec`, and `ragnordb-server` |
+| Checkpoint publication and restore | `ragnordb-storage` and `ragnordb-server::database` |
+| Offline WAL diagnostics | `ragnordb-cli::inspect` |
 
 Cross-crate changes are sometimes necessary, but the pull request should still
 explain which layer owns the new behavior and why the other changes are
@@ -2303,8 +2669,8 @@ Beyond the current roadmap, possible directions include:
 - agent-oriented database interfaces once the transactional core is proven.
 
 These are not current promises. They describe directions that become meaningful
-only after durability, replication, distributed transactions, and testing are
-solid.
+only after replication, distributed transactions, immutable storage, and
+system-level testing are solid.
 
 ---
 
@@ -2313,7 +2679,9 @@ solid.
 **Correctness is a state transition, not a comment.** A transaction, tablet,
 WAL, and Raft group each own different state. The code should make it possible
 to point to the exact transition that changes a mutation from pending to
-committed, committed to applied, and applied to durable.
+validated, validated to durable, durable to applied, and applied to
+acknowledged. Replicated mode adds the separate Raft committed frontier without
+collapsing these states.
 
 **The authoritative log must be singular.** Single-node mode uses one durable
 database commit record. Replicated mode uses the Raft log. Two competing commit
