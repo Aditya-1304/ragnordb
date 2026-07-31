@@ -141,3 +141,84 @@ fn startup_replays_durable_state_and_restores_allocator_floors() {
         .execute_sql(&mut recovered_session, "ROLLBACK")
         .expect("recovered transaction must roll back");
 }
+
+/// Proves that process restart cannot publish writes from an explicit
+/// transaction that never reached COMMIT.
+///
+/// The SQL session is the sole owner of buffered explicit-transaction writes.
+/// Dropping the session and database models process loss: recovery may rebuild
+/// only state represented by durable commit records.
+#[test]
+fn startup_does_not_recover_an_uncommitted_explicit_transaction() {
+    let test_dir = TestDir::new("uncommitted-restart");
+    let node_id = NodeId(8);
+
+    let (mut first_database, _) = LocalDatabase::recover(test_dir.path(), node_id)
+        .expect("empty database recovery must succeed");
+
+    let mut first_session = SqlSession::new();
+
+    first_database
+        .execute_sql(
+            &mut first_session,
+            "CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+        )
+        .expect("table creation must become durable");
+
+    first_database
+        .execute_sql(&mut first_session, "BEGIN")
+        .expect("explicit transaction must begin");
+
+    first_database
+        .execute_sql(
+            &mut first_session,
+            "INSERT INTO users (id, name) VALUES (1, 'Uncommitted')",
+        )
+        .expect("write must be buffered in the explicit transaction");
+
+    // Confirm that the transaction owns the buffered write before simulating
+    // process loss. This prevents the restart assertion from passing merely
+    // because the INSERT failed to enter the transaction.
+    let transaction_view = result_set(
+        first_database
+            .execute_sql(
+                &mut first_session,
+                "SELECT id, name FROM users WHERE id = 1",
+            )
+            .expect("the transaction must read its own buffered write"),
+    );
+
+    assert_eq!(
+        transaction_view.rows,
+        vec![Row {
+            values: vec![Value::Int(1), Value::Text("Uncommitted".to_string())],
+        }]
+    );
+
+    // No COMMIT or ROLLBACK is issued. Losing both runtime objects models a
+    // process crash with an active explicit transaction.
+    drop(first_session);
+    drop(first_database);
+
+    let (mut recovered_database, _) = LocalDatabase::recover(test_dir.path(), node_id)
+        .expect("database restart recovery must succeed");
+
+    let mut recovered_session = SqlSession::new();
+
+    let recovered_rows = result_set(
+        recovered_database
+            .execute_sql(
+                &mut recovered_session,
+                "SELECT id, name FROM users WHERE id = 1",
+            )
+            .expect("the recovered durable table must remain queryable"),
+    );
+
+    assert!(
+        recovered_rows.rows.is_empty(),
+        "recovery must never publish a write from a transaction that did not commit"
+    );
+}
