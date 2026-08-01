@@ -47,13 +47,18 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Configuration(String),
 
-    /// A-WAL rejected the database record before assigning it a logical extent.
+    /// A-WAL rejected the database record before assigning it a logical extent
     ///
-    /// The logical operation was definitely not staged. The underlying WAL may
-    /// still be fail-stopped when rollover metadata or another mutating internal
-    /// operation failed before the database record itself was assigned space.
+    /// `recovery_required` distinguishes an ordinary admission rejection from a
+    /// record that was not staged because the shared writer is sticky-fatal
     #[error("WAL append was definitely not staged: {reason}")]
-    WalAppendNotStaged { reason: String },
+    WalAppendNotStaged {
+        reason: String,
+
+        /// whether the shared WAL writer requires reopen and recovery despite
+        /// the user record itself being definitely absent
+        recovery_required: bool,
+    },
 
     /// A commit record acquired a WAL extent, but its durable outcome cannot be
     /// determined without reopen and recovery.

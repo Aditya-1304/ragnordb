@@ -71,16 +71,17 @@ impl Server {
 
         let connection_semaphore = Arc::new(Semaphore::new(max_connections as usize));
 
-        let admin_state = Arc::new(AdminState {
-            started_at,
-            connection_semaphore: connection_semaphore.clone(),
-            max_connections,
-        });
-
         // recover the complete runtime before binding client facing listeners
         // no session can allocate identifiers or observe state while physical
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let (database, recovery_report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
+
+        let admin_state = Arc::new(AdminState {
+            started_at,
+            connection_semaphore: connection_semaphore.clone(),
+            max_connections,
+            durability_gate: database.durability_gate(),
+        });
 
         info!(
             segments_scanned = recovery_report.segments_scanned,

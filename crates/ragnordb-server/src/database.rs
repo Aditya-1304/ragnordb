@@ -15,7 +15,9 @@ use std::{
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
-use ragnordb_common::{Error, Result, ids::NodeId, proto::snapshot as snapshot_proto};
+use ragnordb_common::{
+    Error, Result, durability::DurabilityGate, ids::NodeId, proto::snapshot as snapshot_proto,
+};
 use ragnordb_exec::{ExecutionResult, LocalExecutor, SqlSession};
 use ragnordb_storage::{
     checkpoint::{
@@ -80,6 +82,7 @@ pub struct LocalDatabase {
     checkpoint_adapter: Option<Arc<LocalWalAdapter>>,
     checkpoint_publication_lock: Arc<Mutex<()>>,
     data_directory_lock: Option<DataDirectoryLock>,
+    durability_gate: DurabilityGate,
 }
 
 impl fmt::Debug for LocalDatabase {
@@ -106,6 +109,7 @@ impl Default for LocalDatabase {
             checkpoint_adapter: None,
             checkpoint_publication_lock: Arc::new(Mutex::new(())),
             data_directory_lock: None,
+            durability_gate: DurabilityGate::new(),
         }
     }
 }
@@ -246,6 +250,7 @@ impl LocalDatabase {
                 checkpoint_adapter: Some(adapter),
                 checkpoint_publication_lock: Arc::new(Mutex::new(())),
                 data_directory_lock: Some(data_directory_lock),
+                durability_gate: DurabilityGate::new(),
             },
             recovery_report,
         ))
@@ -283,15 +288,22 @@ impl LocalDatabase {
     pub async fn publish_checkpoint(
         database: &SharedLocalDatabase,
     ) -> Result<LiveCheckpointPublication> {
-        let publication_lock = {
+        let (publication_lock, durability_gate) = {
             let runtime = database.lock().await;
-            runtime.checkpoint_publication_lock.clone()
+            runtime.durability_gate.ensure_healthy()?;
+
+            (
+                runtime.checkpoint_publication_lock.clone(),
+                runtime.durability_gate.clone(),
+            )
         };
 
         let _publication_guard = publication_lock.lock_owned().await;
+        durability_gate.ensure_healthy()?;
 
         let (data_dir, snapshot, adapter, retention_pin) = {
             let mut runtime = database.lock().await;
+            runtime.durability_gate.ensure_healthy()?;
 
             let data_dir = runtime.data_dir.clone().ok_or_else(|| {
                 Error::Configuration(
@@ -306,9 +318,6 @@ impl LocalDatabase {
                 )
             })?;
 
-            // acquire protection before fixing the snapshot frontier. If capture
-            // fails, ordinary RAII drop releases the pin without changing
-            // retention
             let retention_pin: CheckpointRetentionPin =
                 adapter.acquire_checkpoint_retention_pin()?;
             let snapshot = runtime.capture_checkpoint_image()?;
@@ -316,43 +325,79 @@ impl LocalDatabase {
             (data_dir, snapshot, adapter, retention_pin)
         };
 
-        // snapshot file I/O and WAL synchronization are blocking operations.
-        // Running them on the blocking pool prevents the async server executor
-        // from being stalled while the database mutex remains available to
-        // normal SQL work
-        tokio::task::spawn_blocking(move || -> Result<LiveCheckpointPublication> {
-            let snapshot_file = publish_snapshot_file(&data_dir, &snapshot)?;
-            let checkpoint = publish_checkpoint_metadata(adapter.as_ref(), &snapshot_file)?;
+        let worker_gate = durability_gate.clone();
+        let join_gate = durability_gate.clone();
 
-            // the matching marker is now durable. The new snapshot is a valid
-            // recovery source, so the older WAL path no longer needs this
-            // publication pin
-            drop(retention_pin);
+        let worker = tokio::task::spawn_blocking(move || -> Result<LiveCheckpointPublication> {
+            let result = (|| {
+                // snapshot file failure occurs before authoritative WAL
+                // publication and is therefore retryable without fencing
+                let snapshot_file = publish_snapshot_file(&data_dir, &snapshot)?;
 
-            let pruned_segments =
-                adapter.advance_checkpoint_retention(checkpoint.replay_from_lsn)?;
+                // a concurrent SQL durability failure may have fenced the
+                // node while the immutable file was being written
+                worker_gate.ensure_healthy()?;
 
-            Ok(LiveCheckpointPublication {
-                checkpoint,
-                retention_advanced_to: checkpoint.replay_from_lsn,
-                pruned_segments,
-            })
+                let checkpoint = publish_checkpoint_metadata(adapter.as_ref(), &snapshot_file)?;
+
+                // the marker is durable, so the new snapshot is now a valid
+                // recovery source. Releasing the old-history pin is safe even
+                // if another operation fenced the node immediately afterward
+                drop(retention_pin);
+
+                worker_gate.ensure_healthy()?;
+
+                let pruned_segments =
+                    adapter.advance_checkpoint_retention(checkpoint.replay_from_lsn)?;
+
+                Ok(LiveCheckpointPublication {
+                    checkpoint,
+                    retention_advanced_to: checkpoint.replay_from_lsn,
+                    pruned_segments,
+                })
+            })();
+
+            if let Err(error) = &result {
+                worker_gate.observe_error(error);
+            }
+
+            result
         })
-        .await
-        .map_err(|source| Error::RecoveryRequired {
-            reason: format!("checkpoint publication worker failed: {source}"),
-        })?
+        .await;
+
+        match worker {
+            Ok(result) => result,
+
+            Err(source) => Err(join_gate.require_recovery(
+                ragnordb_common::durability::DurabilityFailureKind::RecoveryRequired,
+                format!("checkpoint publication worker failed: {source}"),
+            )),
+        }
     }
 
-    /// Execute one SQL statement through the connection's SQL session.
+    /// execute one SQL statement through the connection's SQL session
+    ///
+    /// every statement, including reads and metadata inspection, is rejected
+    /// after authoritative durable state becomes uncertain. The error that
+    /// first crosses this boundary fences every later connection
     pub fn execute_sql(&mut self, session: &mut SqlSession, sql: &str) -> Result<ExecutionResult> {
-        let Self {
-            executor,
-            transaction_manager,
-            ..
-        } = self;
+        self.durability_gate.ensure_healthy()?;
 
-        session.execute_sql(sql, executor, transaction_manager)
+        let result = {
+            let Self {
+                executor,
+                transaction_manager,
+                ..
+            } = self;
+
+            session.execute_sql(sql, executor, transaction_manager)
+        };
+
+        if let Err(error) = &result {
+            self.durability_gate.observe_error(error);
+        }
+
+        result
     }
 
     /// capture one immutable database image under the runtime's write barrier.
@@ -362,6 +407,8 @@ impl LocalDatabase {
     /// WAL publication; the live `publish_checkpoint` workflow owns those later
     /// stages
     pub fn capture_checkpoint_image(&mut self) -> Result<snapshot_proto::DatabaseSnapshot> {
+        self.durability_gate.ensure_healthy()?;
+
         let snapshot_id = self.next_snapshot_id.ok_or_else(|| {
             Error::Configuration("snapshot ID allocator is exhausted".to_string())
         })?;
@@ -373,7 +420,17 @@ impl LocalDatabase {
             .allocate_commit_timestamp(previous_timestamp)?;
 
         let tables = self.executor.capture_snapshot_tables()?;
-        let replay_from_lsn = self.executor.replay_from_end_lsn();
+        // durable runtimes use A-WAL's complete physical frontier. This includes
+        // previously published checkpoint pointer and marker records, allowing
+        // later checkpoints to make obsolete checkpoint metadata reclaimable
+        //
+        // in memory executor tests have no A-WAL adapter and retain their
+        // semantic state-changing frontier
+        let replay_from_lsn = self
+            .checkpoint_adapter
+            .as_ref()
+            .map(|adapter| adapter.durable_lsn().as_u64())
+            .unwrap_or_else(|| self.executor.replay_from_end_lsn());
         let max_table_id = self.executor.catalog().table_id_high_water_mark();
         let max_transaction_id = self.transaction_manager.last_allocated_transaction_id();
 
@@ -391,5 +448,11 @@ impl LocalDatabase {
             }),
             tables,
         })
+    }
+
+    /// return the node-wide durability gate used by SQL, checkpoint publication,
+    /// retention, and administrative health reporting
+    pub fn durability_gate(&self) -> DurabilityGate {
+        self.durability_gate.clone()
     }
 }

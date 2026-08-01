@@ -1,3 +1,4 @@
+use ragnordb_common::durability::DurabilityGate;
 use ragnordb_common::protocol::read_frame;
 use ragnordb_server::admin::AdminState;
 use ragnordb_server::database::LocalDatabase;
@@ -81,6 +82,7 @@ async fn admin_status_returns_json() {
     let shutdown = CancellationToken::new();
 
     let state = Arc::new(AdminState {
+        durability_gate: DurabilityGate::new(),
         started_at: 123,
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
@@ -103,6 +105,8 @@ async fn admin_status_returns_json() {
     assert_eq!(json["server"]["active_connections"], 0);
     assert!(json["build"]["version"].is_string());
     assert!(json["infra"]["raft"].is_string());
+    assert_eq!(json["durability"]["state"], "healthy");
+    assert_eq!(json["durability"]["recovery_required"], false);
 
     shutdown.cancel();
     server_task.await.unwrap();
@@ -121,6 +125,7 @@ async fn admin_metrics_returns_prometheus_text() {
         started_at: 123,
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
+        durability_gate: DurabilityGate::new(),
     });
 
     let server_task = {
@@ -205,6 +210,7 @@ async fn admin_status_uses_json_content_type() {
         started_at: 123,
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
+        durability_gate: DurabilityGate::new(),
     });
 
     let server_task = {

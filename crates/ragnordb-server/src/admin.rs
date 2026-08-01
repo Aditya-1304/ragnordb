@@ -1,4 +1,5 @@
 use axum::{Json, Router, http::header, response::IntoResponse, routing::get};
+use ragnordb_common::durability::{DurabilityGate, NodeDurabilityState};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -18,6 +19,7 @@ pub struct AdminState {
     pub started_at: u64,
     pub connection_semaphore: Arc<Semaphore>,
     pub max_connections: u32,
+    pub durability_gate: DurabilityGate,
 }
 
 pub async fn start_admin_server(
@@ -70,6 +72,19 @@ async fn handle_status(
 ) -> Json<serde_json::Value> {
     let active = state.max_connections as usize - state.connection_semaphore.available_permits();
 
+    let durability = match state.durability_gate.state() {
+        NodeDurabilityState::Healthy => serde_json::json!({
+            "state": "healthy",
+            "recovery_required": false,
+        }),
+
+        NodeDurabilityState::RecoveryRequired(failure) => serde_json::json!({
+            "state": failure.kind().as_str(),
+            "recovery_required": true,
+            "reason": failure.reason(),
+        }),
+    };
+
     Json(serde_json::json!({
         "build": {
             "version": BUILD_INFO.ragnordb_version,
@@ -87,6 +102,7 @@ async fn handle_status(
             "started_at": state.started_at,
             "max_connections": state.max_connections,
             "active_connections": active,
-        }
+        },
+        "durability": durability,
     }))
 }

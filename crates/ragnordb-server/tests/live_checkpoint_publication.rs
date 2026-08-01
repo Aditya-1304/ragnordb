@@ -113,3 +113,33 @@ async fn live_database_publishes_checkpoint_and_recovers_its_wal_suffix() {
         ]
     );
 }
+
+/// A checkpoint-only workload must advance past the previous checkpoint's WAL
+/// metadata so obsolete pointer and marker records eventually become prunable.
+#[tokio::test]
+async fn second_checkpoint_without_dml_advances_the_physical_replay_frontier() {
+    let data_dir = tempfile::tempdir().expect("temporary database directory must be created");
+    let node_id = NodeId(32);
+
+    let (database, _) =
+        LocalDatabase::recover(data_dir.path(), node_id).expect("empty database must recover");
+    let database = database.into_shared();
+
+    let first = LocalDatabase::publish_checkpoint(&database)
+        .await
+        .expect("first checkpoint must publish");
+
+    let second = LocalDatabase::publish_checkpoint(&database)
+        .await
+        .expect("second checkpoint must publish without intervening DML");
+
+    assert!(
+        second.checkpoint.replay_from_lsn > first.checkpoint.replay_from_lsn,
+        "second checkpoint must cover the first checkpoint's WAL metadata"
+    );
+
+    assert_eq!(
+        second.checkpoint.replay_from_lsn, first.checkpoint.marker_extent.end_lsn,
+        "the second capture must use A-WAL's exact durable frontier"
+    );
+}

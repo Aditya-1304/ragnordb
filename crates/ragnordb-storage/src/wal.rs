@@ -468,6 +468,15 @@ where
         Ok(CheckpointRetentionPin { _guard: guard })
     }
 
+    /// returns the first logical WAL position not yet covered by durability
+    ///
+    /// `LocalDatabase` samples this while holding its serialized state boundary,
+    /// making the frontier an exact cut after every state-changing record already
+    /// represented by the captured catalog and MVCC image
+    pub fn durable_lsn(&self) -> Lsn {
+        self.wal.durable_lsn()
+    }
+
     /// advance WAL retention after a complete checkpoint becomes durable
     ///
     /// callers must invoke this only after `publish_checkpoint` has durably
@@ -612,9 +621,15 @@ where
 /// received no extent or may already exist in the recovered durable prefix
 fn map_commit_append_failure(failure: AppendFailure) -> Error {
     match failure {
-        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
-            reason: source.to_string(),
-        },
+        AppendFailure::NotStaged(source) => {
+            let recovery_required = source.requires_recovery();
+            let reason = source.to_string();
+
+            Error::WalAppendNotStaged {
+                reason,
+                recovery_required,
+            }
+        }
 
         AppendFailure::OutcomeUnknown { extent, source } => Error::CommitOutcomeUnknown {
             start_lsn: extent.start_lsn.as_u64(),
@@ -637,9 +652,15 @@ fn map_checkpoint_retention_failure(operation: &'static str, source: WalError) -
 
 fn map_catalog_append_failure(failure: AppendFailure) -> Error {
     match failure {
-        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
-            reason: source.to_string(),
-        },
+        AppendFailure::NotStaged(source) => {
+            let recovery_required = source.requires_recovery();
+            let reason = source.to_string();
+
+            Error::WalAppendNotStaged {
+                reason,
+                recovery_required,
+            }
+        }
 
         AppendFailure::OutcomeUnknown { extent, source } => Error::CatalogOutcomeUnknown {
             start_lsn: extent.start_lsn.as_u64(),
@@ -651,9 +672,15 @@ fn map_catalog_append_failure(failure: AppendFailure) -> Error {
 
 fn map_checkpoint_append_failure(failure: AppendFailure, stage: &'static str) -> Error {
     match failure {
-        AppendFailure::NotStaged(source) => Error::WalAppendNotStaged {
-            reason: format!("checkpoint {stage} append failed before staging: {source}"),
-        },
+        AppendFailure::NotStaged(source) => {
+            let recovery_required = source.requires_recovery();
+            let reason = format!("checkpoint {stage} append failed before staging: {source}");
+
+            Error::WalAppendNotStaged {
+                reason,
+                recovery_required,
+            }
+        }
 
         AppendFailure::OutcomeUnknown { extent, source } => Error::CheckpointOutcomeUnknown {
             stage,
