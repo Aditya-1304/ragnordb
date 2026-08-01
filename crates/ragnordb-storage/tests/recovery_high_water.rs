@@ -8,6 +8,7 @@ use ragnordb_common::{
     ids::{ColumnId, TableId, Timestamp, TxnId},
 };
 use ragnordb_storage::{
+    checkpoint::SNAPSHOT_FILE_VERSION,
     key::{encode_row_key, make_row_key},
     recovery::{DecodedRecoveryRecord, RecoveryHighWaterMarks, RecoveryPayload, RecoveryState},
     wal::{CatalogUpdate, CheckpointMarker, SingleNodeTxnCommit, SnapshotPointer, WalMutation},
@@ -65,6 +66,9 @@ fn snapshot_pointer() -> SnapshotPointer {
         replay_from_lsn: Lsn::new(256),
         relative_path: "snapshots/snapshot-8.ragnor".to_string(),
         table_ids: BTreeSet::from([TableId(9), TableId(42)]),
+        file_length: 128,
+        file_checksum_crc32c: 1,
+        snapshot_format_version: SNAPSHOT_FILE_VERSION,
     }
 }
 

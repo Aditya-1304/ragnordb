@@ -5,6 +5,7 @@ use ragnordb_common::{
     ids::{TableId, Timestamp},
 };
 use ragnordb_storage::{
+    checkpoint::SNAPSHOT_FILE_VERSION,
     recovery::{
         DecodedRecoveryRecord, RecoveryCheckpointCandidate, RecoveryCheckpointSelector,
         RecoveryPayload,
@@ -24,6 +25,9 @@ fn snapshot_pointer(
         replay_from_lsn: Lsn::new(replay_from_lsn),
         relative_path: format!("snapshots/snapshot-{snapshot_id}.ragnor"),
         table_ids: BTreeSet::from([TableId(snapshot_id)]),
+        file_length: 128,
+        file_checksum_crc32c: 1,
+        snapshot_format_version: SNAPSHOT_FILE_VERSION,
     }
 }
 

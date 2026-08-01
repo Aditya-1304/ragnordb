@@ -11,7 +11,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::Path,
 };
 
@@ -32,7 +31,7 @@ use wal::{
 };
 
 use crate::{
-    checkpoint::decode_snapshot_file,
+    checkpoint::load_snapshot_file_bounded,
     mvcc::{InMemoryMvcc, Mutation, MvccStorage},
     wal::{
         CatalogUpdate, CheckpointMarker, RagnorDbWalRecordType, SingleNodeTxnCommit,
@@ -647,13 +646,12 @@ pub fn load_recovery_checkpoint(
     }
 
     let snapshot_path = data_dir.as_ref().join(&candidate.pointer.relative_path);
-    let bytes = fs::read(&snapshot_path).map_err(|source| Error::RecoveryFailed {
-        reason: format!(
-            "failed to read selected snapshot {}: {source}",
-            snapshot_path.display()
-        ),
-    })?;
-    let snapshot = decode_snapshot_file(&bytes)?;
+    let snapshot = load_snapshot_file_bounded(
+        &snapshot_path,
+        candidate.pointer.file_length,
+        candidate.pointer.file_checksum_crc32c,
+        candidate.pointer.snapshot_format_version,
+    )?;
     let snapshot_timestamp = snapshot
         .snapshot_timestamp
         .as_ref()

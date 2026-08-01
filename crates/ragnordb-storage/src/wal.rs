@@ -38,7 +38,7 @@ use crate::key::decode_row_key;
 pub const SINGLE_NODE_TXN_COMMIT_VERSION: u32 = 1;
 
 /// Current durable schema version for `SnapshotPointer`.
-pub const SNAPSHOT_POINTER_VERSION: u32 = 1;
+pub const SNAPSHOT_POINTER_VERSION: u32 = 2;
 
 /// current durable schema version for `CatalogUpdate`
 pub const CATALOG_UPDATE_VERSION: u32 = 1;
@@ -843,6 +843,15 @@ pub struct SnapshotPointer {
     ///
     /// an empty set is valid for a snapshot of an empty catalog
     pub table_ids: BTreeSet<TableId>,
+
+    /// exact immutable snapshot file length
+    pub file_length: u64,
+
+    /// CRC32C covering the complete snapshot file, including its envelope
+    pub file_checksum_crc32c: u32,
+
+    /// file envelope version recovery must observe before trusting the file
+    pub snapshot_format_version: u32,
 }
 
 impl SnapshotPointer {
@@ -877,6 +886,9 @@ impl SnapshotPointer {
             replay_from_lsn: self.replay_from_lsn.as_u64(),
             relative_path: self.relative_path.clone(),
             table_ids: self.table_ids.iter().map(TableId::to_proto).collect(),
+            file_length: self.file_length,
+            file_checksum_crc32c: self.file_checksum_crc32c,
+            snapshot_format_version: self.snapshot_format_version,
         }
     }
 
@@ -917,6 +929,9 @@ impl SnapshotPointer {
             replay_from_lsn: Lsn::new(proto.replay_from_lsn),
             relative_path: proto.relative_path,
             table_ids,
+            file_length: proto.file_length,
+            file_checksum_crc32c: proto.file_checksum_crc32c,
+            snapshot_format_version: proto.snapshot_format_version,
         };
 
         pointer.validate().map_err(|message| {
@@ -933,6 +948,14 @@ impl SnapshotPointer {
 
         if self.snapshot_timestamp.0 == 0 {
             return Err("snapshot timestamp 0 is reserved".to_string());
+        }
+
+        if self.file_length == 0 {
+            return Err("snapshot file length must be nonzero".to_string());
+        }
+
+        if self.snapshot_format_version == 0 {
+            return Err("snapshot format version 0 is reserved".to_string());
         }
 
         validate_relative_snapshot_path(&self.relative_path)?;

@@ -96,6 +96,15 @@ message SnapshotPointer {
 
     // Deterministically ordered set of table states represented by the snapshot.
     repeated ragnordb.ids.TableId table_ids = 6;
+
+    // exact size of the immutable snapshot file in bytes
+    uint64 file_length = 7;
+
+    // CRC32C of the complete snapshot file, including its fixed envelope
+    uint32 file_checksum_crc32c = 8;
+
+    // Snapshot-file envelope version expected by recovery
+    uint32 snapshot_format_version = 9;
 }
 
 // durable publication marker for completed database snapshot

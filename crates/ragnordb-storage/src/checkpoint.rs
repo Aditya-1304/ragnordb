@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::Path,
 };
 
@@ -39,6 +39,23 @@ const SNAPSHOT_HEADER_LENGTH: usize = 8 + 4 + 8 + 4;
 /// Data-directory child containing immutable database snapshot files.
 pub const SNAPSHOT_DIRECTORY_NAME: &str = "snapshots";
 
+/// maximum snapshot file accepted during publication or recovery
+///
+/// the initial 256 MiB limit keeps startup memory bounded until snapshot
+/// decoding becomes streaming
+pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// maximum number of tables accepted from one snapshot
+pub const MAX_SNAPSHOT_TABLES: usize = 4_096;
+
+/// maximum total MVCC entries accepted from one snapshot
+pub const MAX_SNAPSHOT_ENTRIES: usize = 10_000_000;
+
+/// maximum encoded row-key size accepted from snapshot state
+pub const MAX_SNAPSHOT_KEY_BYTES: usize = 1024 * 1024;
+
+/// maximum canonical encoded row size accepted from snapshot state
+pub const MAX_SNAPSHOT_ROW_BYTES: usize = 16 * 1024 * 1024;
 /// a snapshot file that completed file sync, atomic rename, and directory sync
 #[must_use = "published snapshot metadata is required by WAL pointer publication"]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +66,8 @@ pub struct PublishedSnapshotFile {
     relative_path: String,
     table_ids: BTreeSet<TableId>,
     file_length: u64,
+    file_checksum_crc32c: u32,
+    snapshot_format_version: u32,
 }
 
 impl PublishedSnapshotFile {
@@ -65,6 +84,16 @@ impl PublishedSnapshotFile {
     /// complete encoded file length used by diagnostics and restore validation
     pub const fn file_length(&self) -> u64 {
         self.file_length
+    }
+
+    /// CRC32C covering the complete immutable snapshot file
+    pub const fn file_checksum_crc32c(&self) -> u32 {
+        self.file_checksum_crc32c
+    }
+
+    /// version of the snapshot file envelope.
+    pub const fn snapshot_format_version(&self) -> u32 {
+        self.snapshot_format_version
     }
 }
 
@@ -147,6 +176,16 @@ pub fn publish_snapshot_file(
         reason: "encoded snapshot length does not fit in u64".to_string(),
     })?;
 
+    if file_length > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(Error::SnapshotPublicationFailed {
+            reason: format!(
+                "encoded snapshot length {file_length} exceeds maximum \
+                 {MAX_SNAPSHOT_FILE_BYTES}"
+            ),
+        });
+    }
+
+    let file_checksum_crc32c = crc32c::crc32c(&bytes);
     let snapshot_timestamp = snapshot
         .snapshot_timestamp
         .as_ref()
@@ -218,6 +257,8 @@ pub fn publish_snapshot_file(
         relative_path: format!("{SNAPSHOT_DIRECTORY_NAME}/{final_name}"),
         table_ids,
         file_length,
+        file_checksum_crc32c,
+        snapshot_format_version: SNAPSHOT_FILE_VERSION,
     })
 }
 
@@ -239,6 +280,9 @@ where
         replay_from_lsn: snapshot_file.replay_from_lsn,
         relative_path: snapshot_file.relative_path.clone(),
         table_ids: snapshot_file.table_ids.clone(),
+        file_length: snapshot_file.file_length,
+        file_checksum_crc32c: snapshot_file.file_checksum_crc32c,
+        snapshot_format_version: snapshot_file.snapshot_format_version,
     };
     let marker = CheckpointMarker {
         snapshot_id: snapshot_file.snapshot_id,
@@ -297,6 +341,16 @@ pub fn encode_snapshot_file(snapshot: &snapshot_proto::DatabaseSnapshot) -> Resu
 /// envelope checks run before protobuf decoding so arbitrary, truncated, or
 /// corrupted files cannot be mistaken for database state
 pub fn decode_snapshot_file(file: &[u8]) -> Result<snapshot_proto::DatabaseSnapshot> {
+    let file_length = u64::try_from(file.len())
+        .map_err(|_| corrupt_snapshot("snapshot length does not fit in u64"))?;
+
+    if file_length > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(corrupt_snapshot(format!(
+            "snapshot file length {file_length} exceeds maximum \
+             {MAX_SNAPSHOT_FILE_BYTES}"
+        )));
+    }
+
     if file.len() < SNAPSHOT_HEADER_LENGTH {
         return Err(corrupt_snapshot(format!(
             "file is {} bytes; V1 header requires {SNAPSHOT_HEADER_LENGTH} bytes",
@@ -353,6 +407,228 @@ pub fn decode_snapshot_file(file: &[u8]) -> Result<snapshot_proto::DatabaseSnaps
     Ok(snapshot)
 }
 
+/// Read and validate a selected snapshot without trusting its declared size.
+///
+/// Recovery checks the pointer-bound length and format before allocating the
+/// protobuf body. The whole-file checksum is checked before semantic decoding,
+/// proving that the file is the exact immutable object originally published by
+/// the checkpoint.
+pub fn load_snapshot_file_bounded(
+    path: impl AsRef<Path>,
+    expected_file_length: u64,
+    expected_file_checksum_crc32c: u32,
+    expected_format_version: u32,
+) -> Result<snapshot_proto::DatabaseSnapshot> {
+    let path = path.as_ref();
+
+    if expected_format_version != SNAPSHOT_FILE_VERSION {
+        return Err(corrupt_snapshot(format!(
+            "pointer requires snapshot format version {expected_format_version}; \
+             this binary supports {SNAPSHOT_FILE_VERSION}"
+        )));
+    }
+
+    if expected_file_length > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(corrupt_snapshot(format!(
+            "pointer declares snapshot length {expected_file_length}, exceeding \
+             maximum {MAX_SNAPSHOT_FILE_BYTES}"
+        )));
+    }
+
+    if expected_file_length < SNAPSHOT_HEADER_LENGTH as u64 {
+        return Err(corrupt_snapshot(format!(
+            "pointer declares snapshot length {expected_file_length}; header \
+             requires {SNAPSHOT_HEADER_LENGTH} bytes"
+        )));
+    }
+
+    let mut file = File::open(path).map_err(|source| Error::RecoveryFailed {
+        reason: format!(
+            "failed to open selected snapshot {}: {source}",
+            path.display()
+        ),
+    })?;
+
+    let actual_file_length = file
+        .metadata()
+        .map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to read selected snapshot metadata {}: {source}",
+                path.display()
+            ),
+        })?
+        .len();
+
+    if actual_file_length != expected_file_length {
+        return Err(corrupt_snapshot(format!(
+            "selected snapshot {} length {actual_file_length} does not match \
+             pointer length {expected_file_length}",
+            path.display()
+        )));
+    }
+
+    let mut header = [0u8; SNAPSHOT_HEADER_LENGTH];
+
+    file.read_exact(&mut header)
+        .map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to read selected snapshot header {}: {source}",
+                path.display()
+            ),
+        })?;
+
+    if header[..SNAPSHOT_FILE_MAGIC.len()] != SNAPSHOT_FILE_MAGIC {
+        return Err(corrupt_snapshot(
+            "selected snapshot magic does not match RagnorDB",
+        ));
+    }
+
+    let file_version = read_u32_le(&header, 8);
+
+    if file_version != expected_format_version {
+        return Err(corrupt_snapshot(format!(
+            "selected snapshot file version {file_version} does not match \
+             pointer version {expected_format_version}"
+        )));
+    }
+
+    let declared_body_length = read_u64_le(&header, 12);
+    let declared_file_length = (SNAPSHOT_HEADER_LENGTH as u64)
+        .checked_add(declared_body_length)
+        .ok_or_else(|| corrupt_snapshot("declared snapshot length overflows u64"))?;
+
+    if declared_file_length != expected_file_length {
+        return Err(corrupt_snapshot(format!(
+            "selected snapshot header declares {declared_file_length} bytes, \
+             but pointer requires {expected_file_length}"
+        )));
+    }
+
+    let body_length = usize::try_from(declared_body_length).map_err(|_| {
+        corrupt_snapshot(format!(
+            "declared snapshot body length {declared_body_length} does not fit this platform"
+        ))
+    })?;
+
+    let file_capacity = usize::try_from(expected_file_length).map_err(|_| {
+        corrupt_snapshot(format!(
+            "snapshot file length {expected_file_length} does not fit this platform"
+        ))
+    })?;
+
+    let mut bytes = Vec::with_capacity(file_capacity);
+    bytes.extend_from_slice(&header);
+
+    let mut body = vec![0u8; body_length];
+
+    file.read_exact(&mut body)
+        .map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to read selected snapshot body {}: {source}",
+                path.display()
+            ),
+        })?;
+
+    bytes.extend_from_slice(&body);
+
+    let mut trailing = [0u8; 1];
+    let trailing_bytes = file
+        .read(&mut trailing)
+        .map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed while checking selected snapshot tail {}: {source}",
+                path.display()
+            ),
+        })?;
+
+    if trailing_bytes != 0 {
+        return Err(corrupt_snapshot(format!(
+            "selected snapshot {} grew while it was being read",
+            path.display()
+        )));
+    }
+
+    let actual_file_checksum_crc32c = crc32c::crc32c(&bytes);
+
+    if actual_file_checksum_crc32c != expected_file_checksum_crc32c {
+        return Err(corrupt_snapshot(format!(
+            "selected snapshot whole-file checksum mismatch: pointer \
+             {expected_file_checksum_crc32c:#010x}, file \
+             {actual_file_checksum_crc32c:#010x}"
+        )));
+    }
+
+    decode_snapshot_file(&bytes)
+}
+
+fn validate_snapshot_resource_limits(
+    snapshot: &snapshot_proto::DatabaseSnapshot,
+) -> std::result::Result<(), String> {
+    if snapshot.tables.len() > MAX_SNAPSHOT_TABLES {
+        return Err(format!(
+            "snapshot contains {} tables; maximum is {}",
+            snapshot.tables.len(),
+            MAX_SNAPSHOT_TABLES
+        ));
+    }
+
+    let mut total_entries = 0usize;
+
+    for table in &snapshot.tables {
+        total_entries = total_entries
+            .checked_add(table.default_values.len())
+            .and_then(|count| count.checked_add(table.locks.len()))
+            .and_then(|count| count.checked_add(table.writes.len()))
+            .ok_or_else(|| "snapshot MVCC entry count overflow".to_string())?;
+
+        if total_entries > MAX_SNAPSHOT_ENTRIES {
+            return Err(format!(
+                "snapshot contains more than {MAX_SNAPSHOT_ENTRIES} MVCC entries"
+            ));
+        }
+
+        for entry in &table.default_values {
+            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+                return Err(format!(
+                    "snapshot default-value key is {} bytes; maximum is {}",
+                    entry.key.len(),
+                    MAX_SNAPSHOT_KEY_BYTES
+                ));
+            }
+
+            if entry.row.len() > MAX_SNAPSHOT_ROW_BYTES {
+                return Err(format!(
+                    "snapshot row is {} bytes; maximum is {}",
+                    entry.row.len(),
+                    MAX_SNAPSHOT_ROW_BYTES
+                ));
+            }
+        }
+
+        for entry in &table.locks {
+            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+                return Err(format!(
+                    "snapshot lock key is {} bytes; maximum is {}",
+                    entry.key.len(),
+                    MAX_SNAPSHOT_KEY_BYTES
+                ));
+            }
+        }
+
+        for entry in &table.writes {
+            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+                return Err(format!(
+                    "snapshot write key is {} bytes; maximum is {}",
+                    entry.key.len(),
+                    MAX_SNAPSHOT_KEY_BYTES
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum SnapshotValidationContext {
     Caller,
@@ -371,6 +647,10 @@ fn validate_snapshot(
             corrupt_snapshot(format!("invalid snapshot body: {message}"))
         }
     };
+
+    if let Err(message) = validate_snapshot_resource_limits(snapshot) {
+        return Err(invalid(message));
+    }
 
     if snapshot.snapshot_id == 0 {
         return Err(invalid("snapshot ID 0 is reserved".to_string()));

@@ -100,6 +100,15 @@ pub struct SnapshotPointer {
     /// Deterministically ordered set of table states represented by the snapshot.
     #[prost(message, repeated, tag = "6")]
     pub table_ids: ::prost::alloc::vec::Vec<super::ids::TableId>,
+    /// exact size of the immutable snapshot file in bytes
+    #[prost(uint64, tag = "7")]
+    pub file_length: u64,
+    /// CRC32C of the complete snapshot file, including its fixed envelope
+    #[prost(uint32, tag = "8")]
+    pub file_checksum_crc32c: u32,
+    /// Snapshot-file envelope version expected by recovery
+    #[prost(uint32, tag = "9")]
+    pub snapshot_format_version: u32,
 }
 /// durable publication marker for completed database snapshot
 ///

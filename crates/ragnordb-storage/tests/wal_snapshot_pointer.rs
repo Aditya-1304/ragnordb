@@ -6,6 +6,7 @@ use ragnordb_common::{
     ids::{TableId, Timestamp},
     proto::wal as wal_proto,
 };
+use ragnordb_storage::checkpoint::SNAPSHOT_FILE_VERSION;
 use ragnordb_storage::wal::{SNAPSHOT_POINTER_VERSION, SnapshotPointer};
 use wal::lsn::Lsn;
 
@@ -16,6 +17,9 @@ fn valid_pointer() -> SnapshotPointer {
         replay_from_lsn: Lsn::new(4096),
         relative_path: "snapshots/7.snap".to_string(),
         table_ids: BTreeSet::from([TableId(1), TableId(9)]),
+        file_length: 128,
+        file_checksum_crc32c: 1,
+        snapshot_format_version: SNAPSHOT_FILE_VERSION,
     }
 }
 
@@ -70,14 +74,14 @@ fn valid_snapshot_pointer_round_trips() {
     assert_eq!(decoded, original);
 }
 
-/// Verifies that V1 snapshot-pointer bytes remain recoverable.
+/// Verifies that V1 snapshot-pointer bytes fail closed.
 ///
 /// Realistic bug caught:
 ///
-/// New encoder and decoder code could agree after protobuf field-number changes
-/// while existing snapshot pointers become unreadable.
+/// A V1 pointer does not bind recovery to an exact snapshot length, checksum,
+/// or file format. Accepting it could restore a replaced or incompatible file.
 #[test]
-fn v1_snapshot_pointer_golden_bytes_remain_decodable() {
+fn v1_snapshot_pointer_without_file_identity_is_rejected() {
     const V1_GOLDEN_BYTES: &[u8] = &[
         // SnapshotPointer.version = 1.
         0x08, 0x01, // SnapshotPointer.snapshot_id = 7.
@@ -89,17 +93,13 @@ fn v1_snapshot_pointer_golden_bytes_remain_decodable() {
         0x32, 0x02, 0x08, 0x01, 0x32, 0x02, 0x08, 0x09,
     ];
 
-    let expected = SnapshotPointer {
-        snapshot_id: 7,
-        snapshot_timestamp: Timestamp(5),
-        replay_from_lsn: Lsn::new(4096),
-        relative_path: "snapshots/7.snap".to_string(),
-        table_ids: BTreeSet::from([TableId(1), TableId(9)]),
-    };
+    let error = SnapshotPointer::decode(V1_GOLDEN_BYTES).unwrap_err();
 
-    let decoded = SnapshotPointer::decode(V1_GOLDEN_BYTES).unwrap();
-
-    assert_eq!(decoded, expected);
+    assert!(matches!(
+        error,
+        Error::CorruptData(message)
+            if message.contains("unsupported SnapshotPointer version 1")
+    ));
 }
 
 /// Ensures recovery never applies unsupported snapshot-pointer semantics.
@@ -117,7 +117,7 @@ fn zero_and_unsupported_snapshot_pointer_versions_are_rejected() {
 
     assert_decode_rejected(
         |proto| proto.version = SNAPSHOT_POINTER_VERSION + 1,
-        "unsupported SnapshotPointer version 2",
+        "unsupported SnapshotPointer version 3",
     );
 }
 
@@ -151,6 +151,26 @@ fn invalid_snapshot_identity_and_timestamp_are_rejected() {
     assert_decode_rejected(
         |proto| proto.snapshot_timestamp = None,
         "missing its snapshot timestamp",
+    );
+
+    assert_encode_rejected(
+        |pointer| pointer.file_length = 0,
+        "snapshot file length must be nonzero",
+    );
+
+    assert_encode_rejected(
+        |pointer| pointer.snapshot_format_version = 0,
+        "snapshot format version 0 is reserved",
+    );
+
+    assert_decode_rejected(
+        |proto| proto.file_length = 0,
+        "snapshot file length must be nonzero",
+    );
+
+    assert_decode_rejected(
+        |proto| proto.snapshot_format_version = 0,
+        "snapshot format version 0 is reserved",
     );
 }
 

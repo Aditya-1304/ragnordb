@@ -10,7 +10,7 @@ use ragnordb_common::{
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_storage::{
-    checkpoint::{encode_snapshot_file, publish_snapshot_file},
+    checkpoint::{PublishedSnapshotFile, encode_snapshot_file, publish_snapshot_file},
     key::{encode_row_key, make_row_key},
     mvcc::MvccStorage,
     recovery::{RecoveryCheckpointCandidate, load_recovery_checkpoint},
@@ -84,7 +84,7 @@ fn test_snapshot() -> (snapshot_proto::DatabaseSnapshot, Vec<u8>, Vec<u8>) {
 
 fn candidate(
     snapshot: &snapshot_proto::DatabaseSnapshot,
-    relative_path: String,
+    published: &PublishedSnapshotFile,
 ) -> RecoveryCheckpointCandidate {
     RecoveryCheckpointCandidate {
         pointer_lsn: Lsn::new(8192),
@@ -97,8 +97,11 @@ fn candidate(
                     .expect("test snapshot timestamp must exist"),
             ),
             replay_from_lsn: Lsn::new(snapshot.replay_from_lsn),
-            relative_path,
+            relative_path: published.relative_path().to_string(),
             table_ids: BTreeSet::from([TableId(7)]),
+            file_length: published.file_length(),
+            file_checksum_crc32c: published.file_checksum_crc32c(),
+            snapshot_format_version: published.snapshot_format_version(),
         },
     }
 }
@@ -115,7 +118,7 @@ fn selected_checkpoint_restores_catalog_mvcc_and_allocator_state() {
     let (snapshot, key, expected_row) = test_snapshot();
     let published =
         publish_snapshot_file(data_dir.path(), &snapshot).expect("snapshot file must be durable");
-    let checkpoint = candidate(&snapshot, published.relative_path().to_string());
+    let checkpoint = candidate(&snapshot, &published);
 
     let loaded = load_recovery_checkpoint(data_dir.path(), &checkpoint)
         .expect("published checkpoint must restore into private state");
@@ -160,7 +163,7 @@ fn selected_checkpoint_rejects_snapshot_identity_mismatch() {
     let (snapshot, _, _) = test_snapshot();
     let published =
         publish_snapshot_file(data_dir.path(), &snapshot).expect("snapshot file must be durable");
-    let mut checkpoint = candidate(&snapshot, published.relative_path().to_string());
+    let mut checkpoint = candidate(&snapshot, &published);
     checkpoint.pointer.snapshot_id += 1;
 
     let error = load_recovery_checkpoint(data_dir.path(), &checkpoint).unwrap_err();

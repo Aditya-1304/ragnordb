@@ -102,6 +102,15 @@ fn checkpoint_becomes_retention_safe_only_after_matching_wal_pair_is_durable() {
     assert_eq!(pointer.snapshot_timestamp, marker.snapshot_timestamp);
     assert_eq!(pointer.replay_from_lsn, marker.replay_from_lsn);
     assert_eq!(pointer.relative_path, snapshot_file.relative_path());
+    assert_eq!(pointer.file_length, snapshot_file.file_length());
+    assert_eq!(
+        pointer.file_checksum_crc32c,
+        snapshot_file.file_checksum_crc32c()
+    );
+    assert_eq!(
+        pointer.snapshot_format_version,
+        snapshot_file.snapshot_format_version()
+    );
 }
 
 /// Realistic bug caught:
@@ -124,6 +133,9 @@ fn marker_sync_outcome_unknown_never_returns_a_retention_safe_checkpoint() {
         replay_from_lsn: Lsn::new(snapshot.replay_from_lsn),
         relative_path: snapshot_file.relative_path().to_string(),
         table_ids: BTreeSet::new(),
+        file_length: snapshot_file.file_length(),
+        file_checksum_crc32c: snapshot_file.file_checksum_crc32c(),
+        snapshot_format_version: snapshot_file.snapshot_format_version(),
     };
     let pointer_payload_length = expected_pointer
         .encode()
