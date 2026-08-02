@@ -13,6 +13,7 @@ use crate::result::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityFailureKind {
     WalWriterFatal,
+    StorageCorruption,
     CommitOutcomeUnknown,
     CatalogOutcomeUnknown,
     CheckpointOutcomeUnknown,
@@ -24,6 +25,7 @@ impl DurabilityFailureKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WalWriterFatal => "wal_writer_fatal",
+            Self::StorageCorruption => "storage_corruption",
             Self::CommitOutcomeUnknown => "commit_outcome_unknown",
             Self::CatalogOutcomeUnknown => "catalog_outcome_unknown",
             Self::CheckpointOutcomeUnknown => "checkpoint_outcome_unknown",
@@ -140,11 +142,16 @@ impl DurabilityGate {
                 Some(DurabilityFailureKind::CheckpointOutcomeUnknown)
             }
 
+            // CorruptData is reserved for bytes that violate a canonical
+            // storage, recovery, or internal encoding contract. Once such
+            // bytes are observed by a live operation, later reads and writes
+            // cannot safely assume that the affected state is isolated.
+            Error::CorruptData(_) => Some(DurabilityFailureKind::StorageCorruption),
+
             Error::RecoveryRequired { .. } => Some(DurabilityFailureKind::RecoveryRequired),
 
             Error::NotImplemented(_)
             | Error::InvalidArgument(_)
-            | Error::CorruptData(_)
             | Error::WriteConflict(_)
             | Error::SqlParse(_)
             | Error::UnsupportedSql(_)
@@ -196,6 +203,26 @@ mod tests {
         assert!(matches!(
             gate.ensure_healthy().unwrap_err(),
             Error::RecoveryRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn storage_corruption_fences_the_node() {
+        let gate = DurabilityGate::new();
+
+        gate.observe_error(&Error::CorruptData(
+            "MVCC write references a missing default value".to_string(),
+        ));
+
+        let NodeDurabilityState::RecoveryRequired(failure) = gate.state() else {
+            panic!("storage corruption must require recovery");
+        };
+
+        assert_eq!(failure.kind(), DurabilityFailureKind::StorageCorruption);
+        assert_eq!(failure.kind().as_str(), "storage_corruption");
+        assert!(matches!(
+            gate.ensure_healthy(),
+            Err(Error::RecoveryRequired { .. })
         ));
     }
 

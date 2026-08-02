@@ -87,6 +87,44 @@ fn unknown_commit_blocks_subsequent_reads_and_other_table_writes() {
     ));
 }
 
+/// Realistic bug caught:
+///
+/// A live read can discover a broken MVCC write/default relationship or a
+/// malformed stored row. Returning that corruption only to the current client
+/// would allow later statements to keep using storage whose integrity is no
+/// longer established.
+#[test]
+fn live_storage_corruption_blocks_subsequent_reads_and_writes() {
+    let mut database = LocalDatabase::new();
+    let gate = database.durability_gate();
+    let mut session = SqlSession::new();
+
+    database
+        .execute_sql(&mut session, "CREATE TABLE users (id INT PRIMARY KEY)")
+        .unwrap();
+
+    // `execute_sql` observes every error returned by the live executor through
+    // this same node-wide gate. Injecting the typed error here isolates the
+    // durability classification from a particular private storage layout.
+    gate.observe_error(&Error::CorruptData(
+        "MVCC write references a missing default value".to_string(),
+    ));
+
+    assert!(matches!(
+        database.execute_sql(&mut session, "SELECT id FROM users"),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(matches!(
+        database.execute_sql(&mut session, "INSERT INTO users (id) VALUES (1)"),
+        Err(Error::RecoveryRequired { .. })
+    ));
+
+    let NodeDurabilityState::RecoveryRequired(failure) = gate.state() else {
+        panic!("live storage corruption must fence the node");
+    };
+    assert_eq!(failure.kind().as_str(), "storage_corruption");
+}
+
 /// Every database-owned durability failure class must cross the same shared
 /// SQL admission boundary.
 #[test]
