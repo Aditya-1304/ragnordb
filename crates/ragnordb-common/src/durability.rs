@@ -151,6 +151,7 @@ impl DurabilityGate {
             | Error::SchemaMismatch(_)
             | Error::ConstraintViolation(_)
             | Error::Configuration(_)
+            | Error::StatementTimeout { .. }
             | Error::WalAppendNotStaged {
                 recovery_required: false,
                 ..

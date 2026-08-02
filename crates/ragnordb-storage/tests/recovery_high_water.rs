@@ -55,6 +55,7 @@ fn transaction_commit(table_id: TableId) -> SingleNodeTxnCommit {
         txn_id: TxnId(41),
         start_timestamp: Timestamp(70),
         commit_timestamp: Timestamp(90),
+        schema_version: 1,
         writes: BTreeMap::from([(encoded_key, WalMutation::Put(encoded_row))]),
     }
 }

@@ -21,8 +21,8 @@ use ragnordb_common::{
 use ragnordb_exec::{ExecutionResult, LocalExecutor, SqlSession};
 use ragnordb_storage::{
     checkpoint::{
-        PublishedCheckpoint, publish_checkpoint as publish_checkpoint_metadata,
-        publish_snapshot_file,
+        PublishedCheckpoint, cleanup_orphan_snapshot_files,
+        publish_checkpoint as publish_checkpoint_metadata, publish_snapshot_file,
     },
     recovery::{
         RecoveryState, load_recovery_checkpoint, replay_recovery_stream_from_state,
@@ -46,6 +46,19 @@ type LocalWalAdapter = RagnorDbWalAdapter<FsSegmentDirectory, ()>;
 
 /// shared server-wide local database runtime
 pub type SharedLocalDatabase = Arc<Mutex<LocalDatabase>>;
+
+/// Point-in-time storage state exposed through administrative health endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStatus {
+    pub durable_lsn: u64,
+    pub replay_frontier: u64,
+    pub latest_checkpoint_id: Option<u64>,
+    pub wal_retained_bytes: u64,
+    pub retention_pins_active: usize,
+    pub oldest_retention_pin_lsn: Option<u64>,
+    pub wal_last_append_nanos: u64,
+    pub wal_last_sync_nanos: u64,
+}
 
 /// result returned only after the complete live checkpoint workflow succeeds
 #[must_use = "checkpoint publication contains the durable and retention boundaries"]
@@ -83,6 +96,8 @@ pub struct LocalDatabase {
     checkpoint_publication_lock: Arc<Mutex<()>>,
     data_directory_lock: Option<DataDirectoryLock>,
     durability_gate: DurabilityGate,
+    latest_checkpoint_id: Option<u64>,
+    checkpoint_replay_frontier: Lsn,
 }
 
 impl fmt::Debug for LocalDatabase {
@@ -110,6 +125,8 @@ impl Default for LocalDatabase {
             checkpoint_publication_lock: Arc::new(Mutex::new(())),
             data_directory_lock: None,
             durability_gate: DurabilityGate::new(),
+            latest_checkpoint_id: None,
+            checkpoint_replay_frontier: Lsn::ZERO,
         }
     }
 }
@@ -185,6 +202,12 @@ impl LocalDatabase {
 
         let checkpoint_stream = scan_recovery_records(&wal, first_retained_lsn)?;
         let checkpoint_candidate = select_recovery_checkpoint(checkpoint_stream)?;
+        let selected_snapshot_path = checkpoint_candidate
+            .as_ref()
+            .map(|candidate| candidate.pointer.relative_path.clone());
+        let selected_snapshot_id = checkpoint_candidate
+            .as_ref()
+            .map(|candidate| candidate.pointer.snapshot_id);
 
         let (recovered_state, replay_from_lsn) = match checkpoint_candidate {
             Some(candidate) => {
@@ -210,6 +233,11 @@ impl LocalDatabase {
 
         let replay_stream = scan_recovery_records(&wal, replay_from_lsn)?;
         let recovered_state = replay_recovery_stream_from_state(replay_stream, recovered_state)?;
+
+        // Cleanup follows complete snapshot validation and WAL-suffix replay.
+        // Until this point every final file may still be the only recoverable
+        // image for a candidate discovered during startup.
+        cleanup_orphan_snapshot_files(&data_dir, selected_snapshot_path.as_deref())?;
 
         let high_water_marks = recovered_state.high_water_marks();
         let floors = high_water_marks.checked_allocator_floors()?;
@@ -251,6 +279,8 @@ impl LocalDatabase {
                 checkpoint_publication_lock: Arc::new(Mutex::new(())),
                 data_directory_lock: Some(data_directory_lock),
                 durability_gate: DurabilityGate::new(),
+                latest_checkpoint_id: selected_snapshot_id,
+                checkpoint_replay_frontier: replay_from_lsn,
             },
             recovery_report,
         ))
@@ -366,7 +396,22 @@ impl LocalDatabase {
         .await;
 
         match worker {
-            Ok(result) => result,
+            Ok(Ok(publication)) => {
+                let mut runtime = database.lock().await;
+                runtime.latest_checkpoint_id = Some(publication.checkpoint.snapshot_id);
+                runtime.checkpoint_replay_frontier = publication.checkpoint.replay_from_lsn;
+                crate::metrics::counter_inc("ragnordb_checkpoint_success_total");
+                crate::metrics::gauge_set(
+                    "ragnordb_checkpoint_replay_frontier",
+                    publication.checkpoint.replay_from_lsn.as_u64() as f64,
+                );
+                Ok(publication)
+            }
+
+            Ok(Err(error)) => {
+                crate::metrics::counter_inc("ragnordb_checkpoint_failure_total");
+                Err(error)
+            }
 
             Err(source) => Err(join_gate.require_recovery(
                 ragnordb_common::durability::DurabilityFailureKind::RecoveryRequired,
@@ -454,5 +499,52 @@ impl LocalDatabase {
     /// retention, and administrative health reporting
     pub fn durability_gate(&self) -> DurabilityGate {
         self.durability_gate.clone()
+    }
+
+    /// return storage progress without exposing mutable database internals
+    pub fn status(&self) -> DatabaseStatus {
+        match &self.checkpoint_adapter {
+            Some(adapter) => {
+                let wal_metrics = adapter.metrics();
+
+                DatabaseStatus {
+                    durable_lsn: adapter.durable_lsn().as_u64(),
+                    replay_frontier: self.checkpoint_replay_frontier.as_u64(),
+                    latest_checkpoint_id: self.latest_checkpoint_id,
+                    wal_retained_bytes: wal_metrics.current_wal_size,
+                    retention_pins_active: wal_metrics.retention_pins_active,
+                    //  only live RagnorDB-owned retention pin protects LSN
+                    // zero during checkpoint publication
+                    oldest_retention_pin_lsn: (wal_metrics.retention_pins_active != 0).then_some(0),
+                    wal_last_append_nanos: adapter.last_append_duration_nanos(),
+                    wal_last_sync_nanos: wal_metrics
+                        .last_sync_duration
+                        .as_nanos()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                }
+            }
+            None => DatabaseStatus {
+                durable_lsn: self.executor.replay_from_end_lsn(),
+                replay_frontier: self.executor.replay_from_end_lsn(),
+                latest_checkpoint_id: self.latest_checkpoint_id,
+                wal_retained_bytes: 0,
+                retention_pins_active: 0,
+                oldest_retention_pin_lsn: None,
+                wal_last_append_nanos: 0,
+                wal_last_sync_nanos: 0,
+            },
+        }
+    }
+
+    /// complete the durable clean shutdown protocol for the owned A-WAL
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.durability_gate.ensure_healthy()?;
+
+        if let Some(adapter) = &self.checkpoint_adapter {
+            adapter.shutdown()?;
+        }
+
+        Ok(())
     }
 }

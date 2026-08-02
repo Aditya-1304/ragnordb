@@ -24,6 +24,12 @@ pub struct SingleNodeTxnCommit {
     /// Complete transaction mutation batch in deterministic key order
     #[prost(message, repeated, tag = "6")]
     pub writes: ::prost::alloc::vec::Vec<WalWrite>,
+    /// Catalog schema revision used to validate keys and rows for this commit.
+    ///
+    /// Version 1 records predate this field and are interpreted as schema
+    /// version 1 because schema evolution was not yet available.
+    #[prost(uint64, tag = "7")]
+    pub schema_version: u64,
 }
 /// One encoded row mutation within a committed transaction batch
 #[derive(Clone, PartialEq, ::prost::Message)]

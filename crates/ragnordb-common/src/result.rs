@@ -47,6 +47,13 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Configuration(String),
 
+    /// statement expired before it acquired the serialized database owner
+    ///
+    /// once execution begins, RagnorDB waits for the authoritative durability
+    /// outcome instead of converting an in flight commit into a cancellation
+    #[error("statement admission timed out after {timeout_ms} ms")]
+    StatementTimeout { timeout_ms: u64 },
+
     /// A-WAL rejected the database record before assigning it a logical extent
     ///
     /// `recovery_required` distinguishes an ordinary admission rejection from a

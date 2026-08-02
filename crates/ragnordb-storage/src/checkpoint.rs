@@ -56,6 +56,21 @@ pub const MAX_SNAPSHOT_KEY_BYTES: usize = 1024 * 1024;
 
 /// maximum canonical encoded row size accepted from snapshot state
 pub const MAX_SNAPSHOT_ROW_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct SnapshotResourceLimits {
+    tables: usize,
+    entries: usize,
+    key_bytes: usize,
+    row_bytes: usize,
+}
+
+const SNAPSHOT_RESOURCE_LIMITS: SnapshotResourceLimits = SnapshotResourceLimits {
+    tables: MAX_SNAPSHOT_TABLES,
+    entries: MAX_SNAPSHOT_ENTRIES,
+    key_bytes: MAX_SNAPSHOT_KEY_BYTES,
+    row_bytes: MAX_SNAPSHOT_ROW_BYTES,
+};
 /// a snapshot file that completed file sync, atomic rename, and directory sync
 #[must_use = "published snapshot metadata is required by WAL pointer publication"]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +275,94 @@ pub fn publish_snapshot_file(
         file_checksum_crc32c,
         snapshot_format_version: SNAPSHOT_FILE_VERSION,
     })
+}
+
+/// Remove snapshot artifacts that cannot participate in future recovery.
+///
+/// Recovery calls this only after the selected checkpoint has been validated
+/// and its WAL suffix has replayed successfully. The selected immutable file is
+/// retained; stale temporary files and older final snapshot files are removed.
+/// Files outside RagnorDB's managed snapshot naming scheme are never touched.
+pub fn cleanup_orphan_snapshot_files(
+    data_dir: impl AsRef<Path>,
+    selected_relative_path: Option<&str>,
+) -> Result<usize> {
+    let snapshot_dir = data_dir.as_ref().join(SNAPSHOT_DIRECTORY_NAME);
+
+    if !snapshot_dir.exists() {
+        return Ok(0);
+    }
+
+    let selected_name = selected_relative_path
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| name.to_os_string());
+    let entries = fs::read_dir(&snapshot_dir).map_err(|source| Error::RecoveryFailed {
+        reason: format!(
+            "failed to enumerate snapshot directory {}: {source}",
+            snapshot_dir.display()
+        ),
+    })?;
+    let mut removed = 0usize;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to read an entry from snapshot directory {}: {source}",
+                snapshot_dir.display()
+            ),
+        })?;
+        let file_type = entry.file_type().map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to inspect snapshot artifact {}: {source}",
+                entry.path().display()
+            ),
+        })?;
+
+        if !file_type.is_file()
+            || selected_name.as_deref() == Some(entry.file_name().as_os_str())
+            || !is_managed_snapshot_artifact(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+
+        fs::remove_file(entry.path()).map_err(|source| Error::RecoveryFailed {
+            reason: format!(
+                "failed to remove orphan snapshot artifact {}: {source}",
+                entry.path().display()
+            ),
+        })?;
+        removed = removed
+            .checked_add(1)
+            .ok_or_else(|| Error::RecoveryFailed {
+                reason: "orphan snapshot removal count overflow".to_string(),
+            })?;
+    }
+
+    if removed != 0 {
+        File::open(&snapshot_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| Error::RecoveryFailed {
+                reason: format!(
+                    "failed to sync snapshot directory {} after orphan cleanup: {source}",
+                    snapshot_dir.display()
+                ),
+            })?;
+    }
+
+    Ok(removed)
+}
+
+fn is_managed_snapshot_artifact(name: &str) -> bool {
+    fn has_numeric_identity(name: &str, prefix: &str, suffix: &str) -> bool {
+        name.strip_prefix(prefix)
+            .and_then(|remaining| remaining.strip_suffix(suffix))
+            .is_some_and(|identity| {
+                !identity.is_empty() && identity.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    }
+
+    has_numeric_identity(name, "snapshot-", ".ragnor")
+        || has_numeric_identity(name, ".snapshot-", ".ragnor.tmp")
 }
 
 /// publish the WAL metadata that makes one durable snapshot a checkpoint
@@ -564,11 +667,18 @@ pub fn load_snapshot_file_bounded(
 fn validate_snapshot_resource_limits(
     snapshot: &snapshot_proto::DatabaseSnapshot,
 ) -> std::result::Result<(), String> {
-    if snapshot.tables.len() > MAX_SNAPSHOT_TABLES {
+    validate_snapshot_resource_limits_with(snapshot, SNAPSHOT_RESOURCE_LIMITS)
+}
+
+fn validate_snapshot_resource_limits_with(
+    snapshot: &snapshot_proto::DatabaseSnapshot,
+    limits: SnapshotResourceLimits,
+) -> std::result::Result<(), String> {
+    if snapshot.tables.len() > limits.tables {
         return Err(format!(
             "snapshot contains {} tables; maximum is {}",
             snapshot.tables.len(),
-            MAX_SNAPSHOT_TABLES
+            limits.tables
         ));
     }
 
@@ -581,46 +691,47 @@ fn validate_snapshot_resource_limits(
             .and_then(|count| count.checked_add(table.writes.len()))
             .ok_or_else(|| "snapshot MVCC entry count overflow".to_string())?;
 
-        if total_entries > MAX_SNAPSHOT_ENTRIES {
+        if total_entries > limits.entries {
             return Err(format!(
-                "snapshot contains more than {MAX_SNAPSHOT_ENTRIES} MVCC entries"
+                "snapshot contains more than {} MVCC entries",
+                limits.entries
             ));
         }
 
         for entry in &table.default_values {
-            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+            if entry.key.len() > limits.key_bytes {
                 return Err(format!(
                     "snapshot default-value key is {} bytes; maximum is {}",
                     entry.key.len(),
-                    MAX_SNAPSHOT_KEY_BYTES
+                    limits.key_bytes
                 ));
             }
 
-            if entry.row.len() > MAX_SNAPSHOT_ROW_BYTES {
+            if entry.row.len() > limits.row_bytes {
                 return Err(format!(
                     "snapshot row is {} bytes; maximum is {}",
                     entry.row.len(),
-                    MAX_SNAPSHOT_ROW_BYTES
+                    limits.row_bytes
                 ));
             }
         }
 
         for entry in &table.locks {
-            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+            if entry.key.len() > limits.key_bytes {
                 return Err(format!(
                     "snapshot lock key is {} bytes; maximum is {}",
                     entry.key.len(),
-                    MAX_SNAPSHOT_KEY_BYTES
+                    limits.key_bytes
                 ));
             }
         }
 
         for entry in &table.writes {
-            if entry.key.len() > MAX_SNAPSHOT_KEY_BYTES {
+            if entry.key.len() > limits.key_bytes {
                 return Err(format!(
                     "snapshot write key is {} bytes; maximum is {}",
                     entry.key.len(),
-                    MAX_SNAPSHOT_KEY_BYTES
+                    limits.key_bytes
                 ));
             }
         }
@@ -766,4 +877,119 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
 
 fn corrupt_snapshot(message: impl std::fmt::Display) -> Error {
     Error::CorruptData(format!("invalid database snapshot: {message}"))
+}
+
+#[cfg(test)]
+mod resource_limit_tests {
+    use super::*;
+
+    fn limits() -> SnapshotResourceLimits {
+        SnapshotResourceLimits {
+            tables: 1,
+            entries: 1,
+            key_bytes: 2,
+            row_bytes: 3,
+        }
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A small encoded protobuf can declare enough repeated table messages to
+    /// force excessive allocation and startup work before semantic recovery.
+    #[test]
+    fn snapshot_table_count_is_bounded() {
+        let snapshot = snapshot_proto::DatabaseSnapshot {
+            tables: vec![
+                snapshot_proto::SnapshotTable::default(),
+                snapshot_proto::SnapshotTable::default(),
+            ],
+            ..snapshot_proto::DatabaseSnapshot::default()
+        };
+
+        let error = validate_snapshot_resource_limits_with(&snapshot, limits()).unwrap_err();
+
+        assert!(error.contains("2 tables; maximum is 1"));
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// Entry limits could be enforced per table or per column-family list while
+    /// allowing the combined MVCC population to exceed the process budget.
+    #[test]
+    fn combined_snapshot_entry_count_is_bounded() {
+        let snapshot = snapshot_proto::DatabaseSnapshot {
+            tables: vec![snapshot_proto::SnapshotTable {
+                default_values: vec![snapshot_proto::DefaultValueEntry::default()],
+                locks: vec![snapshot_proto::LockEntry::default()],
+                ..snapshot_proto::SnapshotTable::default()
+            }],
+            ..snapshot_proto::DatabaseSnapshot::default()
+        };
+
+        let error = validate_snapshot_resource_limits_with(&snapshot, limits()).unwrap_err();
+
+        assert!(error.contains("more than 1 MVCC entries"));
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// Oversized keys in any MVCC column family could bypass the file-size
+    /// bound and cause disproportionate indexing allocations during restore.
+    #[test]
+    fn every_snapshot_key_family_is_bounded() {
+        for table in [
+            snapshot_proto::SnapshotTable {
+                default_values: vec![snapshot_proto::DefaultValueEntry {
+                    key: vec![0; 3],
+                    ..snapshot_proto::DefaultValueEntry::default()
+                }],
+                ..snapshot_proto::SnapshotTable::default()
+            },
+            snapshot_proto::SnapshotTable {
+                locks: vec![snapshot_proto::LockEntry {
+                    key: vec![0; 3],
+                    ..snapshot_proto::LockEntry::default()
+                }],
+                ..snapshot_proto::SnapshotTable::default()
+            },
+            snapshot_proto::SnapshotTable {
+                writes: vec![snapshot_proto::WriteEntry {
+                    key: vec![0; 3],
+                    ..snapshot_proto::WriteEntry::default()
+                }],
+                ..snapshot_proto::SnapshotTable::default()
+            },
+        ] {
+            let snapshot = snapshot_proto::DatabaseSnapshot {
+                tables: vec![table],
+                ..snapshot_proto::DatabaseSnapshot::default()
+            };
+
+            let error = validate_snapshot_resource_limits_with(&snapshot, limits()).unwrap_err();
+            assert!(error.contains("key is 3 bytes; maximum is 2"));
+        }
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A single row value could consume most startup memory even when table,
+    /// entry, key, and whole-file counts remain within their independent limits.
+    #[test]
+    fn snapshot_row_size_is_bounded() {
+        let snapshot = snapshot_proto::DatabaseSnapshot {
+            tables: vec![snapshot_proto::SnapshotTable {
+                default_values: vec![snapshot_proto::DefaultValueEntry {
+                    key: vec![0; 2],
+                    row: vec![0; 4],
+                    ..snapshot_proto::DefaultValueEntry::default()
+                }],
+                ..snapshot_proto::SnapshotTable::default()
+            }],
+            ..snapshot_proto::DatabaseSnapshot::default()
+        };
+
+        let error = validate_snapshot_resource_limits_with(&snapshot, limits()).unwrap_err();
+
+        assert!(error.contains("row is 4 bytes; maximum is 3"));
+    }
 }

@@ -40,6 +40,7 @@ fn valid_commit() -> SingleNodeTxnCommit {
         txn_id: TxnId(7),
         start_timestamp: Timestamp(11),
         commit_timestamp: Timestamp(12),
+        schema_version: 1,
         writes,
     }
 }
@@ -133,6 +134,7 @@ fn v1_single_node_commit_golden_bytes_remain_decodable() {
         txn_id: TxnId(7),
         start_timestamp: Timestamp(11),
         commit_timestamp: Timestamp(12),
+        schema_version: 1,
         writes: expected_writes,
     };
 
@@ -156,7 +158,7 @@ fn zero_and_unsupported_versions_are_rejected() {
 
     assert_decode_rejected(
         |proto| proto.version = SINGLE_NODE_TXN_COMMIT_VERSION + 1,
-        "unsupported SingleNodeTxnCommit version 2",
+        "unsupported SingleNodeTxnCommit version 3",
     );
 }
 
@@ -187,6 +189,16 @@ fn invalid_transaction_metadata_is_rejected_on_encode_and_decode() {
     assert_encode_rejected(
         |record| record.commit_timestamp = Timestamp(0),
         "commit timestamp 0 is reserved",
+    );
+
+    assert_encode_rejected(
+        |record| record.schema_version = 0,
+        "schema version 0 is reserved",
+    );
+
+    assert_decode_rejected(
+        |proto| proto.schema_version = 0,
+        "schema version 0 is reserved",
     );
 
     assert_encode_rejected(

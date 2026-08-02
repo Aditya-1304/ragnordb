@@ -15,7 +15,31 @@ use ragnordb_common::{Error, Result};
 use serde::Deserialize;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS: u64 = 5_000;
 const ADMIN_PORT_OFFSET: u16 = 100;
+
+/// controls whether client SQL text may enter structured server logs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatementLogging {
+    Off,
+    MetadataOnly,
+    Redacted,
+    Full,
+}
+
+const fn default_statement_timeout_ms() -> u64 {
+    DEFAULT_STATEMENT_TIMEOUT_MS
+}
+
+const fn default_shutdown_grace_period_ms() -> u64 {
+    DEFAULT_SHUTDOWN_GRACE_PERIOD_MS
+}
+
+const fn default_statement_logging() -> StatementLogging {
+    StatementLogging::MetadataOnly
+}
 
 /// Static address information for one cluster seed node.
 ///
@@ -48,6 +72,15 @@ pub struct NodeConfig {
     /// Maximum number of concurrent SQL client connections.
     pub max_connections: u32,
 
+    /// Maximum time a request may wait to acquire the database execution owner.
+    pub statement_timeout_ms: u64,
+
+    /// Time allowed for accepted connections to drain during shutdown.
+    pub shutdown_grace_period_ms: u64,
+
+    /// Policy governing SQL statement text in logs.
+    pub statement_logging: StatementLogging,
+
     /// Stable cluster identity used by metadata bootstrap.
     pub cluster_id: Option<String>,
 
@@ -72,6 +105,15 @@ struct NodeConfigFile {
 
     #[serde(default = "default_max_connections")]
     max_connections: u32,
+
+    #[serde(default = "default_statement_timeout_ms")]
+    statement_timeout_ms: u64,
+
+    #[serde(default = "default_shutdown_grace_period_ms")]
+    shutdown_grace_period_ms: u64,
+
+    #[serde(default = "default_statement_logging")]
+    statement_logging: StatementLogging,
 
     cluster_id: Option<String>,
 
@@ -100,6 +142,9 @@ impl NodeConfig {
             listen_addr,
             admin_addr,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
+            shutdown_grace_period_ms: DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
+            statement_logging: StatementLogging::MetadataOnly,
             cluster_id: None,
             bootstrap: false,
             seed_nodes: Vec::new(),
@@ -140,6 +185,9 @@ impl NodeConfig {
             listen_addr: file.listen_addr,
             admin_addr,
             max_connections: file.max_connections,
+            statement_timeout_ms: file.statement_timeout_ms,
+            shutdown_grace_period_ms: file.shutdown_grace_period_ms,
+            statement_logging: file.statement_logging,
             cluster_id: file.cluster_id,
             bootstrap: file.bootstrap,
             seed_nodes: file.seed_nodes,
@@ -186,6 +234,18 @@ impl NodeConfig {
         if self.max_connections == 0 {
             return Err(Error::Configuration(
                 "max_connections must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.statement_timeout_ms == 0 {
+            return Err(Error::Configuration(
+                "statement_timeout_ms must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.shutdown_grace_period_ms == 0 {
+            return Err(Error::Configuration(
+                "shutdown_grace_period_ms must be greater than zero".to_string(),
             ));
         }
 
@@ -311,6 +371,9 @@ mod tests {
 
         assert_eq!(config.admin_addr, "127.0.0.1:7201".parse().unwrap());
         assert_eq!(config.max_connections, 100);
+        assert_eq!(config.statement_timeout_ms, 30_000);
+        assert_eq!(config.shutdown_grace_period_ms, 5_000);
+        assert_eq!(config.statement_logging, StatementLogging::MetadataOnly);
         assert!(config.seed_nodes.is_empty());
     }
 
@@ -334,6 +397,9 @@ node_id = 1
 data_dir = "./data/n1"
 listen_addr = "127.0.0.1:7101"
 max_connections = 128
+statement_timeout_ms = 2500
+shutdown_grace_period_ms = 7000
+statement_logging = "redacted"
 cluster_id = "ragnordb-dev"
 bootstrap = true
 
@@ -360,6 +426,9 @@ admin_addr = "127.0.0.1:7203"
 
         assert_eq!(config.node_id, NodeId(1));
         assert_eq!(config.max_connections, 128);
+        assert_eq!(config.statement_timeout_ms, 2_500);
+        assert_eq!(config.shutdown_grace_period_ms, 7_000);
+        assert_eq!(config.statement_logging, StatementLogging::Redacted);
         assert_eq!(config.seed_nodes.len(), 3);
         assert_eq!(config.cluster_id.as_deref(), Some("ragnordb-dev"));
         assert!(config.bootstrap);

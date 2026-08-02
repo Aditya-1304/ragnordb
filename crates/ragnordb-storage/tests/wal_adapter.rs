@@ -97,6 +97,7 @@ fn valid_commit() -> SingleNodeTxnCommit {
         txn_id: TxnId(7),
         start_timestamp: Timestamp(11),
         commit_timestamp: Timestamp(12),
+        schema_version: 1,
         writes,
     }
 }

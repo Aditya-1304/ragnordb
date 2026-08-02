@@ -14,11 +14,13 @@ use std::{
     path::Path,
 };
 
-use ragnordb_catalog::{Catalog, MemoryCatalog};
+use ragnordb_catalog::{Catalog, MemoryCatalog, TableSchema};
 use ragnordb_common::{
     Error, Result,
-    catalog_codec::TableDefinition,
+    catalog_codec::{DataType, TableDefinition},
+    codec::Value,
     command_codec::CatalogOperation,
+    encoding::decode_row,
     ids::{TableId, Timestamp, TxnId},
     proto::snapshot as snapshot_proto,
 };
@@ -32,6 +34,7 @@ use wal::{
 
 use crate::{
     checkpoint::load_snapshot_file_bounded,
+    key::{decode_primary_key, decode_row_key, encode_row_key, make_row_key},
     mvcc::{InMemoryMvcc, Mutation, MvccStorage},
     wal::{
         CatalogUpdate, CheckpointMarker, RagnorDbWalRecordType, SingleNodeTxnCommit,
@@ -381,6 +384,17 @@ pub struct RecoveryState {
     catalog: MemoryCatalog,
     mvcc_by_table: BTreeMap<TableId, InMemoryMvcc>,
     high_water_marks: RecoveryHighWaterMarks,
+
+    /// Exact committed identity observed in the selected WAL replay stream.
+    ///
+    /// Storing the validated semantic record avoids relying on a digest with
+    /// collision semantics. Recovery streams are bounded by retained WAL size,
+    /// and the map is discarded after startup publishes reconstructed state.
+    transactions_by_id: BTreeMap<TxnId, SingleNodeTxnCommit>,
+
+    /// Single-node commit timestamps are globally unique because one allocator
+    /// serializes their creation. Reuse by another transaction is corruption.
+    transactions_by_commit_timestamp: BTreeMap<Timestamp, TxnId>,
 }
 
 impl RecoveryState {
@@ -470,6 +484,8 @@ impl RecoveryState {
                 max_table_id,
                 max_snapshot_id: high_water.max_snapshot_id,
             },
+            transactions_by_id: BTreeMap::new(),
+            transactions_by_commit_timestamp: BTreeMap::new(),
         })
     }
 
@@ -555,14 +571,46 @@ impl RecoveryState {
     }
 
     fn apply_transaction_commit(&mut self, lsn: Lsn, commit: &SingleNodeTxnCommit) -> Result<()> {
-        if self.catalog.table_by_id(commit.table_id).is_none() {
+        if let Some(previous) = self.transactions_by_id.get(&commit.txn_id) {
+            if previous == commit {
+                // Exact duplicate replay is intentionally idempotent. Returning
+                // before MVCC application also avoids depending on lower-layer
+                // duplicate-detection details.
+                return Ok(());
+            }
+
             return Err(Error::CorruptData(format!(
+                "SingleNodeTxnCommit at WAL LSN {} reuses transaction ID {} \
+                 for a different logical commit",
+                lsn.as_u64(),
+                commit.txn_id.0,
+            )));
+        }
+
+        if let Some(previous_txn_id) = self
+            .transactions_by_commit_timestamp
+            .get(&commit.commit_timestamp)
+        {
+            return Err(Error::CorruptData(format!(
+                "SingleNodeTxnCommit at WAL LSN {} reuses commit timestamp {} \
+                 previously owned by transaction {} for transaction {}",
+                lsn.as_u64(),
+                commit.commit_timestamp.0,
+                previous_txn_id.0,
+                commit.txn_id.0,
+            )));
+        }
+
+        let schema = self.catalog.table_by_id(commit.table_id).ok_or_else(|| {
+            Error::CorruptData(format!(
                 "SingleNodeTxnCommit at WAL LSN {} references table {} \
                  before its catalog definition appears in durable history",
                 lsn.as_u64(),
                 commit.table_id.0
-            )));
-        }
+            ))
+        })?;
+
+        validate_commit_against_schema(lsn, schema.as_ref(), commit)?;
 
         let storage = self
             .mvcc_by_table
@@ -601,6 +649,11 @@ impl RecoveryState {
                 recovery_corruption(lsn, "failed to apply durable SingleNodeTxnCommit", source)
             })?;
 
+        self.transactions_by_id
+            .insert(commit.txn_id, commit.clone());
+        self.transactions_by_commit_timestamp
+            .insert(commit.commit_timestamp, commit.txn_id);
+
         Ok(())
     }
 
@@ -617,6 +670,132 @@ impl RecoveryState {
         RecoveryHighWaterMarks,
     ) {
         (self.catalog, self.mvcc_by_table, self.high_water_marks)
+    }
+}
+
+/// Validate durable transaction bytes against the exact catalog schema that
+/// gives their row and primary-key encodings semantic meaning.
+///
+/// The WAL codec proves that keys and rows are canonically encoded. Recovery
+/// must additionally prove that those values could have been produced by the
+/// live SQL path for the referenced schema revision.
+fn validate_commit_against_schema(
+    lsn: Lsn,
+    schema: &TableSchema,
+    commit: &SingleNodeTxnCommit,
+) -> Result<()> {
+    let corrupt = |message: String| {
+        Error::CorruptData(format!(
+            "SingleNodeTxnCommit at WAL LSN {} violates table {} schema: {message}",
+            lsn.as_u64(),
+            schema.id.0,
+        ))
+    };
+
+    if commit.schema_version != schema.schema_version {
+        return Err(corrupt(format!(
+            "commit schema version {} does not match catalog schema version {}",
+            commit.schema_version, schema.schema_version,
+        )));
+    }
+
+    let primary_key_columns = schema
+        .primary_key_columns()
+        .map_err(|source| corrupt(source.to_string()))?;
+
+    for (encoded_key, mutation) in &commit.writes {
+        let row_key = decode_row_key(encoded_key).map_err(|source| corrupt(source.to_string()))?;
+        let key_values = decode_primary_key(&row_key.primary_key_bytes)
+            .map_err(|source| corrupt(source.to_string()))?;
+
+        if key_values.len() != primary_key_columns.len() {
+            return Err(corrupt(format!(
+                "primary key has {} values, but schema requires {}",
+                key_values.len(),
+                primary_key_columns.len(),
+            )));
+        }
+
+        for (value, column) in key_values.iter().zip(&primary_key_columns) {
+            if !value_matches_type(value, column.ty, false) {
+                return Err(corrupt(format!(
+                    "primary-key column {} expects {:?}, but key contains {}",
+                    column.name,
+                    column.ty,
+                    value_kind(value),
+                )));
+            }
+        }
+
+        let WalMutation::Put(encoded_row) = mutation else {
+            continue;
+        };
+
+        let row = decode_row(encoded_row).map_err(|source| corrupt(source.to_string()))?;
+
+        if row.values.len() != schema.columns.len() {
+            return Err(corrupt(format!(
+                "row has {} values, but schema requires {}",
+                row.values.len(),
+                schema.columns.len(),
+            )));
+        }
+
+        for (value, column) in row.values.iter().zip(&schema.columns) {
+            if !value_matches_type(value, column.ty, column.nullable) {
+                return Err(corrupt(format!(
+                    "column {} expects {}{:?}, but row contains {}",
+                    column.name,
+                    if column.nullable { "nullable " } else { "" },
+                    column.ty,
+                    value_kind(value),
+                )));
+            }
+        }
+
+        let row_primary_key = schema
+            .primary_key_column_ids
+            .iter()
+            .map(|column_id| {
+                let ordinal = schema.column_ordinal(*column_id).ok_or_else(|| {
+                    corrupt(format!(
+                        "primary-key column ID {} has no row-layout ordinal",
+                        column_id.0,
+                    ))
+                })?;
+
+                Ok(row.values[ordinal].clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expected_key = make_row_key(schema.id, &row_primary_key)
+            .and_then(|key| encode_row_key(&key))
+            .map_err(|source| corrupt(source.to_string()))?;
+
+        if expected_key != *encoded_key {
+            return Err(corrupt(
+                "physical row key does not match the row's primary-key values".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn value_matches_type(value: &Value, expected: DataType, nullable: bool) -> bool {
+    match value {
+        Value::Null => nullable,
+        Value::Int(_) => expected == DataType::Int,
+        Value::Text(_) => expected == DataType::Text,
+        Value::Bool(_) => expected == DataType::Bool,
+    }
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NULL",
+        Value::Int(_) => "INT",
+        Value::Text(_) => "TEXT",
+        Value::Bool(_) => "BOOL",
     }
 }
 

@@ -11,19 +11,24 @@ use ragnordb_storage::{
 };
 use wal::{
     config::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN, WalConfig},
+    error::WalError,
     io::fault::FaultDirectory,
     lsn::Lsn,
-    types::WalIdentity,
+    types::{RecordType, WalIdentity, record_types},
     wal::WalHandle,
 };
 
 type TestWalHandle = WalHandle<FaultDirectory, ()>;
 
 fn empty_snapshot(snapshot_id: u64) -> snapshot_proto::DatabaseSnapshot {
+    empty_snapshot_at(snapshot_id, Lsn::new(4096))
+}
+
+fn empty_snapshot_at(snapshot_id: u64, replay_from_lsn: Lsn) -> snapshot_proto::DatabaseSnapshot {
     snapshot_proto::DatabaseSnapshot {
         snapshot_id,
         snapshot_timestamp: Some(Timestamp(40).to_proto()),
-        replay_from_lsn: 4096,
+        replay_from_lsn: replay_from_lsn.as_u64(),
         high_water_marks: Some(snapshot_proto::AllocatorHighWaterMarks {
             max_transaction_id: Some(TxnId(12).to_proto()),
             max_timestamp: Some(Timestamp(40).to_proto()),
@@ -32,6 +37,65 @@ fn empty_snapshot(snapshot_id: u64) -> snapshot_proto::DatabaseSnapshot {
         }),
         tables: Vec::new(),
     }
+}
+
+/// Realistic bug caught:
+///
+/// Checkpoint publication could update only an in-memory retention floor while
+/// leaving every obsolete WAL segment on disk. That would pass logical recovery
+/// tests but allow checkpoint metadata and transaction history to grow without
+/// bound across repeated checkpoints.
+#[test]
+fn newer_checkpoint_frontier_physically_prunes_covered_wal_segments() {
+    let data_dir = tempfile::tempdir().expect("temporary data directory must be created");
+    let wal_dir = tempfile::tempdir().expect("temporary WAL directory must be created");
+    let directory = FaultDirectory::new(wal_dir.path().to_path_buf());
+    let mut config = wal_config(wal_dir.path());
+
+    config.max_record_size = 1024;
+    config.target_segment_size = SEGMENT_HEADER_LEN
+        + 4 * (RECORD_HEADER_LEN as u64 + u64::from(config.max_record_size))
+        + RECORD_HEADER_LEN as u64
+        + 24;
+
+    let handle = open_handle(directory, config);
+    let observer = handle.clone();
+    let adapter = RagnorDbWalAdapter::new(handle);
+    let first_file = publish_snapshot_file(data_dir.path(), &empty_snapshot_at(1, Lsn::ZERO))
+        .expect("first snapshot file must be durable");
+    let first = publish_checkpoint(&adapter, &first_file)
+        .expect("first checkpoint metadata must be durable");
+
+    // Large user records create multiple sealed segments between checkpoints.
+    // Their contents are irrelevant to this storage-level retention test.
+    for fill in 0_u8..12 {
+        let _extent = observer
+            .append_and_sync(RecordType::new(record_types::USER_MIN), &vec![fill; 1024])
+            .expect("retention test WAL filler must become durable");
+    }
+
+    let second_frontier = observer.durable_lsn();
+    let second_file =
+        publish_snapshot_file(data_dir.path(), &empty_snapshot_at(2, second_frontier))
+            .expect("second snapshot file must be durable");
+    let second = publish_checkpoint(&adapter, &second_file)
+        .expect("second checkpoint metadata must be durable");
+    let pruned = adapter
+        .advance_checkpoint_retention(second.replay_from_lsn)
+        .expect("published checkpoint must advance physical retention");
+
+    assert!(
+        pruned > 0,
+        "at least one covered WAL segment must be removed"
+    );
+    assert!(matches!(
+        observer.read_at(first.pointer_extent.start_lsn),
+        Err(WalError::LsnPruned { .. })
+    ));
+    assert!(
+        observer.read_at(second.pointer_extent.start_lsn).is_ok(),
+        "newest checkpoint metadata must remain readable"
+    );
 }
 
 fn wal_config(path: &std::path::Path) -> WalConfig {

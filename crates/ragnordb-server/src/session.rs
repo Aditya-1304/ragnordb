@@ -17,9 +17,9 @@ pub struct SessionId(pub u64);
 
 /// Connection-level state for one SQL client.
 ///
-/// `statement_timeout_ms` records the configured V1 default. Actual deadline
-/// enforcement requires request cancellation and asynchronous execution support
-/// and remains a later server-runtime integration.
+/// `statement_timeout_ms` bounds how long a request may wait for the serialized
+/// database execution owner. Once admitted, execution runs to its authoritative
+/// durability outcome so an in-flight commit is never mislabeled as cancelled.
 #[derive(Debug)]
 pub struct Session {
     pub session_id: SessionId,

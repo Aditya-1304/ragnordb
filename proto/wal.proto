@@ -28,6 +28,12 @@ message SingleNodeTxnCommit {
 
     // Complete transaction mutation batch in deterministic key order
     repeated WalWrite writes = 6;
+
+    // Catalog schema revision used to validate keys and rows for this commit.
+    //
+    // Version 1 records predate this field and are interpreted as schema
+    // version 1 because schema evolution was not yet available.
+    uint64 schema_version = 7;
 }
 
 // One encoded row mutation within a committed transaction batch

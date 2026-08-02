@@ -86,6 +86,7 @@ async fn admin_status_returns_json() {
         started_at: 123,
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
+        database: LocalDatabase::shared(),
     });
 
     let server_task = {
@@ -126,6 +127,7 @@ async fn admin_metrics_returns_prometheus_text() {
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
         durability_gate: DurabilityGate::new(),
+        database: LocalDatabase::shared(),
     });
 
     let server_task = {
@@ -211,6 +213,7 @@ async fn admin_status_uses_json_content_type() {
         connection_semaphore: Arc::new(Semaphore::new(10)),
         max_connections: 10,
         durability_gate: DurabilityGate::new(),
+        database: LocalDatabase::shared(),
     });
 
     let server_task = {

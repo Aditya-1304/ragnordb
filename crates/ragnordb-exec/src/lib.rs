@@ -68,6 +68,9 @@ type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
 
 type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
+/// Temporary materialized-result boundary until the client protocol streams.
+pub const MAX_MATERIALIZED_RESULT_ROWS: usize = 100_000;
+
 #[derive(Default)]
 struct InMemoryCatalogLog {
     next_lsn: Mutex<u64>,
@@ -524,10 +527,13 @@ impl LocalExecutor {
             .catalog()
             .list_tables()
             .into_iter()
+            .take(MAX_MATERIALIZED_RESULT_ROWS + 1)
             .map(|table| Row {
                 values: vec![Value::Text(table.name.clone())],
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        ensure_result_row_limit(rows.len())?;
 
         Ok(ExecutionResult::Query(ResultSet {
             columns: vec![ResultColumn {
@@ -912,10 +918,28 @@ fn matching_rows(
     let mut rows = Vec::new();
 
     while let Some(row) = filtered.next()? {
+        if rows.len() == MAX_MATERIALIZED_RESULT_ROWS {
+            return Err(Error::InvalidArgument(format!(
+                "query result exceeds the materialized row limit of \
+                 {MAX_MATERIALIZED_RESULT_ROWS}; add a selective predicate"
+            )));
+        }
+
         rows.push(row);
     }
 
     Ok(rows)
+}
+
+fn ensure_result_row_limit(row_count: usize) -> Result<()> {
+    if row_count > MAX_MATERIALIZED_RESULT_ROWS {
+        return Err(Error::InvalidArgument(format!(
+            "query result exceeds the materialized row limit of \
+             {MAX_MATERIALIZED_RESULT_ROWS}; add a selective predicate"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Select point lookup only when every primary-key column is constrained by a

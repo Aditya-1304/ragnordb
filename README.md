@@ -45,6 +45,15 @@ cargo fmt --all --check
 
 ---
 
+## Platform Support
+
+RagnorDB and A-WAL currently support Linux only. A-WAL's positional file I/O,
+directory synchronization, and durability tests target Linux filesystem
+semantics. Other platforms are not a supported deployment target until their
+equivalent primitives and crash tests are implemented.
+
+---
+
 ## What RagnorDB Is Building
 
 The target is a row-oriented distributed OLTP database
@@ -485,14 +494,17 @@ panicking or wrapping.
 - One session per connection.
 - One in-flight statement per connection.
 - Configurable maximum connection count.
+- Configurable statement-admission deadline and shutdown grace period.
 - Shared database state across connections.
 - Stable success and error JSON.
 - Internal error-detail redaction.
-- Structured `tracing` logs.
+- Configurable `off`, `metadata-only`, `redacted`, or `full` SQL logging;
+  `metadata-only` is the safe default.
 - Prometheus metrics.
 - JSON node status.
 - Build information for RagnorDB and its infrastructure dependencies.
-- Graceful admin-server shutdown after `Ctrl+C`.
+- SIGINT/SIGTERM shutdown with connection draining and an explicit A-WAL clean
+  shutdown witness.
 
 ### Durability and recovery
 
@@ -1435,8 +1447,10 @@ Response frame:
 [len: u32 little-endian][UTF-8 JSON bytes]
 ```
 
-The maximum frame size is 16 MiB. Oversized frames are rejected before their
-payload is allocated.
+The maximum request and response frame size is 16 MiB. Oversized request frames
+are rejected before payload allocation, and oversized materialized responses
+are rejected before any length prefix is written. Until streaming exists, a
+query may materialize at most 100,000 result rows.
 
 Protocol rules:
 
@@ -1485,6 +1499,7 @@ Current client-visible codes:
 | `UNSUPPORTED_SQL` | no | Parsed SQL is outside the implemented SQL surface |
 | `SQL_PARSE_ERROR` | no | The parser could not construct a valid statement |
 | `INVALID_ARGUMENT` | no | Session state or a logical request invariant is invalid |
+| `STATEMENT_TIMEOUT` | yes | The request expired before acquiring the serialized database execution owner; execution did not begin |
 | `CONNECTION_LIMIT` | yes | The server has no free connection permit |
 | `COMMIT_OUTCOME_UNKNOWN` | no | A commit acquired a WAL extent but recovery must determine whether it became durable |
 | `CATALOG_OUTCOME_UNKNOWN` | no | A catalog record acquired a WAL extent but recovery must determine its durable outcome |
@@ -1525,6 +1540,10 @@ The response reports:
 - server start time;
 - active connections;
 - maximum connections.
+- node-wide durability state and recovery-required reason;
+- durable WAL LSN and retained bytes;
+- latest checkpoint identity and replay frontier;
+- active retention-pin count.
 
 ### Prometheus metrics
 
@@ -1542,12 +1561,22 @@ RagnorDB_requests_success_total
 RagnorDB_requests_error_total
 RagnorDB_response_rows_read_total
 RagnorDB_response_rows_written_total
+ragnordb_txn_commits_total
+ragnordb_txn_aborts_total
+ragnordb_txn_commit_unknown_total
+ragnordb_statement_execution_seconds
+ragnordb_wal_append_latency_seconds
+ragnordb_wal_sync_latency_seconds
+ragnordb_recovery_duration_seconds
+ragnordb_recovery_records_replayed_total
+ragnordb_checkpoint_success_total
+ragnordb_checkpoint_failure_total
+ragnordb_checkpoint_replay_frontier
+ragnordb_wal_durable_lsn
+ragnordb_wal_retained_bytes
+ragnordb_wal_oldest_retention_pin
+ragnordb_node_recovery_required
 ```
-
-Later milestones add transaction latency, commit outcomes, write conflicts,
-timestamp allocation, tablet routing, Raft commit/apply lag, WAL append/sync
-latency, recovery duration, snapshots, MVCC version counts, Bloom-filter skips,
-compaction, and garbage-collection metrics.
 
 ### Offline WAL inspection
 

@@ -69,6 +69,7 @@ fn transaction_commit(table_id: TableId, key: Vec<u8>, row: Vec<u8>) -> SingleNo
         txn_id: TxnId(7),
         start_timestamp: Timestamp(12),
         commit_timestamp: Timestamp(13),
+        schema_version: 1,
         writes: BTreeMap::from([(key, WalMutation::Put(row))]),
     }
 }
@@ -179,4 +180,217 @@ fn transaction_before_catalog_is_rejected_without_orphan_state() {
 
     assert!(state.catalog().list_tables().is_empty());
     assert!(state.table_storage(table_id).is_none());
+}
+
+fn schema_replay_error(commit: SingleNodeTxnCommit) -> Error {
+    let table_id = commit.table_id;
+    let mut state = RecoveryState::new();
+
+    state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(64),
+            payload: RecoveryPayload::CatalogUpdate(catalog_update(table_id)),
+        })
+        .expect("catalog schema must replay before the transaction");
+
+    state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(128),
+            payload: RecoveryPayload::SingleNodeTxnCommit(commit),
+        })
+        .unwrap_err()
+}
+
+/// Verifies that canonical key and row bytes must also satisfy the recovered
+/// catalog schema before they can enter private MVCC state.
+///
+/// Realistic bug caught:
+///
+/// Earlier software could durably write a canonically encoded row with the
+/// wrong arity, types, nullability, primary key, or schema revision. Codec-only
+/// validation would accept those bytes and publish logically impossible data
+/// after restart.
+#[test]
+fn replay_rejects_canonical_mutations_that_violate_catalog_schema() {
+    let table_id = TableId(9);
+    let valid_key = encoded_key(table_id, 1);
+
+    let mut wrong_schema = transaction_commit(table_id, valid_key.clone(), encoded_row(1, "Ada"));
+    wrong_schema.schema_version = 2;
+    assert!(
+        schema_replay_error(wrong_schema)
+            .to_string()
+            .contains("schema version 2")
+    );
+
+    let wrong_key_arity = transaction_commit(
+        table_id,
+        encode_row_key(&make_row_key(table_id, &[Value::Int(1), Value::Int(2)]).unwrap()).unwrap(),
+        encoded_row(1, "Ada"),
+    );
+    assert!(
+        schema_replay_error(wrong_key_arity)
+            .to_string()
+            .contains("primary key has 2 values")
+    );
+
+    let wrong_key_type = transaction_commit(
+        table_id,
+        encode_row_key(&make_row_key(table_id, &[Value::Text("one".to_string())]).unwrap())
+            .unwrap(),
+        encoded_row(1, "Ada"),
+    );
+    assert!(
+        schema_replay_error(wrong_key_type)
+            .to_string()
+            .contains("primary-key column id expects Int")
+    );
+
+    let wrong_row_arity = transaction_commit(
+        table_id,
+        valid_key.clone(),
+        encode_row(&Row {
+            values: vec![Value::Int(1)],
+        })
+        .unwrap(),
+    );
+    assert!(
+        schema_replay_error(wrong_row_arity)
+            .to_string()
+            .contains("row has 1 values")
+    );
+
+    let wrong_row_type = transaction_commit(
+        table_id,
+        valid_key.clone(),
+        encode_row(&Row {
+            values: vec![Value::Int(1), Value::Bool(true)],
+        })
+        .unwrap(),
+    );
+    assert!(
+        schema_replay_error(wrong_row_type)
+            .to_string()
+            .contains("column name expects Text")
+    );
+
+    let null_in_required_column = transaction_commit(
+        table_id,
+        valid_key.clone(),
+        encode_row(&Row {
+            values: vec![Value::Int(1), Value::Null],
+        })
+        .unwrap(),
+    );
+    assert!(
+        schema_replay_error(null_in_required_column)
+            .to_string()
+            .contains("column name expects Text")
+    );
+
+    let mismatched_physical_key = transaction_commit(table_id, valid_key, encoded_row(2, "Ada"));
+    assert!(
+        schema_replay_error(mismatched_physical_key)
+            .to_string()
+            .contains("physical row key does not match")
+    );
+}
+
+/// Verifies that one durable transaction identity names exactly one logical
+/// commit throughout semantic replay.
+///
+/// Realistic bug caught:
+///
+/// Two individually valid WAL records could reuse a transaction ID for
+/// disjoint keys. MVCC idempotence checks operate per key and would otherwise
+/// apply both records as if they were one larger transaction.
+#[test]
+fn replay_rejects_conflicting_duplicate_transaction_identity() {
+    let table_id = TableId(9);
+    let first_key = encoded_key(table_id, 1);
+    let second_key = encoded_key(table_id, 2);
+    let first = transaction_commit(table_id, first_key.clone(), encoded_row(1, "Ada"));
+    let conflicting = transaction_commit(table_id, second_key.clone(), encoded_row(2, "Grace"));
+    let mut state = RecoveryState::new();
+
+    state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(64),
+            payload: RecoveryPayload::CatalogUpdate(catalog_update(table_id)),
+        })
+        .unwrap();
+    state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(128),
+            payload: RecoveryPayload::SingleNodeTxnCommit(first),
+        })
+        .unwrap();
+
+    let error = state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(192),
+            payload: RecoveryPayload::SingleNodeTxnCommit(conflicting),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::CorruptData(message)
+            if message.contains("transaction ID 7")
+                && message.contains("different logical commit")
+    ));
+    assert_eq!(
+        state
+            .table_storage(table_id)
+            .unwrap()
+            .read(&second_key, Timestamp(13))
+            .unwrap(),
+        None
+    );
+}
+
+/// Verifies that the serialized single-node history cannot assign one commit
+/// timestamp to two different transactions.
+///
+/// Realistic bug caught:
+///
+/// Reused visibility timestamps make MVCC ordering ambiguous even when the
+/// transactions touch different keys and their individual records are valid.
+#[test]
+fn replay_rejects_commit_timestamp_reuse_by_another_transaction() {
+    let table_id = TableId(9);
+    let first = transaction_commit(table_id, encoded_key(table_id, 1), encoded_row(1, "Ada"));
+    let mut second =
+        transaction_commit(table_id, encoded_key(table_id, 2), encoded_row(2, "Grace"));
+    second.txn_id = TxnId(8);
+    second.start_timestamp = Timestamp(11);
+    let mut state = RecoveryState::new();
+
+    for record in [
+        DecodedRecoveryRecord {
+            lsn: Lsn::new(64),
+            payload: RecoveryPayload::CatalogUpdate(catalog_update(table_id)),
+        },
+        DecodedRecoveryRecord {
+            lsn: Lsn::new(128),
+            payload: RecoveryPayload::SingleNodeTxnCommit(first),
+        },
+    ] {
+        state.apply_record(&record).unwrap();
+    }
+
+    let error = state
+        .apply_record(&DecodedRecoveryRecord {
+            lsn: Lsn::new(192),
+            payload: RecoveryPayload::SingleNodeTxnCommit(second),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::CorruptData(message)
+            if message.contains("reuses commit timestamp 13")
+                && message.contains("transaction 7")
+                && message.contains("transaction 8")
+    ));
 }

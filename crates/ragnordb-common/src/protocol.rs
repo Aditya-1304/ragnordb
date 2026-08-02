@@ -39,7 +39,16 @@ where
     W: AsyncWrite + Unpin,
 {
     let bytes = serde_json::to_vec(response)?;
-    let len = bytes.len() as u32;
+
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err(format!(
+            "response frame size {} exceeds maximum of {MAX_FRAME_SIZE}",
+            bytes.len()
+        )
+        .into());
+    }
+
+    let len = u32::try_from(bytes.len())?;
 
     writer.write_all(&len.to_le_bytes()).await?;
     writer.write_all(&bytes).await?;
@@ -52,7 +61,7 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn request_frame_round_trip() {
@@ -127,5 +136,24 @@ mod tests {
         client.write_all(&invalid_utf8).await.unwrap();
 
         assert!(read_frame(&mut server).await.is_err());
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A materialized result larger than the protocol limit could truncate its
+    /// usize length into u32 and place a malformed frame on the connection.
+    #[tokio::test]
+    async fn rejects_oversized_response_before_writing_a_length_prefix() {
+        let (mut server, mut client) = duplex(16);
+        let response = json!({ "value": "x".repeat(MAX_FRAME_SIZE) });
+
+        let error = write_frame(&mut server, &response).await.unwrap_err();
+
+        assert!(error.to_string().contains("response frame size"));
+
+        drop(server);
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
     }
 }

@@ -187,6 +187,10 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
 
         Error::InvalidArgument(_) => error_response("INVALID_ARGUMENT", &error.to_string(), false),
 
+        Error::StatementTimeout { .. } => {
+            error_response("STATEMENT_TIMEOUT", &error.to_string(), true)
+        }
+
         Error::NotImplemented(_) => error_response("UNSUPPORTED_SQL", &error.to_string(), false),
 
         Error::CorruptData(_)

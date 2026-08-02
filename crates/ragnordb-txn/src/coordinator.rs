@@ -27,6 +27,15 @@ pub trait SingleNodeCommitParticipant {
     /// Return the single table owned by this participant.
     fn table_id(&self) -> TableId;
 
+    /// Return the catalog schema revision used to encode transaction rows.
+    ///
+    /// Single-node mode currently has no schema evolution, so existing
+    /// participants use the initial revision. Future schema-aware participants
+    /// can override this without changing the durable commit coordinator.
+    fn schema_version(&self) -> u64 {
+        1
+    }
+
     /// Validate the complete transaction without changing visible state.
     fn validate_commit(&self, transaction: &Transaction) -> Result<()>;
 
@@ -335,6 +344,7 @@ where
             txn_id: transaction.id(),
             start_timestamp: transaction.start_ts(),
             commit_timestamp,
+            schema_version: self.participant.schema_version(),
             writes,
         }
     }

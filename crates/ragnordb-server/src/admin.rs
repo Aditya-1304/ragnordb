@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::build_info::BUILD_INFO;
+use crate::database::SharedLocalDatabase;
 use crate::metrics;
 
 /// Thread-safe error type returned by administrative server tasks.
@@ -20,6 +21,7 @@ pub struct AdminState {
     pub connection_semaphore: Arc<Semaphore>,
     pub max_connections: u32,
     pub durability_gate: DurabilityGate,
+    pub database: SharedLocalDatabase,
 }
 
 pub async fn start_admin_server(
@@ -71,18 +73,27 @@ async fn handle_status(
     axum::extract::State(state): axum::extract::State<Arc<AdminState>>,
 ) -> Json<serde_json::Value> {
     let active = state.max_connections as usize - state.connection_semaphore.available_permits();
+    let database = state.database.lock().await;
+    let storage = database.status();
+    drop(database);
 
     let durability = match state.durability_gate.state() {
-        NodeDurabilityState::Healthy => serde_json::json!({
-            "state": "healthy",
-            "recovery_required": false,
-        }),
+        NodeDurabilityState::Healthy => {
+            metrics::gauge_set("ragnordb_node_recovery_required", 0.0);
+            serde_json::json!({
+                "state": "healthy",
+                "recovery_required": false,
+            })
+        }
 
-        NodeDurabilityState::RecoveryRequired(failure) => serde_json::json!({
-            "state": failure.kind().as_str(),
-            "recovery_required": true,
-            "reason": failure.reason(),
-        }),
+        NodeDurabilityState::RecoveryRequired(failure) => {
+            metrics::gauge_set("ragnordb_node_recovery_required", 1.0);
+            serde_json::json!({
+                "state": failure.kind().as_str(),
+                "recovery_required": true,
+                "reason": failure.reason(),
+            })
+        }
     };
 
     Json(serde_json::json!({
@@ -104,5 +115,13 @@ async fn handle_status(
             "active_connections": active,
         },
         "durability": durability,
+        "storage": {
+            "durable_lsn": storage.durable_lsn,
+            "replay_frontier": storage.replay_frontier,
+            "latest_checkpoint_id": storage.latest_checkpoint_id,
+            "wal_retained_bytes": storage.wal_retained_bytes,
+            "retention_pins_active": storage.retention_pins_active,
+            "oldest_retention_pin_lsn": storage.oldest_retention_pin_lsn,
+        },
     }))
 }

@@ -22,20 +22,24 @@ use ragnordb_common::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     format,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use wal::{
     error::{AppendFailure, WalError},
     io::directory::SegmentDirectory,
     lsn::Lsn,
     types::{RecordType, record_types::USER_MIN},
-    wal::{WalHandle, retention_pin::RetentionPinGuard},
+    wal::{WalHandle, metrics::WalMetrics, retention_pin::RetentionPinGuard},
 };
 
 use crate::key::decode_row_key;
 
 /// current durable schema version for `SingleNodeTxnCommit`
-pub const SINGLE_NODE_TXN_COMMIT_VERSION: u32 = 1;
+pub const SINGLE_NODE_TXN_COMMIT_VERSION: u32 = 2;
 
 /// Current durable schema version for `SnapshotPointer`.
 pub const SNAPSHOT_POINTER_VERSION: u32 = 2;
@@ -145,6 +149,9 @@ pub struct SingleNodeTxnCommit {
     /// visibility timestamp assigned to the complete batch
     pub commit_timestamp: Timestamp,
 
+    /// catalog schema revision used to encode every key and row in the batch
+    pub schema_version: u64,
+
     /// Deterministically ordered, unique mutation set
     pub writes: BTreeMap<Vec<u8>, WalMutation>,
 }
@@ -212,16 +219,26 @@ impl SingleNodeTxnCommit {
             start_timestamp: Some(self.start_timestamp.to_proto()),
             commit_timestamp: Some(self.commit_timestamp.to_proto()),
             writes,
+            schema_version: self.schema_version,
         }
     }
 
     fn from_proto(proto: wal_proto::SingleNodeTxnCommit) -> Result<Self> {
-        if proto.version != SINGLE_NODE_TXN_COMMIT_VERSION {
+        if proto.version != 1 && proto.version != SINGLE_NODE_TXN_COMMIT_VERSION {
             return Err(Error::CorruptData(format!(
-                "unsupported SingleNodeTxnCommit version {}; expected {}",
-                proto.version, SINGLE_NODE_TXN_COMMIT_VERSION
+                "unsupported SingleNodeTxnCommit version {}; expected 1 or {}",
+                proto.version, SINGLE_NODE_TXN_COMMIT_VERSION,
             )));
         }
+
+        // V1 predates explicit schema binding. Schema evolution did not exist
+        // in that format, so every valid V1 record was necessarily encoded
+        // against the initial table schema.
+        let schema_version = if proto.version == 1 {
+            1
+        } else {
+            proto.schema_version
+        };
 
         let table_id = proto.table_id.ok_or_else(|| {
             Error::CorruptData("SingleNodeTxnCommit is missing its table identifier".to_string())
@@ -268,6 +285,7 @@ impl SingleNodeTxnCommit {
             txn_id: TxnId::from_proto(txn_id),
             start_timestamp: Timestamp::from_proto(start_timestamp),
             commit_timestamp: Timestamp::from_proto(commit_timestamp),
+            schema_version,
             writes,
         };
 
@@ -300,6 +318,10 @@ impl SingleNodeTxnCommit {
                 "commit timestamp {} must be greater than start timestamp {}",
                 self.commit_timestamp.0, self.start_timestamp.0
             ));
+        }
+
+        if self.schema_version == 0 {
+            return Err("schema version 0 is reserved".to_string());
         }
 
         if self.writes.is_empty() {
@@ -439,6 +461,7 @@ where
     D: SegmentDirectory,
 {
     wal: WalHandle<D, C>,
+    last_append_duration_nanos: AtomicU64,
 }
 
 impl<D, C> RagnorDbWalAdapter<D, C>
@@ -447,7 +470,10 @@ where
 {
     /// construct an adapter around the node's serialized A-WAL writer
     pub fn new(wal: WalHandle<D, C>) -> Self {
-        Self { wal }
+        Self {
+            wal,
+            last_append_duration_nanos: AtomicU64::new(0),
+        }
     }
 
     /// protect the currently retained WAL prefix during checkpoint publication
@@ -475,6 +501,25 @@ where
     /// represented by the captured catalog and MVCC image
     pub fn durable_lsn(&self) -> Lsn {
         self.wal.durable_lsn()
+    }
+
+    /// Return a point-in-time operational snapshot from the shared WAL owner.
+    pub fn metrics(&self) -> WalMetrics {
+        self.wal.metrics()
+    }
+
+    /// Return the latest database-record append latency sampled by this adapter.
+    pub fn last_append_duration_nanos(&self) -> u64 {
+        self.last_append_duration_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Publish A-WAL's clean-shutdown witness after all database work drains.
+    pub fn shutdown(&self) -> Result<()> {
+        self.wal
+            .shutdown()
+            .map_err(|source| Error::RecoveryRequired {
+                reason: format!("failed to cleanly shut down A-WAL: {source}"),
+            })
     }
 
     /// advance WAL retention after a complete checkpoint becomes durable
@@ -509,10 +554,15 @@ where
         let payload = commit.encode()?;
         let record_type = RagnorDbWalRecordType::SingleNodeTxnCommit.as_wal_record_type();
 
+        let started = Instant::now();
         let extent = self
             .wal
             .append_and_sync(record_type, &payload)
             .map_err(map_commit_append_failure)?;
+        self.last_append_duration_nanos.store(
+            started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
 
         Ok(DurableWalExtent {
             start_lsn: extent.start_lsn,
