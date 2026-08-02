@@ -10,13 +10,11 @@
 use crate::proto::ids;
 use serde::{Deserialize, Serialize};
 
-/// Works as an identifier for a node in the DB cluster
+/// Identifies one physical server/storage identity in the database cluster.
 ///
-/// Node IDs are statically added in the bootstrap or generation of node and never changes during a node's lifetime.
-/// It is used in:
-/// - Raft group membership
-/// - Internode transport
-/// - Metadata group leader/tablet leader caches
+/// Node IDs remain stable for the lifetime of a server's storage identity.
+/// They are used for transport routing and node-level metadata, but never
+/// directly as Raft voter identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
@@ -27,6 +25,36 @@ impl NodeId {
 
     pub fn from_proto(proto: ids::NodeId) -> Self {
         NodeId(proto.id)
+    }
+}
+
+/// Identifies one lifetime of one replica within one Raft group.
+///
+/// A replica ID is distinct from the physical [`NodeId`] hosting the replica.
+/// Moving or replacing a replica allocates a new replica ID, even when the
+/// physical node remains unchanged. Removed replica IDs are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReplicaId(pub u64);
+
+impl ReplicaId {
+    pub fn to_proto(&self) -> ids::ReplicaId {
+        ids::ReplicaId { id: self.0 }
+    }
+
+    pub fn from_proto(proto: ids::ReplicaId) -> Self {
+        Self(proto.id)
+    }
+
+    /// Converts the database identity into the Raft core's strong identity.
+    ///
+    /// Validation remains explicit because protobuf scalar fields default to
+    /// zero when absent or malformed.
+    pub fn to_raft(self) -> Result<raft::types::ReplicaId, &'static str> {
+        raft::types::ReplicaId::new(self.0).ok_or("replica ID must be non-zero")
+    }
+
+    pub fn from_raft(replica_id: raft::types::ReplicaId) -> Self {
+        Self(replica_id.get())
     }
 }
 

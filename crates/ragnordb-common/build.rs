@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/rpc.proto",
         "../../proto/wal.proto",
         "../../proto/snapshot.proto",
+        "../../proto/raft.proto",
     ];
 
     std::fs::create_dir_all("src/proto")?;

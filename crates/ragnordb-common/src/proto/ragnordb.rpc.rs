@@ -83,14 +83,21 @@ pub struct AllocateTimestampResponse {
     #[prost(message, optional, tag = "1")]
     pub timestamp: ::core::option::Option<super::ids::Timestamp>,
 }
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReplicaRoute {
+    #[prost(message, optional, tag = "1")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(message, optional, tag = "2")]
+    pub node_id: ::core::option::Option<super::ids::NodeId>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LookupTabletResponse {
     #[prost(message, optional, tag = "1")]
     pub tablet_id: ::core::option::Option<super::ids::TabletId>,
-    #[prost(message, optional, tag = "2")]
-    pub leader_id: ::core::option::Option<super::ids::NodeId>,
-    #[prost(message, repeated, tag = "3")]
-    pub replica_ids: ::prost::alloc::vec::Vec<super::ids::NodeId>,
+    #[prost(message, optional, tag = "4")]
+    pub leader_replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "5")]
+    pub replicas: ::prost::alloc::vec::Vec<ReplicaRoute>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LookupSchemaResponse {

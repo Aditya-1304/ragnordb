@@ -1,5 +1,5 @@
 use super::command_codec::TabletCommand;
-use crate::ids::{NodeId, RaftGroupId, RequestId, TabletId, Timestamp};
+use crate::ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp};
 use crate::proto::rpc;
 
 /// A framed inter-node message on the multiplexed TCP transport.
@@ -188,15 +188,23 @@ impl MetadataRequest {
     }
 }
 
-/// Responses from the metadata Raft group
+/// Resolves one Raft consensus identity to its physical transport destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaRoute {
+    pub replica_id: ReplicaId,
+    pub node_id: NodeId,
+}
+
+/// Responses from the metadata Raft group.
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataResponse {
     AllocateTimestamp {
         timestamp: Timestamp,
     },
     LookupTablet {
         tablet_id: TabletId,
-        leader_id: NodeId,
-        replica_ids: Vec<NodeId>,
+        leader_replica_id: ReplicaId,
+        replicas: Vec<ReplicaRoute>,
     },
     LookupSchema {
         schema_bytes: Vec<u8>,
@@ -216,13 +224,19 @@ impl MetadataResponse {
             }
             MetadataResponse::LookupTablet {
                 tablet_id,
-                leader_id,
-                replica_ids,
+                leader_replica_id,
+                replicas,
             } => Some(rpc::metadata_response::Response::LookupTablet(
                 rpc::LookupTabletResponse {
                     tablet_id: Some(tablet_id.to_proto()),
-                    leader_id: Some(leader_id.to_proto()),
-                    replica_ids: replica_ids.iter().map(|id| id.to_proto()).collect(),
+                    leader_replica_id: Some(leader_replica_id.to_proto()),
+                    replicas: replicas
+                        .iter()
+                        .map(|route| rpc::ReplicaRoute {
+                            replica_id: Some(route.replica_id.to_proto()),
+                            node_id: Some(route.node_id.to_proto()),
+                        })
+                        .collect(),
                 },
             )),
             MetadataResponse::LookupSchema {
@@ -246,14 +260,43 @@ impl MetadataResponse {
                 })
             }
             Some(rpc::metadata_response::Response::LookupTablet(resp)) => {
+                let leader_replica_id = ReplicaId::from_proto(
+                    resp.leader_replica_id.ok_or("missing leader_replica_id")?,
+                );
+                if leader_replica_id.0 == 0 {
+                    return Err("leader replica ID must be non-zero");
+                }
+
+                let mut replicas = Vec::with_capacity(resp.replicas.len());
+                for route in resp.replicas {
+                    let replica_id =
+                        ReplicaId::from_proto(route.replica_id.ok_or("missing route replica_id")?);
+                    let node_id = NodeId::from_proto(route.node_id.ok_or("missing route node_id")?);
+                    if replica_id.0 == 0 || node_id.0 == 0 {
+                        return Err("replica routes must contain non-zero identities");
+                    }
+                    if replicas
+                        .iter()
+                        .any(|existing: &ReplicaRoute| existing.replica_id == replica_id)
+                    {
+                        return Err("duplicate replica ID in tablet route");
+                    }
+                    replicas.push(ReplicaRoute {
+                        replica_id,
+                        node_id,
+                    });
+                }
+                if !replicas
+                    .iter()
+                    .any(|route| route.replica_id == leader_replica_id)
+                {
+                    return Err("leader replica is absent from tablet routes");
+                }
+
                 Ok(MetadataResponse::LookupTablet {
                     tablet_id: TabletId::from_proto(resp.tablet_id.ok_or("missing tablet_id")?),
-                    leader_id: NodeId::from_proto(resp.leader_id.ok_or("missing leader_id")?),
-                    replica_ids: resp
-                        .replica_ids
-                        .into_iter()
-                        .map(NodeId::from_proto)
-                        .collect(),
+                    leader_replica_id,
+                    replicas,
                 })
             }
 
@@ -389,8 +432,21 @@ mod tests {
     fn metadata_response_lookup_tablet_roundtrip() {
         let resp = MetadataResponse::LookupTablet {
             tablet_id: TabletId(10),
-            leader_id: NodeId(1),
-            replica_ids: vec![NodeId(1), NodeId(2), NodeId(3)],
+            leader_replica_id: ReplicaId(11),
+            replicas: vec![
+                ReplicaRoute {
+                    replica_id: ReplicaId(11),
+                    node_id: NodeId(1),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(12),
+                    node_id: NodeId(2),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(13),
+                    node_id: NodeId(3),
+                },
+            ],
         };
         let proto = resp.to_proto();
         let decoded = MetadataResponse::from_proto(proto).unwrap();

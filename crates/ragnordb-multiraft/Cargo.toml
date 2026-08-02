@@ -10,3 +10,4 @@ ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
 raft.workspace = true
 wal.workspace = true
+thiserror.workspace = true

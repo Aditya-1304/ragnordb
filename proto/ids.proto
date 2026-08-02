@@ -5,6 +5,11 @@ message NodeId {
     uint64 id = 1;
 }
 
+// Identifies one lifetime of one replica inside one Raft group.
+message ReplicaId {
+    uint64 id = 1;
+}
+
 message TabletId {
     uint64 id = 1;
 }
@@ -33,4 +38,3 @@ message RequestId {
     bytes client_id = 1; // this will be u128 as 16 bytes
     uint64 sequence = 2;
 }
-

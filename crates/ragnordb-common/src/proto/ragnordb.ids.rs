@@ -4,6 +4,12 @@ pub struct NodeId {
     #[prost(uint64, tag = "1")]
     pub id: u64,
 }
+/// Identifies one lifetime of one replica inside one Raft group.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReplicaId {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct TabletId {
     #[prost(uint64, tag = "1")]

@@ -1,0 +1,21 @@
+syntax = "proto3";
+package ragnordb.raft;
+
+import "ids.proto";
+
+message ReplicaPlacement {
+    ragnordb.ids.ReplicaId replica_id = 1;
+    ragnordb.ids.NodeId node_id = 2;
+}
+
+// Durable, exactly-once authority for the initial identity and membership of
+// one Raft group.
+message RaftGroupBootstrap {
+    uint32 format_version = 1;
+    string cluster_id = 2;
+    ragnordb.ids.RaftGroupId raft_group_id = 3;
+    uint64 configuration_epoch = 4;
+    repeated ReplicaPlacement replica_placements = 5;
+    repeated ragnordb.ids.ReplicaId initial_voters = 6;
+    repeated ragnordb.ids.ReplicaId initial_learners = 7;
+}

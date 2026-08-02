@@ -129,11 +129,26 @@ fn new_node(id: u64, peers: Vec<u64>) -> TestNode {
     RaftNode::new(id, peers, MemStorage::new(), MemStorage::new(), 5, 2)
 }
 
+/// persists and acknowledges the current Ready before releasing messages
+///
+/// the smoke test uses Raft's embedded storage compatibility adapter; the
+/// production MultiRaft host will replace this with one ordered A-WAL batch
+fn take_raft_messages(node: &mut TestNode) -> Vec<raft::message::Envelope<(), ()>> {
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready)
+        .expect("smoke-test Ready persistence failed");
+    node.advance_persisted(ready.id)
+        .expect("smoke-test Ready acknowledgement failed");
+    ready.messages
+}
+
 #[test]
 fn raft_node_instantiates_as_follower() {
     let node = new_node(1, vec![2, 3]);
 
-    assert_eq!(node.id(), 1);
+    assert_eq!(node.id().get(), 1);
     assert_eq!(node.role(), &Role::Follower);
     assert_eq!(node.leader_id(), None);
     assert_eq!(node.commit_index(), 0);
@@ -147,44 +162,40 @@ fn raft_elects_single_leader() {
     let mut n3 = new_node(3, vec![1, 2]);
 
     n1.tick(n1.current_election_timeout());
-    let prevotes = n1.ready().messages;
+    let prevotes = take_raft_messages(&mut n1);
 
     assert_eq!(n1.role(), &Role::Candidate);
 
     for msg in prevotes {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             _ => unreachable!(),
         }
     }
 
-    let responses: Vec<_> = n2
-        .ready()
-        .messages
+    let responses: Vec<_> = take_raft_messages(&mut n2)
         .into_iter()
-        .chain(n3.ready().messages)
+        .chain(take_raft_messages(&mut n3))
         .collect();
 
     for msg in responses {
         n1.step(msg);
     }
 
-    let vote_requests = n1.ready().messages;
+    let vote_requests = take_raft_messages(&mut n1);
 
     for msg in vote_requests {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             _ => unreachable!(),
         }
     }
 
-    let vote_responses: Vec<_> = n2
-        .ready()
-        .messages
+    let vote_responses: Vec<_> = take_raft_messages(&mut n2)
         .into_iter()
-        .chain(n3.ready().messages)
+        .chain(take_raft_messages(&mut n3))
         .collect();
 
     for msg in vote_responses {

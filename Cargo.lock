@@ -1267,6 +1267,7 @@ dependencies = [
  "raft",
  "ragnordb-common",
  "ragnordb-tablet",
+ "thiserror",
  "wal",
 ]
 

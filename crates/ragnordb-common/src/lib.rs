@@ -17,6 +17,7 @@ pub mod durability;
 pub mod encoding;
 pub mod ids;
 pub mod protocol;
+pub mod raft_bootstrap;
 pub mod result;
 pub mod rpc_codec;
 
@@ -44,6 +45,9 @@ pub mod proto {
     }
     pub mod snapshot {
         include!("proto/ragnordb.snapshot.rs");
+    }
+    pub mod raft {
+        include!("proto/ragnordb.raft.rs");
     }
 }
 

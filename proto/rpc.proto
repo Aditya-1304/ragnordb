@@ -65,10 +65,20 @@ message AllocateTimestampResponse {
     ragnordb.ids.Timestamp timestamp = 1;
 }
 
+message ReplicaRoute {
+    ragnordb.ids.ReplicaId replica_id = 1;
+    ragnordb.ids.NodeId node_id = 2;
+}
+
 message LookupTabletResponse {
     ragnordb.ids.TabletId tablet_id = 1;
-    ragnordb.ids.NodeId leader_id = 2;
-    repeated ragnordb.ids.NodeId replica_ids = 3;
+
+    // These fields previously conflated physical nodes with Raft replicas.
+    // Reserving them prevents old payloads from acquiring new semantics.
+    reserved 2, 3;
+
+    ragnordb.ids.ReplicaId leader_replica_id = 4;
+    repeated ReplicaRoute replicas = 5;
 }
 
 message LookupSchemaResponse {
