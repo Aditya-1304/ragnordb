@@ -4,6 +4,8 @@
 //! envelope targets this tablet generation before dispatching its payload. The
 //! state machine will also own replicated request deduplication in later slices
 
+use std::collections::BTreeMap;
+
 use ragnordb_common::{
     command_codec::{TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError},
     ids::TabletId,
@@ -17,10 +19,16 @@ use crate::Tablet;
 /// wrapping `Tablet` keeps replication metadata out of the existing local
 /// execution API. Every command must pass this boundary before a payload is
 /// allowed to inspect or mutate MVCC state
+///
+/// each instance belomgs to one raft group. its client sequence
+/// map is naturally scode to that group and cannot consume sequence
+/// applied by a different tablet state machine
+
 #[derive(Debug)]
 pub struct TabletStateMachine<S = InMemoryMvcc> {
     tablet: Tablet<S>,
     epoch: u64,
+    client_deduplication: BTreeMap<u128, ClientDeduplicationState>,
 }
 
 impl<S: MvccStorage> TabletStateMachine<S> {
@@ -31,18 +39,22 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             return Err(TabletCommandApplyError::ZeroTabletEpoch);
         }
 
-        Ok(Self { tablet, epoch })
+        Ok(Self {
+            tablet,
+            epoch,
+            client_deduplication: BTreeMap::new(),
+        })
     }
 
     /// apply one committed command after deterministic target validation
     ///
-    /// Target checks intentionally precede payload dispatch. A command routed
-    /// with an obsolete descriptor therefore cannot mutate the current tablet
-    /// generation, even when the command itself is otherwise valid
+    /// target validation runs before request deduplication so a command sent to
+    /// the wrong tablet generation cannot consume a client sequence. Successful
+    /// payload results are cached only after dispatch completes
     pub fn apply(
         &mut self,
         envelope: TabletCommandEnvelope,
-    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+    ) -> Result<TabletCommandApplyOutcome, TabletCommandApplyError> {
         envelope.validate()?;
 
         let local_tablet_id = self.tablet.id();
@@ -61,12 +73,96 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             });
         }
 
-        match envelope.command {
-            TabletCommand::Noop(_) => Ok(TabletCommandApplyResult::Noop),
+        let client_id = envelope.request_id.client_id;
+        let sequence = envelope.request_id.sequence;
 
-            command => Err(TabletCommandApplyError::UnsupportedCommand {
-                command: command_name(&command),
-            }),
+        if let Some(deduplication) = self.client_deduplication.get(&client_id) {
+            if sequence == deduplication.last_sequence_applied {
+                return Ok(TabletCommandApplyOutcome::deduplicated(
+                    deduplication.cached_result,
+                ));
+            }
+
+            if sequence < deduplication.last_sequence_applied {
+                return Err(TabletCommandApplyError::StaleRequestSequence {
+                    last_sequence_applied: deduplication.last_sequence_applied,
+                    received_sequence: sequence,
+                });
+            }
+
+            let expected_sequence = deduplication
+                .last_sequence_applied
+                .checked_add(1)
+                .ok_or(TabletCommandApplyError::RequestSequenceExhausted { client_id })?;
+
+            if sequence != expected_sequence {
+                return Err(TabletCommandApplyError::RequestSequenceGap {
+                    last_sequence_applied: deduplication.last_sequence_applied,
+                    expected_sequence,
+                    received_sequence: sequence,
+                });
+            }
+        } else if sequence != 1 {
+            return Err(TabletCommandApplyError::RequestSequenceGap {
+                last_sequence_applied: 0,
+                expected_sequence: 1,
+                received_sequence: sequence,
+            });
+        }
+
+        let result = match envelope.command {
+            TabletCommand::Noop(_) => TabletCommandApplyResult::Noop,
+
+            command => {
+                return Err(TabletCommandApplyError::UnsupportedCommand {
+                    command: command_name(&command),
+                });
+            }
+        };
+
+        self.client_deduplication.insert(
+            client_id,
+            ClientDeduplicationState {
+                last_sequence_applied: sequence,
+                cached_result: result,
+            },
+        );
+
+        Ok(TabletCommandApplyOutcome::applied(result))
+    }
+}
+
+/// last successfully applied request and result for one client in this Raft
+/// group’s sequence namespace
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientDeduplicationState {
+    last_sequence_applied: u64,
+    cached_result: TabletCommandApplyResult,
+}
+
+/// result and provenance for one state machine apply attempt
+///
+/// callers return `result` to the client in both cases. The `deduplicated` flag
+/// lets proposal tracking and diagnostics distinguish a fresh transition from
+/// an exact retry served by replicated state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletCommandApplyOutcome {
+    pub result: TabletCommandApplyResult,
+    pub deduplicated: bool,
+}
+
+impl TabletCommandApplyOutcome {
+    fn applied(result: TabletCommandApplyResult) -> Self {
+        Self {
+            result,
+            deduplicated: false,
+        }
+    }
+
+    fn deduplicated(result: TabletCommandApplyResult) -> Self {
+        Self {
+            result,
+            deduplicated: true,
         }
     }
 }
@@ -101,6 +197,26 @@ pub enum TabletCommandApplyError {
         expected_epoch: u64,
     },
 
+    #[error(
+        "request sequence {received_sequence} is stale; client state has already applied sequence {last_sequence_applied}"
+    )]
+    StaleRequestSequence {
+        last_sequence_applied: u64,
+        received_sequence: u64,
+    },
+
+    #[error(
+        "request sequence gap after {last_sequence_applied}: expected {expected_sequence}, received {received_sequence}"
+    )]
+    RequestSequenceGap {
+        last_sequence_applied: u64,
+        expected_sequence: u64,
+        received_sequence: u64,
+    },
+
+    #[error("request sequence space is exhausted for client {client_id:#034x}")]
+    RequestSequenceExhausted { client_id: u128 },
+
     #[error("tablet command payload {command} is not implemented by this state machine")]
     UnsupportedCommand { command: &'static str },
 
@@ -127,22 +243,37 @@ mod tests {
         ids::{RequestId, TableId, TabletId},
     };
 
-    use super::{TabletCommandApplyError, TabletCommandApplyResult, TabletStateMachine};
+    use super::{
+        TabletCommandApplyError, TabletCommandApplyOutcome, TabletCommandApplyResult,
+        TabletStateMachine,
+    };
     use crate::Tablet;
 
     const LOCAL_TABLET_ID: TabletId = TabletId(41);
     const LOCAL_TABLET_EPOCH: u64 = 7;
 
     fn state_machine() -> TabletStateMachine {
-        let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
+        state_machine_for(LOCAL_TABLET_ID)
+    }
+
+    fn state_machine_for(tablet_id: TabletId) -> TabletStateMachine {
+        let tablet = Tablet::new(tablet_id, TableId(9)).unwrap();
         TabletStateMachine::new(tablet, LOCAL_TABLET_EPOCH).unwrap()
     }
 
     fn noop_envelope(tablet_id: TabletId, expected_epoch: u64) -> TabletCommandEnvelope {
+        noop_envelope_for_sequence(tablet_id, expected_epoch, 1)
+    }
+
+    fn noop_envelope_for_sequence(
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        sequence: u64,
+    ) -> TabletCommandEnvelope {
         TabletCommandEnvelope::new(
             RequestId {
                 client_id: 0xf5b4_81ab_9b67_4418_ba82_b49c_e371_007d,
-                sequence: 1,
+                sequence,
             },
             tablet_id,
             expected_epoch,
@@ -167,13 +298,19 @@ mod tests {
             }
         );
 
-        // A stale rejection must not poison the state machine. The same logical
-        // request remains valid when routed with the current tablet epoch
+        // Rejection must not consume the request sequence. The same request is
+        // still fresh when routed using the current tablet epoch.
         let result = state_machine
             .apply(noop_envelope(LOCAL_TABLET_ID, LOCAL_TABLET_EPOCH))
             .unwrap();
 
-        assert_eq!(result, TabletCommandApplyResult::Noop);
+        assert_eq!(
+            result,
+            TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: false,
+            }
+        );
     }
 
     #[test]
@@ -192,5 +329,114 @@ mod tests {
                 requested_tablet_id,
             }
         );
+    }
+
+    #[test]
+    fn exact_request_retry_returns_cached_result_without_reapplying() {
+        let mut state_machine = state_machine();
+
+        let first = state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        let retry = state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            first,
+            TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: false,
+            }
+        );
+
+        assert_eq!(
+            retry,
+            TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: true,
+            }
+        );
+    }
+
+    #[test]
+    fn request_sequence_gap_is_rejected_without_consuming_missing_sequence() {
+        let mut state_machine = state_machine();
+
+        state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        let error = state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                3,
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            TabletCommandApplyError::RequestSequenceGap {
+                last_sequence_applied: 1,
+                expected_sequence: 2,
+                received_sequence: 3,
+            }
+        );
+
+        let missing = state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                2,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            missing,
+            TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn client_request_sequences_are_scoped_to_each_state_machine() {
+        let second_tablet_id = TabletId(LOCAL_TABLET_ID.0 + 1);
+        let mut first_group = state_machine_for(LOCAL_TABLET_ID);
+        let mut second_group = state_machine_for(second_tablet_id);
+
+        let first_result = first_group
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        let second_result = second_group
+            .apply(noop_envelope_for_sequence(
+                second_tablet_id,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        assert!(!first_result.deduplicated);
+        assert!(!second_result.deduplicated);
     }
 }
