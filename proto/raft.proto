@@ -50,3 +50,27 @@ enum RaftConfigurationChangeKind {
     RAFT_CONFIGURATION_CHANGE_KIND_PROMOTE_LEARNER = 2;
     RAFT_CONFIGURATION_CHANGE_KIND_REMOVE_REPLICA = 3;
 }
+
+// durable election and commit frontier for one replica lifetime. This record
+// is appended after every entry and configuration record in its persistence
+// batch so no recoverable prefix can reference missing log state
+message RaftHardStateRecord {
+    uint32 format_version = 1;
+    ragnordb.ids.RaftGroupId raft_group_id = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    uint64 current_term = 4;
+    ragnordb.ids.ReplicaId voted_for = 5;
+    uint64 commit_index = 6;
+}
+
+// durable membership state associated with one replica lifetime. Repeated
+// identities are encoded in ascending order by the domain codec
+message RaftConfStateRecord {
+    uint32 format_version = 1;
+    ragnordb.ids.RaftGroupId raft_group_id = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    uint64 configuration_version = 4;
+    repeated ragnordb.ids.ReplicaId voters = 5;
+    repeated ragnordb.ids.ReplicaId learners = 6;
+    repeated ragnordb.ids.ReplicaId outgoing_voters = 7;
+}

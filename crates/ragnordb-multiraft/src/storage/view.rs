@@ -31,7 +31,7 @@ pub enum RaftLogReplayOutcome {
 }
 
 /// recovered log state for exactly one `(raft_group_id, replica_id)` lifetime
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RaftReplicaLogView {
     identity: RaftReplicaIdentity,
     entries: BTreeMap<u64, RecoveredRaftLogEntry>,

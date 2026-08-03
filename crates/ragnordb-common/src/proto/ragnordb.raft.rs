@@ -64,6 +64,43 @@ pub struct RaftConfigurationChange {
     #[prost(message, optional, tag = "3")]
     pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
 }
+/// durable election and commit frontier for one replica lifetime. This record
+/// is appended after every entry and configuration record in its persistence
+/// batch so no recoverable prefix can reference missing log state
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RaftHardStateRecord {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "4")]
+    pub current_term: u64,
+    #[prost(message, optional, tag = "5")]
+    pub voted_for: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "6")]
+    pub commit_index: u64,
+}
+/// durable membership state associated with one replica lifetime. Repeated
+/// identities are encoded in ascending order by the domain codec
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaftConfStateRecord {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "4")]
+    pub configuration_version: u64,
+    #[prost(message, repeated, tag = "5")]
+    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "6")]
+    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "7")]
+    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RaftConfigurationChangeKind {

@@ -5,4 +5,5 @@
 //! these records without creating a second write-through persistence path
 
 pub mod codec;
+pub mod persistence;
 pub mod view;

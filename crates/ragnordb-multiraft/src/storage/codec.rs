@@ -3,19 +3,22 @@
 //! every entry records both the Raft group and replica lifetime. Log indexes
 //! are meaningful only inside that identity pair and must never be used as a
 //! global shared WAL key
-
 use prost::Message;
 use raft::{
     entry::{EntryPayload, LogEntry},
-    types::{ConfChange, ConfChangeKind},
+    types::{ConfChange, ConfChangeKind, ConfState, HardState},
 };
 use ragnordb_common::{
     ids::{RaftGroupId, ReplicaId},
     proto::raft as raft_proto,
 };
+use std::collections::BTreeSet;
 
 /// durable format accepted for Raft log-entry records
 pub const RAFT_LOG_ENTRY_RECORD_VERSION: u32 = 1;
+
+/// durable format accepted for Raft stable-state records
+pub const RAFT_STABLE_STATE_RECORD_VERSION: u32 = 1;
 
 /// one Raft replica lifetime inside a logical Raft group
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -303,6 +306,270 @@ fn configuration_change_from_proto(
 
     validate_configuration_change(change)?;
     Ok(change)
+}
+
+/// durable, identity-bound election and commit state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftHardStateRecord {
+    pub format_version: u32,
+    pub identity: RaftReplicaIdentity,
+    pub hard_state: HardState,
+}
+
+impl RaftHardStateRecord {
+    /// convert validated Raft-core state into its durable V1 representation
+    pub fn from_core(
+        identity: RaftReplicaIdentity,
+        hard_state: HardState,
+    ) -> Result<Self, RaftStableStateCodecError> {
+        let record = Self {
+            format_version: RAFT_STABLE_STATE_RECORD_VERSION,
+            identity,
+            hard_state,
+        };
+
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// return the public Raft-core state represented by this record
+    pub fn to_core(&self) -> Result<HardState, RaftStableStateCodecError> {
+        self.validate()?;
+        Ok(self.hard_state.clone())
+    }
+
+    /// encode a validated stable-state record for A-WAL
+    pub fn encode(&self) -> Result<Vec<u8>, RaftStableStateCodecError> {
+        self.validate()?;
+
+        Ok(raft_proto::RaftHardStateRecord {
+            format_version: self.format_version,
+            raft_group_id: Some(self.identity.raft_group_id.to_proto()),
+            replica_id: Some(self.identity.replica_id.to_proto()),
+            current_term: self.hard_state.current_term,
+            voted_for: self
+                .hard_state
+                .voted_for
+                .map(|replica_id| ReplicaId::from_raft(replica_id).to_proto()),
+            commit_index: self.hard_state.commit,
+        }
+        .encode_to_vec())
+    }
+
+    /// Decode stable state returned by shared-WAL recovery.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RaftStableStateCodecError> {
+        let proto = raft_proto::RaftHardStateRecord::decode(bytes)
+            .map_err(|error| RaftStableStateCodecError::Decode(error.to_string()))?;
+
+        let identity = decode_stable_identity(proto.raft_group_id, proto.replica_id)?;
+
+        let voted_for = proto
+            .voted_for
+            .map(ReplicaId::from_proto)
+            .map(ReplicaId::to_raft)
+            .transpose()
+            .map_err(|_| RaftStableStateCodecError::ZeroVotedForReplicaId)?;
+
+        let record = Self {
+            format_version: proto.format_version,
+            identity,
+            hard_state: HardState {
+                current_term: proto.current_term,
+                voted_for,
+                commit: proto.commit_index,
+            },
+        };
+
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validate state created directly by the live persistence path.
+    pub fn validate(&self) -> Result<(), RaftStableStateCodecError> {
+        validate_stable_header(self.format_version, self.identity)?;
+
+        if self.hard_state.current_term == 0 {
+            return Err(RaftStableStateCodecError::ZeroCurrentTerm);
+        }
+
+        Ok(())
+    }
+}
+
+/// durable, identity bound Raft membership state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftConfStateRecord {
+    pub format_version: u32,
+    pub identity: RaftReplicaIdentity,
+    pub conf_state: ConfState,
+}
+
+impl RaftConfStateRecord {
+    /// convert validated Raft-core membership into its durable V1 record
+    pub fn from_core(
+        identity: RaftReplicaIdentity,
+        conf_state: ConfState,
+    ) -> Result<Self, RaftStableStateCodecError> {
+        let record = Self {
+            format_version: RAFT_STABLE_STATE_RECORD_VERSION,
+            identity,
+            conf_state,
+        };
+
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Return the public Raft-core membership represented by this record.
+    pub fn to_core(&self) -> Result<ConfState, RaftStableStateCodecError> {
+        self.validate()?;
+        Ok(self.conf_state.clone())
+    }
+
+    /// encode membership sets in deterministic ascending identity order
+    pub fn encode(&self) -> Result<Vec<u8>, RaftStableStateCodecError> {
+        self.validate()?;
+
+        Ok(raft_proto::RaftConfStateRecord {
+            format_version: self.format_version,
+            raft_group_id: Some(self.identity.raft_group_id.to_proto()),
+            replica_id: Some(self.identity.replica_id.to_proto()),
+            configuration_version: self.conf_state.version,
+            voters: encode_core_replicas(&self.conf_state.voters),
+            learners: encode_core_replicas(&self.conf_state.learners),
+            outgoing_voters: encode_core_replicas(&self.conf_state.outgoing_voters),
+        }
+        .encode_to_vec())
+    }
+
+    /// Decode membership returned by shared-WAL recovery.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RaftStableStateCodecError> {
+        let proto = raft_proto::RaftConfStateRecord::decode(bytes)
+            .map_err(|error| RaftStableStateCodecError::Decode(error.to_string()))?;
+
+        let identity = decode_stable_identity(proto.raft_group_id, proto.replica_id)?;
+
+        let record = Self {
+            format_version: proto.format_version,
+            identity,
+            conf_state: ConfState {
+                version: proto.configuration_version,
+                voters: decode_core_replicas("voters", proto.voters)?,
+                learners: decode_core_replicas("learners", proto.learners)?,
+                outgoing_voters: decode_core_replicas("outgoing_voters", proto.outgoing_voters)?,
+            },
+        };
+
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// validate membership created directly by the live persistence path
+    pub fn validate(&self) -> Result<(), RaftStableStateCodecError> {
+        validate_stable_header(self.format_version, self.identity)?;
+
+        self.conf_state
+            .validate()
+            .map_err(|error| RaftStableStateCodecError::InvalidConfState(format!("{error:?}")))
+    }
+}
+
+fn validate_stable_header(
+    format_version: u32,
+    identity: RaftReplicaIdentity,
+) -> Result<(), RaftStableStateCodecError> {
+    if format_version != RAFT_STABLE_STATE_RECORD_VERSION {
+        return Err(RaftStableStateCodecError::UnsupportedVersion(
+            format_version,
+        ));
+    }
+
+    identity
+        .validate()
+        .map_err(RaftStableStateCodecError::InvalidIdentity)
+}
+
+fn decode_stable_identity(
+    raft_group_id: Option<ragnordb_common::proto::ids::RaftGroupId>,
+    replica_id: Option<ragnordb_common::proto::ids::ReplicaId>,
+) -> Result<RaftReplicaIdentity, RaftStableStateCodecError> {
+    let raft_group_id = RaftGroupId::from_proto(
+        raft_group_id.ok_or(RaftStableStateCodecError::MissingField("raft_group_id"))?,
+    );
+
+    let replica_id = ReplicaId::from_proto(
+        replica_id.ok_or(RaftStableStateCodecError::MissingField("replica_id"))?,
+    );
+
+    RaftReplicaIdentity::new(raft_group_id, replica_id)
+        .map_err(RaftStableStateCodecError::InvalidIdentity)
+}
+
+fn encode_core_replicas(
+    replicas: &BTreeSet<raft::types::ReplicaId>,
+) -> Vec<ragnordb_common::proto::ids::ReplicaId> {
+    replicas
+        .iter()
+        .copied()
+        .map(ReplicaId::from_raft)
+        .map(|replica_id| replica_id.to_proto())
+        .collect()
+}
+
+fn decode_core_replicas(
+    field: &'static str,
+    replicas: Vec<ragnordb_common::proto::ids::ReplicaId>,
+) -> Result<BTreeSet<raft::types::ReplicaId>, RaftStableStateCodecError> {
+    let mut decoded = BTreeSet::new();
+
+    for replica_id in replicas {
+        let replica_id = ReplicaId::from_proto(replica_id)
+            .to_raft()
+            .map_err(|_| RaftStableStateCodecError::ZeroMembershipReplicaId { field })?;
+
+        if !decoded.insert(replica_id) {
+            return Err(RaftStableStateCodecError::DuplicateMembershipReplica {
+                field,
+                replica_id: replica_id.get(),
+            });
+        }
+    }
+
+    Ok(decoded)
+}
+
+/// Invalid or corrupt durable Raft stable-state record.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RaftStableStateCodecError {
+    #[error("unsupported Raft stable-state record version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("Raft stable-state record is missing required field {0}")]
+    MissingField(&'static str),
+
+    #[error("invalid Raft stable-state identity: {0}")]
+    InvalidIdentity(RaftLogEntryCodecError),
+
+    #[error("Raft HardState contains reserved current term zero")]
+    ZeroCurrentTerm,
+
+    #[error("Raft HardState vote contains reserved replica ID zero")]
+    ZeroVotedForReplicaId,
+
+    #[error("Raft {field} contains reserved replica ID zero")]
+    ZeroMembershipReplicaId { field: &'static str },
+
+    #[error("Raft {field} contains duplicate replica ID {replica_id}")]
+    DuplicateMembershipReplica {
+        field: &'static str,
+        replica_id: u64,
+    },
+
+    #[error("invalid Raft ConfState: {0}")]
+    InvalidConfState(String),
+
+    #[error("cannot decode durable Raft stable-state record: {0}")]
+    Decode(String),
 }
 
 /// Invalid or corrupt durable Raft log-entry record.
