@@ -6,6 +6,19 @@ import "row.proto";
 import "mvcc.proto";
 import "catalog.proto";
 
+//durable proposal payload for one tablet state machine command
+//
+// routing and retry metadata live inside the bytes commited by raft
+// so replay performs the same epoch validation and request
+// deduplication as live apply
+message TabletCommandEnvelope {
+    uint32 format_version = 1;
+    ragnordb.ids.RequestId request_id = 2;
+    ragnordb.ids.TabletId tablet_id = 3;
+    uint64 expected_epoch = 4;
+    TabletCommand command = 5;
+}
+
 message TabletCommand {
     oneof command {
         PrewriteCommand prewrite = 1;

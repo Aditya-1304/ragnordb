@@ -1,8 +1,157 @@
 use super::catalog_codec::TableDefinition as TableDef;
 use super::codec::{Value, WriteKind};
-use crate::ids::{Timestamp, TxnId};
+use crate::ids::{RequestId, TabletId, Timestamp, TxnId};
+use prost::Message;
 
 use crate::proto::command;
+/// the tablet command envelope format accepted
+pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 1;
+
+/// durable identity and routing metadata for one replicated tablet command
+///
+/// complete envelope is proposed to Raft. Keeping the request identity,
+/// tablet identity, and expected epoch beside the payload ensures that live
+/// apply and recovery replay make the same deduplication and stale-route
+/// decisions
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletCommandEnvelope {
+    pub format_version: u32,
+    pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub expected_epoch: u64,
+    pub command: TabletCommand,
+}
+
+impl TabletCommandEnvelope {
+    /// build a V1 envelope after validating its routing metadata and payload
+    pub fn new(
+        request_id: RequestId,
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        command: TabletCommand,
+    ) -> Result<Self, TabletCommandEnvelopeError> {
+        let envelope = Self {
+            format_version: TABLET_COMMAND_ENVELOPE_VERSION,
+            request_id,
+            tablet_id,
+            expected_epoch,
+            command,
+        };
+
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// validate invariants required before an envelope enters the Raft log
+    pub fn validate(&self) -> Result<(), TabletCommandEnvelopeError> {
+        self.validate_metadata()?;
+
+        self.command
+            .to_proto()
+            .map(|_| ())
+            .map_err(TabletCommandEnvelopeError::InvalidCommand)
+    }
+
+    fn validate_metadata(&self) -> Result<(), TabletCommandEnvelopeError> {
+        if self.format_version != TABLET_COMMAND_ENVELOPE_VERSION {
+            return Err(TabletCommandEnvelopeError::UnsupportedVersion(
+                self.format_version,
+            ));
+        }
+
+        if self.tablet_id.0 == 0 {
+            return Err(TabletCommandEnvelopeError::ZeroTabletId);
+        }
+
+        if self.expected_epoch == 0 {
+            return Err(TabletCommandEnvelopeError::ZeroExpectedEpoch);
+        }
+
+        Ok(())
+    }
+
+    /// encode the complete durable proposal payload
+    pub fn encode(&self) -> Result<Vec<u8>, TabletCommandEnvelopeError> {
+        Ok(self.to_proto()?.encode_to_vec())
+    }
+
+    /// decode and validate bytes recovered from Raft storage
+    pub fn decode(bytes: &[u8]) -> Result<Self, TabletCommandEnvelopeError> {
+        let proto = command::TabletCommandEnvelope::decode(bytes)
+            .map_err(|error| TabletCommandEnvelopeError::Decode(error.to_string()))?;
+
+        Self::from_proto(proto)
+    }
+
+    pub fn to_proto(&self) -> Result<command::TabletCommandEnvelope, TabletCommandEnvelopeError> {
+        self.validate_metadata()?;
+
+        Ok(command::TabletCommandEnvelope {
+            format_version: self.format_version,
+            request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            expected_epoch: self.expected_epoch,
+            command: Some(
+                self.command
+                    .to_proto()
+                    .map_err(TabletCommandEnvelopeError::InvalidCommand)?,
+            ),
+        })
+    }
+
+    pub fn from_proto(
+        proto: command::TabletCommandEnvelope,
+    ) -> Result<Self, TabletCommandEnvelopeError> {
+        let envelope = Self {
+            format_version: proto.format_version,
+            request_id: RequestId::from_proto(
+                proto
+                    .request_id
+                    .ok_or(TabletCommandEnvelopeError::MissingField("request_id"))?,
+            )
+            .map_err(TabletCommandEnvelopeError::InvalidRequestId)?,
+            tablet_id: TabletId::from_proto(
+                proto
+                    .tablet_id
+                    .ok_or(TabletCommandEnvelopeError::MissingField("tablet_id"))?,
+            ),
+            expected_epoch: proto.expected_epoch,
+            command: TabletCommand::from_proto(
+                proto
+                    .command
+                    .ok_or(TabletCommandEnvelopeError::MissingField("command"))?,
+            )
+            .map_err(TabletCommandEnvelopeError::InvalidCommand)?,
+        };
+
+        envelope.validate()?;
+        Ok(envelope)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletCommandEnvelopeError {
+    #[error("unsupported tablet command envelope version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("tablet command envelope contains the reserved tablet ID zero")]
+    ZeroTabletId,
+
+    #[error("tablet command envelope expected epoch must be non-zero")]
+    ZeroExpectedEpoch,
+
+    #[error("tablet command envelope is missing required field {0}")]
+    MissingField(&'static str),
+
+    #[error("invalid request ID: {0}")]
+    InvalidRequestId(&'static str),
+
+    #[error("invalid tablet command: {0}")]
+    InvalidCommand(&'static str),
+
+    #[error("cannot decode tablet command envelope: {0}")]
+    Decode(String),
+}
 
 /// A single-key prewrite command (part of distributed txn 2PC).
 ///
@@ -708,5 +857,48 @@ mod tests {
         let error = command.to_proto().unwrap_err();
 
         assert!(error.contains("must not contain commit_timestamp"));
+    }
+
+    #[test]
+    fn tablet_command_envelope_roundtrip_preserves_apply_identity() {
+        let envelope = TabletCommandEnvelope::new(
+            RequestId {
+                client_id: 0x8f4f_5692_3c11_4dc8_a53f_418a_62d3_97e1,
+                sequence: 7,
+            },
+            TabletId(41),
+            3,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+
+        let encoded = envelope.encode().unwrap();
+        let decoded = TabletCommandEnvelope::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn tablet_command_envelope_rejects_unknown_format_version() {
+        let envelope = TabletCommandEnvelope::new(
+            RequestId {
+                client_id: 0x62a6_26f5_7849_46ee_8329_c983_ec15_29f4,
+                sequence: 1,
+            },
+            TabletId(9),
+            1,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+
+        let mut proto = envelope.to_proto().unwrap();
+        proto.format_version = TABLET_COMMAND_ENVELOPE_VERSION + 1;
+
+        let error = TabletCommandEnvelope::decode(&proto.encode_to_vec()).unwrap_err();
+
+        assert_eq!(
+            error,
+            TabletCommandEnvelopeError::UnsupportedVersion(TABLET_COMMAND_ENVELOPE_VERSION + 1)
+        );
     }
 }
