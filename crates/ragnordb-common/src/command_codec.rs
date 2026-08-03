@@ -2,10 +2,14 @@ use super::catalog_codec::TableDefinition as TableDef;
 use super::codec::{Value, WriteKind};
 use crate::ids::{RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
+use std::collections::BTreeMap;
 
 use crate::proto::command;
 /// the tablet command envelope format accepted
 pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 1;
+
+/// tablet state machine snapshot format
+pub const TABLET_STATE_MACHINE_SNAPSHOT_VERSION: u32 = 1;
 
 /// durable identity and routing metadata for one replicated tablet command
 ///
@@ -150,6 +154,219 @@ pub enum TabletCommandEnvelopeError {
     InvalidCommand(&'static str),
 
     #[error("cannot decode tablet command envelope: {0}")]
+    Decode(String),
+}
+
+/// durable cached result for one successfully applied tablet command
+///
+/// new command results must receive explicit protobuf variants before they can
+/// be stored in replicated deduplication state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedTabletCommandResult {
+    Noop,
+}
+
+impl CachedTabletCommandResult {
+    fn to_proto(self) -> command::CachedTabletCommandResult {
+        match self {
+            Self::Noop => command::CachedTabletCommandResult::Noop,
+        }
+    }
+
+    fn from_proto(
+        result: command::CachedTabletCommandResult,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
+        match result {
+            command::CachedTabletCommandResult::Noop => Ok(Self::Noop),
+
+            command::CachedTabletCommandResult::Unspecified => {
+                Err(TabletStateMachineSnapshotError::UnspecifiedCachedResult)
+            }
+        }
+    }
+}
+
+/// durable per client deduplication state within one Raft group
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientDeduplicationSnapshot {
+    pub last_sequence_applied: u64,
+    pub cached_result: CachedTabletCommandResult,
+}
+
+/// versioned snapshot of replicated tablet command metadata
+///
+/// the surrounding tablet snapshot owns MVCC bytes and Raft metadata. This
+/// value preserves the tablet generation and retry state that must be restored
+/// before post-snapshot commands are applied
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletStateMachineSnapshot {
+    pub format_version: u32,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+}
+
+impl TabletStateMachineSnapshot {
+    pub fn new(
+        tablet_id: TabletId,
+        tablet_epoch: u64,
+        clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
+        let snapshot = Self {
+            format_version: TABLET_STATE_MACHINE_SNAPSHOT_VERSION,
+            tablet_id,
+            tablet_epoch,
+            clients,
+        };
+
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<(), TabletStateMachineSnapshotError> {
+        if self.format_version != TABLET_STATE_MACHINE_SNAPSHOT_VERSION {
+            return Err(TabletStateMachineSnapshotError::UnsupportedVersion(
+                self.format_version,
+            ));
+        }
+
+        if self.tablet_id.0 == 0 {
+            return Err(TabletStateMachineSnapshotError::ZeroTabletId);
+        }
+
+        if self.tablet_epoch == 0 {
+            return Err(TabletStateMachineSnapshotError::ZeroTabletEpoch);
+        }
+
+        if self
+            .clients
+            .values()
+            .any(|client| client.last_sequence_applied == 0)
+        {
+            return Err(TabletStateMachineSnapshotError::ZeroRequestSequence);
+        }
+
+        Ok(())
+    }
+
+    /// encode a deterministic protobuf image for inclusion in a tablet
+    /// snapshot. `BTreeMap` ordering fixes the repeated-client entry order
+    pub fn encode(&self) -> Result<Vec<u8>, TabletStateMachineSnapshotError> {
+        self.validate()?;
+        Ok(self.to_proto().encode_to_vec())
+    }
+
+    /// decode and validate command metadata recovered from a tablet snapshot
+    pub fn decode(bytes: &[u8]) -> Result<Self, TabletStateMachineSnapshotError> {
+        let proto = command::TabletStateMachineSnapshot::decode(bytes)
+            .map_err(|error| TabletStateMachineSnapshotError::Decode(error.to_string()))?;
+
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> command::TabletStateMachineSnapshot {
+        command::TabletStateMachineSnapshot {
+            format_version: self.format_version,
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+            clients: self
+                .clients
+                .iter()
+                .map(|(client_id, state)| command::ClientDeduplicationSnapshot {
+                    last_request_id: Some(
+                        RequestId {
+                            client_id: *client_id,
+                            sequence: state.last_sequence_applied,
+                        }
+                        .to_proto(),
+                    ),
+                    cached_result: state.cached_result.to_proto() as i32,
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(
+        proto: command::TabletStateMachineSnapshot,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
+        let tablet_id = TabletId::from_proto(
+            proto
+                .tablet_id
+                .ok_or(TabletStateMachineSnapshotError::MissingField("tablet_id"))?,
+        );
+
+        let mut clients = BTreeMap::new();
+
+        for client in proto.clients {
+            let request_id = RequestId::from_proto(client.last_request_id.ok_or(
+                TabletStateMachineSnapshotError::MissingField("clients.last_request_id"),
+            )?)
+            .map_err(TabletStateMachineSnapshotError::InvalidRequestId)?;
+
+            let cached_result = CachedTabletCommandResult::from_proto(
+                command::CachedTabletCommandResult::try_from(client.cached_result).map_err(
+                    |_| TabletStateMachineSnapshotError::InvalidCachedResult(client.cached_result),
+                )?,
+            )?;
+
+            if clients
+                .insert(
+                    request_id.client_id,
+                    ClientDeduplicationSnapshot {
+                        last_sequence_applied: request_id.sequence,
+                        cached_result,
+                    },
+                )
+                .is_some()
+            {
+                return Err(TabletStateMachineSnapshotError::DuplicateClient(
+                    request_id.client_id,
+                ));
+            }
+        }
+
+        let snapshot = Self {
+            format_version: proto.format_version,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
+            clients,
+        };
+
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletStateMachineSnapshotError {
+    #[error("unsupported tablet state-machine snapshot version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("tablet state-machine snapshot contains the reserved tablet ID zero")]
+    ZeroTabletId,
+
+    #[error("tablet state-machine snapshot epoch must be non-zero")]
+    ZeroTabletEpoch,
+
+    #[error("tablet state-machine snapshot contains request sequence zero")]
+    ZeroRequestSequence,
+
+    #[error("tablet state-machine snapshot is missing required field {0}")]
+    MissingField(&'static str),
+
+    #[error("invalid request ID in tablet state-machine snapshot: {0}")]
+    InvalidRequestId(&'static str),
+
+    #[error("tablet state-machine snapshot contains duplicate client {0:#034x}")]
+    DuplicateClient(u128),
+
+    #[error("tablet state-machine snapshot contains unknown cached result {0}")]
+    InvalidCachedResult(i32),
+
+    #[error("tablet state-machine snapshot contains an unspecified cached result")]
+    UnspecifiedCachedResult,
+
+    #[error("cannot decode tablet state-machine snapshot: {0}")]
     Decode(String),
 }
 

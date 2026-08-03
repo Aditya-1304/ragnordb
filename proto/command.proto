@@ -87,3 +87,25 @@ message CreateTableOperation {
 
 message NoopCommand {
 }
+
+// replicated command metadata that must survive tablet snapshot installation
+// entries are encoded in ascending client-ID order by the domain codec
+message TabletStateMachineSnapshot {
+    uint32 format_version = 1;
+    ragnordb.ids.TabletId tablet_id = 2;
+    uint64 tablet_epoch = 3;
+    repeated ClientDeduplicationSnapshot clients = 4;
+}
+
+// last applied request and cached result for one client in this Raft group
+message ClientDeduplicationSnapshot {
+    ragnordb.ids.RequestId last_request_id = 1;
+    CachedTabletCommandResult cached_result = 2;
+}
+
+// durable command results require explicit variants so a newer result cannot
+// accidentally acquire old semantics during recovery
+enum CachedTabletCommandResult {
+    CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED = 0;
+    CACHED_TABLET_COMMAND_RESULT_NOOP = 1;
+}

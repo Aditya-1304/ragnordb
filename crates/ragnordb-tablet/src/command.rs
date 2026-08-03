@@ -7,7 +7,11 @@
 use std::collections::BTreeMap;
 
 use ragnordb_common::{
-    command_codec::{TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError},
+    command_codec::{
+        CachedTabletCommandResult, ClientDeduplicationSnapshot, TabletCommand,
+        TabletCommandEnvelope, TabletCommandEnvelopeError, TabletStateMachineSnapshot,
+        TabletStateMachineSnapshotError,
+    },
     ids::TabletId,
 };
 use ragnordb_storage::mvcc::{InMemoryMvcc, MvccStorage};
@@ -23,7 +27,6 @@ use crate::Tablet;
 /// each instance belomgs to one raft group. its client sequence
 /// map is naturally scode to that group and cannot consume sequence
 /// applied by a different tablet state machine
-
 #[derive(Debug)]
 pub struct TabletStateMachine<S = InMemoryMvcc> {
     tablet: Tablet<S>,
@@ -43,6 +46,65 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             tablet,
             epoch,
             client_deduplication: BTreeMap::new(),
+        })
+    }
+
+    /// nncode replicated command metadata that must accompany a tablet snapshot
+    ///
+    /// MVCC data is intentionally owned by the surrounding tablet snapshot. This
+    /// image contains only tablet-generation and retry-deduplication state
+    pub fn encode_snapshot_state(&self) -> Result<Vec<u8>, TabletStateMachineSnapshotError> {
+        let clients = self
+            .client_deduplication
+            .iter()
+            .map(|(client_id, state)| {
+                (
+                    *client_id,
+                    ClientDeduplicationSnapshot {
+                        last_sequence_applied: state.last_sequence_applied,
+                        cached_result: state.cached_result.into(),
+                    },
+                )
+            })
+            .collect();
+
+        TabletStateMachineSnapshot::new(self.tablet.id(), self.epoch, clients)?.encode()
+    }
+
+    /// restore replicated command metadata before applying any post-snapshot Raft
+    /// entry
+    pub fn restore_from_snapshot(
+        tablet: Tablet<S>,
+        bytes: &[u8],
+    ) -> Result<Self, TabletStateMachineRestoreError> {
+        let snapshot = TabletStateMachineSnapshot::decode(bytes)?;
+        let local_tablet_id = tablet.id();
+
+        if snapshot.tablet_id != local_tablet_id {
+            return Err(TabletStateMachineRestoreError::TabletIdMismatch {
+                local_tablet_id,
+                snapshot_tablet_id: snapshot.tablet_id,
+            });
+        }
+
+        let client_deduplication = snapshot
+            .clients
+            .into_iter()
+            .map(|(client_id, state)| {
+                (
+                    client_id,
+                    ClientDeduplicationState {
+                        last_sequence_applied: state.last_sequence_applied,
+                        cached_result: state.cached_result.into(),
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            tablet,
+            epoch: snapshot.tablet_epoch,
+            client_deduplication,
         })
     }
 
@@ -175,6 +237,37 @@ pub enum TabletCommandApplyResult {
     Noop,
 }
 
+impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
+    fn from(result: TabletCommandApplyResult) -> Self {
+        match result {
+            TabletCommandApplyResult::Noop => Self::Noop,
+        }
+    }
+}
+
+impl From<CachedTabletCommandResult> for TabletCommandApplyResult {
+    fn from(result: CachedTabletCommandResult) -> Self {
+        match result {
+            CachedTabletCommandResult::Noop => Self::Noop,
+        }
+    }
+}
+
+/// failure while restoring command metadata into a tablet state machine
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletStateMachineRestoreError {
+    #[error(
+        "tablet snapshot belongs to tablet {snapshot_tablet_id:?}, but the supplied tablet is {local_tablet_id:?}"
+    )]
+    TabletIdMismatch {
+        local_tablet_id: TabletId,
+        snapshot_tablet_id: TabletId,
+    },
+
+    #[error("invalid tablet state-machine snapshot: {0}")]
+    InvalidSnapshot(#[from] TabletStateMachineSnapshotError),
+}
+
 /// deterministic rejection returned by the tablet apply boundary
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TabletCommandApplyError {
@@ -245,7 +338,7 @@ mod tests {
 
     use super::{
         TabletCommandApplyError, TabletCommandApplyOutcome, TabletCommandApplyResult,
-        TabletStateMachine,
+        TabletStateMachine, TabletStateMachineRestoreError,
     };
     use crate::Tablet;
 
@@ -438,5 +531,71 @@ mod tests {
 
         assert!(!first_result.deduplicated);
         assert!(!second_result.deduplicated);
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_cached_request_result() {
+        let mut original = state_machine();
+
+        original
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        let snapshot = original.encode_snapshot_state().unwrap();
+
+        let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
+        let mut restored = TabletStateMachine::restore_from_snapshot(tablet, &snapshot).unwrap();
+
+        // The last acknowledged request must be served from restored deduplication
+        // state instead of being dispatched as a fresh state transition.
+        let retry = restored
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            retry,
+            TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: true,
+            }
+        );
+
+        // Restoration must also preserve the next expected sequence.
+        let next = restored
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                2,
+            ))
+            .unwrap();
+
+        assert!(!next.deduplicated);
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_state_for_another_tablet() {
+        let original = state_machine();
+        let snapshot = original.encode_snapshot_state().unwrap();
+
+        let other_tablet_id = TabletId(LOCAL_TABLET_ID.0 + 1);
+        let other_tablet = Tablet::new(other_tablet_id, TableId(9)).unwrap();
+
+        let error = TabletStateMachine::restore_from_snapshot(other_tablet, &snapshot).unwrap_err();
+
+        assert_eq!(
+            error,
+            TabletStateMachineRestoreError::TabletIdMismatch {
+                local_tablet_id: other_tablet_id,
+                snapshot_tablet_id: LOCAL_TABLET_ID,
+            }
+        );
     }
 }

@@ -132,3 +132,52 @@ pub struct CreateTableOperation {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct NoopCommand {}
+/// replicated command metadata that must survive tablet snapshot installation
+/// entries are encoded in ascending client-ID order by the domain codec
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletStateMachineSnapshot {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(message, repeated, tag = "4")]
+    pub clients: ::prost::alloc::vec::Vec<ClientDeduplicationSnapshot>,
+}
+/// last applied request and cached result for one client in this Raft group
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientDeduplicationSnapshot {
+    #[prost(message, optional, tag = "1")]
+    pub last_request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(enumeration = "CachedTabletCommandResult", tag = "2")]
+    pub cached_result: i32,
+}
+/// durable command results require explicit variants so a newer result cannot
+/// accidentally acquire old semantics during recovery
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CachedTabletCommandResult {
+    Unspecified = 0,
+    Noop = 1,
+}
+impl CachedTabletCommandResult {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED",
+            Self::Noop => "CACHED_TABLET_COMMAND_RESULT_NOOP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED" => Some(Self::Unspecified),
+            "CACHED_TABLET_COMMAND_RESULT_NOOP" => Some(Self::Noop),
+            _ => None,
+        }
+    }
+}
