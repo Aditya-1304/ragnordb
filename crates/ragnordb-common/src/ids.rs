@@ -250,6 +250,61 @@ impl RequestId {
     }
 }
 
+/// distributed transaction phase used to derive a stable participant request
+///
+/// each phase receives an independent request namespace. Recovery and a new
+/// coordinator can therefore reproduce the same request ID without sharing
+/// volatile client sequence state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ParticipantCommandPhase {
+    Prewrite = 1,
+    Commit = 2,
+    Rollback = 3,
+    ResolveIntent = 4,
+}
+
+/// derive the request identity for one distributed transaction participant
+///
+/// The fixed, versioned byte layout makes the result independent of platform
+/// endianness and process-local hash implementations. Sequence one is used
+/// because the phase is already part of the derived client namespace.
+pub fn participant_request_id(
+    txn_id: TxnId,
+    phase: ParticipantCommandPhase,
+    participant_tablet_id: TabletId,
+) -> Result<RequestId, &'static str> {
+    if txn_id.0 == 0 {
+        return Err("participant request transaction ID must be non-zero");
+    }
+
+    if participant_tablet_id.0 == 0 {
+        return Err("participant request tablet ID must be non-zero");
+    }
+
+    const FNV_128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    const DOMAIN: &[u8] = b"ragnordb/participant-request/v1";
+
+    let mut client_id = FNV_128_OFFSET_BASIS;
+
+    for byte in DOMAIN
+        .iter()
+        .copied()
+        .chain(txn_id.0.to_be_bytes())
+        .chain([phase as u8])
+        .chain(participant_tablet_id.0.to_be_bytes())
+    {
+        client_id ^= u128::from(byte);
+        client_id = client_id.wrapping_mul(FNV_128_PRIME);
+    }
+
+    Ok(RequestId {
+        client_id,
+        sequence: 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +392,29 @@ mod tests {
         let decoded = ColumnId::from_proto(id.to_proto());
 
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn participant_request_ids_are_stable_and_phase_scoped() {
+        let txn_id = TxnId(91);
+        let tablet_id = TabletId(17);
+
+        let first =
+            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, tablet_id).unwrap();
+
+        let replay =
+            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, tablet_id).unwrap();
+
+        let commit =
+            participant_request_id(txn_id, ParticipantCommandPhase::Commit, tablet_id).unwrap();
+
+        let other_tablet =
+            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, TabletId(18))
+                .unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(first, commit);
+        assert_ne!(first, other_tablet);
+        assert_eq!(first.sequence, 1);
     }
 }

@@ -159,13 +159,16 @@ pub enum TabletCommandEnvelopeError {
 
 /// durable cached result for one successfully applied tablet command
 ///
-/// new command results must receive explicit protobuf variants before they can
-/// be stored in replicated deduplication state
+/// every result has an explicit protobuf value because these values are stored
+/// in replicated tablet snapshots and must retain their meaning across upgrades
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedTabletCommandResult {
     Noop,
     SingleShardCommit,
     Prewrite,
+    Commit,
+    Rollback,
+    ResolveIntent,
 }
 
 impl CachedTabletCommandResult {
@@ -174,6 +177,9 @@ impl CachedTabletCommandResult {
             Self::Noop => command::CachedTabletCommandResult::Noop,
             Self::SingleShardCommit => command::CachedTabletCommandResult::SingleShardCommit,
             Self::Prewrite => command::CachedTabletCommandResult::Prewrite,
+            Self::Commit => command::CachedTabletCommandResult::Commit,
+            Self::Rollback => command::CachedTabletCommandResult::Rollback,
+            Self::ResolveIntent => command::CachedTabletCommandResult::ResolveIntent,
         }
     }
 
@@ -182,11 +188,11 @@ impl CachedTabletCommandResult {
     ) -> Result<Self, TabletStateMachineSnapshotError> {
         match result {
             command::CachedTabletCommandResult::Noop => Ok(Self::Noop),
-
             command::CachedTabletCommandResult::SingleShardCommit => Ok(Self::SingleShardCommit),
-
             command::CachedTabletCommandResult::Prewrite => Ok(Self::Prewrite),
-
+            command::CachedTabletCommandResult::Commit => Ok(Self::Commit),
+            command::CachedTabletCommandResult::Rollback => Ok(Self::Rollback),
+            command::CachedTabletCommandResult::ResolveIntent => Ok(Self::ResolveIntent),
             command::CachedTabletCommandResult::Unspecified => {
                 Err(TabletStateMachineSnapshotError::UnspecifiedCachedResult)
             }

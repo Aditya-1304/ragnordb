@@ -133,6 +133,32 @@ pub trait MvccStorage {
         ))
     }
 
+    /// commit one previously installed distributed transaction intent
+    ///
+    /// an exact replay succeeds without creating a second write version. A
+    /// missing, conflicting, or rolled-back intent fails without mutation
+    fn commit_intent(
+        &mut self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _commit_ts: Timestamp,
+        _key: &[u8],
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed intent commit is not supported by this MVCC backend",
+        ))
+    }
+
+    /// roll back one distributed transaction intent and persist its tombstone
+    ///
+    /// the rollback marker prevents a delayed prewrite or commit from
+    /// resurrecting an aborted transaction. Exact replays are idempotent
+    fn rollback_intent(&mut self, _txn_id: TxnId, _start_ts: Timestamp, _key: &[u8]) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed intent rollback is not supported by this MVCC backend",
+        ))
+    }
+
     /// Atomically validate and commit a transaction's complete mutation set.
     ///
     /// No mutation may be applied when validation of any key fails.
@@ -897,6 +923,261 @@ impl MvccStorage for InMemoryMvcc {
         }
 
         self.locks.insert(key.to_vec(), expected_lock);
+
+        Ok(())
+    }
+
+    fn commit_intent(
+        &mut self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        key: &[u8],
+    ) -> Result<()> {
+        validate_commit_metadata(txn_id, start_ts, commit_ts)?;
+        validate_encoded_key_argument(key, "intent commit key")?;
+
+        // A committed write is the durable replay witness after its lock has
+        // been removed. Validate the complete referenced state before treating
+        // the command as an idempotent success.
+        if let Some(write) = self
+            .writes
+            .get(key)
+            .and_then(|versions| versions.get(&commit_ts))
+        {
+            validate_write_record(commit_ts, write)?;
+
+            if write.start_timestamp != start_ts || write.op == WriteKind::Rollback {
+                return Err(Error::CorruptData(format!(
+                    "write timestamp {} is occupied by another transaction outcome",
+                    commit_ts.0
+                )));
+            }
+
+            if self
+                .locks
+                .get(key)
+                .is_some_and(|lock| lock.start_timestamp == start_ts)
+            {
+                return Err(Error::CorruptData(format!(
+                    "committed transaction at timestamp {} still has an intent lock",
+                    commit_ts.0
+                )));
+            }
+
+            match write.op {
+                WriteKind::Put => {
+                    let row = self
+                        .default
+                        .get(key)
+                        .and_then(|versions| versions.get(&start_ts))
+                        .ok_or_else(|| {
+                            Error::CorruptData(format!(
+                                "committed Put at timestamp {} has no default value",
+                                commit_ts.0
+                            ))
+                        })?;
+
+                    decode_row(row)?;
+                }
+
+                WriteKind::Delete => {
+                    if self
+                        .default
+                        .get(key)
+                        .is_some_and(|versions| versions.contains_key(&start_ts))
+                    {
+                        return Err(Error::CorruptData(format!(
+                            "committed Delete at timestamp {} retains a default value",
+                            commit_ts.0
+                        )));
+                    }
+                }
+
+                WriteKind::Rollback => unreachable!("handled above"),
+            }
+
+            return Ok(());
+        }
+
+        let lock = self.locks.get(key).cloned().ok_or_else(|| {
+            Error::WriteConflict(format!(
+                "transaction {} has no intent to commit at start timestamp {}",
+                txn_id.0, start_ts.0
+            ))
+        })?;
+
+        if lock.txn_id != txn_id || lock.start_timestamp != start_ts {
+            return Err(Error::WriteConflict(format!(
+                "row is locked by transaction {} at start timestamp {}",
+                lock.txn_id.0, lock.start_timestamp.0
+            )));
+        }
+
+        let mutation = match lock.op {
+            WriteKind::Put => {
+                let row = self
+                    .default
+                    .get(key)
+                    .and_then(|versions| versions.get(&start_ts))
+                    .ok_or_else(|| {
+                        Error::CorruptData(format!(
+                            "transaction {} has a Put lock without its default value",
+                            txn_id.0
+                        ))
+                    })?
+                    .clone();
+
+                decode_row(&row)?;
+                Mutation::Put(row)
+            }
+
+            WriteKind::Delete => {
+                if self
+                    .default
+                    .get(key)
+                    .is_some_and(|versions| versions.contains_key(&start_ts))
+                {
+                    return Err(Error::CorruptData(format!(
+                        "transaction {} has a Delete lock with a default value",
+                        txn_id.0
+                    )));
+                }
+
+                Mutation::Delete
+            }
+
+            WriteKind::Rollback => {
+                return Err(Error::CorruptData(format!(
+                    "transaction {} has an invalid Rollback intent lock",
+                    txn_id.0
+                )));
+            }
+        };
+
+        let mutations = BTreeMap::from([(key.to_vec(), mutation)]);
+        self.commit_batch(txn_id, start_ts, commit_ts, &mutations)?;
+
+        Ok(())
+    }
+
+    fn rollback_intent(&mut self, txn_id: TxnId, start_ts: Timestamp, key: &[u8]) -> Result<()> {
+        validate_commit_preflight_metadata(txn_id, start_ts)?;
+        validate_encoded_key_argument(key, "intent rollback key")?;
+
+        if let Some(write_versions) = self.writes.get(key) {
+            for (stored_write_ts, write) in write_versions {
+                validate_write_record(*stored_write_ts, write)?;
+
+                if write.start_timestamp == start_ts && write.op != WriteKind::Rollback {
+                    return Err(Error::WriteConflict(format!(
+                        "transaction starting at timestamp {} is already committed",
+                        start_ts.0
+                    )));
+                }
+            }
+
+            if let Some(rollback) = write_versions.get(&start_ts) {
+                if rollback.start_timestamp != start_ts || rollback.op != WriteKind::Rollback {
+                    return Err(Error::CorruptData(format!(
+                        "write timestamp {} is occupied by a non-rollback outcome",
+                        start_ts.0
+                    )));
+                }
+
+                if self
+                    .locks
+                    .get(key)
+                    .is_some_and(|lock| lock.start_timestamp == start_ts)
+                    || self
+                        .default
+                        .get(key)
+                        .is_some_and(|versions| versions.contains_key(&start_ts))
+                {
+                    return Err(Error::CorruptData(format!(
+                        "rolled-back transaction at timestamp {} retains intent state",
+                        start_ts.0
+                    )));
+                }
+
+                return Ok(());
+            }
+        }
+
+        let locked_op = match self.locks.get(key) {
+            Some(lock) if lock.txn_id != txn_id || lock.start_timestamp != start_ts => {
+                return Err(Error::WriteConflict(format!(
+                    "row is locked by transaction {} at start timestamp {}",
+                    lock.txn_id.0, lock.start_timestamp.0
+                )));
+            }
+
+            Some(lock) => Some(lock.op),
+            None => None,
+        };
+
+        match locked_op {
+            Some(WriteKind::Put) => {
+                let row = self
+                    .default
+                    .get(key)
+                    .and_then(|versions| versions.get(&start_ts))
+                    .ok_or_else(|| {
+                        Error::CorruptData(format!(
+                            "transaction {} has a Put lock without its default value",
+                            txn_id.0
+                        ))
+                    })?;
+
+                decode_row(row)?;
+            }
+
+            Some(WriteKind::Delete) | None => {
+                if self
+                    .default
+                    .get(key)
+                    .is_some_and(|versions| versions.contains_key(&start_ts))
+                {
+                    return Err(Error::CorruptData(format!(
+                        "transaction {} has a default value without a matching Put lock",
+                        txn_id.0
+                    )));
+                }
+            }
+
+            Some(WriteKind::Rollback) => {
+                return Err(Error::CorruptData(format!(
+                    "transaction {} has an invalid Rollback intent lock",
+                    txn_id.0
+                )));
+            }
+        }
+
+        // All validation is complete. Remove the intent state and publish the
+        // rollback marker as one serialized in-memory transition.
+        if locked_op == Some(WriteKind::Put) {
+            let remove_key = if let Some(versions) = self.default.get_mut(key) {
+                versions.remove(&start_ts);
+                versions.is_empty()
+            } else {
+                false
+            };
+
+            if remove_key {
+                self.default.remove(key);
+            }
+        }
+
+        self.locks.remove(key);
+
+        self.writes.entry(key.to_vec()).or_default().insert(
+            start_ts,
+            WriteRecord {
+                start_timestamp: start_ts,
+                commit_timestamp: start_ts,
+                op: WriteKind::Rollback,
+            },
+        );
 
         Ok(())
     }

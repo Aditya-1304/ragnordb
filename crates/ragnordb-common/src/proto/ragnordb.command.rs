@@ -164,6 +164,9 @@ pub enum CachedTabletCommandResult {
     Noop = 1,
     SingleShardCommit = 2,
     Prewrite = 3,
+    Commit = 4,
+    Rollback = 5,
+    ResolveIntent = 6,
 }
 impl CachedTabletCommandResult {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -176,6 +179,9 @@ impl CachedTabletCommandResult {
             Self::Noop => "CACHED_TABLET_COMMAND_RESULT_NOOP",
             Self::SingleShardCommit => "CACHED_TABLET_COMMAND_RESULT_SINGLE_SHARD_COMMIT",
             Self::Prewrite => "CACHED_TABLET_COMMAND_RESULT_PREWRITE",
+            Self::Commit => "CACHED_TABLET_COMMAND_RESULT_COMMIT",
+            Self::Rollback => "CACHED_TABLET_COMMAND_RESULT_ROLLBACK",
+            Self::ResolveIntent => "CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -187,6 +193,9 @@ impl CachedTabletCommandResult {
                 Some(Self::SingleShardCommit)
             }
             "CACHED_TABLET_COMMAND_RESULT_PREWRITE" => Some(Self::Prewrite),
+            "CACHED_TABLET_COMMAND_RESULT_COMMIT" => Some(Self::Commit),
+            "CACHED_TABLET_COMMAND_RESULT_ROLLBACK" => Some(Self::Rollback),
+            "CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT" => Some(Self::ResolveIntent),
             _ => None,
         }
     }

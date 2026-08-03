@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 
 use ragnordb_common::{
     Error,
-    codec::WriteKind,
+    codec::{TxnStatus, WriteKind},
     command_codec::{
-        CachedTabletCommandResult, ClientDeduplicationSnapshot, PrewriteCommand,
-        SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
-        TabletStateMachineSnapshot, TabletStateMachineSnapshotError,
+        CachedTabletCommandResult, ClientDeduplicationSnapshot, CommitCommand, PrewriteCommand,
+        ResolveIntentCommand, RollbackCommand, SingleShardCommitCommand, TabletCommand,
+        TabletCommandEnvelope, TabletCommandEnvelopeError, TabletStateMachineSnapshot,
+        TabletStateMachineSnapshotError,
     },
     encoding::encode_row,
     ids::TabletId,
@@ -186,9 +187,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         let result = match envelope.command {
             TabletCommand::Noop(_) => TabletCommandApplyResult::Noop,
             TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command)?,
-
             TabletCommand::Prewrite(command) => self.apply_prewrite(command)?,
-
+            TabletCommand::Commit(command) => self.apply_commit(command)?,
+            TabletCommand::Rollback(command) => self.apply_rollback(command)?,
+            TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command)?,
             command => {
                 return Err(TabletCommandApplyError::UnsupportedCommand {
                     command: command_name(&command),
@@ -283,6 +285,86 @@ impl<S: MvccStorage> TabletStateMachine<S> {
 
         Ok(())
     }
+
+    fn apply_commit(
+        &mut self,
+        command: CommitCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        self.validate_owned_key(&command.key)?;
+
+        self.tablet
+            .storage
+            .commit_intent(
+                command.txn_id,
+                command.start_timestamp,
+                command.commit_timestamp,
+                &command.key,
+            )
+            .map_err(map_database_error)?;
+
+        Ok(TabletCommandApplyResult::Commit)
+    }
+
+    fn apply_rollback(
+        &mut self,
+        command: RollbackCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        self.validate_owned_key(&command.key)?;
+
+        self.tablet
+            .storage
+            .rollback_intent(command.txn_id, command.start_timestamp, &command.key)
+            .map_err(map_database_error)?;
+
+        Ok(TabletCommandApplyResult::Rollback)
+    }
+
+    fn apply_resolve_intent(
+        &mut self,
+        command: ResolveIntentCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        self.validate_owned_key(&command.key)?;
+
+        match (command.resolved_status, command.commit_timestamp) {
+            (TxnStatus::Committed, Some(commit_timestamp)) => self
+                .tablet
+                .storage
+                .commit_intent(
+                    command.txn_id,
+                    command.start_timestamp,
+                    commit_timestamp,
+                    &command.key,
+                )
+                .map_err(map_database_error)?,
+
+            (TxnStatus::Aborted, None) => self
+                .tablet
+                .storage
+                .rollback_intent(command.txn_id, command.start_timestamp, &command.key)
+                .map_err(map_database_error)?,
+
+            (TxnStatus::Pending, _) => {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "pending transaction cannot be resolved".to_string(),
+                });
+            }
+
+            (TxnStatus::Committed, None) => {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "committed intent resolution requires commit_timestamp".to_string(),
+                });
+            }
+
+            (TxnStatus::Aborted, Some(_)) => {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "aborted intent resolution must not contain commit_timestamp"
+                        .to_string(),
+                });
+            }
+        }
+
+        Ok(TabletCommandApplyResult::ResolveIntent)
+    }
 }
 
 fn mutation_from_command(
@@ -371,6 +453,15 @@ pub enum TabletCommandApplyResult {
 
     /// One distributed transaction intent was installed atomically.
     Prewrite,
+
+    /// One distributed intent was committed into a visible MVCC write.
+    Commit,
+
+    /// One distributed intent was removed and protected by a rollback marker.
+    Rollback,
+
+    /// One intent was resolved according to the durable transaction status.
+    ResolveIntent,
 }
 
 impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
@@ -379,6 +470,9 @@ impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
             TabletCommandApplyResult::Noop => Self::Noop,
             TabletCommandApplyResult::SingleShardCommit => Self::SingleShardCommit,
             TabletCommandApplyResult::Prewrite => Self::Prewrite,
+            TabletCommandApplyResult::Commit => Self::Commit,
+            TabletCommandApplyResult::Rollback => Self::Rollback,
+            TabletCommandApplyResult::ResolveIntent => Self::ResolveIntent,
         }
     }
 }
@@ -389,6 +483,9 @@ impl From<CachedTabletCommandResult> for TabletCommandApplyResult {
             CachedTabletCommandResult::Noop => Self::Noop,
             CachedTabletCommandResult::SingleShardCommit => Self::SingleShardCommit,
             CachedTabletCommandResult::Prewrite => Self::Prewrite,
+            CachedTabletCommandResult::Commit => Self::Commit,
+            CachedTabletCommandResult::Rollback => Self::Rollback,
+            CachedTabletCommandResult::ResolveIntent => Self::ResolveIntent,
         }
     }
 }
@@ -485,10 +582,10 @@ fn command_name(command: &TabletCommand) -> &'static str {
 mod tests {
     use ragnordb_common::{
         Error,
-        codec::{Row, Value, WriteKind},
+        codec::{Row, TxnStatus, Value, WriteKind},
         command_codec::{
-            NoopCommand, PrewriteCommand, SingleShardCommitCommand, TabletCommand,
-            TabletCommandEnvelope, WriteEntry,
+            CommitCommand, NoopCommand, PrewriteCommand, ResolveIntentCommand, RollbackCommand,
+            SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
         },
         ids::{RequestId, TableId, TabletId, Timestamp, TxnId},
     };
@@ -860,5 +957,151 @@ mod tests {
             state_machine.tablet().get(&reader, &key),
             Err(Error::WriteConflict(_))
         ));
+    }
+
+    #[test]
+    fn commit_resolves_prewrite_and_is_safe_to_replay() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(8)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let row = test_row(8, "Edsger");
+
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: TxnId(13),
+                    start_timestamp: Timestamp(60),
+                    key: encoded_key.clone(),
+                    row: Some(row.clone()),
+                    primary_key: encoded_key.clone(),
+                    op: WriteKind::Put,
+                    ttl_ms: 30_000,
+                }),
+            ))
+            .unwrap();
+
+        let commit = CommitCommand {
+            txn_id: TxnId(13),
+            start_timestamp: Timestamp(60),
+            commit_timestamp: Timestamp(70),
+            key: encoded_key,
+        };
+
+        let outcome = state_machine
+            .apply(command_envelope(2, TabletCommand::Commit(commit.clone())))
+            .unwrap();
+
+        assert_eq!(outcome.result, TabletCommandApplyResult::Commit);
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(state_machine.tablet().stats().write_records, 1);
+
+        // A semantically identical command with a different request sequence
+        // still must not create a duplicate physical MVCC version.
+        let replay = state_machine
+            .apply(command_envelope(3, TabletCommand::Commit(commit)))
+            .unwrap();
+
+        assert_eq!(replay.result, TabletCommandApplyResult::Commit);
+        assert_eq!(state_machine.tablet().stats().write_records, 1);
+
+        let reader = Transaction::new(TxnId(101), Timestamp(71)).unwrap();
+
+        assert_eq!(
+            state_machine.tablet().get(&reader, &key).unwrap(),
+            Some(row)
+        );
+    }
+
+    #[test]
+    fn rollback_removes_intent_and_blocks_a_delayed_prewrite() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(9)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+
+        let prewrite = PrewriteCommand {
+            txn_id: TxnId(14),
+            start_timestamp: Timestamp(80),
+            key: encoded_key.clone(),
+            row: Some(test_row(9, "Barbara")),
+            primary_key: encoded_key.clone(),
+            op: WriteKind::Put,
+            ttl_ms: 30_000,
+        };
+
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(prewrite.clone()),
+            ))
+            .unwrap();
+
+        let outcome = state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::Rollback(RollbackCommand {
+                    txn_id: TxnId(14),
+                    start_timestamp: Timestamp(80),
+                    key: encoded_key,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.result, TabletCommandApplyResult::Rollback);
+        assert_eq!(state_machine.tablet().stats().default_versions, 0);
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(state_machine.tablet().stats().write_records, 1);
+
+        let error = state_machine
+            .apply(command_envelope(3, TabletCommand::Prewrite(prewrite)))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TabletCommandApplyError::WriteConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intent_applies_the_recorded_abort_outcome() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(10)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: TxnId(15),
+                    start_timestamp: Timestamp(90),
+                    key: encoded_key.clone(),
+                    row: Some(test_row(10, "Margaret")),
+                    primary_key: encoded_key.clone(),
+                    op: WriteKind::Put,
+                    ttl_ms: 30_000,
+                }),
+            ))
+            .unwrap();
+
+        let outcome = state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::ResolveIntent(ResolveIntentCommand {
+                    txn_id: TxnId(15),
+                    start_timestamp: Timestamp(90),
+                    key: encoded_key,
+                    resolved_status: TxnStatus::Aborted,
+                    commit_timestamp: None,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.result, TabletCommandApplyResult::ResolveIntent);
+        assert_eq!(state_machine.tablet().stats().default_versions, 0);
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(state_machine.tablet().stats().write_records, 1);
+
+        let reader = Transaction::new(TxnId(102), Timestamp(100)).unwrap();
+        assert_eq!(state_machine.tablet().get(&reader, &key).unwrap(), None);
     }
 }
