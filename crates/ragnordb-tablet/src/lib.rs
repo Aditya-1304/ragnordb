@@ -9,6 +9,7 @@
 //!
 //! This right now does not replicate commands or persist them to WAL.
 
+pub mod command;
 use std::collections::BTreeMap;
 
 use ragnordb_common::{

@@ -1325,6 +1325,7 @@ dependencies = [
  "ragnordb-common",
  "ragnordb-storage",
  "ragnordb-txn",
+ "thiserror",
 ]
 
 [[package]]

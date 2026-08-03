@@ -9,3 +9,4 @@ repository.workspace = true
 ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-storage = { path = "../ragnordb-storage" }
 ragnordb-txn = { path = "../ragnordb-txn" }
+thiserror.workspace = true
