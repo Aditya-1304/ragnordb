@@ -39,7 +39,12 @@ impl RaftReplicaIdentity {
         Ok(identity)
     }
 
-    fn validate(self) -> Result<(), RaftLogEntryCodecError> {
+    /// validate a record constructed directly by an in process caller
+    ///
+    /// recovery obtains the same validation through `decode`, while the live
+    /// persistence path uses this boundary before admitting a record to its
+    /// identity-scoped log view
+    pub fn validate(&self) -> Result<(), RaftLogEntryCodecError> {
         if self.raft_group_id.0 == 0 {
             return Err(RaftLogEntryCodecError::ZeroRaftGroupId);
         }
@@ -134,7 +139,12 @@ impl RaftLogEntryRecord {
         Self::from_proto(proto)
     }
 
-    fn validate(&self) -> Result<(), RaftLogEntryCodecError> {
+    /// Validate a record constructed directly by an in-process caller.
+    ///
+    /// Recovery obtains the same validation through `decode`, while the live
+    /// persistence path uses this boundary before admitting a record to its
+    /// identity-scoped log view.
+    pub fn validate(&self) -> Result<(), RaftLogEntryCodecError> {
         if self.format_version != RAFT_LOG_ENTRY_RECORD_VERSION {
             return Err(RaftLogEntryCodecError::UnsupportedVersion(
                 self.format_version,
