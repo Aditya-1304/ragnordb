@@ -35,10 +35,17 @@ message PrewriteCommand {
     ragnordb.ids.TxnId txn_id = 1;
     ragnordb.ids.Timestamp start_timestamp = 2;
     bytes key = 3;
-    ragnordb.row.Value value = 4;
+
+    // field 4 previously carried one Value, which cannot represent a complete
+    // multi-column SQL row. we will never reuse its durable field number
+    reserved 4;
+
     bytes primary_key = 5;
     ragnordb.mvcc.WriteKind op = 6;
     uint64 ttl_ms = 7;
+
+    // Required for Put and absent for Delete.
+    ragnordb.row.Row row = 8;
 }
 
 message CommitCommand {
@@ -63,8 +70,14 @@ message SingleShardCommitCommand {
 
 message WriteEntry {
     bytes key = 1;
-    ragnordb.row.Value value = 2;
+
+    // field 2 previously carried one Value instead of the complete row
+    reserved 2;
+
     ragnordb.mvcc.WriteKind op = 3;
+
+    // required for Put and absent for Delete
+    ragnordb.row.Row row = 4;
 }
 
 message ResolveIntentCommand {
@@ -108,4 +121,6 @@ message ClientDeduplicationSnapshot {
 enum CachedTabletCommandResult {
     CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED = 0;
     CACHED_TABLET_COMMAND_RESULT_NOOP = 1;
+    CACHED_TABLET_COMMAND_RESULT_SINGLE_SHARD_COMMIT = 2;
+    CACHED_TABLET_COMMAND_RESULT_PREWRITE = 3;
 }

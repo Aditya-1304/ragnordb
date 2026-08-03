@@ -7,14 +7,20 @@
 use std::collections::BTreeMap;
 
 use ragnordb_common::{
+    Error,
+    codec::WriteKind,
     command_codec::{
-        CachedTabletCommandResult, ClientDeduplicationSnapshot, TabletCommand,
-        TabletCommandEnvelope, TabletCommandEnvelopeError, TabletStateMachineSnapshot,
-        TabletStateMachineSnapshotError,
+        CachedTabletCommandResult, ClientDeduplicationSnapshot, PrewriteCommand,
+        SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
+        TabletStateMachineSnapshot, TabletStateMachineSnapshotError,
     },
+    encoding::encode_row,
     ids::TabletId,
 };
-use ragnordb_storage::mvcc::{InMemoryMvcc, MvccStorage};
+use ragnordb_storage::{
+    key::decode_row_key,
+    mvcc::{InMemoryMvcc, Mutation, MvccStorage},
+};
 
 use crate::Tablet;
 
@@ -47,6 +53,11 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             epoch,
             client_deduplication: BTreeMap::new(),
         })
+    }
+
+    /// Borrow the tablet state owned by this replicated state machine.
+    pub fn tablet(&self) -> &Tablet<S> {
+        &self.tablet
     }
 
     /// nncode replicated command metadata that must accompany a tablet snapshot
@@ -174,6 +185,9 @@ impl<S: MvccStorage> TabletStateMachine<S> {
 
         let result = match envelope.command {
             TabletCommand::Noop(_) => TabletCommandApplyResult::Noop,
+            TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command)?,
+
+            TabletCommand::Prewrite(command) => self.apply_prewrite(command)?,
 
             command => {
                 return Err(TabletCommandApplyError::UnsupportedCommand {
@@ -191,6 +205,122 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         );
 
         Ok(TabletCommandApplyOutcome::applied(result))
+    }
+
+    fn apply_single_shard_commit(
+        &mut self,
+        command: SingleShardCommitCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        if command.writes.is_empty() {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "single-shard commit requires at least one write".to_string(),
+            });
+        }
+
+        let mut mutations = BTreeMap::new();
+
+        for write in command.writes {
+            self.validate_owned_key(&write.key)?;
+
+            let mutation = mutation_from_command(write.op, write.row)?;
+
+            if mutations.insert(write.key, mutation).is_some() {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "single-shard commit contains a duplicate row key".to_string(),
+                });
+            }
+        }
+
+        self.tablet
+            .storage
+            .commit_batch(
+                command.txn_id,
+                command.start_timestamp,
+                command.commit_timestamp,
+                &mutations,
+            )
+            .map_err(map_database_error)?;
+
+        Ok(TabletCommandApplyResult::SingleShardCommit)
+    }
+
+    fn apply_prewrite(
+        &mut self,
+        command: PrewriteCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        self.validate_owned_key(&command.key)?;
+
+        let mutation = mutation_from_command(command.op, command.row)?;
+
+        self.tablet
+            .storage
+            .prewrite(
+                command.txn_id,
+                command.start_timestamp,
+                &command.key,
+                &mutation,
+                &command.primary_key,
+                command.ttl_ms,
+            )
+            .map_err(map_database_error)?;
+
+        Ok(TabletCommandApplyResult::Prewrite)
+    }
+
+    fn validate_owned_key(&self, key: &[u8]) -> Result<(), TabletCommandApplyError> {
+        let row_key = decode_row_key(key).map_err(map_database_error)?;
+
+        if row_key.table_id != self.tablet.table_id() {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: format!(
+                    "row belongs to table {}, but tablet {} owns table {}",
+                    row_key.table_id.0,
+                    self.tablet.id().0,
+                    self.tablet.table_id().0
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn mutation_from_command(
+    op: WriteKind,
+    row: Option<ragnordb_common::codec::Row>,
+) -> Result<Mutation, TabletCommandApplyError> {
+    match (op, row) {
+        (WriteKind::Put, Some(row)) => encode_row(&row)
+            .map(Mutation::Put)
+            .map_err(map_database_error),
+
+        (WriteKind::Delete, None) => Ok(Mutation::Delete),
+
+        (WriteKind::Put, None) => Err(TabletCommandApplyError::InvalidCommand {
+            reason: "Put command requires a complete row".to_string(),
+        }),
+
+        (WriteKind::Delete, Some(_)) => Err(TabletCommandApplyError::InvalidCommand {
+            reason: "Delete command must not contain a row".to_string(),
+        }),
+
+        (WriteKind::Rollback, _) => Err(TabletCommandApplyError::InvalidCommand {
+            reason: "Rollback is not a valid write mutation payload".to_string(),
+        }),
+    }
+}
+
+fn map_database_error(error: Error) -> TabletCommandApplyError {
+    match error {
+        Error::InvalidArgument(reason) => TabletCommandApplyError::InvalidCommand { reason },
+
+        Error::WriteConflict(reason) => TabletCommandApplyError::WriteConflict { reason },
+
+        Error::CorruptData(reason) => TabletCommandApplyError::CorruptState { reason },
+
+        error => TabletCommandApplyError::StorageFailure {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -235,12 +365,20 @@ pub enum TabletCommandApplyResult {
     ///  no-op passed target validation and intentionally changed no MVCC
     /// state. Later phases use this result for replicated barriers
     Noop,
+
+    /// A complete single-tablet write batch committed atomically.
+    SingleShardCommit,
+
+    /// One distributed transaction intent was installed atomically.
+    Prewrite,
 }
 
 impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
     fn from(result: TabletCommandApplyResult) -> Self {
         match result {
             TabletCommandApplyResult::Noop => Self::Noop,
+            TabletCommandApplyResult::SingleShardCommit => Self::SingleShardCommit,
+            TabletCommandApplyResult::Prewrite => Self::Prewrite,
         }
     }
 }
@@ -249,6 +387,8 @@ impl From<CachedTabletCommandResult> for TabletCommandApplyResult {
     fn from(result: CachedTabletCommandResult) -> Self {
         match result {
             CachedTabletCommandResult::Noop => Self::Noop,
+            CachedTabletCommandResult::SingleShardCommit => Self::SingleShardCommit,
+            CachedTabletCommandResult::Prewrite => Self::Prewrite,
         }
     }
 }
@@ -310,6 +450,18 @@ pub enum TabletCommandApplyError {
     #[error("request sequence space is exhausted for client {client_id:#034x}")]
     RequestSequenceExhausted { client_id: u128 },
 
+    #[error("invalid tablet command: {reason}")]
+    InvalidCommand { reason: String },
+
+    #[error("tablet command encountered a write conflict: {reason}")]
+    WriteConflict { reason: String },
+
+    #[error("tablet command detected corrupt MVCC state: {reason}")]
+    CorruptState { reason: String },
+
+    #[error("tablet storage could not execute the command: {reason}")]
+    StorageFailure { reason: String },
+
     #[error("tablet command payload {command} is not implemented by this state machine")]
     UnsupportedCommand { command: &'static str },
 
@@ -332,9 +484,16 @@ fn command_name(command: &TabletCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use ragnordb_common::{
-        command_codec::{NoopCommand, TabletCommand, TabletCommandEnvelope},
-        ids::{RequestId, TableId, TabletId},
+        Error,
+        codec::{Row, Value, WriteKind},
+        command_codec::{
+            NoopCommand, PrewriteCommand, SingleShardCommitCommand, TabletCommand,
+            TabletCommandEnvelope, WriteEntry,
+        },
+        ids::{RequestId, TableId, TabletId, Timestamp, TxnId},
     };
+    use ragnordb_storage::key::{encode_row_key, make_row_key};
+    use ragnordb_txn::Transaction;
 
     use super::{
         TabletCommandApplyError, TabletCommandApplyOutcome, TabletCommandApplyResult,
@@ -363,6 +522,24 @@ mod tests {
         expected_epoch: u64,
         sequence: u64,
     ) -> TabletCommandEnvelope {
+        command_envelope_for(
+            tablet_id,
+            expected_epoch,
+            sequence,
+            TabletCommand::Noop(NoopCommand),
+        )
+    }
+
+    fn command_envelope(sequence: u64, command: TabletCommand) -> TabletCommandEnvelope {
+        command_envelope_for(LOCAL_TABLET_ID, LOCAL_TABLET_EPOCH, sequence, command)
+    }
+
+    fn command_envelope_for(
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        sequence: u64,
+        command: TabletCommand,
+    ) -> TabletCommandEnvelope {
         TabletCommandEnvelope::new(
             RequestId {
                 client_id: 0xf5b4_81ab_9b67_4418_ba82_b49c_e371_007d,
@@ -370,9 +547,15 @@ mod tests {
             },
             tablet_id,
             expected_epoch,
-            TabletCommand::Noop(NoopCommand),
+            command,
         )
         .unwrap()
+    }
+
+    fn test_row(id: i64, name: &str) -> Row {
+        Row {
+            values: vec![Value::Int(id), Value::Text(name.to_string())],
+        }
     }
 
     #[test]
@@ -597,5 +780,85 @@ mod tests {
                 snapshot_tablet_id: LOCAL_TABLET_ID,
             }
         );
+    }
+
+    #[test]
+    fn single_shard_commit_applies_complete_row_batch() {
+        let mut state_machine = state_machine();
+        let first_key = make_row_key(TableId(9), &[Value::Int(1)]).unwrap();
+        let second_key = make_row_key(TableId(9), &[Value::Int(2)]).unwrap();
+        let first_row = test_row(1, "Ada");
+        let second_row = test_row(2, "Grace");
+
+        let command = SingleShardCommitCommand {
+            txn_id: TxnId(11),
+            start_timestamp: Timestamp(20),
+            commit_timestamp: Timestamp(30),
+            writes: vec![
+                WriteEntry {
+                    key: encode_row_key(&first_key).unwrap(),
+                    row: Some(first_row.clone()),
+                    op: WriteKind::Put,
+                },
+                WriteEntry {
+                    key: encode_row_key(&second_key).unwrap(),
+                    row: Some(second_row.clone()),
+                    op: WriteKind::Put,
+                },
+            ],
+        };
+
+        let outcome = state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::SingleShardCommit(command),
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.result, TabletCommandApplyResult::SingleShardCommit);
+        assert!(!outcome.deduplicated);
+
+        let reader = Transaction::new(TxnId(99), Timestamp(31)).unwrap();
+
+        assert_eq!(
+            state_machine.tablet().get(&reader, &first_key).unwrap(),
+            Some(first_row)
+        );
+        assert_eq!(
+            state_machine.tablet().get(&reader, &second_key).unwrap(),
+            Some(second_row)
+        );
+    }
+
+    #[test]
+    fn prewrite_atomically_installs_default_value_and_lock() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(7)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+
+        let command = PrewriteCommand {
+            txn_id: TxnId(12),
+            start_timestamp: Timestamp(40),
+            key: encoded_key.clone(),
+            row: Some(test_row(7, "Lin")),
+            primary_key: encoded_key,
+            op: WriteKind::Put,
+            ttl_ms: 30_000,
+        };
+
+        let outcome = state_machine
+            .apply(command_envelope(1, TabletCommand::Prewrite(command)))
+            .unwrap();
+
+        assert_eq!(outcome.result, TabletCommandApplyResult::Prewrite);
+        assert_eq!(state_machine.tablet().stats().default_versions, 1);
+        assert_eq!(state_machine.tablet().stats().locks, 1);
+
+        let reader = Transaction::new(TxnId(100), Timestamp(50)).unwrap();
+
+        assert!(matches!(
+            state_machine.tablet().get(&reader, &key),
+            Err(Error::WriteConflict(_))
+        ));
     }
 }

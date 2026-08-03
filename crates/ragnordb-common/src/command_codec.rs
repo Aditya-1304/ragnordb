@@ -1,5 +1,5 @@
 use super::catalog_codec::TableDefinition as TableDef;
-use super::codec::{Value, WriteKind};
+use super::codec::{Row, WriteKind};
 use crate::ids::{RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
 use std::collections::BTreeMap;
@@ -164,12 +164,16 @@ pub enum TabletCommandEnvelopeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedTabletCommandResult {
     Noop,
+    SingleShardCommit,
+    Prewrite,
 }
 
 impl CachedTabletCommandResult {
     fn to_proto(self) -> command::CachedTabletCommandResult {
         match self {
             Self::Noop => command::CachedTabletCommandResult::Noop,
+            Self::SingleShardCommit => command::CachedTabletCommandResult::SingleShardCommit,
+            Self::Prewrite => command::CachedTabletCommandResult::Prewrite,
         }
     }
 
@@ -178,6 +182,10 @@ impl CachedTabletCommandResult {
     ) -> Result<Self, TabletStateMachineSnapshotError> {
         match result {
             command::CachedTabletCommandResult::Noop => Ok(Self::Noop),
+
+            command::CachedTabletCommandResult::SingleShardCommit => Ok(Self::SingleShardCommit),
+
+            command::CachedTabletCommandResult::Prewrite => Ok(Self::Prewrite),
 
             command::CachedTabletCommandResult::Unspecified => {
                 Err(TabletStateMachineSnapshotError::UnspecifiedCachedResult)
@@ -370,47 +378,53 @@ pub enum TabletStateMachineSnapshotError {
     Decode(String),
 }
 
-/// A single-key prewrite command (part of distributed txn 2PC).
+/// replicated single-key prewrite for a distributed transaction
 ///
-/// this wil; be proposed to the tablet Raft group during the prewrite phase.
-/// The tablet atomically checks for conflicts and writes
-/// default/{key}/{start_ts} + lock/{key}
+/// Put carries a complete SQL row. A Delete carries no row. Applying the
+/// command atomically installs the default-value entry and corresponding lock
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrewriteCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
     pub key: Vec<u8>,
-    pub value: Value,
+    pub row: Option<Row>,
     pub primary_key: Vec<u8>,
     pub op: WriteKind,
     pub ttl_ms: u64,
 }
 
 impl PrewriteCommand {
-    pub fn to_proto(&self) -> command::PrewriteCommand {
-        command::PrewriteCommand {
+    pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
+        validate_command_mutation(self.op, self.row.as_ref())?;
+
+        Ok(command::PrewriteCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             key: self.key.clone(),
-            value: Some(self.value.to_proto()),
             primary_key: self.primary_key.clone(),
             op: self.op.to_proto() as i32,
             ttl_ms: self.ttl_ms,
-        }
+            row: self.row.as_ref().map(Row::to_proto),
+        })
     }
 
     pub fn from_proto(proto: command::PrewriteCommand) -> Result<Self, &'static str> {
-        Ok(PrewriteCommand {
+        let op = WriteKind::from_proto(
+            crate::proto::mvcc::WriteKind::try_from(proto.op).map_err(|_| "invalid op")?,
+        )?;
+
+        let row = proto.row.map(Row::from_proto).transpose()?;
+        validate_command_mutation(op, row.as_ref())?;
+
+        Ok(Self {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
             key: proto.key,
-            value: Value::from_proto(proto.value.ok_or("missing value")?)?,
+            row,
             primary_key: proto.primary_key,
-            op: WriteKind::from_proto(
-                crate::proto::mvcc::WriteKind::try_from(proto.op).map_err(|_| "invalid op")?,
-            )?,
+            op,
             ttl_ms: proto.ttl_ms,
         })
     }
@@ -482,31 +496,50 @@ impl RollbackCommand {
     }
 }
 
-/// A single key value write within a SingkeShardCommit batch
+/// one complete row mutation within a shard commit batch
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteEntry {
     pub key: Vec<u8>,
-    pub value: Value,
+    pub row: Option<Row>,
     pub op: WriteKind,
 }
 
 impl WriteEntry {
-    pub fn to_proto(&self) -> command::WriteEntry {
-        command::WriteEntry {
+    pub fn to_proto(&self) -> Result<command::WriteEntry, &'static str> {
+        validate_command_mutation(self.op, self.row.as_ref())?;
+
+        Ok(command::WriteEntry {
             key: self.key.clone(),
-            value: Some(self.value.to_proto()),
             op: self.op.to_proto() as i32,
-        }
+            row: self.row.as_ref().map(Row::to_proto),
+        })
     }
 
     pub fn from_proto(proto: command::WriteEntry) -> Result<Self, &'static str> {
-        Ok(WriteEntry {
+        let op = WriteKind::from_proto(
+            crate::proto::mvcc::WriteKind::try_from(proto.op).map_err(|_| "invalid op")?,
+        )?;
+
+        let row = proto.row.map(Row::from_proto).transpose()?;
+        validate_command_mutation(op, row.as_ref())?;
+
+        Ok(Self {
             key: proto.key,
-            value: Value::from_proto(proto.value.ok_or("missing value")?)?,
-            op: WriteKind::from_proto(
-                crate::proto::mvcc::WriteKind::try_from(proto.op).map_err(|_| "invalid op")?,
-            )?,
+            row,
+            op,
         })
+    }
+}
+
+fn validate_command_mutation(op: WriteKind, row: Option<&Row>) -> Result<(), &'static str> {
+    match (op, row) {
+        (WriteKind::Put, Some(_)) | (WriteKind::Delete, None) => Ok(()),
+
+        (WriteKind::Put, None) => Err("Put command requires a complete row"),
+
+        (WriteKind::Delete, Some(_)) => Err("Delete command must not contain a row"),
+
+        (WriteKind::Rollback, _) => Err("Rollback is not a valid write mutation payload"),
     }
 }
 
@@ -523,13 +556,17 @@ pub struct SingleShardCommitCommand {
     pub writes: Vec<WriteEntry>,
 }
 impl SingleShardCommitCommand {
-    pub fn to_proto(&self) -> command::SingleShardCommitCommand {
-        command::SingleShardCommitCommand {
+    pub fn to_proto(&self) -> Result<command::SingleShardCommitCommand, &'static str> {
+        Ok(command::SingleShardCommitCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             commit_timestamp: Some(self.commit_timestamp.to_proto()),
-            writes: self.writes.iter().map(|w| w.to_proto()).collect(),
-        }
+            writes: self
+                .writes
+                .iter()
+                .map(WriteEntry::to_proto)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     pub fn from_proto(proto: command::SingleShardCommitCommand) -> Result<Self, &'static str> {
@@ -734,8 +771,9 @@ impl TabletCommand {
     pub fn to_proto(&self) -> Result<command::TabletCommand, &'static str> {
         let command = match self {
             TabletCommand::Prewrite(command) => Some(command::tablet_command::Command::Prewrite(
-                command.to_proto(),
+                command.to_proto()?,
             )),
+
             TabletCommand::Commit(command) => {
                 Some(command::tablet_command::Command::Commit(command.to_proto()))
             }
@@ -743,7 +781,7 @@ impl TabletCommand {
                 command.to_proto(),
             )),
             TabletCommand::SingleShardCommit(command) => Some(
-                command::tablet_command::Command::SingleShardCommit(command.to_proto()),
+                command::tablet_command::Command::SingleShardCommit(command.to_proto()?),
             ),
             TabletCommand::ResolveIntent(command) => Some(
                 command::tablet_command::Command::ResolveIntent(command.to_proto()?),
@@ -791,26 +829,30 @@ impl TabletCommand {
 mod tests {
     use super::super::catalog_codec::{ColumnDefinition, DataType};
     use super::*;
-    use crate::codec::{TxnStatus, WriteKind};
+    use crate::codec::{Row, TxnStatus, Value, WriteKind};
     use crate::ids::ColumnId;
 
     #[test]
     fn prewrite_command_roundtrip() {
-        let cmd = PrewriteCommand {
+        let command = PrewriteCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             key: b"/table/1/pk/1".to_vec(),
-            value: Value::Text("Ada".to_string()),
+            row: Some(Row {
+                values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+            }),
             primary_key: b"/table/1/pk/1".to_vec(),
             op: WriteKind::Put,
             ttl_ms: 30_000,
         };
-        let proto = cmd.to_proto();
+
+        let proto = command.to_proto().unwrap();
         let decoded = PrewriteCommand::from_proto(proto).unwrap();
+
         assert_eq!(decoded.txn_id.0, 1);
         assert_eq!(decoded.start_timestamp.0, 100);
-        assert!(matches!(decoded.value, Value::Text(ref s) if s == "Ada"));
-        assert!(matches!(decoded.op, WriteKind::Put));
+        assert_eq!(decoded.row.unwrap().values.len(), 2);
+        assert_eq!(decoded.op, WriteKind::Put);
     }
 
     #[test]
@@ -842,35 +884,48 @@ mod tests {
     fn write_entry_roundtrip() {
         let entry = WriteEntry {
             key: b"/table/1/pk/1".to_vec(),
-            value: Value::Int(42),
+            row: Some(Row {
+                values: vec![Value::Int(42)],
+            }),
             op: WriteKind::Put,
         };
-        let proto = entry.to_proto();
+
+        let proto = entry.to_proto().unwrap();
         let decoded = WriteEntry::from_proto(proto).unwrap();
-        assert!(matches!(decoded.value, Value::Int(42)));
+
+        assert!(matches!(
+            decoded.row.unwrap().values.as_slice(),
+            [Value::Int(42)]
+        ));
     }
 
     #[test]
     fn single_shard_commit_roundtrip() {
-        let cmd = SingleShardCommitCommand {
+        let command = SingleShardCommitCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(110),
             writes: vec![
                 WriteEntry {
                     key: b"/table/1/pk/1".to_vec(),
-                    value: Value::Text("Ada".to_string()),
+                    row: Some(Row {
+                        values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+                    }),
                     op: WriteKind::Put,
                 },
                 WriteEntry {
                     key: b"/table/1/pk/2".to_vec(),
-                    value: Value::Text("Bob".to_string()),
+                    row: Some(Row {
+                        values: vec![Value::Int(2), Value::Text("Bob".to_string())],
+                    }),
                     op: WriteKind::Put,
                 },
             ],
         };
-        let proto = cmd.to_proto();
+
+        let proto = command.to_proto().unwrap();
         let decoded = SingleShardCommitCommand::from_proto(proto).unwrap();
+
         assert_eq!(decoded.writes.len(), 2);
     }
 
@@ -947,7 +1002,9 @@ mod tests {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             key: b"/table/1/pk/1".to_vec(),
-            value: Value::Int(1),
+            row: Some(Row {
+                values: vec![Value::Int(1)],
+            }),
             primary_key: b"/table/1/pk/1".to_vec(),
             op: WriteKind::Put,
             ttl_ms: 30_000,

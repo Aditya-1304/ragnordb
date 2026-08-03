@@ -50,14 +50,15 @@ pub struct PrewriteCommand {
     pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
     #[prost(bytes = "vec", tag = "3")]
     pub key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(message, optional, tag = "4")]
-    pub value: ::core::option::Option<super::row::Value>,
     #[prost(bytes = "vec", tag = "5")]
     pub primary_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "super::mvcc::WriteKind", tag = "6")]
     pub op: i32,
     #[prost(uint64, tag = "7")]
     pub ttl_ms: u64,
+    /// Required for Put and absent for Delete.
+    #[prost(message, optional, tag = "8")]
+    pub row: ::core::option::Option<super::row::Row>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommitCommand {
@@ -94,10 +95,11 @@ pub struct SingleShardCommitCommand {
 pub struct WriteEntry {
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(message, optional, tag = "2")]
-    pub value: ::core::option::Option<super::row::Value>,
     #[prost(enumeration = "super::mvcc::WriteKind", tag = "3")]
     pub op: i32,
+    /// required for Put and absent for Delete
+    #[prost(message, optional, tag = "4")]
+    pub row: ::core::option::Option<super::row::Row>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveIntentCommand {
@@ -160,6 +162,8 @@ pub struct ClientDeduplicationSnapshot {
 pub enum CachedTabletCommandResult {
     Unspecified = 0,
     Noop = 1,
+    SingleShardCommit = 2,
+    Prewrite = 3,
 }
 impl CachedTabletCommandResult {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -170,6 +174,8 @@ impl CachedTabletCommandResult {
         match self {
             Self::Unspecified => "CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED",
             Self::Noop => "CACHED_TABLET_COMMAND_RESULT_NOOP",
+            Self::SingleShardCommit => "CACHED_TABLET_COMMAND_RESULT_SINGLE_SHARD_COMMIT",
+            Self::Prewrite => "CACHED_TABLET_COMMAND_RESULT_PREWRITE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -177,6 +183,10 @@ impl CachedTabletCommandResult {
         match value {
             "CACHED_TABLET_COMMAND_RESULT_UNSPECIFIED" => Some(Self::Unspecified),
             "CACHED_TABLET_COMMAND_RESULT_NOOP" => Some(Self::Noop),
+            "CACHED_TABLET_COMMAND_RESULT_SINGLE_SHARD_COMMIT" => {
+                Some(Self::SingleShardCommit)
+            }
+            "CACHED_TABLET_COMMAND_RESULT_PREWRITE" => Some(Self::Prewrite),
             _ => None,
         }
     }

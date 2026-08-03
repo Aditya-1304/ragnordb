@@ -112,6 +112,27 @@ pub trait MvccStorage {
         read_ts: Timestamp,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// Atomically install one distributed transaction intent.
+    ///
+    /// An exact replay is idempotent. A conflicting lock, a newer committed write,
+    /// or an existing rollback marker rejects the prewrite without changing either
+    /// the default-value or lock map.
+    ///
+    /// Backends that have not implemented distributed intents fail explicitly.
+    fn prewrite(
+        &mut self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _key: &[u8],
+        _mutation: &Mutation,
+        _primary_key: &[u8],
+        _ttl_ms: u64,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed prewrite is not supported by this MVCC backend",
+        ))
+    }
+
     /// Atomically validate and commit a transaction's complete mutation set.
     ///
     /// No mutation may be applied when validation of any key fails.
@@ -786,6 +807,98 @@ impl MvccStorage for InMemoryMvcc {
             write_keys: self.writes.len(),
             write_records: self.writes.values().map(BTreeMap::len).sum(),
         }
+    }
+
+    fn prewrite(
+        &mut self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        key: &[u8],
+        mutation: &Mutation,
+        primary_key: &[u8],
+        ttl_ms: u64,
+    ) -> Result<()> {
+        validate_commit_preflight_metadata(txn_id, start_ts)?;
+        validate_encoded_key_argument(primary_key, "prewrite primary key")?;
+
+        if ttl_ms == 0 {
+            return Err(Error::InvalidArgument(
+                "prewrite lock TTL must be non-zero".to_string(),
+            ));
+        }
+
+        self.validate_mutation(key, mutation, start_ts)?;
+        self.validate_write_history(key, start_ts)?;
+
+        let expected_lock = LockRecord {
+            txn_id,
+            primary_key: primary_key.to_vec(),
+            start_timestamp: start_ts,
+            ttl_ms,
+            op: mutation.write_kind(),
+        };
+
+        if let Some(existing_lock) = self.locks.get(key) {
+            if existing_lock.txn_id != txn_id || existing_lock.start_timestamp != start_ts {
+                return Err(Error::WriteConflict(format!(
+                    "row is locked by transaction {} at start timestamp {}",
+                    existing_lock.txn_id.0, existing_lock.start_timestamp.0
+                )));
+            }
+
+            if existing_lock != &expected_lock {
+                return Err(Error::CorruptData(format!(
+                    "transaction {} replayed prewrite with different lock metadata",
+                    txn_id.0
+                )));
+            }
+
+            if let Mutation::Put(expected_row) = mutation {
+                let stored_row = self
+                    .default
+                    .get(key)
+                    .and_then(|versions| versions.get(&start_ts))
+                    .ok_or_else(|| {
+                        Error::CorruptData(format!(
+                            "transaction {} has a Put lock without its default value",
+                            txn_id.0
+                        ))
+                    })?;
+
+                if stored_row != expected_row {
+                    return Err(Error::CorruptData(format!(
+                        "transaction {} replayed prewrite with different row bytes",
+                        txn_id.0
+                    )));
+                }
+            }
+
+            return Ok(());
+        }
+
+        if self
+            .default
+            .get(key)
+            .is_some_and(|versions| versions.contains_key(&start_ts))
+        {
+            return Err(Error::CorruptData(format!(
+                "transaction {} has a default value without its prewrite lock",
+                txn_id.0
+            )));
+        }
+
+        // All validation is complete. The following insertions are infallible
+        // in-memory mutations and publish the value and lock as one operation.
+        if let Mutation::Put(row) = mutation {
+            self.default
+                .entry(key.to_vec())
+                .or_default()
+                .insert(start_ts, row.clone());
+        }
+
+        self.locks.insert(key.to_vec(), expected_lock);
+
+        Ok(())
     }
 }
 
