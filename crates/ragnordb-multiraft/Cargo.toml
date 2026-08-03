@@ -11,3 +11,4 @@ ragnordb-tablet = { path = "../ragnordb-tablet" }
 raft.workspace = true
 wal.workspace = true
 thiserror.workspace = true
+prost.workspace = true

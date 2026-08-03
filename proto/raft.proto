@@ -19,3 +19,34 @@ message RaftGroupBootstrap {
     repeated ragnordb.ids.ReplicaId initial_voters = 6;
     repeated ragnordb.ids.ReplicaId initial_learners = 7;
 }
+
+// durable V1 representation of one Raft log entry owned by one replica
+// lifetime. group and replica identities are carried in every record so a
+// shared WAL can never infer ownership from the log index alone
+message RaftLogEntryRecord {
+    uint32 format_version = 1;
+    ragnordb.ids.RaftGroupId raft_group_id = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    uint64 index = 4;
+    uint64 term = 5;
+
+    oneof payload {
+        bytes normal_command = 6;
+        RaftConfigurationChange configuration_change = 7;
+    }
+}
+
+// durable representation of the Raft core's validated configuration-change
+// payload. configuration entries are never decoded as tablet commands
+message RaftConfigurationChange {
+    uint64 expected_version = 1;
+    RaftConfigurationChangeKind kind = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+}
+
+enum RaftConfigurationChangeKind {
+    RAFT_CONFIGURATION_CHANGE_KIND_UNSPECIFIED = 0;
+    RAFT_CONFIGURATION_CHANGE_KIND_ADD_LEARNER = 1;
+    RAFT_CONFIGURATION_CHANGE_KIND_PROMOTE_LEARNER = 2;
+    RAFT_CONFIGURATION_CHANGE_KIND_REMOVE_REPLICA = 3;
+}

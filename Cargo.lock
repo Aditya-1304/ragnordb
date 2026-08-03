@@ -1264,6 +1264,7 @@ dependencies = [
 name = "ragnordb-multiraft"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "raft",
  "ragnordb-common",
  "ragnordb-tablet",

@@ -25,3 +25,76 @@ pub struct RaftGroupBootstrap {
     #[prost(message, repeated, tag = "7")]
     pub initial_learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
 }
+/// durable V1 representation of one Raft log entry owned by one replica
+/// lifetime. group and replica identities are carried in every record so a
+/// shared WAL can never infer ownership from the log index alone
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaftLogEntryRecord {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "4")]
+    pub index: u64,
+    #[prost(uint64, tag = "5")]
+    pub term: u64,
+    #[prost(oneof = "raft_log_entry_record::Payload", tags = "6, 7")]
+    pub payload: ::core::option::Option<raft_log_entry_record::Payload>,
+}
+/// Nested message and enum types in `RaftLogEntryRecord`.
+pub mod raft_log_entry_record {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(bytes, tag = "6")]
+        NormalCommand(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag = "7")]
+        ConfigurationChange(super::RaftConfigurationChange),
+    }
+}
+/// durable representation of the Raft core's validated configuration-change
+/// payload. configuration entries are never decoded as tablet commands
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RaftConfigurationChange {
+    #[prost(uint64, tag = "1")]
+    pub expected_version: u64,
+    #[prost(enumeration = "RaftConfigurationChangeKind", tag = "2")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RaftConfigurationChangeKind {
+    Unspecified = 0,
+    AddLearner = 1,
+    PromoteLearner = 2,
+    RemoveReplica = 3,
+}
+impl RaftConfigurationChangeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RAFT_CONFIGURATION_CHANGE_KIND_UNSPECIFIED",
+            Self::AddLearner => "RAFT_CONFIGURATION_CHANGE_KIND_ADD_LEARNER",
+            Self::PromoteLearner => "RAFT_CONFIGURATION_CHANGE_KIND_PROMOTE_LEARNER",
+            Self::RemoveReplica => "RAFT_CONFIGURATION_CHANGE_KIND_REMOVE_REPLICA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RAFT_CONFIGURATION_CHANGE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "RAFT_CONFIGURATION_CHANGE_KIND_ADD_LEARNER" => Some(Self::AddLearner),
+            "RAFT_CONFIGURATION_CHANGE_KIND_PROMOTE_LEARNER" => {
+                Some(Self::PromoteLearner)
+            }
+            "RAFT_CONFIGURATION_CHANGE_KIND_REMOVE_REPLICA" => Some(Self::RemoveReplica),
+            _ => None,
+        }
+    }
+}
