@@ -47,6 +47,16 @@ impl RaftWalRecordType {
 
         RecordType::new(id)
     }
+
+    /// classify a shared WAL record without claiming unrelated user records
+    pub const fn from_wal_record_type(record_type: RecordType) -> Option<Self> {
+        match record_type.as_u16() {
+            RAFT_LOG_ENTRY_RECORD_ID => Some(Self::LogEntry),
+            RAFT_CONF_STATE_RECORD_ID => Some(Self::ConfState),
+            RAFT_HARD_STATE_RECORD_ID => Some(Self::HardState),
+            _ => None,
+        }
+    }
 }
 
 /// minimal public A-WAL boundary required by Raft persistence

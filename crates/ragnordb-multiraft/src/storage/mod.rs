@@ -6,4 +6,5 @@
 
 pub mod codec;
 pub mod persistence;
+pub mod recovery;
 pub mod view;
