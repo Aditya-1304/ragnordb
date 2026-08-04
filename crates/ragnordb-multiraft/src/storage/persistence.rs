@@ -21,12 +21,14 @@ use super::{
         RaftConfStateRecord, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
         RaftReplicaIdentity, RaftStableStateCodecError,
     },
+    frontier::{RaftProgress, RaftProgressError, RaftProgressRecord},
     view::{RaftLogViewError, RaftReplicaLogView},
 };
 
 const RAFT_LOG_ENTRY_RECORD_ID: u16 = USER_MIN + 8;
 const RAFT_CONF_STATE_RECORD_ID: u16 = USER_MIN + 9;
 const RAFT_HARD_STATE_RECORD_ID: u16 = USER_MIN + 10;
+const RAFT_PROGRESS_RECORD_ID: u16 = USER_MIN + 11;
 
 /// permanent user record identities reserved for Raft storage in shared A-WAL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub enum RaftWalRecordType {
     LogEntry,
     ConfState,
     HardState,
+    Progress,
 }
 
 impl RaftWalRecordType {
@@ -43,6 +46,7 @@ impl RaftWalRecordType {
             Self::LogEntry => RAFT_LOG_ENTRY_RECORD_ID,
             Self::ConfState => RAFT_CONF_STATE_RECORD_ID,
             Self::HardState => RAFT_HARD_STATE_RECORD_ID,
+            Self::Progress => RAFT_PROGRESS_RECORD_ID,
         };
 
         RecordType::new(id)
@@ -54,6 +58,7 @@ impl RaftWalRecordType {
             RAFT_LOG_ENTRY_RECORD_ID => Some(Self::LogEntry),
             RAFT_CONF_STATE_RECORD_ID => Some(Self::ConfState),
             RAFT_HARD_STATE_RECORD_ID => Some(Self::HardState),
+            RAFT_PROGRESS_RECORD_ID => Some(Self::Progress),
             _ => None,
         }
     }
@@ -112,6 +117,7 @@ pub struct RaftWalStorage<W> {
     hard_state: Option<HardState>,
     durable_end_lsn: Option<Lsn>,
     recovery_required: bool,
+    progress: RaftProgress,
 }
 
 impl<W: RaftWal> RaftWalStorage<W> {
@@ -125,6 +131,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
             hard_state: None,
             durable_end_lsn: None,
             recovery_required: false,
+            progress: RaftProgress::default(),
         }
     }
 
@@ -144,12 +151,95 @@ impl<W: RaftWal> RaftWalStorage<W> {
         self.hard_state.as_ref()
     }
 
+    /// returns the last progress frontier acknowledged by exact WAL sync
+    pub fn progress(&self) -> RaftProgress {
+        self.progress
+    }
+
     pub fn durable_end_lsn(&self) -> Option<Lsn> {
         self.durable_end_lsn
     }
 
     pub fn recovery_required(&self) -> bool {
         self.recovery_required
+    }
+
+    /// persist a post Ready apply or truncation frontier as its own WAL batch
+    ///
+    /// progress may reference only a commit already acknowledged durable. This
+    /// prevents a crash prefix from retaining applied state before HardState
+    pub fn persist_progress(
+        &mut self,
+        progress: RaftProgress,
+    ) -> Result<RaftPersistedBatch, RaftPersistenceError> {
+        if self.recovery_required {
+            return Err(RaftPersistenceError::RecoveryRequired);
+        }
+
+        progress.validate_successor(self.progress)?;
+
+        let durable_commit = self
+            .hard_state
+            .as_ref()
+            .map(|hard_state| hard_state.commit)
+            .unwrap_or(0);
+
+        if progress.applied_index > durable_commit {
+            return Err(RaftPersistenceError::AppliedBeyondDurableCommit {
+                applied_index: progress.applied_index,
+                durable_commit,
+            });
+        }
+
+        if progress.truncated_through_index != 0 {
+            let boundary = self
+                .log_view
+                .entry(progress.truncated_through_index)
+                .ok_or(RaftPersistenceError::MissingTruncationBoundary {
+                    index: progress.truncated_through_index,
+                })?;
+
+            if boundary.record.term != progress.truncated_through_term {
+                return Err(RaftPersistenceError::TruncationTermMismatch {
+                    index: progress.truncated_through_index,
+                    expected_term: boundary.record.term,
+                    received_term: progress.truncated_through_term,
+                });
+            }
+        }
+
+        let payload = RaftProgressRecord::new(self.identity, progress)?.encode()?;
+
+        let extent = match self
+            .wal
+            .append(RaftWalRecordType::Progress.as_wal_record_type(), &payload)
+        {
+            Ok(extent) => extent,
+
+            Err(failure) => {
+                return Err(self.map_append_failure(failure, &[]));
+            }
+        };
+
+        if let Err(source) = self.wal.sync_through(extent.end_lsn) {
+            self.recovery_required = true;
+
+            return Err(RaftPersistenceError::OutcomeUnknown {
+                start_lsn: extent.start_lsn,
+                end_lsn: extent.end_lsn,
+                reason: source.to_string(),
+            });
+        }
+
+        // publish the logical frontier only after its exact extent is durable
+        self.progress = progress;
+        self.durable_end_lsn = Some(extent.end_lsn);
+
+        Ok(RaftPersistedBatch {
+            start_lsn: Some(extent.start_lsn),
+            end_lsn: Some(extent.end_lsn),
+            record_count: 1,
+        })
     }
 
     /// persist one ordered generation and publish it only after exact sync
@@ -420,4 +510,32 @@ pub enum RaftPersistenceError {
 
     #[error("internal Raft persistence invariant failed: {0}")]
     InternalInvariant(&'static str),
+
+    #[error("invalid Raft progress state: {0}")]
+    InvalidProgress(#[from] RaftProgressError),
+
+    #[error(
+        "applied index {applied_index} exceeds \
+     durable commit index {durable_commit}"
+    )]
+    AppliedBeyondDurableCommit {
+        applied_index: u64,
+        durable_commit: u64,
+    },
+
+    #[error(
+        "truncation boundary index {index} is \
+     absent from the durable log"
+    )]
+    MissingTruncationBoundary { index: u64 },
+
+    #[error(
+        "truncation boundary {index} has term \
+     {expected_term}, not {received_term}"
+    )]
+    TruncationTermMismatch {
+        index: u64,
+        expected_term: u64,
+        received_term: u64,
+    },
 }

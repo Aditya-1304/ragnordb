@@ -19,6 +19,7 @@ use super::{
         RaftConfStateRecord, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
         RaftReplicaIdentity, RaftStableStateCodecError,
     },
+    frontier::{RaftProgress, RaftProgressError, RaftProgressRecord},
     persistence::RaftWalRecordType,
     view::{RaftLogViewError, RaftReplicaLogView},
 };
@@ -43,6 +44,7 @@ pub struct RecoveredRaftReplica {
     log_view: RaftReplicaLogView,
     conf_state: Option<ConfState>,
     hard_state: Option<HardState>,
+    progress: RaftProgress,
 }
 
 impl RecoveredRaftReplica {
@@ -51,6 +53,7 @@ impl RecoveredRaftReplica {
             log_view: RaftReplicaLogView::new(identity),
             conf_state: None,
             hard_state: None,
+            progress: RaftProgress::default(),
         }
     }
 
@@ -72,6 +75,11 @@ impl RecoveredRaftReplica {
     /// return the latest valid election and commit state
     pub fn hard_state(&self) -> Option<&HardState> {
         self.hard_state.as_ref()
+    }
+
+    /// return the latest recovered truncation and applied frontiers
+    pub fn progress(&self) -> RaftProgress {
+        self.progress
     }
 }
 
@@ -151,8 +159,20 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
             RaftWalRecordType::LogEntry => {
                 let entry = RaftLogEntryRecord::decode(&record.payload)?;
 
-                recovered
-                    .replica_mut(entry.identity)
+                let replica = recovered.replica_mut(entry.identity);
+
+                // once a prefix has been truncated, later WAL records must
+                // never recreate entries inside that compacted prefix
+                if entry.index <= replica.progress.truncated_through_index {
+                    return Err(RaftStorageRecoveryError::EntryAtOrBelowTruncation {
+                        identity: entry.identity,
+                        entry_index: entry.index,
+                        truncated_through_index: replica.progress.truncated_through_index,
+                        lsn: record.lsn,
+                    });
+                }
+
+                replica
                     .log_view
                     .replay(entry, record.lsn)
                     .map_err(|source| RaftStorageRecoveryError::InvalidLogTransition {
@@ -189,13 +209,63 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
 
                 replica.hard_state = Some(hard_state);
             }
+
+            RaftWalRecordType::Progress => {
+                let progress = RaftProgressRecord::decode(&record.payload)?;
+
+                let identity = progress.identity;
+                let progress = progress.progress;
+                let replica = recovered.replica_mut(identity);
+
+                progress.validate_successor(replica.progress)?;
+
+                let durable_commit = replica
+                    .hard_state
+                    .as_ref()
+                    .map(|hard_state| hard_state.commit)
+                    .unwrap_or(0);
+
+                // applied state may depend only on a HardState commit record
+                // that appeared earlier in the recoverable WAL prefix
+                if progress.applied_index > durable_commit {
+                    return Err(RaftStorageRecoveryError::AppliedBeyondRecoveredCommit {
+                        identity,
+                        applied_index: progress.applied_index,
+                        durable_commit,
+                        lsn: record.lsn,
+                    });
+                }
+
+                if progress.truncated_through_index != 0 {
+                    let boundary = replica
+                        .log_view
+                        .entry(progress.truncated_through_index)
+                        .ok_or(RaftStorageRecoveryError::MissingTruncationBoundary {
+                            identity,
+                            index: progress.truncated_through_index,
+                            lsn: record.lsn,
+                        })?;
+
+                    if boundary.record.term != progress.truncated_through_term {
+                        return Err(RaftStorageRecoveryError::TruncationTermMismatch {
+                            identity,
+                            index: progress.truncated_through_index,
+                            expected_term: boundary.record.term,
+                            received_term: progress.truncated_through_term,
+                            lsn: record.lsn,
+                        });
+                    }
+                }
+
+                replica.progress = progress;
+            }
         }
     }
 
     Ok(recovered)
 }
 
-/// corruption or I/O failure encountered during shared-WAL Raft recovery
+/// corruption or I/O failure encountered during shared WAL Raft recovery
 #[derive(Debug, thiserror::Error)]
 pub enum RaftStorageRecoveryError {
     #[error("shared-WAL replay failed: {0}")]
@@ -206,6 +276,9 @@ pub enum RaftStorageRecoveryError {
 
     #[error("invalid durable Raft stable state: {0}")]
     InvalidStableState(#[from] RaftStableStateCodecError),
+
+    #[error("invalid durable Raft progress state: {0}")]
+    InvalidProgress(#[from] RaftProgressError),
 
     #[error(
         "Raft WAL LSN must increase: previous \
@@ -221,13 +294,61 @@ pub enum RaftStorageRecoveryError {
 
     #[error(
         "Raft HardState for {identity:?} at WAL LSN \
-         {lsn:?} commits index {commit_index}, but only \
-         index {last_log_index} has been recovered"
+         {lsn:?} commits index {commit_index}, but \
+         only index {last_log_index} has been recovered"
     )]
     HardStateCommitBeyondRecoveredLog {
         identity: RaftReplicaIdentity,
         commit_index: u64,
         last_log_index: u64,
+        lsn: Lsn,
+    },
+
+    #[error(
+        "Raft entry {entry_index} for {identity:?} \
+         at WAL LSN {lsn:?} is at or below \
+         truncation boundary {truncated_through_index}"
+    )]
+    EntryAtOrBelowTruncation {
+        identity: RaftReplicaIdentity,
+        entry_index: u64,
+        truncated_through_index: u64,
+        lsn: Lsn,
+    },
+
+    #[error(
+        "Raft progress for {identity:?} at WAL LSN \
+         {lsn:?} applies index {applied_index}, but \
+         durable commit is {durable_commit}"
+    )]
+    AppliedBeyondRecoveredCommit {
+        identity: RaftReplicaIdentity,
+        applied_index: u64,
+        durable_commit: u64,
+        lsn: Lsn,
+    },
+
+    #[error(
+        "Raft progress for {identity:?} at WAL LSN \
+         {lsn:?} references missing truncation \
+         boundary {index}"
+    )]
+    MissingTruncationBoundary {
+        identity: RaftReplicaIdentity,
+        index: u64,
+        lsn: Lsn,
+    },
+
+    #[error(
+        "Raft truncation boundary {index} for \
+         {identity:?} at WAL LSN {lsn:?} has term \
+         {expected_term}, not {received_term}"
+    )]
+    TruncationTermMismatch {
+        identity: RaftReplicaIdentity,
+        index: u64,
+        expected_term: u64,
+        received_term: u64,
         lsn: Lsn,
     },
 }

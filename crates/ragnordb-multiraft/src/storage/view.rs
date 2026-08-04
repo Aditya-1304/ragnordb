@@ -78,6 +78,11 @@ impl RaftReplicaLogView {
         self.entries.get(&index)
     }
 
+    /// iterate over the retained logical log in increasing index order
+    pub fn entries(&self) -> impl Iterator<Item = &RecoveredRaftLogEntry> {
+        self.entries.values()
+    }
+
     /// return the latest WAL LSN consumed by this view
     pub fn last_replayed_lsn(&self) -> Option<Lsn> {
         self.last_replayed_lsn

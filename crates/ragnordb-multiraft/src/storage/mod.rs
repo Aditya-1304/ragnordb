@@ -4,7 +4,9 @@
 //! build replay views, persistence, and public Raft storage adapters on top of
 //! these records without creating a second write-through persistence path
 
+pub mod adapter;
 pub mod codec;
+pub mod frontier;
 pub mod persistence;
 pub mod recovery;
 pub mod view;

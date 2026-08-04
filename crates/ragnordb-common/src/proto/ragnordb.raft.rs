@@ -101,6 +101,24 @@ pub struct RaftConfStateRecord {
     #[prost(message, repeated, tag = "7")]
     pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
 }
+/// durable logical frontiers for one replica lifetime. The truncation boundary
+/// retains its term so the Raft core can validate AppendEntries immediately
+/// before the first retained log entry
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RaftProgressRecord {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "4")]
+    pub truncated_through_index: u64,
+    #[prost(uint64, tag = "5")]
+    pub truncated_through_term: u64,
+    #[prost(uint64, tag = "6")]
+    pub applied_index: u64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RaftConfigurationChangeKind {

@@ -74,3 +74,15 @@ message RaftConfStateRecord {
     repeated ragnordb.ids.ReplicaId learners = 6;
     repeated ragnordb.ids.ReplicaId outgoing_voters = 7;
 }
+
+// durable logical frontiers for one replica lifetime. The truncation boundary
+// retains its term so the Raft core can validate AppendEntries immediately
+// before the first retained log entry
+message RaftProgressRecord {
+    uint32 format_version = 1;
+    ragnordb.ids.RaftGroupId raft_group_id = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    uint64 truncated_through_index = 4;
+    uint64 truncated_through_term = 5;
+    uint64 applied_index = 6;
+}
