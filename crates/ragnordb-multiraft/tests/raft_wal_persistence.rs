@@ -237,6 +237,37 @@ fn persistence_rejects_conflicting_same_index_snapshot_before_wal_append() {
     assert_eq!(storage.log_view().snapshot_boundary(), Some((19, 7)));
 }
 
+/// Realistic bug caught: a batch must not durably publish a log term that is
+/// newer than the HardState term that describes the resulting Raft state.
+#[test]
+fn persistence_rejects_hard_state_below_resulting_log_term_before_wal_append() {
+    let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+
+    let error = storage
+        .persist(RaftPersistenceBatch {
+            snapshot: None,
+            entries: vec![LogEntry::normal_with_size(1, 7, b"term-seven".to_vec(), 10)],
+            hard_state: Some(HardState {
+                current_term: 6,
+                voted_for: None,
+                commit: 0,
+            }),
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RaftPersistenceError::HardStateBeforeLogTerm {
+            current_term: 6,
+            maximum_log_term: 7,
+        }
+    );
+    assert!(storage.wal().operations.is_empty());
+    assert!(storage.log_view().is_empty());
+    assert!(storage.hard_state().is_none());
+    assert!(!storage.recovery_required());
+}
+
 /// Realistic bug caught: one group observes an uncertain shared-WAL outcome,
 /// but another group continues consuming Ready generations through a separate
 /// per-replica writer.

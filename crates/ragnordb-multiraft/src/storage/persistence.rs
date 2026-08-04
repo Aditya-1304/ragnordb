@@ -465,6 +465,30 @@ impl<W: RaftWal> RaftWalStorage<W> {
             None
         };
 
+        let maximum_log_term = preview
+            .entries()
+            .map(|entry| entry.record.term)
+            .max()
+            .unwrap_or(0);
+        let snapshot_term = preview
+            .snapshot_boundary()
+            .map(|(_, term)| term)
+            .unwrap_or(0);
+        let maximum_observed_term = maximum_log_term.max(snapshot_term);
+        let effective_current_term = hard_state
+            .as_ref()
+            .map(|state| state.current_term)
+            .or_else(|| self.hard_state.as_ref().map(|state| state.current_term))
+            .unwrap_or(0)
+            .max(snapshot_term);
+
+        if effective_current_term < maximum_observed_term {
+            return Err(RaftPersistenceError::HardStateBeforeLogTerm {
+                current_term: effective_current_term,
+                maximum_log_term: maximum_observed_term,
+            });
+        }
+
         Ok(PreparedBatch {
             records,
             entry_records,
@@ -554,5 +578,13 @@ pub enum RaftPersistenceError {
     HardStateBeforeSnapshotCommit {
         commit_index: u64,
         snapshot_index: u64,
+    },
+
+    #[error(
+        "HardState term {current_term} is below the maximum durable Raft term +         {maximum_log_term}"
+    )]
+    HardStateBeforeLogTerm {
+        current_term: u64,
+        maximum_log_term: u64,
     },
 }

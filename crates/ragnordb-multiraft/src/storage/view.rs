@@ -233,36 +233,31 @@ impl RaftReplicaLogView {
                 return Ok(RaftLogReplayOutcome::IdempotentReplay);
             }
 
-            if record.term < existing.record.term {
-                return Err(RaftLogViewError::TermRegression {
-                    index,
-                    current_term: existing.record.term,
-                    received_term: record.term,
-                });
-            }
-
-            // A suffix replacement may not introduce a term below a later
-            // term already observed in the retained suffix. Exact replay is
-            // handled above because its term need not match that suffix tail.
-            let (maximum_retained_index, maximum_retained_term) = self
-                .entries
-                .last_key_value()
-                .map(|(retained_index, entry)| (*retained_index, entry.record.term))
-                .unwrap_or((self.snapshot_index, self.snapshot_term));
-
-            if record.term < maximum_retained_term {
-                return Err(RaftLogViewError::LogTermRegression {
-                    previous_index: maximum_retained_index,
-                    previous_term: maximum_retained_term,
-                    received_index: index,
-                    received_term: record.term,
-                });
-            }
-
             if index <= self.committed_index {
                 return Err(RaftLogViewError::CommittedPrefixOverwrite {
                     index,
                     committed_index: self.committed_index,
+                });
+            }
+
+            // A different term means that the local entry and every later
+            // entry belong to a stale suffix. Raft conflict resolution does
+            // not require the replacement term to be higher; it only must be
+            // compatible with the retained predecessor or snapshot boundary.
+            let predecessor_term = self
+                .entries
+                .get(&(index - 1))
+                .map(|entry| entry.record.term)
+                .or_else(|| (index == self.snapshot_index + 1).then_some(self.snapshot_term));
+
+            if let Some(previous_term) = predecessor_term
+                && record.term < previous_term
+            {
+                return Err(RaftLogViewError::LogTermRegression {
+                    previous_index: index - 1,
+                    previous_term,
+                    received_index: index,
+                    received_term: record.term,
                 });
             }
 

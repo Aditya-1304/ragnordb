@@ -56,6 +56,40 @@ fn later_term_overwrite_truncates_the_stale_suffix() {
     );
 }
 
+/// Realistic bug caught: Raft may replace an uncommitted suffix with a lower
+/// term when that suffix came from a stale leader. Rejecting the direction of
+/// the term change would make valid Ready entries impossible to persist.
+#[test]
+fn lower_term_replaces_an_uncommitted_stale_suffix() {
+    let identity = identity(50);
+    let mut view = RaftReplicaLogView::new(identity);
+
+    view.replay(entry(identity, 1, 1, b"one"), Lsn::new(10))
+        .unwrap();
+    view.replay(entry(identity, 2, 5, b"stale-two"), Lsn::new(20))
+        .unwrap();
+    view.replay(entry(identity, 3, 5, b"stale-three"), Lsn::new(30))
+        .unwrap();
+    view.advance_commit(1).unwrap();
+
+    let replacement = view
+        .replay(entry(identity, 2, 4, b"new-two"), Lsn::new(40))
+        .unwrap();
+    assert_eq!(
+        replacement,
+        RaftLogReplayOutcome::ReplacedSuffix { removed_entries: 2 }
+    );
+
+    assert_eq!(
+        view.replay(entry(identity, 3, 6, b"new-three"), Lsn::new(50))
+            .unwrap(),
+        RaftLogReplayOutcome::Appended
+    );
+    assert_eq!(view.committed_index(), 1);
+    assert_eq!(view.entry(2).unwrap().record.term, 4);
+    assert_eq!(view.entry(3).unwrap().record.term, 6);
+}
+
 #[test]
 fn same_index_and_term_with_different_payload_is_corruption() {
     let identity = identity(42);
