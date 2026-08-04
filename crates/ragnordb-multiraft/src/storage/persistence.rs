@@ -22,6 +22,7 @@ use super::{
         RaftSnapshotPointerRecord, RaftStableStateCodecError, SnapshotTransitionError,
         validate_hard_state_successor, validate_snapshot_successor,
     },
+    recovery::RecoveredRaftReplica,
     view::{RaftLogViewError, RaftReplicaLogView},
 };
 use ragnordb_common::wal_registry::SharedWalRecordType;
@@ -496,6 +497,38 @@ impl<W: RaftWal> RaftWalStorage<W> {
             hard_state,
         })
     }
+
+    /// reconstruct the live persistence writer from one fully recovered replica
+    ///
+    /// the WAL frontier is supplied explicitly by startup because a replica's
+    /// latest Raft record is not necessarily the node's latest physical WAL
+    /// record. Other Raft groups and database records may be interleaved in the
+    /// shared WAL
+    pub fn from_recovered(
+        wal: W,
+        recovered: &RecoveredRaftReplica,
+        durable_end_lsn: Lsn,
+    ) -> Result<Self, RaftPersistenceError> {
+        if let Some(last_replayed_lsn) = recovered.log_view().last_replayed_lsn()
+            && durable_end_lsn <= last_replayed_lsn
+        {
+            return Err(RaftPersistenceError::RecoveredFrontierBeforeLastRecord {
+                durable_end_lsn,
+                last_replayed_lsn,
+            });
+        }
+
+        Ok(Self {
+            wal,
+            identity: recovered.identity(),
+            log_view: recovered.log_view().clone(),
+            conf_state: recovered.conf_state().cloned(),
+            hard_state: recovered.hard_state().cloned(),
+            durable_end_lsn: Some(durable_end_lsn),
+            recovery_required: false,
+            snapshot: recovered.snapshot().cloned(),
+        })
+    }
 }
 
 struct PreparedRecord {
@@ -586,5 +619,14 @@ pub enum RaftPersistenceError {
     HardStateBeforeLogTerm {
         current_term: u64,
         maximum_log_term: u64,
+    },
+
+    #[error(
+        "recovered WAL frontier {durable_end_lsn:?} does not cover \
+     the last Raft record at {last_replayed_lsn:?}"
+    )]
+    RecoveredFrontierBeforeLastRecord {
+        durable_end_lsn: Lsn,
+        last_replayed_lsn: Lsn,
     },
 }

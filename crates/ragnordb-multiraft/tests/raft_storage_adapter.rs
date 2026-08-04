@@ -209,3 +209,31 @@ fn recovered_adapters_restart_a_real_raft_node() {
     assert_eq!(node.last_log_index(), 3);
     assert_eq!(node.conf_state(), &conf_state());
 }
+
+/// Realistic bug caught:
+///
+/// after restart, the live Raft writer must continue from
+/// the recovered durable state. Reinitializing it with `new()` would silently
+/// discard the recovered suffix, snapshot boundary, stable state, and WAL
+/// durability frontier before the next Ready generation
+#[test]
+fn recovered_wal_storage_is_seeded_before_the_next_ready() {
+    let storage = durable_storage();
+
+    let mut source = RecordSource::new(storage.wal().records.clone());
+    let recovered = recover_raft_storage(&mut source).unwrap();
+    let replica = recovered.replica(identity()).unwrap();
+
+    let durable_end_lsn = Lsn::new(10_000);
+    let seeded =
+        RaftWalStorage::from_recovered(RecordingWal::new(), replica, durable_end_lsn).unwrap();
+
+    assert_eq!(seeded.log_view().identity(), identity());
+    assert_eq!(seeded.log_view().snapshot_boundary(), Some((2, 1)));
+    assert_eq!(seeded.log_view().last_index(), Some(3));
+    assert_eq!(seeded.hard_state(), replica.hard_state());
+    assert_eq!(seeded.conf_state(), replica.conf_state());
+    assert_eq!(seeded.snapshot(), replica.snapshot());
+    assert_eq!(seeded.durable_end_lsn(), Some(durable_end_lsn));
+    assert!(!seeded.recovery_required());
+}
