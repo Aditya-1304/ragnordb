@@ -47,4 +47,6 @@ pub struct RequestId {
     pub client_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub raft_group_id: ::core::option::Option<RaftGroupId>,
 }

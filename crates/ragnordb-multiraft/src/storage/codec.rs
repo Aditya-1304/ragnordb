@@ -12,13 +12,115 @@ use ragnordb_common::{
     ids::{RaftGroupId, ReplicaId},
     proto::raft as raft_proto,
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 /// durable format accepted for Raft log-entry records
 pub const RAFT_LOG_ENTRY_RECORD_VERSION: u32 = 1;
 
 /// durable format accepted for Raft stable-state records
 pub const RAFT_STABLE_STATE_RECORD_VERSION: u32 = 1;
+pub const RAFT_SNAPSHOT_POINTER_RECORD_VERSION: u32 = 1;
+
+/// Durable reference to a snapshot file synchronized before its WAL pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftSnapshotPointerRecord {
+    pub format_version: u32,
+    pub identity: RaftReplicaIdentity,
+    pub snapshot_id: u64,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub applied_index: u64,
+    pub conf_state: ConfState,
+    pub size_bytes: u64,
+    pub checksum: [u8; 32],
+    pub file_name: String,
+}
+
+impl RaftSnapshotPointerRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, RaftStableStateCodecError> {
+        self.validate()?;
+        Ok(raft_proto::RaftSnapshotPointerRecord {
+            format_version: self.format_version,
+            raft_group_id: Some(self.identity.raft_group_id.to_proto()),
+            replica_id: Some(self.identity.replica_id.to_proto()),
+            snapshot_id: self.snapshot_id,
+            last_included_index: self.last_included_index,
+            last_included_term: self.last_included_term,
+            applied_index: self.applied_index,
+            configuration_version: self.conf_state.version,
+            voters: encode_core_replicas(&self.conf_state.voters),
+            learners: encode_core_replicas(&self.conf_state.learners),
+            outgoing_voters: encode_core_replicas(&self.conf_state.outgoing_voters),
+            size_bytes: self.size_bytes,
+            checksum: self.checksum.to_vec(),
+            file_name: self.file_name.clone(),
+        }
+        .encode_to_vec())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RaftStableStateCodecError> {
+        let proto = raft_proto::RaftSnapshotPointerRecord::decode(bytes)
+            .map_err(|error| RaftStableStateCodecError::Decode(error.to_string()))?;
+        let identity = decode_stable_identity(proto.raft_group_id, proto.replica_id)?;
+        let checksum: [u8; 32] = proto
+            .checksum
+            .try_into()
+            .map_err(|_| RaftStableStateCodecError::InvalidSnapshotChecksumLength)?;
+        let record = Self {
+            format_version: proto.format_version,
+            identity,
+            snapshot_id: proto.snapshot_id,
+            last_included_index: proto.last_included_index,
+            last_included_term: proto.last_included_term,
+            applied_index: proto.applied_index,
+            conf_state: ConfState {
+                version: proto.configuration_version,
+                voters: decode_core_replicas("voters", proto.voters)?,
+                learners: decode_core_replicas("learners", proto.learners)?,
+                outgoing_voters: decode_core_replicas("outgoing_voters", proto.outgoing_voters)?,
+            },
+            size_bytes: proto.size_bytes,
+            checksum,
+            file_name: proto.file_name,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), RaftStableStateCodecError> {
+        if self.format_version != RAFT_SNAPSHOT_POINTER_RECORD_VERSION {
+            return Err(RaftStableStateCodecError::UnsupportedVersion(
+                self.format_version,
+            ));
+        }
+        self.identity
+            .validate()
+            .map_err(RaftStableStateCodecError::InvalidIdentity)?;
+        if self.snapshot_id == 0 {
+            return Err(RaftStableStateCodecError::ZeroSnapshotId);
+        }
+        if self.last_included_index == 0 || self.last_included_term == 0 {
+            return Err(RaftStableStateCodecError::InvalidSnapshotBoundary);
+        }
+        if self.applied_index != self.last_included_index {
+            return Err(RaftStableStateCodecError::SnapshotAppliedIndexMismatch {
+                last_included_index: self.last_included_index,
+                applied_index: self.applied_index,
+            });
+        }
+        let mut components = Path::new(&self.file_name).components();
+        let is_single_safe_component = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if self.size_bytes == 0 || !is_single_safe_component {
+            return Err(RaftStableStateCodecError::InvalidSnapshotFileMetadata);
+        }
+        self.conf_state
+            .validate()
+            .map_err(|error| RaftStableStateCodecError::InvalidConfState(format!("{error:?}")))
+    }
+}
 
 /// one Raft replica lifetime inside a logical Raft group
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -396,82 +498,48 @@ impl RaftHardStateRecord {
     }
 }
 
-/// durable, identity bound Raft membership state
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftConfStateRecord {
-    pub format_version: u32,
-    pub identity: RaftReplicaIdentity,
-    pub conf_state: ConfState,
-}
-
-impl RaftConfStateRecord {
-    /// convert validated Raft-core membership into its durable V1 record
-    pub fn from_core(
-        identity: RaftReplicaIdentity,
-        conf_state: ConfState,
-    ) -> Result<Self, RaftStableStateCodecError> {
-        let record = Self {
-            format_version: RAFT_STABLE_STATE_RECORD_VERSION,
-            identity,
-            conf_state,
-        };
-
-        record.validate()?;
-        Ok(record)
+/// validate a durable HardState transition before WAL admission or recovery.
+pub fn validate_hard_state_successor(
+    previous: Option<&HardState>,
+    received: &HardState,
+) -> Result<(), RaftStableStateCodecError> {
+    if received.current_term == 0 {
+        return Err(RaftStableStateCodecError::ZeroCurrentTerm);
     }
-
-    /// Return the public Raft-core membership represented by this record.
-    pub fn to_core(&self) -> Result<ConfState, RaftStableStateCodecError> {
-        self.validate()?;
-        Ok(self.conf_state.clone())
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if received.current_term < previous.current_term {
+        return Err(RaftStableStateCodecError::TermRegression {
+            previous: previous.current_term,
+            received: received.current_term,
+        });
     }
-
-    /// encode membership sets in deterministic ascending identity order
-    pub fn encode(&self) -> Result<Vec<u8>, RaftStableStateCodecError> {
-        self.validate()?;
-
-        Ok(raft_proto::RaftConfStateRecord {
-            format_version: self.format_version,
-            raft_group_id: Some(self.identity.raft_group_id.to_proto()),
-            replica_id: Some(self.identity.replica_id.to_proto()),
-            configuration_version: self.conf_state.version,
-            voters: encode_core_replicas(&self.conf_state.voters),
-            learners: encode_core_replicas(&self.conf_state.learners),
-            outgoing_voters: encode_core_replicas(&self.conf_state.outgoing_voters),
+    if received.commit < previous.commit {
+        return Err(RaftStableStateCodecError::CommitRegression {
+            previous: previous.commit,
+            received: received.commit,
+        });
+    }
+    if received.current_term == previous.current_term {
+        match (previous.voted_for, received.voted_for) {
+            (Some(previous_vote), Some(received_vote)) if previous_vote != received_vote => {
+                return Err(RaftStableStateCodecError::VoteChangedInTerm {
+                    term: received.current_term,
+                    previous: previous_vote.get(),
+                    received: received_vote.get(),
+                });
+            }
+            (Some(previous_vote), None) => {
+                return Err(RaftStableStateCodecError::VoteClearedInTerm {
+                    term: received.current_term,
+                    previous: previous_vote.get(),
+                });
+            }
+            _ => {}
         }
-        .encode_to_vec())
     }
-
-    /// Decode membership returned by shared-WAL recovery.
-    pub fn decode(bytes: &[u8]) -> Result<Self, RaftStableStateCodecError> {
-        let proto = raft_proto::RaftConfStateRecord::decode(bytes)
-            .map_err(|error| RaftStableStateCodecError::Decode(error.to_string()))?;
-
-        let identity = decode_stable_identity(proto.raft_group_id, proto.replica_id)?;
-
-        let record = Self {
-            format_version: proto.format_version,
-            identity,
-            conf_state: ConfState {
-                version: proto.configuration_version,
-                voters: decode_core_replicas("voters", proto.voters)?,
-                learners: decode_core_replicas("learners", proto.learners)?,
-                outgoing_voters: decode_core_replicas("outgoing_voters", proto.outgoing_voters)?,
-            },
-        };
-
-        record.validate()?;
-        Ok(record)
-    }
-
-    /// validate membership created directly by the live persistence path
-    pub fn validate(&self) -> Result<(), RaftStableStateCodecError> {
-        validate_stable_header(self.format_version, self.identity)?;
-
-        self.conf_state
-            .validate()
-            .map_err(|error| RaftStableStateCodecError::InvalidConfState(format!("{error:?}")))
-    }
+    Ok(())
 }
 
 fn validate_stable_header(
@@ -553,8 +621,44 @@ pub enum RaftStableStateCodecError {
     #[error("Raft HardState contains reserved current term zero")]
     ZeroCurrentTerm,
 
+    #[error("Raft HardState term regressed from {previous} to {received}")]
+    TermRegression { previous: u64, received: u64 },
+
+    #[error("Raft HardState commit regressed from {previous} to {received}")]
+    CommitRegression { previous: u64, received: u64 },
+
+    #[error("Raft HardState vote changed in term {term} from {previous} to {received}")]
+    VoteChangedInTerm {
+        term: u64,
+        previous: u64,
+        received: u64,
+    },
+
+    #[error("Raft HardState vote for {previous} was cleared in term {term}")]
+    VoteClearedInTerm { term: u64, previous: u64 },
+
     #[error("Raft HardState vote contains reserved replica ID zero")]
     ZeroVotedForReplicaId,
+
+    #[error("Raft snapshot pointer contains reserved snapshot ID zero")]
+    ZeroSnapshotId,
+
+    #[error("Raft snapshot pointer has an invalid included index or term")]
+    InvalidSnapshotBoundary,
+
+    #[error(
+        "Raft snapshot applies through index {applied_index}, but its included boundary is {last_included_index}"
+    )]
+    SnapshotAppliedIndexMismatch {
+        last_included_index: u64,
+        applied_index: u64,
+    },
+
+    #[error("Raft snapshot pointer has invalid file name or length metadata")]
+    InvalidSnapshotFileMetadata,
+
+    #[error("Raft snapshot checksum must contain exactly 32 bytes")]
+    InvalidSnapshotChecksumLength,
 
     #[error("Raft {field} contains reserved replica ID zero")]
     ZeroMembershipReplicaId { field: &'static str },

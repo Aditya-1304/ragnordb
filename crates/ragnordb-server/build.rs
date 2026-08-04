@@ -35,15 +35,27 @@ fn main() {
         "cargo:rustc-env=RAFT_VERSION={}",
         package_version(&raft_manifest)
     );
+    println!(
+        "cargo:rustc-env=RAFT_REVISION={}",
+        repository_revision(&raft_manifest)
+    );
 
     println!(
         "cargo:rustc-env=WAL_VERSION={}",
         package_version(&wal_manifest)
     );
+    println!(
+        "cargo:rustc-env=WAL_REVISION={}",
+        repository_revision(&wal_manifest)
+    );
 
     println!(
         "cargo:rustc-env=BLOOM_VERSION={}",
         package_version(&bloom_manifest)
+    );
+    println!(
+        "cargo:rustc-env=BLOOM_REVISION={}",
+        repository_revision(&bloom_manifest)
     );
 
     println!("cargo:rustc-env=RAGNORDB_FEATURES={}", enabled_features());
@@ -90,6 +102,40 @@ fn package_version(manifest_path: &Path) -> String {
                 manifest_path.display()
             )
         })
+}
+
+/// capture the exact local dependency revision in the server binary
+///
+/// path dependencies remain convenient during multi-repository development,
+/// while this provenance prevents an operator from seeing only three identical
+/// package versions for builds produced from different source revisions. A
+/// dirty suffix makes unreproducible working-tree builds explicit
+fn repository_revision(manifest_path: &Path) -> String {
+    let Some(repository) = manifest_path.parent() else {
+        return "unknown".to_string();
+    };
+    let revision = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|output| !output.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(repository)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| !output.stdout.is_empty());
+
+    if dirty && revision != "unknown" {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    }
 }
 
 fn enabled_features() -> String {

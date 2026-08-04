@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use ragnordb_common::Error;
+use ragnordb_common::{Error, wal_registry::SharedWalRecordType};
 use ragnordb_storage::wal::RagnorDbWalRecordType;
 use wal::types::{
     RecordType,
@@ -78,6 +78,20 @@ fn awal_internal_records_are_classified_outside_ragnordb_namespace() {
             record_type.as_u16()
         );
     }
+}
+
+/// The tablet snapshot chunk ID is permanently reserved for the external
+/// snapshot subsystem. Database command recovery must not reinterpret that
+/// known foreign record as an unknown user payload.
+#[test]
+fn reserved_tablet_snapshot_records_are_left_for_their_semantic_owner() {
+    assert_eq!(
+        RagnorDbWalRecordType::classify(
+            SharedWalRecordType::TabletSnapshotChunk.as_wal_record_type(),
+        )
+        .unwrap(),
+        None
+    );
 }
 
 /// Ensures recovery never guesses how an unrecognized user payload should be

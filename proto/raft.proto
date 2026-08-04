@@ -63,26 +63,25 @@ message RaftHardStateRecord {
     uint64 commit_index = 6;
 }
 
-// durable membership state associated with one replica lifetime. Repeated
-// identities are encoded in ascending order by the domain codec
-message RaftConfStateRecord {
-    uint32 format_version = 1;
-    ragnordb.ids.RaftGroupId raft_group_id = 2;
-    ragnordb.ids.ReplicaId replica_id = 3;
-    uint64 configuration_version = 4;
-    repeated ragnordb.ids.ReplicaId voters = 5;
-    repeated ragnordb.ids.ReplicaId learners = 6;
-    repeated ragnordb.ids.ReplicaId outgoing_voters = 7;
-}
 
-// durable logical frontiers for one replica lifetime. The truncation boundary
-// retains its term so the Raft core can validate AppendEntries immediately
-// before the first retained log entry
-message RaftProgressRecord {
+// durable pointer to a separately synchronized Raft snapshot image. confState
+// is authoritative here because the snapshot replaces the committed prefix;
+// outside snapshots membership is derived from committed configuration entries
+message RaftSnapshotPointerRecord {
     uint32 format_version = 1;
     ragnordb.ids.RaftGroupId raft_group_id = 2;
     ragnordb.ids.ReplicaId replica_id = 3;
-    uint64 truncated_through_index = 4;
-    uint64 truncated_through_term = 5;
-    uint64 applied_index = 6;
+    uint64 snapshot_id = 4;
+    uint64 last_included_index = 5;
+    uint64 last_included_term = 6;
+    uint64 configuration_version = 7;
+    repeated ragnordb.ids.ReplicaId voters = 8;
+    repeated ragnordb.ids.ReplicaId learners = 9;
+    repeated ragnordb.ids.ReplicaId outgoing_voters = 10;
+    uint64 size_bytes = 11;
+    bytes checksum = 12;
+    string file_name = 13;
+    // The state-machine image is applied through this exact index. V1 requires
+    // it to equal last_included_index so replay always resumes at index + 1.
+    uint64 applied_index = 14;
 }

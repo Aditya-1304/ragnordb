@@ -52,8 +52,11 @@ impl Server {
             max_connections,
             ragnordb_version = BUILD_INFO.ragnordb_version,
             raft_version = BUILD_INFO.raft_version,
+            raft_revision = BUILD_INFO.raft_revision,
             wal_version = BUILD_INFO.wal_version,
+            wal_revision = BUILD_INFO.wal_revision,
             bloom_version = BUILD_INFO.bloom_version,
+            bloom_revision = BUILD_INFO.bloom_revision,
             feature_flags = BUILD_INFO.feature_flags,
             "node starting",
         );

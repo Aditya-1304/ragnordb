@@ -37,4 +37,5 @@ message RaftGroupId {
 message RequestId {
     bytes client_id = 1; // this will be u128 as 16 bytes
     uint64 sequence = 2;
+    RaftGroupId raft_group_id = 3;
 }

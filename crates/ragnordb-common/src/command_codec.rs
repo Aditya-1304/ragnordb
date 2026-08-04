@@ -1,15 +1,15 @@
 use super::catalog_codec::TableDefinition as TableDef;
 use super::codec::{Row, WriteKind};
-use crate::ids::{RequestId, TabletId, Timestamp, TxnId};
+use crate::ids::{RaftGroupId, RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
 use std::collections::BTreeMap;
 
 use crate::proto::command;
 /// the tablet command envelope format accepted
-pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 1;
+pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 2;
 
 /// tablet state machine snapshot format
-pub const TABLET_STATE_MACHINE_SNAPSHOT_VERSION: u32 = 1;
+pub const TABLET_STATE_MACHINE_SNAPSHOT_VERSION: u32 = 2;
 
 /// durable identity and routing metadata for one replicated tablet command
 ///
@@ -69,6 +69,21 @@ impl TabletCommandEnvelope {
 
         if self.expected_epoch == 0 {
             return Err(TabletCommandEnvelopeError::ZeroExpectedEpoch);
+        }
+        if self.request_id.client_id == 0 {
+            return Err(TabletCommandEnvelopeError::InvalidRequestId(
+                "client ID must be non-zero",
+            ));
+        }
+        if self.request_id.sequence == 0 {
+            return Err(TabletCommandEnvelopeError::InvalidRequestId(
+                "request sequence must be non-zero",
+            ));
+        }
+        if self.request_id.raft_group_id.0 == 0 {
+            return Err(TabletCommandEnvelopeError::InvalidRequestId(
+                "Raft group ID must be non-zero",
+            ));
         }
 
         Ok(())
@@ -133,7 +148,7 @@ impl TabletCommandEnvelope {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum TabletCommandEnvelopeError {
     #[error("unsupported tablet command envelope version {0}")]
     UnsupportedVersion(u32),
@@ -201,10 +216,29 @@ impl CachedTabletCommandResult {
 }
 
 /// durable per client deduplication state within one Raft group
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientDeduplicationSnapshot {
     pub last_sequence_applied: u64,
-    pub cached_result: CachedTabletCommandResult,
+    pub cached_outcome: CachedTabletCommandOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachedTabletCommandOutcome {
+    Applied(CachedTabletCommandResult),
+    Rejected(CachedTabletCommandRejection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedTabletCommandRejection {
+    pub kind: CachedTabletCommandRejectionKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedTabletCommandRejectionKind {
+    InvalidCommand,
+    WriteConflict,
+    UnsupportedCommand,
 }
 
 /// versioned snapshot of replicated tablet command metadata
@@ -217,6 +251,7 @@ pub struct TabletStateMachineSnapshot {
     pub format_version: u32,
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
+    pub raft_group_id: RaftGroupId,
     pub clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
 }
 
@@ -224,12 +259,14 @@ impl TabletStateMachineSnapshot {
     pub fn new(
         tablet_id: TabletId,
         tablet_epoch: u64,
+        raft_group_id: RaftGroupId,
         clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
     ) -> Result<Self, TabletStateMachineSnapshotError> {
         let snapshot = Self {
             format_version: TABLET_STATE_MACHINE_SNAPSHOT_VERSION,
             tablet_id,
             tablet_epoch,
+            raft_group_id,
             clients,
         };
 
@@ -250,6 +287,10 @@ impl TabletStateMachineSnapshot {
 
         if self.tablet_epoch == 0 {
             return Err(TabletStateMachineSnapshotError::ZeroTabletEpoch);
+        }
+
+        if self.raft_group_id.0 == 0 {
+            return Err(TabletStateMachineSnapshotError::ZeroRaftGroupId);
         }
 
         if self
@@ -283,6 +324,7 @@ impl TabletStateMachineSnapshot {
             format_version: self.format_version,
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
+            raft_group_id: Some(self.raft_group_id.to_proto()),
             clients: self
                 .clients
                 .iter()
@@ -291,10 +333,29 @@ impl TabletStateMachineSnapshot {
                         RequestId {
                             client_id: *client_id,
                             sequence: state.last_sequence_applied,
+                            raft_group_id: self.raft_group_id,
                         }
                         .to_proto(),
                     ),
-                    cached_result: state.cached_result.to_proto() as i32,
+                    cached_result: match &state.cached_outcome {
+                        CachedTabletCommandOutcome::Applied(result) => result.to_proto() as i32,
+                        CachedTabletCommandOutcome::Rejected(_) => {
+                            command::CachedTabletCommandResult::Unspecified as i32
+                        }
+                    },
+                    cached_rejection: match &state.cached_outcome {
+                        CachedTabletCommandOutcome::Applied(_) => None,
+                        CachedTabletCommandOutcome::Rejected(rejection) => Some(
+                            command::CachedTabletCommandRejection {
+                                kind: match rejection.kind {
+                                    CachedTabletCommandRejectionKind::InvalidCommand => command::CachedTabletCommandRejectionKind::InvalidCommand,
+                                    CachedTabletCommandRejectionKind::WriteConflict => command::CachedTabletCommandRejectionKind::WriteConflict,
+                                    CachedTabletCommandRejectionKind::UnsupportedCommand => command::CachedTabletCommandRejectionKind::UnsupportedCommand,
+                                } as i32,
+                                reason: rejection.reason.clone(),
+                            },
+                        ),
+                    },
                 })
                 .collect(),
         }
@@ -308,6 +369,9 @@ impl TabletStateMachineSnapshot {
                 .tablet_id
                 .ok_or(TabletStateMachineSnapshotError::MissingField("tablet_id"))?,
         );
+        let raft_group_id = RaftGroupId::from_proto(proto.raft_group_id.ok_or(
+            TabletStateMachineSnapshotError::MissingField("raft_group_id"),
+        )?);
 
         let mut clients = BTreeMap::new();
 
@@ -317,18 +381,58 @@ impl TabletStateMachineSnapshot {
             )?)
             .map_err(TabletStateMachineSnapshotError::InvalidRequestId)?;
 
-            let cached_result = CachedTabletCommandResult::from_proto(
-                command::CachedTabletCommandResult::try_from(client.cached_result).map_err(
-                    |_| TabletStateMachineSnapshotError::InvalidCachedResult(client.cached_result),
-                )?,
-            )?;
+            let cached_outcome = if let Some(rejection) = client.cached_rejection {
+                if client.cached_result != command::CachedTabletCommandResult::Unspecified as i32 {
+                    return Err(TabletStateMachineSnapshotError::MultipleCachedOutcomes);
+                }
+                let kind = match command::CachedTabletCommandRejectionKind::try_from(rejection.kind)
+                    .map_err(|_| {
+                        TabletStateMachineSnapshotError::InvalidCachedRejection(rejection.kind)
+                    })? {
+                    command::CachedTabletCommandRejectionKind::InvalidCommand => {
+                        CachedTabletCommandRejectionKind::InvalidCommand
+                    }
+                    command::CachedTabletCommandRejectionKind::WriteConflict => {
+                        CachedTabletCommandRejectionKind::WriteConflict
+                    }
+                    command::CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                        CachedTabletCommandRejectionKind::UnsupportedCommand
+                    }
+                    command::CachedTabletCommandRejectionKind::Unspecified => {
+                        return Err(TabletStateMachineSnapshotError::InvalidCachedRejection(
+                            rejection.kind,
+                        ));
+                    }
+                };
+                CachedTabletCommandOutcome::Rejected(CachedTabletCommandRejection {
+                    kind,
+                    reason: rejection.reason,
+                })
+            } else {
+                CachedTabletCommandOutcome::Applied(CachedTabletCommandResult::from_proto(
+                    command::CachedTabletCommandResult::try_from(client.cached_result).map_err(
+                        |_| {
+                            TabletStateMachineSnapshotError::InvalidCachedResult(
+                                client.cached_result,
+                            )
+                        },
+                    )?,
+                )?)
+            };
+
+            if request_id.raft_group_id != raft_group_id {
+                return Err(TabletStateMachineSnapshotError::RequestGroupMismatch {
+                    snapshot: raft_group_id,
+                    request: request_id.raft_group_id,
+                });
+            }
 
             if clients
                 .insert(
                     request_id.client_id,
                     ClientDeduplicationSnapshot {
                         last_sequence_applied: request_id.sequence,
-                        cached_result,
+                        cached_outcome,
                     },
                 )
                 .is_some()
@@ -343,6 +447,7 @@ impl TabletStateMachineSnapshot {
             format_version: proto.format_version,
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
+            raft_group_id,
             clients,
         };
 
@@ -362,6 +467,15 @@ pub enum TabletStateMachineSnapshotError {
     #[error("tablet state-machine snapshot epoch must be non-zero")]
     ZeroTabletEpoch,
 
+    #[error("tablet state-machine snapshot contains reserved Raft group ID zero")]
+    ZeroRaftGroupId,
+
+    #[error("tablet snapshot group {snapshot:?} contains request from group {request:?}")]
+    RequestGroupMismatch {
+        snapshot: RaftGroupId,
+        request: RaftGroupId,
+    },
+
     #[error("tablet state-machine snapshot contains request sequence zero")]
     ZeroRequestSequence,
 
@@ -377,6 +491,12 @@ pub enum TabletStateMachineSnapshotError {
     #[error("tablet state-machine snapshot contains unknown cached result {0}")]
     InvalidCachedResult(i32),
 
+    #[error("tablet state-machine snapshot contains unknown cached rejection {0}")]
+    InvalidCachedRejection(i32),
+
+    #[error("tablet state-machine snapshot contains both a cached result and rejection")]
+    MultipleCachedOutcomes,
+
     #[error("tablet state-machine snapshot contains an unspecified cached result")]
     UnspecifiedCachedResult,
 
@@ -384,7 +504,7 @@ pub enum TabletStateMachineSnapshotError {
     Decode(String),
 }
 
-/// replicated single-key prewrite for a distributed transaction
+/// replicated participant-wide prewrite for a distributed transaction
 ///
 /// Put carries a complete SQL row. A Delete carries no row. Applying the
 /// command atomically installs the default-value entry and corresponding lock
@@ -392,51 +512,56 @@ pub enum TabletStateMachineSnapshotError {
 pub struct PrewriteCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
-    pub key: Vec<u8>,
-    pub row: Option<Row>,
+    pub writes: Vec<WriteEntry>,
     pub primary_key: Vec<u8>,
-    pub op: WriteKind,
     pub ttl_ms: u64,
 }
 
 impl PrewriteCommand {
     pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
-        validate_command_mutation(self.op, self.row.as_ref())?;
+        validate_txn_start(self.txn_id, self.start_timestamp)?;
+        validate_write_entries(&self.writes)?;
+        if self.primary_key.is_empty() {
+            return Err("prewrite primary key must not be empty");
+        }
+        if self.ttl_ms == 0 {
+            return Err("prewrite lock TTL must be non-zero");
+        }
 
         Ok(command::PrewriteCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
-            key: self.key.clone(),
             primary_key: self.primary_key.clone(),
-            op: self.op.to_proto() as i32,
             ttl_ms: self.ttl_ms,
-            row: self.row.as_ref().map(Row::to_proto),
+            writes: self
+                .writes
+                .iter()
+                .map(WriteEntry::to_proto)
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
     pub fn from_proto(proto: command::PrewriteCommand) -> Result<Self, &'static str> {
-        let op = WriteKind::from_proto(
-            crate::proto::mvcc::WriteKind::try_from(proto.op).map_err(|_| "invalid op")?,
-        )?;
-
-        let row = proto.row.map(Row::from_proto).transpose()?;
-        validate_command_mutation(op, row.as_ref())?;
+        let writes = proto
+            .writes
+            .into_iter()
+            .map(WriteEntry::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_write_entries(&writes)?;
 
         Ok(Self {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
-            key: proto.key,
-            row,
+            writes,
             primary_key: proto.primary_key,
-            op,
             ttl_ms: proto.ttl_ms,
         })
     }
 }
 
-/// Commit a single key (secondary commit in distributed txn)
+/// commit every key owned by one tablet participant.
 ///
 /// this removes lock/{key}
 #[derive(Debug, Clone, PartialEq)]
@@ -444,17 +569,22 @@ pub struct CommitCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
     pub commit_timestamp: Timestamp,
-    pub key: Vec<u8>,
+    pub keys: Vec<Vec<u8>>,
 }
 
 impl CommitCommand {
-    pub fn to_proto(&self) -> command::CommitCommand {
-        command::CommitCommand {
+    pub fn to_proto(&self) -> Result<command::CommitCommand, &'static str> {
+        validate_txn_start(self.txn_id, self.start_timestamp)?;
+        if self.commit_timestamp.0 <= self.start_timestamp.0 {
+            return Err("commit timestamp must be greater than start timestamp");
+        }
+        validate_keys(&self.keys)?;
+        Ok(command::CommitCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             commit_timestamp: Some(self.commit_timestamp.to_proto()),
-            key: self.key.clone(),
-        }
+            keys: self.keys.clone(),
+        })
     }
 
     pub fn from_proto(proto: command::CommitCommand) -> Result<Self, &'static str> {
@@ -466,29 +596,31 @@ impl CommitCommand {
             commit_timestamp: Timestamp::from_proto(
                 proto.commit_timestamp.ok_or("missing commit_timestamp")?,
             ),
-            key: proto.key,
+            keys: proto.keys,
         })
     }
 }
 
-/// Rollbacks a single key
+/// roll back every key owned by one tablet participant
 ///
-/// Removes lock/{key} and writes a rollback record so
+/// removes lock/{key} and writes a rollback record so
 /// late prewrite or commot messages are ignored
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollbackCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
-    pub key: Vec<u8>,
+    pub keys: Vec<Vec<u8>>,
 }
 
 impl RollbackCommand {
-    pub fn to_proto(&self) -> command::RollbackCommand {
-        command::RollbackCommand {
+    pub fn to_proto(&self) -> Result<command::RollbackCommand, &'static str> {
+        validate_txn_start(self.txn_id, self.start_timestamp)?;
+        validate_keys(&self.keys)?;
+        Ok(command::RollbackCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
-            key: self.key.clone(),
-        }
+            keys: self.keys.clone(),
+        })
     }
 
     pub fn from_proto(proto: command::RollbackCommand) -> Result<Self, &'static str> {
@@ -497,7 +629,7 @@ impl RollbackCommand {
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
-            key: proto.key,
+            keys: proto.keys,
         })
     }
 }
@@ -537,6 +669,49 @@ impl WriteEntry {
     }
 }
 
+fn validate_write_entries(writes: &[WriteEntry]) -> Result<(), &'static str> {
+    if writes.is_empty() {
+        return Err("participant command requires at least one write");
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for write in writes {
+        if write.key.is_empty() {
+            return Err("participant command contains an empty row key");
+        }
+        validate_command_mutation(write.op, write.row.as_ref())?;
+        if !keys.insert(write.key.as_slice()) {
+            return Err("participant command contains a duplicate row key");
+        }
+    }
+    Ok(())
+}
+
+fn validate_keys(keys: &[Vec<u8>]) -> Result<(), &'static str> {
+    if keys.is_empty() {
+        return Err("participant command requires at least one row key");
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for key in keys {
+        if key.is_empty() {
+            return Err("participant command contains an empty row key");
+        }
+        if !unique.insert(key.as_slice()) {
+            return Err("participant command contains a duplicate row key");
+        }
+    }
+    Ok(())
+}
+
+fn validate_txn_start(txn_id: TxnId, start_timestamp: Timestamp) -> Result<(), &'static str> {
+    if txn_id.0 == 0 {
+        return Err("transaction ID must be non-zero");
+    }
+    if start_timestamp.0 == 0 {
+        return Err("transaction start timestamp must be non-zero");
+    }
+    Ok(())
+}
+
 fn validate_command_mutation(op: WriteKind, row: Option<&Row>) -> Result<(), &'static str> {
     match (op, row) {
         (WriteKind::Put, Some(_)) | (WriteKind::Delete, None) => Ok(()),
@@ -563,6 +738,11 @@ pub struct SingleShardCommitCommand {
 }
 impl SingleShardCommitCommand {
     pub fn to_proto(&self) -> Result<command::SingleShardCommitCommand, &'static str> {
+        validate_txn_start(self.txn_id, self.start_timestamp)?;
+        if self.commit_timestamp.0 <= self.start_timestamp.0 {
+            return Err("commit timestamp must be greater than start timestamp");
+        }
+        validate_write_entries(&self.writes)?;
         Ok(command::SingleShardCommitCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
@@ -603,7 +783,7 @@ impl SingleShardCommitCommand {
 pub struct ResolveIntentCommand {
     pub txn_id: TxnId,
     pub start_timestamp: Timestamp,
-    pub key: Vec<u8>,
+    pub keys: Vec<Vec<u8>>,
     pub resolved_status: crate::codec::TxnStatus,
     pub commit_timestamp: Option<Timestamp>,
 }
@@ -611,6 +791,8 @@ pub struct ResolveIntentCommand {
 impl ResolveIntentCommand {
     /// Convert a validated intent-resolution command to protobuf.
     pub fn to_proto(&self) -> Result<command::ResolveIntentCommand, &'static str> {
+        validate_txn_start(self.txn_id, self.start_timestamp)?;
+        validate_keys(&self.keys)?;
         validate_resolved_status(
             self.resolved_status,
             self.start_timestamp,
@@ -620,7 +802,7 @@ impl ResolveIntentCommand {
         Ok(command::ResolveIntentCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
-            key: self.key.clone(),
+            keys: self.keys.clone(),
             resolved_status: self.resolved_status.to_proto() as i32,
             commit_timestamp: self.commit_timestamp.map(|timestamp| timestamp.to_proto()),
         })
@@ -643,7 +825,7 @@ impl ResolveIntentCommand {
         Ok(Self {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp,
-            key: proto.key,
+            keys: proto.keys,
             resolved_status,
             commit_timestamp,
         })
@@ -780,11 +962,11 @@ impl TabletCommand {
                 command.to_proto()?,
             )),
 
-            TabletCommand::Commit(command) => {
-                Some(command::tablet_command::Command::Commit(command.to_proto()))
-            }
+            TabletCommand::Commit(command) => Some(command::tablet_command::Command::Commit(
+                command.to_proto()?,
+            )),
             TabletCommand::Rollback(command) => Some(command::tablet_command::Command::Rollback(
-                command.to_proto(),
+                command.to_proto()?,
             )),
             TabletCommand::SingleShardCommit(command) => Some(
                 command::tablet_command::Command::SingleShardCommit(command.to_proto()?),
@@ -843,12 +1025,14 @@ mod tests {
         let command = PrewriteCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
-            row: Some(Row {
-                values: vec![Value::Int(1), Value::Text("Ada".to_string())],
-            }),
+            writes: vec![WriteEntry {
+                key: b"/table/1/pk/1".to_vec(),
+                row: Some(Row {
+                    values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+                }),
+                op: WriteKind::Put,
+            }],
             primary_key: b"/table/1/pk/1".to_vec(),
-            op: WriteKind::Put,
             ttl_ms: 30_000,
         };
 
@@ -857,8 +1041,8 @@ mod tests {
 
         assert_eq!(decoded.txn_id.0, 1);
         assert_eq!(decoded.start_timestamp.0, 100);
-        assert_eq!(decoded.row.unwrap().values.len(), 2);
-        assert_eq!(decoded.op, WriteKind::Put);
+        assert_eq!(decoded.writes[0].row.as_ref().unwrap().values.len(), 2);
+        assert_eq!(decoded.writes[0].op, WriteKind::Put);
     }
 
     #[test]
@@ -867,9 +1051,9 @@ mod tests {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(105),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
         };
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = CommitCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.commit_timestamp.0, 105);
     }
@@ -879,9 +1063,9 @@ mod tests {
         let cmd = RollbackCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
         };
-        let proto = cmd.to_proto();
+        let proto = cmd.to_proto().unwrap();
         let decoded = RollbackCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.txn_id.0, 1);
     }
@@ -940,7 +1124,7 @@ mod tests {
         let cmd = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Committed,
             commit_timestamp: Some(Timestamp(105)),
         };
@@ -1007,12 +1191,14 @@ mod tests {
         let cmd = TabletCommand::Prewrite(PrewriteCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
-            row: Some(Row {
-                values: vec![Value::Int(1)],
-            }),
+            writes: vec![WriteEntry {
+                key: b"/table/1/pk/1".to_vec(),
+                row: Some(Row {
+                    values: vec![Value::Int(1)],
+                }),
+                op: WriteKind::Put,
+            }],
             primary_key: b"/table/1/pk/1".to_vec(),
-            op: WriteKind::Put,
             ttl_ms: 30_000,
         });
         let proto = cmd.to_proto().unwrap();
@@ -1026,7 +1212,7 @@ mod tests {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(105),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
         });
         let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
@@ -1038,7 +1224,7 @@ mod tests {
         let cmd = TabletCommand::Rollback(RollbackCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
         });
         let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
@@ -1064,7 +1250,7 @@ mod tests {
         let command = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Aborted,
             commit_timestamp: None,
         };
@@ -1081,7 +1267,7 @@ mod tests {
         let command = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Pending,
             commit_timestamp: None,
         };
@@ -1096,7 +1282,7 @@ mod tests {
         let command = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Committed,
             commit_timestamp: None,
         };
@@ -1114,7 +1300,7 @@ mod tests {
         let command = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Committed,
             commit_timestamp: Some(Timestamp(100)),
         };
@@ -1129,7 +1315,7 @@ mod tests {
         let command = ResolveIntentCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
-            key: b"/table/1/pk/1".to_vec(),
+            keys: vec![b"/table/1/pk/1".to_vec()],
             resolved_status: TxnStatus::Aborted,
             commit_timestamp: Some(Timestamp(105)),
         };
@@ -1145,6 +1331,7 @@ mod tests {
             RequestId {
                 client_id: 0x8f4f_5692_3c11_4dc8_a53f_418a_62d3_97e1,
                 sequence: 7,
+                raft_group_id: RaftGroupId(12),
             },
             TabletId(41),
             3,
@@ -1164,6 +1351,7 @@ mod tests {
             RequestId {
                 client_id: 0x62a6_26f5_7849_46ee_8329_c983_ec15_29f4,
                 sequence: 1,
+                raft_group_id: RaftGroupId(12),
             },
             TabletId(9),
             1,

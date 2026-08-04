@@ -344,12 +344,13 @@ mod tests {
             request_id: RequestId {
                 client_id: 12345,
                 sequence: 1,
+                raft_group_id: RaftGroupId(5),
             },
             command: TabletCommand::Commit(CommitCommand {
                 txn_id: crate::ids::TxnId(1),
                 start_timestamp: Timestamp(100),
                 commit_timestamp: Timestamp(105),
-                key: b"/table/1/pk/1".to_vec(),
+                keys: vec![b"/table/1/pk/1".to_vec()],
             }),
         };
         let proto = req.to_proto().unwrap();
@@ -364,6 +365,7 @@ mod tests {
             request_id: RequestId {
                 client_id: 999,
                 sequence: 5,
+                raft_group_id: RaftGroupId(5),
             },
             success: true,
             error_message: String::new(),

@@ -133,6 +133,20 @@ pub trait MvccStorage {
         ))
     }
 
+    /// Atomically install every intent owned by one tablet participant.
+    fn prewrite_batch(
+        &mut self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _mutations: &BTreeMap<Vec<u8>, Mutation>,
+        _primary_key: &[u8],
+        _ttl_ms: u64,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed prewrite batches are not supported by this MVCC backend",
+        ))
+    }
+
     /// commit one previously installed distributed transaction intent
     ///
     /// an exact replay succeeds without creating a second write version. A
@@ -149,6 +163,19 @@ pub trait MvccStorage {
         ))
     }
 
+    /// Atomically commit all participant intents or leave all keys unchanged.
+    fn commit_intents_batch(
+        &mut self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _commit_ts: Timestamp,
+        _keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed intent commit batches are not supported by this MVCC backend",
+        ))
+    }
+
     /// roll back one distributed transaction intent and persist its tombstone
     ///
     /// the rollback marker prevents a delayed prewrite or commit from
@@ -156,6 +183,18 @@ pub trait MvccStorage {
     fn rollback_intent(&mut self, _txn_id: TxnId, _start_ts: Timestamp, _key: &[u8]) -> Result<()> {
         Err(Error::NotImplemented(
             "distributed intent rollback is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Atomically roll back all participant intents or leave all keys unchanged.
+    fn rollback_intents_batch(
+        &mut self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "distributed intent rollback batches are not supported by this MVCC backend",
         ))
     }
 
@@ -194,7 +233,7 @@ pub trait MvccStorage {
 ///
 /// Mutation methods require exclusive access. A future tablet state-machine
 /// actor will own and serialize access to this structure.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InMemoryMvcc {
     /// `row_key -> start_ts -> encoded row`.
     default: BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>>,
@@ -927,6 +966,27 @@ impl MvccStorage for InMemoryMvcc {
         Ok(())
     }
 
+    fn prewrite_batch(
+        &mut self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+        primary_key: &[u8],
+        ttl_ms: u64,
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Err(Error::InvalidArgument(
+                "distributed prewrite batch must contain at least one mutation".to_string(),
+            ));
+        }
+        let mut staged = self.clone();
+        for (key, mutation) in mutations {
+            staged.prewrite(txn_id, start_ts, key, mutation, primary_key, ttl_ms)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
     fn commit_intent(
         &mut self,
         txn_id: TxnId,
@@ -946,6 +1006,18 @@ impl MvccStorage for InMemoryMvcc {
             .and_then(|versions| versions.get(&commit_ts))
         {
             validate_write_record(commit_ts, write)?;
+
+            if let Some(versions) = self.writes.get(key) {
+                for (other_write_ts, other) in versions {
+                    validate_write_record(*other_write_ts, other)?;
+                    if *other_write_ts != commit_ts && other.start_timestamp == start_ts {
+                        return Err(Error::CorruptData(format!(
+                            "transaction starting at timestamp {} has multiple durable outcomes at write timestamps {} and {}",
+                            start_ts.0, commit_ts.0, other_write_ts.0
+                        )));
+                    }
+                }
+            }
 
             if write.start_timestamp != start_ts || write.op == WriteKind::Rollback {
                 return Err(Error::CorruptData(format!(
@@ -1058,6 +1130,26 @@ impl MvccStorage for InMemoryMvcc {
         let mutations = BTreeMap::from([(key.to_vec(), mutation)]);
         self.commit_batch(txn_id, start_ts, commit_ts, &mutations)?;
 
+        Ok(())
+    }
+
+    fn commit_intents_batch(
+        &mut self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Err(Error::InvalidArgument(
+                "distributed commit batch must contain at least one key".to_string(),
+            ));
+        }
+        let mut staged = self.clone();
+        for key in keys {
+            staged.commit_intent(txn_id, start_ts, commit_ts, key)?;
+        }
+        *self = staged;
         Ok(())
     }
 
@@ -1179,6 +1271,25 @@ impl MvccStorage for InMemoryMvcc {
             },
         );
 
+        Ok(())
+    }
+
+    fn rollback_intents_batch(
+        &mut self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Err(Error::InvalidArgument(
+                "distributed rollback batch must contain at least one key".to_string(),
+            ));
+        }
+        let mut staged = self.clone();
+        for key in keys {
+            staged.rollback_intent(txn_id, start_ts, key)?;
+        }
+        *self = staged;
         Ok(())
     }
 }
@@ -1818,5 +1929,42 @@ mod tests {
 
         assert!(matches!(error, Error::WriteConflict(_)));
         assert_eq!(engine.stats(), stats_before);
+    }
+
+    /// Realistic bug caught: an exact commit replay sees its requested write
+    /// record and returns success without noticing another durable outcome for
+    /// the same transaction start timestamp.
+    #[test]
+    fn commit_replay_rejects_multiple_durable_outcomes_for_start_timestamp() {
+        let key = encoded_key(1);
+        let row = encoded_row(1, "committed");
+        let mut engine = InMemoryMvcc::new();
+        engine
+            .prewrite(
+                TxnId(44),
+                Timestamp(100),
+                &key,
+                &Mutation::Put(row),
+                &key,
+                3_000,
+            )
+            .unwrap();
+        engine
+            .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
+            .unwrap();
+
+        engine.writes.entry(key.clone()).or_default().insert(
+            Timestamp(100),
+            WriteRecord {
+                start_timestamp: Timestamp(100),
+                commit_timestamp: Timestamp(100),
+                op: WriteKind::Rollback,
+            },
+        );
+
+        let error = engine
+            .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptData(_)));
     }
 }

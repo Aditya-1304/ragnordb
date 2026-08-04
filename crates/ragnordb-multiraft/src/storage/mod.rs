@@ -9,4 +9,5 @@ pub mod codec;
 pub mod frontier;
 pub mod persistence;
 pub mod recovery;
+pub mod shared_recovery;
 pub mod view;

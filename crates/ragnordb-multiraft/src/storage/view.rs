@@ -36,6 +36,9 @@ pub struct RaftReplicaLogView {
     identity: RaftReplicaIdentity,
     entries: BTreeMap<u64, RecoveredRaftLogEntry>,
     last_replayed_lsn: Option<Lsn>,
+    snapshot_index: u64,
+    snapshot_term: u64,
+    committed_index: u64,
 }
 
 impl RaftReplicaLogView {
@@ -45,6 +48,9 @@ impl RaftReplicaLogView {
             identity,
             entries: BTreeMap::new(),
             last_replayed_lsn: None,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            committed_index: 0,
         }
     }
 
@@ -70,12 +76,71 @@ impl RaftReplicaLogView {
 
     /// return the last retained log index
     pub fn last_index(&self) -> Option<u64> {
-        self.entries.last_key_value().map(|(index, _)| *index)
+        self.entries
+            .last_key_value()
+            .map(|(index, _)| *index)
+            .or((self.snapshot_index != 0).then_some(self.snapshot_index))
     }
 
     /// look up one entry without consulting another replica lifetime
     pub fn entry(&self, index: u64) -> Option<&RecoveredRaftLogEntry> {
         self.entries.get(&index)
+    }
+
+    pub const fn snapshot_boundary(&self) -> Option<(u64, u64)> {
+        if self.snapshot_index == 0 {
+            None
+        } else {
+            Some((self.snapshot_index, self.snapshot_term))
+        }
+    }
+
+    pub const fn committed_index(&self) -> u64 {
+        self.committed_index
+    }
+
+    /// Advance the recovered commit frontier after a validated HardState.
+    pub fn advance_commit(&mut self, commit: u64) -> Result<(), RaftLogViewError> {
+        if commit < self.committed_index {
+            return Err(RaftLogViewError::CommitRegression {
+                previous: self.committed_index,
+                received: commit,
+            });
+        }
+        self.committed_index = commit;
+        Ok(())
+    }
+
+    /// install a durable snapshot base before replaying its retained suffix
+    pub fn install_snapshot(
+        &mut self,
+        index: u64,
+        term: u64,
+        lsn: Lsn,
+    ) -> Result<(), RaftLogViewError> {
+        if index == 0 || term == 0 {
+            return Err(RaftLogViewError::InvalidSnapshotBoundary { index, term });
+        }
+        if index < self.committed_index || index < self.snapshot_index {
+            return Err(RaftLogViewError::SnapshotRegression {
+                current: self.snapshot_index.max(self.committed_index),
+                received: index,
+            });
+        }
+        if let Some(previous_lsn) = self.last_replayed_lsn
+            && lsn <= previous_lsn
+        {
+            return Err(RaftLogViewError::NonIncreasingLsn {
+                previous: previous_lsn,
+                received: lsn,
+            });
+        }
+        self.entries = self.entries.split_off(&index.saturating_add(1));
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+        self.committed_index = self.committed_index.max(index);
+        self.last_replayed_lsn = Some(lsn);
+        Ok(())
     }
 
     /// iterate over the retained logical log in increasing index order
@@ -117,6 +182,13 @@ impl RaftReplicaLogView {
 
         let index = record.index;
 
+        if index <= self.snapshot_index {
+            return Err(RaftLogViewError::EntryAtOrBelowSnapshot {
+                index,
+                snapshot_index: self.snapshot_index,
+            });
+        }
+
         let outcome = if let Some(existing) = self.entries.get(&index) {
             if record.term == existing.record.term {
                 if record.payload != existing.record.payload {
@@ -136,6 +208,13 @@ impl RaftReplicaLogView {
                         index,
                         current_term: existing.record.term,
                         received_term: record.term,
+                    });
+                }
+
+                if index <= self.committed_index {
+                    return Err(RaftLogViewError::CommittedPrefixOverwrite {
+                        index,
+                        committed_index: self.committed_index,
                     });
                 }
 
@@ -221,4 +300,19 @@ pub enum RaftLogViewError {
         current_term: u64,
         received_term: u64,
     },
+
+    #[error("Raft entry {index} is at or below snapshot boundary {snapshot_index}")]
+    EntryAtOrBelowSnapshot { index: u64, snapshot_index: u64 },
+
+    #[error("Raft entry {index} would overwrite committed prefix through {committed_index}")]
+    CommittedPrefixOverwrite { index: u64, committed_index: u64 },
+
+    #[error("Raft commit index regressed from {previous} to {received}")]
+    CommitRegression { previous: u64, received: u64 },
+
+    #[error("invalid Raft snapshot boundary index {index}, term {term}")]
+    InvalidSnapshotBoundary { index: u64, term: u64 },
+
+    #[error("Raft snapshot boundary regressed from {current} to {received}")]
+    SnapshotRegression { current: u64, received: u64 },
 }

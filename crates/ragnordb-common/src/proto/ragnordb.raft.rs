@@ -82,10 +82,11 @@ pub struct RaftHardStateRecord {
     #[prost(uint64, tag = "6")]
     pub commit_index: u64,
 }
-/// durable membership state associated with one replica lifetime. Repeated
-/// identities are encoded in ascending order by the domain codec
+/// durable pointer to a separately synchronized Raft snapshot image. confState
+/// is authoritative here because the snapshot replaces the committed prefix;
+/// outside snapshots membership is derived from committed configuration entries
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RaftConfStateRecord {
+pub struct RaftSnapshotPointerRecord {
     #[prost(uint32, tag = "1")]
     pub format_version: u32,
     #[prost(message, optional, tag = "2")]
@@ -93,30 +94,28 @@ pub struct RaftConfStateRecord {
     #[prost(message, optional, tag = "3")]
     pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
     #[prost(uint64, tag = "4")]
-    pub configuration_version: u64,
-    #[prost(message, repeated, tag = "5")]
-    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
-    #[prost(message, repeated, tag = "6")]
-    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
-    #[prost(message, repeated, tag = "7")]
-    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
-}
-/// durable logical frontiers for one replica lifetime. The truncation boundary
-/// retains its term so the Raft core can validate AppendEntries immediately
-/// before the first retained log entry
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RaftProgressRecord {
-    #[prost(uint32, tag = "1")]
-    pub format_version: u32,
-    #[prost(message, optional, tag = "2")]
-    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
-    #[prost(message, optional, tag = "3")]
-    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
-    #[prost(uint64, tag = "4")]
-    pub truncated_through_index: u64,
+    pub snapshot_id: u64,
     #[prost(uint64, tag = "5")]
-    pub truncated_through_term: u64,
+    pub last_included_index: u64,
     #[prost(uint64, tag = "6")]
+    pub last_included_term: u64,
+    #[prost(uint64, tag = "7")]
+    pub configuration_version: u64,
+    #[prost(message, repeated, tag = "8")]
+    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "9")]
+    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "10")]
+    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "11")]
+    pub size_bytes: u64,
+    #[prost(bytes = "vec", tag = "12")]
+    pub checksum: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "13")]
+    pub file_name: ::prost::alloc::string::String,
+    /// The state-machine image is applied through this exact index. V1 requires
+    /// it to equal last_included_index so replay always resumes at index + 1.
+    #[prost(uint64, tag = "14")]
     pub applied_index: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

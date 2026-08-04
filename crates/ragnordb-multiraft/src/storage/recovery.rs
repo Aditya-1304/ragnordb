@@ -16,10 +16,11 @@ use wal::{
 
 use super::{
     codec::{
-        RaftConfStateRecord, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
-        RaftReplicaIdentity, RaftStableStateCodecError,
+        DurableRaftEntryPayload, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
+        RaftReplicaIdentity, RaftSnapshotPointerRecord, RaftStableStateCodecError,
+        validate_hard_state_successor,
     },
-    frontier::{RaftProgress, RaftProgressError, RaftProgressRecord},
+    frontier::RaftProgress,
     persistence::RaftWalRecordType,
     view::{RaftLogViewError, RaftReplicaLogView},
 };
@@ -45,6 +46,7 @@ pub struct RecoveredRaftReplica {
     conf_state: Option<ConfState>,
     hard_state: Option<HardState>,
     progress: RaftProgress,
+    snapshot: Option<RaftSnapshotPointerRecord>,
 }
 
 impl RecoveredRaftReplica {
@@ -54,6 +56,7 @@ impl RecoveredRaftReplica {
             conf_state: None,
             hard_state: None,
             progress: RaftProgress::default(),
+            snapshot: None,
         }
     }
 
@@ -80,6 +83,10 @@ impl RecoveredRaftReplica {
     /// return the latest recovered truncation and applied frontiers
     pub fn progress(&self) -> RaftProgress {
         self.progress
+    }
+
+    pub fn snapshot(&self) -> Option<&RaftSnapshotPointerRecord> {
+        self.snapshot.as_ref()
     }
 }
 
@@ -127,19 +134,11 @@ impl RecoveredRaftStorage {
             .entry(identity)
             .or_insert_with(|| RecoveredRaftReplica::new(identity))
     }
-}
 
-///  every Raft-owned record encountered by one forward WAL scan
-///
-/// Unrelated A-WAL records are deliberately ignored. Any malformed Raft-owned
-/// record fails recovery closed instead of silently dropping durable state
-pub fn recover_raft_storage<S: RaftWalRecoverySource>(
-    source: &mut S,
-) -> Result<RecoveredRaftStorage, RaftStorageRecoveryError> {
-    let mut recovered = RecoveredRaftStorage::default();
-
-    while let Some(record) = source.next_record()? {
-        if let Some(previous_lsn) = recovered.last_scanned_lsn
+    /// Route one physical WAL record into its Raft-owned recovery state.
+    /// Non-Raft records still advance the shared physical scan frontier.
+    pub fn observe_record(&mut self, record: WalRecord) -> Result<(), RaftStorageRecoveryError> {
+        if let Some(previous_lsn) = self.last_scanned_lsn
             && record.lsn <= previous_lsn
         {
             return Err(RaftStorageRecoveryError::NonIncreasingWalLsn {
@@ -147,22 +146,15 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
                 received: record.lsn,
             });
         }
-
-        recovered.scanned_records += 1;
-        recovered.last_scanned_lsn = Some(record.lsn);
-
+        self.scanned_records += 1;
+        self.last_scanned_lsn = Some(record.lsn);
         let Some(record_kind) = RaftWalRecordType::from_wal_record_type(record.record_type) else {
-            continue;
+            return Ok(());
         };
-
         match record_kind {
             RaftWalRecordType::LogEntry => {
                 let entry = RaftLogEntryRecord::decode(&record.payload)?;
-
-                let replica = recovered.replica_mut(entry.identity);
-
-                // once a prefix has been truncated, later WAL records must
-                // never recreate entries inside that compacted prefix
+                let replica = self.replica_mut(entry.identity);
                 if entry.index <= replica.progress.truncated_through_index {
                     return Err(RaftStorageRecoveryError::EntryAtOrBelowTruncation {
                         identity: entry.identity,
@@ -171,7 +163,6 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
                         lsn: record.lsn,
                     });
                 }
-
                 replica
                     .log_view
                     .replay(entry, record.lsn)
@@ -180,22 +171,13 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
                         source,
                     })?;
             }
-
-            RaftWalRecordType::ConfState => {
-                let conf_state = RaftConfStateRecord::decode(&record.payload)?;
-
-                recovered.replica_mut(conf_state.identity).conf_state = Some(conf_state.to_core()?);
-            }
-
             RaftWalRecordType::HardState => {
                 let hard_state = RaftHardStateRecord::decode(&record.payload)?;
-
                 let identity = hard_state.identity;
                 let hard_state = hard_state.to_core()?;
-                let replica = recovered.replica_mut(identity);
-
+                let replica = self.replica_mut(identity);
+                validate_hard_state_successor(replica.hard_state.as_ref(), &hard_state)?;
                 let last_log_index = replica.log_view.last_index().unwrap_or(0);
-
                 if hard_state.commit > last_log_index {
                     return Err(
                         RaftStorageRecoveryError::HardStateCommitBeyondRecoveredLog {
@@ -206,61 +188,116 @@ pub fn recover_raft_storage<S: RaftWalRecoverySource>(
                         },
                     );
                 }
-
+                replica
+                    .log_view
+                    .advance_commit(hard_state.commit)
+                    .map_err(|source| RaftStorageRecoveryError::InvalidLogTransition {
+                        lsn: record.lsn,
+                        source,
+                    })?;
                 replica.hard_state = Some(hard_state);
             }
-
-            RaftWalRecordType::Progress => {
-                let progress = RaftProgressRecord::decode(&record.payload)?;
-
-                let identity = progress.identity;
-                let progress = progress.progress;
-                let replica = recovered.replica_mut(identity);
-
-                progress.validate_successor(replica.progress)?;
-
-                let durable_commit = replica
-                    .hard_state
-                    .as_ref()
-                    .map(|hard_state| hard_state.commit)
-                    .unwrap_or(0);
-
-                // applied state may depend only on a HardState commit record
-                // that appeared earlier in the recoverable WAL prefix
-                if progress.applied_index > durable_commit {
-                    return Err(RaftStorageRecoveryError::AppliedBeyondRecoveredCommit {
-                        identity,
-                        applied_index: progress.applied_index,
-                        durable_commit,
+            RaftWalRecordType::SnapshotPointer => {
+                let snapshot = RaftSnapshotPointerRecord::decode(&record.payload)?;
+                let replica = self.replica_mut(snapshot.identity);
+                replica
+                    .log_view
+                    .install_snapshot(
+                        snapshot.last_included_index,
+                        snapshot.last_included_term,
+                        record.lsn,
+                    )
+                    .map_err(|source| RaftStorageRecoveryError::InvalidLogTransition {
                         lsn: record.lsn,
-                    });
-                }
-
-                if progress.truncated_through_index != 0 {
-                    let boundary = replica
-                        .log_view
-                        .entry(progress.truncated_through_index)
-                        .ok_or(RaftStorageRecoveryError::MissingTruncationBoundary {
-                            identity,
-                            index: progress.truncated_through_index,
-                            lsn: record.lsn,
-                        })?;
-
-                    if boundary.record.term != progress.truncated_through_term {
-                        return Err(RaftStorageRecoveryError::TruncationTermMismatch {
-                            identity,
-                            index: progress.truncated_through_index,
-                            expected_term: boundary.record.term,
-                            received_term: progress.truncated_through_term,
-                            lsn: record.lsn,
-                        });
+                        source,
+                    })?;
+                replica.progress = RaftProgress {
+                    truncated_through_index: snapshot.last_included_index,
+                    truncated_through_term: snapshot.last_included_term,
+                    applied_index: snapshot.applied_index,
+                };
+                replica.hard_state = Some(match replica.hard_state.take() {
+                    Some(mut state) if state.current_term >= snapshot.last_included_term => {
+                        state.commit = state.commit.max(snapshot.last_included_index);
+                        state
                     }
-                }
-
-                replica.progress = progress;
+                    Some(_) | None => HardState {
+                        current_term: snapshot.last_included_term,
+                        voted_for: None,
+                        commit: snapshot.last_included_index,
+                    },
+                });
+                replica.conf_state = Some(snapshot.conf_state.clone());
+                replica.snapshot = Some(snapshot);
             }
         }
+        Ok(())
     }
+
+    /// Finalize membership after the shared scan reaches its validated end.
+    pub fn finish_configurations(
+        &mut self,
+        initial_configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
+    ) -> Result<(), RaftStorageRecoveryError> {
+        for (identity, replica) in &mut self.replicas {
+            let mut conf_state = replica
+                .conf_state
+                .clone()
+                .or_else(|| initial_configurations.get(identity).cloned());
+            let commit = replica
+                .hard_state
+                .as_ref()
+                .map(|state| state.commit)
+                .unwrap_or(0);
+            for entry in replica.log_view.entries() {
+                if entry.record.index > commit {
+                    break;
+                }
+                if let DurableRaftEntryPayload::Configuration(change) = entry.record.payload {
+                    let current = conf_state.as_ref().ok_or(
+                        RaftStorageRecoveryError::MissingInitialConfiguration {
+                            identity: *identity,
+                            index: entry.record.index,
+                        },
+                    )?;
+                    conf_state = Some(current.apply(&change).map_err(|source| {
+                        RaftStorageRecoveryError::InvalidCommittedConfiguration {
+                            identity: *identity,
+                            index: entry.record.index,
+                            reason: format!("{source:?}"),
+                        }
+                    })?);
+                }
+            }
+            replica.conf_state = conf_state;
+        }
+        Ok(())
+    }
+}
+
+///  every Raft-owned record encountered by one forward WAL scan
+///
+/// Unrelated A-WAL records are deliberately ignored. Any malformed Raft-owned
+/// record fails recovery closed instead of silently dropping durable state
+pub fn recover_raft_storage<S: RaftWalRecoverySource>(
+    source: &mut S,
+) -> Result<RecoveredRaftStorage, RaftStorageRecoveryError> {
+    recover_raft_storage_with_configurations(source, &BTreeMap::new())
+}
+
+/// Recover all replicas in one pass and derive membership from a snapshot or
+/// the exactly-once bootstrap configuration plus committed change entries.
+pub fn recover_raft_storage_with_configurations<S: RaftWalRecoverySource>(
+    source: &mut S,
+    initial_configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
+) -> Result<RecoveredRaftStorage, RaftStorageRecoveryError> {
+    let mut recovered = RecoveredRaftStorage::default();
+
+    while let Some(record) = source.next_record()? {
+        recovered.observe_record(record)?;
+    }
+
+    recovered.finish_configurations(initial_configurations)?;
 
     Ok(recovered)
 }
@@ -276,9 +313,6 @@ pub enum RaftStorageRecoveryError {
 
     #[error("invalid durable Raft stable state: {0}")]
     InvalidStableState(#[from] RaftStableStateCodecError),
-
-    #[error("invalid durable Raft progress state: {0}")]
-    InvalidProgress(#[from] RaftProgressError),
 
     #[error(
         "Raft WAL LSN must increase: previous \
@@ -317,38 +351,17 @@ pub enum RaftStorageRecoveryError {
     },
 
     #[error(
-        "Raft progress for {identity:?} at WAL LSN \
-         {lsn:?} applies index {applied_index}, but \
-         durable commit is {durable_commit}"
+        "Raft configuration entry {index} for {identity:?} has no bootstrap or snapshot configuration"
     )]
-    AppliedBeyondRecoveredCommit {
-        identity: RaftReplicaIdentity,
-        applied_index: u64,
-        durable_commit: u64,
-        lsn: Lsn,
-    },
-
-    #[error(
-        "Raft progress for {identity:?} at WAL LSN \
-         {lsn:?} references missing truncation \
-         boundary {index}"
-    )]
-    MissingTruncationBoundary {
+    MissingInitialConfiguration {
         identity: RaftReplicaIdentity,
         index: u64,
-        lsn: Lsn,
     },
 
-    #[error(
-        "Raft truncation boundary {index} for \
-         {identity:?} at WAL LSN {lsn:?} has term \
-         {expected_term}, not {received_term}"
-    )]
-    TruncationTermMismatch {
+    #[error("invalid committed Raft configuration entry {index} for {identity:?}: {reason}")]
+    InvalidCommittedConfiguration {
         identity: RaftReplicaIdentity,
         index: u64,
-        expected_term: u64,
-        received_term: u64,
-        lsn: Lsn,
+        reason: String,
     },
 }

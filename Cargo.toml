@@ -36,7 +36,8 @@ metrics-exporter-prometheus = "0.16"
 tokio-util = "0.7"
 toml = "0.8"
 crc32c = "0.6"
+blake3 = "1"
 
-raft = { path = "../Papers/raft" }
-wal = { path = "../wal" }
-bloom-bloom = { path = "../bloom-bloom" }
+raft = { path = "../Papers/raft", version = "=0.1.0" }
+wal = { path = "../wal", version = "=0.1.0" }
+bloom-bloom = { path = "../bloom-bloom", version = "=0.1.0" }

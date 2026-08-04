@@ -1,52 +1,51 @@
 //! ordered shared-WAL persistence for one Raft replica lifetime
 //!
-//! the writer appends entries first, configuration state next, and HardState
-//! last. No logical view or stable state is published until the complete final
-//! record extent has been synchronized through its exact end LSN
+//! snapshot pointers precede dependent entries, and HardState is always last.
+//! No logical state is published until A-WAL synchronizes the complete batch.
 
 use raft::{
     entry::LogEntry,
     types::{ConfState, HardState},
 };
+use std::sync::{Arc, Mutex};
 use wal::{
-    error::{AppendFailure, WalError},
+    error::{BatchAppendFailure, WalError},
     io::directory::SegmentDirectory,
     lsn::Lsn,
-    types::{RecordType, record_types::USER_MIN},
-    wal::{AppendResult, WalHandle},
+    types::RecordType,
+    wal::{BatchAppendResult, WalHandle},
 };
 
 use super::{
     codec::{
-        RaftConfStateRecord, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
-        RaftReplicaIdentity, RaftStableStateCodecError,
+        RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord, RaftReplicaIdentity,
+        RaftSnapshotPointerRecord, RaftStableStateCodecError, validate_hard_state_successor,
     },
-    frontier::{RaftProgress, RaftProgressError, RaftProgressRecord},
     view::{RaftLogViewError, RaftReplicaLogView},
 };
-
-const RAFT_LOG_ENTRY_RECORD_ID: u16 = USER_MIN + 8;
-const RAFT_CONF_STATE_RECORD_ID: u16 = USER_MIN + 9;
-const RAFT_HARD_STATE_RECORD_ID: u16 = USER_MIN + 10;
-const RAFT_PROGRESS_RECORD_ID: u16 = USER_MIN + 11;
+use ragnordb_common::wal_registry::SharedWalRecordType;
 
 /// permanent user record identities reserved for Raft storage in shared A-WAL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftWalRecordType {
     LogEntry,
-    ConfState,
     HardState,
-    Progress,
+    SnapshotPointer,
 }
 
 impl RaftWalRecordType {
     /// return the stable A-WAL record identifier for this payload schema
     pub const fn as_wal_record_type(self) -> RecordType {
         let id = match self {
-            Self::LogEntry => RAFT_LOG_ENTRY_RECORD_ID,
-            Self::ConfState => RAFT_CONF_STATE_RECORD_ID,
-            Self::HardState => RAFT_HARD_STATE_RECORD_ID,
-            Self::Progress => RAFT_PROGRESS_RECORD_ID,
+            Self::LogEntry => SharedWalRecordType::RaftLogEntry
+                .as_wal_record_type()
+                .as_u16(),
+            Self::HardState => SharedWalRecordType::RaftHardState
+                .as_wal_record_type()
+                .as_u16(),
+            Self::SnapshotPointer => SharedWalRecordType::RaftSnapshotPointer
+                .as_wal_record_type()
+                .as_u16(),
         };
 
         RecordType::new(id)
@@ -54,11 +53,10 @@ impl RaftWalRecordType {
 
     /// classify a shared WAL record without claiming unrelated user records
     pub const fn from_wal_record_type(record_type: RecordType) -> Option<Self> {
-        match record_type.as_u16() {
-            RAFT_LOG_ENTRY_RECORD_ID => Some(Self::LogEntry),
-            RAFT_CONF_STATE_RECORD_ID => Some(Self::ConfState),
-            RAFT_HARD_STATE_RECORD_ID => Some(Self::HardState),
-            RAFT_PROGRESS_RECORD_ID => Some(Self::Progress),
+        match SharedWalRecordType::classify(record_type) {
+            Some(SharedWalRecordType::RaftLogEntry) => Some(Self::LogEntry),
+            Some(SharedWalRecordType::RaftHardState) => Some(Self::HardState),
+            Some(SharedWalRecordType::RaftSnapshotPointer) => Some(Self::SnapshotPointer),
             _ => None,
         }
     }
@@ -66,37 +64,114 @@ impl RaftWalRecordType {
 
 /// minimal public A-WAL boundary required by Raft persistence
 pub trait RaftWal {
-    fn append(
+    fn append_batch_and_sync(
         &mut self,
-        record_type: RecordType,
-        payload: &[u8],
-    ) -> Result<AppendResult, AppendFailure>;
-
-    fn sync_through(&mut self, end_lsn: Lsn) -> Result<(), WalError>;
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure>;
 }
 
 impl<D, C> RaftWal for WalHandle<D, C>
 where
     D: SegmentDirectory + Clone,
 {
-    fn append(
+    fn append_batch_and_sync(
         &mut self,
-        record_type: RecordType,
-        payload: &[u8],
-    ) -> Result<AppendResult, AppendFailure> {
-        WalHandle::append(self, record_type, payload)
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        WalHandle::append_batch_and_sync(self, records)
+    }
+}
+
+/// Node-wide owner of the single serialized Raft persistence boundary.
+///
+/// Every group receives a lightweight handle to this owner. An uncertain batch
+/// outcome permanently fences all handles until restart and shared recovery.
+pub struct NodeRaftWal<W> {
+    state: Arc<Mutex<NodeRaftWalState<W>>>,
+}
+
+struct NodeRaftWalState<W> {
+    wal: W,
+    recovery_required: bool,
+}
+
+impl<W> NodeRaftWal<W> {
+    pub fn new(wal: W) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(NodeRaftWalState {
+                wal,
+                recovery_required: false,
+            })),
+        }
     }
 
-    fn sync_through(&mut self, end_lsn: Lsn) -> Result<(), WalError> {
-        WalHandle::sync_through(self, end_lsn)
+    pub fn group_writer(&self) -> NodeRaftWalHandle<W> {
+        NodeRaftWalHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub fn recovery_required(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.recovery_required)
+            .unwrap_or(true)
+    }
+}
+
+impl<W> Clone for NodeRaftWal<W> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+pub struct NodeRaftWalHandle<W> {
+    state: Arc<Mutex<NodeRaftWalState<W>>>,
+}
+
+impl<W> Clone for NodeRaftWalHandle<W> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
+    fn append_batch_and_sync(
+        &mut self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BatchAppendFailure::NotStaged(WalError::BrokenDurabilityContract))?;
+        if state.recovery_required {
+            return Err(BatchAppendFailure::NotStaged(
+                WalError::BrokenDurabilityContract,
+            ));
+        }
+        let result = state.wal.append_batch_and_sync(records);
+        if matches!(result, Err(BatchAppendFailure::OutcomeUnknown { .. }))
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.wal_error().requires_recovery())
+        {
+            state.recovery_required = true;
+        }
+        result
     }
 }
 
 /// one logical persistence generation supplied by the future Ready loop
 #[derive(Debug, Clone)]
 pub struct RaftPersistenceBatch {
+    /// Snapshot file pointer, already synchronized before this WAL batch.
+    pub snapshot: Option<RaftSnapshotPointerRecord>,
     pub entries: Vec<LogEntry<Vec<u8>>>,
-    pub conf_state: Option<ConfState>,
     pub hard_state: Option<HardState>,
 }
 
@@ -117,7 +192,7 @@ pub struct RaftWalStorage<W> {
     hard_state: Option<HardState>,
     durable_end_lsn: Option<Lsn>,
     recovery_required: bool,
-    progress: RaftProgress,
+    snapshot: Option<RaftSnapshotPointerRecord>,
 }
 
 impl<W: RaftWal> RaftWalStorage<W> {
@@ -131,7 +206,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
             hard_state: None,
             durable_end_lsn: None,
             recovery_required: false,
-            progress: RaftProgress::default(),
+            snapshot: None,
         }
     }
 
@@ -151,9 +226,8 @@ impl<W: RaftWal> RaftWalStorage<W> {
         self.hard_state.as_ref()
     }
 
-    /// returns the last progress frontier acknowledged by exact WAL sync
-    pub fn progress(&self) -> RaftProgress {
-        self.progress
+    pub fn snapshot(&self) -> Option<&RaftSnapshotPointerRecord> {
+        self.snapshot.as_ref()
     }
 
     pub fn durable_end_lsn(&self) -> Option<Lsn> {
@@ -162,84 +236,6 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
     pub fn recovery_required(&self) -> bool {
         self.recovery_required
-    }
-
-    /// persist a post Ready apply or truncation frontier as its own WAL batch
-    ///
-    /// progress may reference only a commit already acknowledged durable. This
-    /// prevents a crash prefix from retaining applied state before HardState
-    pub fn persist_progress(
-        &mut self,
-        progress: RaftProgress,
-    ) -> Result<RaftPersistedBatch, RaftPersistenceError> {
-        if self.recovery_required {
-            return Err(RaftPersistenceError::RecoveryRequired);
-        }
-
-        progress.validate_successor(self.progress)?;
-
-        let durable_commit = self
-            .hard_state
-            .as_ref()
-            .map(|hard_state| hard_state.commit)
-            .unwrap_or(0);
-
-        if progress.applied_index > durable_commit {
-            return Err(RaftPersistenceError::AppliedBeyondDurableCommit {
-                applied_index: progress.applied_index,
-                durable_commit,
-            });
-        }
-
-        if progress.truncated_through_index != 0 {
-            let boundary = self
-                .log_view
-                .entry(progress.truncated_through_index)
-                .ok_or(RaftPersistenceError::MissingTruncationBoundary {
-                    index: progress.truncated_through_index,
-                })?;
-
-            if boundary.record.term != progress.truncated_through_term {
-                return Err(RaftPersistenceError::TruncationTermMismatch {
-                    index: progress.truncated_through_index,
-                    expected_term: boundary.record.term,
-                    received_term: progress.truncated_through_term,
-                });
-            }
-        }
-
-        let payload = RaftProgressRecord::new(self.identity, progress)?.encode()?;
-
-        let extent = match self
-            .wal
-            .append(RaftWalRecordType::Progress.as_wal_record_type(), &payload)
-        {
-            Ok(extent) => extent,
-
-            Err(failure) => {
-                return Err(self.map_append_failure(failure, &[]));
-            }
-        };
-
-        if let Err(source) = self.wal.sync_through(extent.end_lsn) {
-            self.recovery_required = true;
-
-            return Err(RaftPersistenceError::OutcomeUnknown {
-                start_lsn: extent.start_lsn,
-                end_lsn: extent.end_lsn,
-                reason: source.to_string(),
-            });
-        }
-
-        // publish the logical frontier only after its exact extent is durable
-        self.progress = progress;
-        self.durable_end_lsn = Some(extent.end_lsn);
-
-        Ok(RaftPersistedBatch {
-            start_lsn: Some(extent.start_lsn),
-            end_lsn: Some(extent.end_lsn),
-            record_count: 1,
-        })
     }
 
     /// persist one ordered generation and publish it only after exact sync
@@ -254,7 +250,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
         let PreparedBatch {
             records,
             entry_records,
-            conf_state,
+            snapshot,
             hard_state,
         } = self.prepare_batch(batch)?;
 
@@ -266,18 +262,40 @@ impl<W: RaftWal> RaftWalStorage<W> {
             });
         }
 
-        let mut extents = Vec::with_capacity(records.len());
-
-        for record in &records {
-            match self
-                .wal
-                .append(record.kind.as_wal_record_type(), &record.payload)
-            {
-                Ok(extent) => extents.push(extent),
-                Err(failure) => {
-                    return Err(self.map_append_failure(failure, &extents));
-                }
+        let borrowed_records: Vec<_> = records
+            .iter()
+            .map(|record| (record.kind.as_wal_record_type(), record.payload.as_slice()))
+            .collect();
+        let extents = match self.wal.append_batch_and_sync(&borrowed_records) {
+            Ok(extents) => extents,
+            Err(BatchAppendFailure::NotStaged(source)) => {
+                let recovery_required = source.requires_recovery();
+                self.recovery_required |= recovery_required;
+                return Err(RaftPersistenceError::NotStaged {
+                    recovery_required,
+                    reason: source.to_string(),
+                });
             }
+            Err(BatchAppendFailure::OutcomeUnknown { result, source }) => {
+                self.recovery_required = true;
+                return Err(RaftPersistenceError::OutcomeUnknown {
+                    start_lsn: result
+                        .record_extents
+                        .first()
+                        .map(|extent| extent.start_lsn)
+                        .unwrap_or(Lsn::ZERO),
+                    end_lsn: result.final_end_lsn,
+                    reason: source.to_string(),
+                });
+            }
+        };
+        let extents = extents.record_extents;
+
+        if extents.len() != records.len() {
+            self.recovery_required = true;
+            return Err(RaftPersistenceError::PostSyncInvariant(
+                "A-WAL returned a different extent count for a successful batch".to_string(),
+            ));
         }
 
         let start_lsn = extents.first().map(|extent| extent.start_lsn).ok_or(
@@ -292,19 +310,27 @@ impl<W: RaftWal> RaftWalStorage<W> {
             ),
         )?;
 
-        if let Err(source) = self.wal.sync_through(end_lsn) {
-            self.recovery_required = true;
+        let mut durable_view = self.log_view.clone();
+        let mut extent_offset = 0;
 
-            return Err(RaftPersistenceError::OutcomeUnknown {
-                start_lsn,
-                end_lsn,
-                reason: source.to_string(),
-            });
+        if let Some(snapshot) = &snapshot {
+            durable_view
+                .install_snapshot(
+                    snapshot.last_included_index,
+                    snapshot.last_included_term,
+                    extents[0].start_lsn,
+                )
+                .map_err(|error| {
+                    self.recovery_required = true;
+                    RaftPersistenceError::PostSyncInvariant(error.to_string())
+                })?;
+            extent_offset = 1;
         }
 
-        let mut durable_view = self.log_view.clone();
-
-        for (record, extent) in entry_records.into_iter().zip(extents.iter()) {
+        for (record, extent) in entry_records
+            .into_iter()
+            .zip(extents.iter().skip(extent_offset))
+        {
             durable_view
                 .replay(record, extent.start_lsn)
                 .map_err(|error| {
@@ -315,11 +341,29 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
         self.log_view = durable_view;
 
-        if let Some(conf_state) = conf_state {
-            self.conf_state = Some(conf_state);
+        if let Some(snapshot) = snapshot {
+            self.conf_state = Some(snapshot.conf_state.clone());
+            self.hard_state = Some(match self.hard_state.take() {
+                Some(mut state) if state.current_term >= snapshot.last_included_term => {
+                    state.commit = state.commit.max(snapshot.last_included_index);
+                    state
+                }
+                Some(_) | None => HardState {
+                    current_term: snapshot.last_included_term,
+                    voted_for: None,
+                    commit: snapshot.last_included_index,
+                },
+            });
+            self.snapshot = Some(snapshot);
         }
 
         if let Some(hard_state) = hard_state {
+            self.log_view
+                .advance_commit(hard_state.commit)
+                .map_err(|error| {
+                    self.recovery_required = true;
+                    RaftPersistenceError::PostSyncInvariant(error.to_string())
+                })?;
             self.hard_state = Some(hard_state);
         }
 
@@ -342,6 +386,31 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
         let mut preview_lsn = preview.last_replayed_lsn().unwrap_or(Lsn::ZERO).as_u64();
 
+        let snapshot = if let Some(snapshot) = batch.snapshot {
+            snapshot.validate()?;
+            if snapshot.identity != self.identity {
+                return Err(RaftPersistenceError::SnapshotIdentityMismatch {
+                    expected: self.identity,
+                    received: snapshot.identity,
+                });
+            }
+            preview_lsn = preview_lsn
+                .checked_add(1)
+                .ok_or(RaftPersistenceError::PreviewLsnExhausted)?;
+            preview.install_snapshot(
+                snapshot.last_included_index,
+                snapshot.last_included_term,
+                Lsn::new(preview_lsn),
+            )?;
+            records.push(PreparedRecord {
+                kind: RaftWalRecordType::SnapshotPointer,
+                payload: snapshot.encode()?,
+            });
+            Some(snapshot)
+        } else {
+            None
+        };
+
         for entry in batch.entries {
             preview_lsn = preview_lsn
                 .checked_add(1)
@@ -359,20 +428,22 @@ impl<W: RaftWal> RaftWalStorage<W> {
             entry_records.push(record);
         }
 
-        let conf_state = if let Some(conf_state) = batch.conf_state {
-            let record = RaftConfStateRecord::from_core(self.identity, conf_state.clone())?;
-
-            records.push(PreparedRecord {
-                kind: RaftWalRecordType::ConfState,
-                payload: record.encode()?,
-            });
-
-            Some(conf_state)
-        } else {
-            None
-        };
-
         let hard_state = if let Some(hard_state) = batch.hard_state {
+            validate_hard_state_successor(self.hard_state.as_ref(), &hard_state)?;
+            if let Some(snapshot) = &snapshot {
+                if hard_state.current_term < snapshot.last_included_term {
+                    return Err(RaftPersistenceError::HardStateBeforeSnapshotTerm {
+                        current_term: hard_state.current_term,
+                        snapshot_term: snapshot.last_included_term,
+                    });
+                }
+                if hard_state.commit < snapshot.last_included_index {
+                    return Err(RaftPersistenceError::HardStateBeforeSnapshotCommit {
+                        commit_index: hard_state.commit,
+                        snapshot_index: snapshot.last_included_index,
+                    });
+                }
+            }
             if hard_state.commit > preview.last_index().unwrap_or(0) {
                 return Err(RaftPersistenceError::CommitBeyondLog {
                     commit_index: hard_state.commit,
@@ -395,58 +466,9 @@ impl<W: RaftWal> RaftWalStorage<W> {
         Ok(PreparedBatch {
             records,
             entry_records,
-            conf_state,
+            snapshot,
             hard_state,
         })
-    }
-
-    fn map_append_failure(
-        &mut self,
-        failure: AppendFailure,
-        prior_extents: &[AppendResult],
-    ) -> RaftPersistenceError {
-        match failure {
-            AppendFailure::NotStaged(source) if prior_extents.is_empty() => {
-                let recovery_required = source.requires_recovery();
-
-                if recovery_required {
-                    self.recovery_required = true;
-                }
-
-                RaftPersistenceError::NotStaged {
-                    recovery_required,
-                    reason: source.to_string(),
-                }
-            }
-
-            AppendFailure::NotStaged(source) => {
-                self.recovery_required = true;
-
-                let first = prior_extents.first().expect("checked non-empty");
-                let last = prior_extents.last().expect("checked non-empty");
-
-                RaftPersistenceError::OutcomeUnknown {
-                    start_lsn: first.start_lsn,
-                    end_lsn: last.end_lsn,
-                    reason: source.to_string(),
-                }
-            }
-
-            AppendFailure::OutcomeUnknown { extent, source } => {
-                self.recovery_required = true;
-
-                let start_lsn = prior_extents
-                    .first()
-                    .map(|prior| prior.start_lsn)
-                    .unwrap_or(extent.start_lsn);
-
-                RaftPersistenceError::OutcomeUnknown {
-                    start_lsn,
-                    end_lsn: extent.end_lsn,
-                    reason: source.to_string(),
-                }
-            }
-        }
     }
 }
 
@@ -458,7 +480,7 @@ struct PreparedRecord {
 struct PreparedBatch {
     records: Vec<PreparedRecord>,
     entry_records: Vec<RaftLogEntryRecord>,
-    conf_state: Option<ConfState>,
+    snapshot: Option<RaftSnapshotPointerRecord>,
     hard_state: Option<HardState>,
 }
 
@@ -511,31 +533,21 @@ pub enum RaftPersistenceError {
     #[error("internal Raft persistence invariant failed: {0}")]
     InternalInvariant(&'static str),
 
-    #[error("invalid Raft progress state: {0}")]
-    InvalidProgress(#[from] RaftProgressError),
-
-    #[error(
-        "applied index {applied_index} exceeds \
-     durable commit index {durable_commit}"
-    )]
-    AppliedBeyondDurableCommit {
-        applied_index: u64,
-        durable_commit: u64,
+    #[error("Raft snapshot belongs to {received:?}, but storage owns {expected:?}")]
+    SnapshotIdentityMismatch {
+        expected: RaftReplicaIdentity,
+        received: RaftReplicaIdentity,
     },
 
-    #[error(
-        "truncation boundary index {index} is \
-     absent from the durable log"
-    )]
-    MissingTruncationBoundary { index: u64 },
+    #[error("HardState term {current_term} is below snapshot term {snapshot_term}")]
+    HardStateBeforeSnapshotTerm {
+        current_term: u64,
+        snapshot_term: u64,
+    },
 
-    #[error(
-        "truncation boundary {index} has term \
-     {expected_term}, not {received_term}"
-    )]
-    TruncationTermMismatch {
-        index: u64,
-        expected_term: u64,
-        received_term: u64,
+    #[error("HardState commit {commit_index} is below snapshot index {snapshot_index}")]
+    HardStateBeforeSnapshotCommit {
+        commit_index: u64,
+        snapshot_index: u64,
     },
 }

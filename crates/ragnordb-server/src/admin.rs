@@ -106,8 +106,11 @@ async fn handle_status(
         },
         "infra": {
             "raft": BUILD_INFO.raft_version,
+            "raft_revision": BUILD_INFO.raft_revision,
             "wal": BUILD_INFO.wal_version,
+            "wal_revision": BUILD_INFO.wal_revision,
             "bloom": BUILD_INFO.bloom_version,
+            "bloom_revision": BUILD_INFO.bloom_revision,
         },
         "server": {
             "started_at": state.started_at,

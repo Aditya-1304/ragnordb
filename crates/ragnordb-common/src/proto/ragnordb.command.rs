@@ -48,17 +48,12 @@ pub struct PrewriteCommand {
     pub txn_id: ::core::option::Option<super::ids::TxnId>,
     #[prost(message, optional, tag = "2")]
     pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "5")]
     pub primary_key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(enumeration = "super::mvcc::WriteKind", tag = "6")]
-    pub op: i32,
     #[prost(uint64, tag = "7")]
     pub ttl_ms: u64,
-    /// Required for Put and absent for Delete.
-    #[prost(message, optional, tag = "8")]
-    pub row: ::core::option::Option<super::row::Row>,
+    #[prost(message, repeated, tag = "9")]
+    pub writes: ::prost::alloc::vec::Vec<WriteEntry>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommitCommand {
@@ -68,8 +63,8 @@ pub struct CommitCommand {
     pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
     #[prost(message, optional, tag = "3")]
     pub commit_timestamp: ::core::option::Option<super::ids::Timestamp>,
-    #[prost(bytes = "vec", tag = "4")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RollbackCommand {
@@ -77,8 +72,8 @@ pub struct RollbackCommand {
     pub txn_id: ::core::option::Option<super::ids::TxnId>,
     #[prost(message, optional, tag = "2")]
     pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SingleShardCommitCommand {
@@ -107,12 +102,12 @@ pub struct ResolveIntentCommand {
     pub txn_id: ::core::option::Option<super::ids::TxnId>,
     #[prost(message, optional, tag = "2")]
     pub start_timestamp: ::core::option::Option<super::ids::Timestamp>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "super::mvcc::TxnStatus", tag = "4")]
     pub resolved_status: i32,
     #[prost(message, optional, tag = "5")]
     pub commit_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(bytes = "vec", repeated, tag = "6")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CatalogCommand {
@@ -146,6 +141,8 @@ pub struct TabletStateMachineSnapshot {
     pub tablet_epoch: u64,
     #[prost(message, repeated, tag = "4")]
     pub clients: ::prost::alloc::vec::Vec<ClientDeduplicationSnapshot>,
+    #[prost(message, optional, tag = "5")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
 }
 /// last applied request and cached result for one client in this Raft group
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -154,6 +151,57 @@ pub struct ClientDeduplicationSnapshot {
     pub last_request_id: ::core::option::Option<super::ids::RequestId>,
     #[prost(enumeration = "CachedTabletCommandResult", tag = "2")]
     pub cached_result: i32,
+    #[prost(message, optional, tag = "3")]
+    pub cached_rejection: ::core::option::Option<CachedTabletCommandRejection>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CachedTabletCommandRejection {
+    #[prost(enumeration = "CachedTabletCommandRejectionKind", tag = "1")]
+    pub kind: i32,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CachedTabletCommandRejectionKind {
+    Unspecified = 0,
+    InvalidCommand = 1,
+    WriteConflict = 2,
+    UnsupportedCommand = 3,
+}
+impl CachedTabletCommandRejectionKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CACHED_TABLET_COMMAND_REJECTION_KIND_UNSPECIFIED",
+            Self::InvalidCommand => {
+                "CACHED_TABLET_COMMAND_REJECTION_KIND_INVALID_COMMAND"
+            }
+            Self::WriteConflict => "CACHED_TABLET_COMMAND_REJECTION_KIND_WRITE_CONFLICT",
+            Self::UnsupportedCommand => {
+                "CACHED_TABLET_COMMAND_REJECTION_KIND_UNSUPPORTED_COMMAND"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CACHED_TABLET_COMMAND_REJECTION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "CACHED_TABLET_COMMAND_REJECTION_KIND_INVALID_COMMAND" => {
+                Some(Self::InvalidCommand)
+            }
+            "CACHED_TABLET_COMMAND_REJECTION_KIND_WRITE_CONFLICT" => {
+                Some(Self::WriteConflict)
+            }
+            "CACHED_TABLET_COMMAND_REJECTION_KIND_UNSUPPORTED_COMMAND" => {
+                Some(Self::UnsupportedCommand)
+            }
+            _ => None,
+        }
+    }
 }
 /// durable command results require explicit variants so a newer result cannot
 /// accidentally acquire old semantics during recovery

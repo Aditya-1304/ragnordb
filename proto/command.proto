@@ -34,31 +34,25 @@ message TabletCommand {
 message PrewriteCommand {
     ragnordb.ids.TxnId txn_id = 1;
     ragnordb.ids.Timestamp start_timestamp = 2;
-    bytes key = 3;
-
-    // field 4 previously carried one Value, which cannot represent a complete
-    // multi-column SQL row. we will never reuse its durable field number
-    reserved 4;
-
+    reserved 3, 4, 6, 8;
     bytes primary_key = 5;
-    ragnordb.mvcc.WriteKind op = 6;
     uint64 ttl_ms = 7;
-
-    // Required for Put and absent for Delete.
-    ragnordb.row.Row row = 8;
+    repeated WriteEntry writes = 9;
 }
 
 message CommitCommand {
     ragnordb.ids.TxnId txn_id = 1;
     ragnordb.ids.Timestamp start_timestamp = 2;
     ragnordb.ids.Timestamp commit_timestamp = 3;
-    bytes key = 4;
+    reserved 4;
+    repeated bytes keys = 5;
 }
 
 message RollbackCommand {
     ragnordb.ids.TxnId txn_id = 1;
     ragnordb.ids.Timestamp start_timestamp = 2;
-    bytes key = 3;
+    reserved 3;
+    repeated bytes keys = 4;
 }
 
 message SingleShardCommitCommand {
@@ -83,9 +77,10 @@ message WriteEntry {
 message ResolveIntentCommand {
     ragnordb.ids.TxnId txn_id = 1;
     ragnordb.ids.Timestamp start_timestamp = 2;
-    bytes key = 3;
+    reserved 3;
     ragnordb.mvcc.TxnStatus resolved_status = 4;
     ragnordb.ids.Timestamp commit_timestamp = 5;
+    repeated bytes keys = 6;
 }
 
 message CatalogCommand {
@@ -108,12 +103,26 @@ message TabletStateMachineSnapshot {
     ragnordb.ids.TabletId tablet_id = 2;
     uint64 tablet_epoch = 3;
     repeated ClientDeduplicationSnapshot clients = 4;
+    ragnordb.ids.RaftGroupId raft_group_id = 5;
 }
 
 // last applied request and cached result for one client in this Raft group
 message ClientDeduplicationSnapshot {
     ragnordb.ids.RequestId last_request_id = 1;
     CachedTabletCommandResult cached_result = 2;
+    CachedTabletCommandRejection cached_rejection = 3;
+}
+
+message CachedTabletCommandRejection {
+    CachedTabletCommandRejectionKind kind = 1;
+    string reason = 2;
+}
+
+enum CachedTabletCommandRejectionKind {
+    CACHED_TABLET_COMMAND_REJECTION_KIND_UNSPECIFIED = 0;
+    CACHED_TABLET_COMMAND_REJECTION_KIND_INVALID_COMMAND = 1;
+    CACHED_TABLET_COMMAND_REJECTION_KIND_WRITE_CONFLICT = 2;
+    CACHED_TABLET_COMMAND_REJECTION_KIND_UNSUPPORTED_COMMAND = 3;
 }
 
 // durable command results require explicit variants so a newer result cannot

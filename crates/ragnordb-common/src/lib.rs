@@ -20,6 +20,7 @@ pub mod protocol;
 pub mod raft_bootstrap;
 pub mod result;
 pub mod rpc_codec;
+pub mod wal_registry;
 
 pub mod proto {
     pub mod ids {

@@ -18,6 +18,7 @@ use ragnordb_common::{
     encoding::decode_row,
     ids::{TableId, Timestamp, TxnId},
     proto::wal as wal_proto,
+    wal_registry::SharedWalRecordType,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,7 +33,7 @@ use wal::{
     error::{AppendFailure, WalError},
     io::directory::SegmentDirectory,
     lsn::Lsn,
-    types::{RecordType, record_types::USER_MIN},
+    types::RecordType,
     wal::{WalHandle, metrics::WalMetrics, retention_pin::RetentionPinGuard},
 };
 
@@ -49,20 +50,6 @@ pub const CATALOG_UPDATE_VERSION: u32 = 1;
 
 /// current duarable schema version for `CheckpointMarker`
 pub const CHECKPOINT_MARKER_VERSION: u32 = 1;
-
-/// snapshot pointer identifier
-const SNAPSHOT_POINTER_ID: u16 = USER_MIN + 3;
-
-/// Identifier for an atomically committed single node transaction
-const SINGLE_NODE_TXN_COMMIT_ID: u16 = USER_MIN + 5;
-
-/// Identifier for durable catalog mutation
-///
-/// intial catalog bootstrap is represented as the furst catalog update
-const CATALOG_UPDATE_ID: u16 = USER_MIN + 6;
-
-/// Identifier for a published checkpoint boundary.
-const CHECKPOINT_MARKER_ID: u16 = USER_MIN + 7;
 
 /// Semantic RagnorDB record kinds carried by A-WAL user records
 ///
@@ -88,10 +75,18 @@ impl RagnorDbWalRecordType {
     /// return the permanent A-WAL record identitdeir for this playload
     pub const fn as_wal_record_type(self) -> RecordType {
         let record_id = match self {
-            Self::SnapshotPointer => SNAPSHOT_POINTER_ID,
-            Self::SingleNodeTxnCommit => SINGLE_NODE_TXN_COMMIT_ID,
-            Self::CatalogUpdate => CATALOG_UPDATE_ID,
-            Self::CheckpointMarker => CHECKPOINT_MARKER_ID,
+            Self::SnapshotPointer => SharedWalRecordType::DatabaseSnapshotPointer
+                .as_wal_record_type()
+                .as_u16(),
+            Self::SingleNodeTxnCommit => SharedWalRecordType::SingleNodeTxnCommit
+                .as_wal_record_type()
+                .as_u16(),
+            Self::CatalogUpdate => SharedWalRecordType::CatalogUpdate
+                .as_wal_record_type()
+                .as_u16(),
+            Self::CheckpointMarker => SharedWalRecordType::CheckpointMarker
+                .as_wal_record_type()
+                .as_u16(),
         };
 
         RecordType::new(record_id)
@@ -113,12 +108,19 @@ impl RagnorDbWalRecordType {
             return Ok(None);
         }
 
-        let logical_type = match record_type.as_u16() {
-            SNAPSHOT_POINTER_ID => Self::SnapshotPointer,
-            SINGLE_NODE_TXN_COMMIT_ID => Self::SingleNodeTxnCommit,
-            CATALOG_UPDATE_ID => Self::CatalogUpdate,
-            CHECKPOINT_MARKER_ID => Self::CheckpointMarker,
-            unknown_id => {
+        let logical_type = match SharedWalRecordType::classify(record_type) {
+            Some(SharedWalRecordType::DatabaseSnapshotPointer) => Self::SnapshotPointer,
+            Some(SharedWalRecordType::SingleNodeTxnCommit) => Self::SingleNodeTxnCommit,
+            Some(SharedWalRecordType::CatalogUpdate) => Self::CatalogUpdate,
+            Some(SharedWalRecordType::CheckpointMarker) => Self::CheckpointMarker,
+            Some(
+                SharedWalRecordType::RaftHardState
+                | SharedWalRecordType::RaftLogEntry
+                | SharedWalRecordType::RaftSnapshotPointer
+                | SharedWalRecordType::TabletSnapshotChunk,
+            ) => return Ok(None),
+            None => {
+                let unknown_id = record_type.as_u16();
                 return Err(Error::CorruptData(format!(
                     "unknown RagnorDB user WAL record type {unknown_id}; \
                      this binary cannot safely select a payload decoder"

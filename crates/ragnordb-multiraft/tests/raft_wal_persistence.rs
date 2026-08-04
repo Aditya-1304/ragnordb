@@ -4,22 +4,25 @@ use raft::{
 };
 use ragnordb_common::ids::{RaftGroupId, ReplicaId};
 use ragnordb_multiraft::storage::{
-    codec::{RaftConfStateRecord, RaftHardStateRecord, RaftReplicaIdentity},
+    codec::{
+        RAFT_SNAPSHOT_POINTER_RECORD_VERSION, RaftHardStateRecord, RaftReplicaIdentity,
+        RaftSnapshotPointerRecord,
+    },
     persistence::{
-        RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalRecordType, RaftWalStorage,
+        NodeRaftWal, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalRecordType,
+        RaftWalStorage,
     },
 };
 use wal::{
-    error::{AppendFailure, WalError},
+    error::{BatchAppendFailure, WalError},
     lsn::Lsn,
     types::RecordType,
-    wal::AppendResult,
+    wal::{AppendResult, BatchAppendResult},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WalOperation {
-    Append(RecordType),
-    SyncThrough(Lsn),
+    Batch(Vec<RecordType>),
 }
 
 struct FakeWal {
@@ -46,31 +49,35 @@ impl FakeWal {
 }
 
 impl RaftWal for FakeWal {
-    fn append(
+    fn append_batch_and_sync(
         &mut self,
-        record_type: RecordType,
-        payload: &[u8],
-    ) -> Result<AppendResult, AppendFailure> {
-        self.operations.push(WalOperation::Append(record_type));
-
-        let start_lsn = self.next_lsn;
-        let end_lsn = start_lsn
-            .checked_add_bytes(payload.len() as u64 + 32)
-            .unwrap();
-
-        self.next_lsn = end_lsn;
-
-        Ok(AppendResult { start_lsn, end_lsn })
-    }
-
-    fn sync_through(&mut self, end_lsn: Lsn) -> Result<(), WalError> {
-        self.operations.push(WalOperation::SyncThrough(end_lsn));
-
-        if self.fail_sync {
-            return Err(WalError::BrokenDurabilityContract);
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        self.operations.push(WalOperation::Batch(
+            records.iter().map(|(kind, _)| *kind).collect(),
+        ));
+        let mut extents = Vec::new();
+        for (_, payload) in records {
+            let start_lsn = self.next_lsn;
+            let end_lsn = start_lsn
+                .checked_add_bytes(payload.len() as u64 + 32)
+                .unwrap();
+            self.next_lsn = end_lsn;
+            extents.push(AppendResult { start_lsn, end_lsn });
         }
-
-        Ok(())
+        if self.fail_sync {
+            return Err(BatchAppendFailure::OutcomeUnknown {
+                result: BatchAppendResult {
+                    final_end_lsn: extents.last().unwrap().end_lsn,
+                    record_extents: extents,
+                },
+                source: WalError::BrokenDurabilityContract,
+            });
+        }
+        Ok(BatchAppendResult {
+            final_end_lsn: extents.last().unwrap().end_lsn,
+            record_extents: extents,
+        })
     }
 }
 
@@ -84,16 +91,31 @@ fn conf_state() -> ConfState {
 
 fn batch() -> RaftPersistenceBatch {
     RaftPersistenceBatch {
+        snapshot: None,
         entries: vec![
             LogEntry::normal_with_size(1, 1, b"one".to_vec(), 3),
             LogEntry::normal_with_size(2, 1, b"two".to_vec(), 3),
         ],
-        conf_state: Some(conf_state()),
         hard_state: Some(HardState {
             current_term: 1,
             voted_for: Some(CoreReplicaId::must(61)),
             commit: 2,
         }),
+    }
+}
+
+fn snapshot_pointer() -> RaftSnapshotPointerRecord {
+    RaftSnapshotPointerRecord {
+        format_version: RAFT_SNAPSHOT_POINTER_RECORD_VERSION,
+        identity: identity(),
+        snapshot_id: 19,
+        last_included_index: 19,
+        last_included_term: 7,
+        applied_index: 19,
+        conf_state: conf_state(),
+        size_bytes: 4096,
+        checksum: [9; 32],
+        file_name: "raft-51-61-19.snapshot".to_string(),
     }
 }
 
@@ -105,22 +127,39 @@ fn stable_state_codecs_preserve_replica_lifetime_and_core_state() {
         voted_for: Some(CoreReplicaId::must(61)),
         commit: 19,
     };
-    let conf_state = conf_state();
-
     let hard_record = RaftHardStateRecord::from_core(identity, hard_state.clone()).unwrap();
-    let conf_record = RaftConfStateRecord::from_core(identity, conf_state.clone()).unwrap();
+    let snapshot = snapshot_pointer();
 
     let decoded_hard = RaftHardStateRecord::decode(&hard_record.encode().unwrap()).unwrap();
-    let decoded_conf = RaftConfStateRecord::decode(&conf_record.encode().unwrap()).unwrap();
+    let decoded_snapshot = RaftSnapshotPointerRecord::decode(&snapshot.encode().unwrap()).unwrap();
 
     assert_eq!(decoded_hard.identity, identity);
     assert_eq!(decoded_hard.to_core().unwrap(), hard_state);
-    assert_eq!(decoded_conf.identity, identity);
-    assert_eq!(decoded_conf.to_core().unwrap(), conf_state);
+    assert_eq!(decoded_snapshot, snapshot);
+}
+
+/// Realistic bug caught: recovery trusts a pointer that either escapes the
+/// snapshot directory or claims tablet state applied through a different
+/// frontier than the Raft prefix it replaces.
+#[test]
+fn snapshot_pointer_rejects_unsafe_file_identity_and_mismatched_applied_frontier() {
+    let mut snapshot = snapshot_pointer();
+    snapshot.file_name = "../foreign.snapshot".to_string();
+    assert!(matches!(
+        snapshot.validate(),
+        Err(ragnordb_multiraft::storage::codec::RaftStableStateCodecError::InvalidSnapshotFileMetadata)
+    ));
+
+    let mut snapshot = snapshot_pointer();
+    snapshot.applied_index -= 1;
+    assert!(matches!(
+        snapshot.validate(),
+        Err(ragnordb_multiraft::storage::codec::RaftStableStateCodecError::SnapshotAppliedIndexMismatch { .. })
+    ));
 }
 
 #[test]
-fn persistence_orders_entries_then_conf_state_then_hard_state_and_exact_sync() {
+fn persistence_uses_one_ordered_batch_with_hard_state_last() {
     let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
 
     let persisted = storage.persist(batch()).unwrap();
@@ -128,18 +167,16 @@ fn persistence_orders_entries_then_conf_state_then_hard_state_and_exact_sync() {
 
     assert_eq!(
         storage.wal().operations,
-        vec![
-            WalOperation::Append(RaftWalRecordType::LogEntry.as_wal_record_type()),
-            WalOperation::Append(RaftWalRecordType::LogEntry.as_wal_record_type()),
-            WalOperation::Append(RaftWalRecordType::ConfState.as_wal_record_type()),
-            WalOperation::Append(RaftWalRecordType::HardState.as_wal_record_type()),
-            WalOperation::SyncThrough(end_lsn),
-        ]
+        vec![WalOperation::Batch(vec![
+            RaftWalRecordType::LogEntry.as_wal_record_type(),
+            RaftWalRecordType::LogEntry.as_wal_record_type(),
+            RaftWalRecordType::HardState.as_wal_record_type(),
+        ])]
     );
 
-    assert_eq!(persisted.record_count, 4);
+    assert_eq!(persisted.record_count, 3);
     assert_eq!(storage.log_view().last_index(), Some(2));
-    assert_eq!(storage.conf_state(), Some(&conf_state()));
+    assert!(storage.conf_state().is_none());
     assert_eq!(storage.hard_state().unwrap().commit, 2);
     assert_eq!(storage.durable_end_lsn(), Some(end_lsn));
     assert!(!storage.recovery_required());
@@ -162,4 +199,40 @@ fn sync_failure_does_not_publish_unacknowledged_raft_state() {
         storage.persist(batch()).unwrap_err(),
         RaftPersistenceError::RecoveryRequired
     );
+}
+
+/// Realistic bug caught: one group observes an uncertain shared-WAL outcome,
+/// but another group continues consuming Ready generations through a separate
+/// per-replica writer.
+#[test]
+fn uncertain_batch_fences_every_group_writer_on_the_node() {
+    let node_wal = NodeRaftWal::new(FakeWal::failing_sync());
+    let mut first = RaftWalStorage::new(node_wal.group_writer(), identity());
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+    let mut second = RaftWalStorage::new(node_wal.group_writer(), second_identity);
+
+    assert!(matches!(
+        first.persist(batch()).unwrap_err(),
+        RaftPersistenceError::OutcomeUnknown { .. }
+    ));
+    assert!(node_wal.recovery_required());
+
+    let error = second
+        .persist(RaftPersistenceBatch {
+            snapshot: None,
+            entries: Vec::new(),
+            hard_state: Some(HardState {
+                current_term: 1,
+                voted_for: Some(CoreReplicaId::must(62)),
+                commit: 0,
+            }),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RaftPersistenceError::NotStaged {
+            recovery_required: true,
+            ..
+        }
+    ));
 }

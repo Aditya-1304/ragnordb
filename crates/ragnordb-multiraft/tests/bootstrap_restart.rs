@@ -1,9 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs, process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ragnordb_common::{
@@ -12,7 +14,7 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::bootstrap::{
     BootstrapGroupError, BootstrapOutcome, BootstrapStore, BootstrapStoreError,
-    BootstrapStoreInstall, bootstrap_group_exactly_once,
+    BootstrapStoreInstall, FileBootstrapStore, bootstrap_group_exactly_once,
 };
 
 #[derive(Default)]
@@ -179,4 +181,32 @@ fn uncertain_first_install_is_resolved_from_restart_state() {
     );
 
     assert_eq!(restarted_process.successful_installs(), 1);
+}
+
+/// Realistic bug caught: exactly-once bootstrap works only in a test memory
+/// store and a real process restart loses or replaces the initial membership.
+#[test]
+fn filesystem_bootstrap_store_survives_process_reopen() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("ragnordb-bootstrap-{}-{unique}", process::id()));
+    let requested = bootstrap();
+
+    let mut first = FileBootstrapStore::open(&directory).unwrap();
+    assert_eq!(
+        bootstrap_group_exactly_once(&mut first, &requested).unwrap(),
+        BootstrapOutcome::Installed
+    );
+    drop(first);
+
+    let mut reopened = FileBootstrapStore::open(&directory).unwrap();
+    assert_eq!(
+        bootstrap_group_exactly_once(&mut reopened, &requested).unwrap(),
+        BootstrapOutcome::AlreadyInstalled
+    );
+
+    fs::remove_dir_all(directory).unwrap();
 }

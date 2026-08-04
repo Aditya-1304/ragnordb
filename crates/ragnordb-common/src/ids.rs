@@ -225,12 +225,14 @@ impl RowKey {
 pub struct RequestId {
     pub client_id: u128,
     pub sequence: u64,
+    pub raft_group_id: RaftGroupId,
 }
 impl RequestId {
     pub fn to_proto(&self) -> ids::RequestId {
         ids::RequestId {
             client_id: self.client_id.to_le_bytes().to_vec(),
             sequence: self.sequence,
+            raft_group_id: Some(self.raft_group_id.to_proto()),
         }
     }
     pub fn from_proto(proto: ids::RequestId) -> Result<Self, &'static str> {
@@ -246,6 +248,9 @@ impl RequestId {
         Ok(RequestId {
             client_id,
             sequence: proto.sequence,
+            raft_group_id: RaftGroupId::from_proto(
+                proto.raft_group_id.ok_or("missing raft_group_id")?,
+            ),
         })
     }
 }
@@ -273,6 +278,7 @@ pub fn participant_request_id(
     txn_id: TxnId,
     phase: ParticipantCommandPhase,
     participant_tablet_id: TabletId,
+    raft_group_id: RaftGroupId,
 ) -> Result<RequestId, &'static str> {
     if txn_id.0 == 0 {
         return Err("participant request transaction ID must be non-zero");
@@ -282,26 +288,27 @@ pub fn participant_request_id(
         return Err("participant request tablet ID must be non-zero");
     }
 
-    const FNV_128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    const FNV_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    if raft_group_id.0 == 0 {
+        return Err("participant request Raft group ID must be non-zero");
+    }
+
     const DOMAIN: &[u8] = b"ragnordb/participant-request/v1";
 
-    let mut client_id = FNV_128_OFFSET_BASIS;
-
-    for byte in DOMAIN
-        .iter()
-        .copied()
-        .chain(txn_id.0.to_be_bytes())
-        .chain([phase as u8])
-        .chain(participant_tablet_id.0.to_be_bytes())
-    {
-        client_id ^= u128::from(byte);
-        client_id = client_id.wrapping_mul(FNV_128_PRIME);
-    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&txn_id.0.to_be_bytes());
+    hasher.update(&[phase as u8]);
+    hasher.update(&raft_group_id.0.to_be_bytes());
+    hasher.update(&participant_tablet_id.0.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut client_bytes = [0_u8; 16];
+    client_bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    let client_id = u128::from_be_bytes(client_bytes);
 
     Ok(RequestId {
         client_id,
         sequence: 1,
+        raft_group_id,
     })
 }
 
@@ -338,6 +345,7 @@ mod tests {
         let id = RequestId {
             client_id: u128::MAX,
             sequence: 12345,
+            raft_group_id: RaftGroupId(7),
         };
 
         let decoded = RequestId::from_proto(id.to_proto()).unwrap();
@@ -350,6 +358,7 @@ mod tests {
         let proto = crate::proto::ids::RequestId {
             client_id: vec![1, 2, 3],
             sequence: 0,
+            raft_group_id: Some(RaftGroupId(7).to_proto()),
         };
 
         assert!(RequestId::from_proto(proto).is_err());
@@ -399,22 +408,53 @@ mod tests {
         let txn_id = TxnId(91);
         let tablet_id = TabletId(17);
 
-        let first =
-            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, tablet_id).unwrap();
+        let first = participant_request_id(
+            txn_id,
+            ParticipantCommandPhase::Prewrite,
+            tablet_id,
+            RaftGroupId(9),
+        )
+        .unwrap();
 
-        let replay =
-            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, tablet_id).unwrap();
+        let replay = participant_request_id(
+            txn_id,
+            ParticipantCommandPhase::Prewrite,
+            tablet_id,
+            RaftGroupId(9),
+        )
+        .unwrap();
 
-        let commit =
-            participant_request_id(txn_id, ParticipantCommandPhase::Commit, tablet_id).unwrap();
+        let commit = participant_request_id(
+            txn_id,
+            ParticipantCommandPhase::Commit,
+            tablet_id,
+            RaftGroupId(9),
+        )
+        .unwrap();
 
-        let other_tablet =
-            participant_request_id(txn_id, ParticipantCommandPhase::Prewrite, TabletId(18))
-                .unwrap();
+        let other_tablet = participant_request_id(
+            txn_id,
+            ParticipantCommandPhase::Prewrite,
+            TabletId(18),
+            RaftGroupId(9),
+        )
+        .unwrap();
+        let other_group = participant_request_id(
+            txn_id,
+            ParticipantCommandPhase::Prewrite,
+            tablet_id,
+            RaftGroupId(10),
+        )
+        .unwrap();
 
         assert_eq!(first, replay);
         assert_ne!(first, commit);
         assert_ne!(first, other_tablet);
+        assert_ne!(first, other_group);
         assert_eq!(first.sequence, 1);
+        assert_eq!(
+            first.client_id,
+            102_646_484_353_885_394_073_598_988_506_450_246_135
+        );
     }
 }

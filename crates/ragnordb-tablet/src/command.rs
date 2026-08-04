@@ -1,22 +1,23 @@
 //! deterministic apply boundary for replicated tablet commands
 //!
-//! raft decides command order, while this module validates that each committed
+//! Raft decides command order, while this module validates that each committed
 //! envelope targets this tablet generation before dispatching its payload. The
-//! state machine will also own replicated request deduplication in later slices
+//! state machine also owns replicated request deduplication.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error,
     codec::{TxnStatus, WriteKind},
     command_codec::{
+        CachedTabletCommandOutcome, CachedTabletCommandRejection, CachedTabletCommandRejectionKind,
         CachedTabletCommandResult, ClientDeduplicationSnapshot, CommitCommand, PrewriteCommand,
         ResolveIntentCommand, RollbackCommand, SingleShardCommitCommand, TabletCommand,
         TabletCommandEnvelope, TabletCommandEnvelopeError, TabletStateMachineSnapshot,
         TabletStateMachineSnapshotError,
     },
     encoding::encode_row,
-    ids::TabletId,
+    ids::{RaftGroupId, TabletId},
 };
 use ragnordb_storage::{
     key::decode_row_key,
@@ -31,27 +32,40 @@ use crate::Tablet;
 /// execution API. Every command must pass this boundary before a payload is
 /// allowed to inspect or mutate MVCC state
 ///
-/// each instance belomgs to one raft group. its client sequence
-/// map is naturally scode to that group and cannot consume sequence
-/// applied by a different tablet state machine
+/// Each instance belongs to one Raft group. The complete `(client, group)` key
+/// prevents request sequences from being conflated when node-level diagnostics
+/// or future state aggregation observes more than one group.
 #[derive(Debug)]
 pub struct TabletStateMachine<S = InMemoryMvcc> {
     tablet: Tablet<S>,
     epoch: u64,
-    client_deduplication: BTreeMap<u128, ClientDeduplicationState>,
+    raft_group_id: RaftGroupId,
+    // V2 intentionally retains one outcome per client without time-based
+    // eviction. Durable GC requires a protocol-level retry horizon and snapshot
+    // watermark; deleting entries earlier could permit an old acknowledged
+    // request to execute twice after restart.
+    client_deduplication: BTreeMap<ClientDeduplicationKey, ClientDeduplicationState>,
 }
 
 impl<S: MvccStorage> TabletStateMachine<S> {
     /// bind a tablet to the non-zero descriptor epoch represented by this
     /// state-machine instance
-    pub fn new(tablet: Tablet<S>, epoch: u64) -> Result<Self, TabletCommandApplyError> {
+    pub fn new(
+        tablet: Tablet<S>,
+        epoch: u64,
+        raft_group_id: RaftGroupId,
+    ) -> Result<Self, TabletCommandApplyError> {
         if epoch == 0 {
             return Err(TabletCommandApplyError::ZeroTabletEpoch);
+        }
+        if raft_group_id.0 == 0 {
+            return Err(TabletCommandApplyError::ZeroRaftGroupId);
         }
 
         Ok(Self {
             tablet,
             epoch,
+            raft_group_id,
             client_deduplication: BTreeMap::new(),
         })
     }
@@ -61,7 +75,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &self.tablet
     }
 
-    /// nncode replicated command metadata that must accompany a tablet snapshot
+    /// Encode replicated command metadata that must accompany a tablet snapshot.
     ///
     /// MVCC data is intentionally owned by the surrounding tablet snapshot. This
     /// image contains only tablet-generation and retry-deduplication state
@@ -69,18 +83,20 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         let clients = self
             .client_deduplication
             .iter()
-            .map(|(client_id, state)| {
+            .map(|(key, state)| {
+                debug_assert_eq!(key.raft_group_id, self.raft_group_id);
                 (
-                    *client_id,
+                    key.client_id,
                     ClientDeduplicationSnapshot {
                         last_sequence_applied: state.last_sequence_applied,
-                        cached_result: state.cached_result.into(),
+                        cached_outcome: state.cached_outcome.clone(),
                     },
                 )
             })
             .collect();
 
-        TabletStateMachineSnapshot::new(self.tablet.id(), self.epoch, clients)?.encode()
+        TabletStateMachineSnapshot::new(self.tablet.id(), self.epoch, self.raft_group_id, clients)?
+            .encode()
     }
 
     /// restore replicated command metadata before applying any post-snapshot Raft
@@ -104,10 +120,13 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             .into_iter()
             .map(|(client_id, state)| {
                 (
-                    client_id,
+                    ClientDeduplicationKey {
+                        client_id,
+                        raft_group_id: snapshot.raft_group_id,
+                    },
                     ClientDeduplicationState {
                         last_sequence_applied: state.last_sequence_applied,
-                        cached_result: state.cached_result.into(),
+                        cached_outcome: state.cached_outcome,
                     },
                 )
             })
@@ -116,45 +135,99 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         Ok(Self {
             tablet,
             epoch: snapshot.tablet_epoch,
+            raft_group_id: snapshot.raft_group_id,
             client_deduplication,
         })
     }
 
-    /// apply one committed command after deterministic target validation
+    /// Validate routing and storage-key structure before proposing a command.
     ///
-    /// target validation runs before request deduplication so a command sent to
-    /// the wrong tablet generation cannot consume a client sequence. Successful
-    /// payload results are cached only after dispatch completes
-    pub fn apply(
-        &mut self,
-        envelope: TabletCommandEnvelope,
-    ) -> Result<TabletCommandApplyOutcome, TabletCommandApplyError> {
+    /// This boundary contains no state-dependent conflict checks. The Ready
+    /// runtime can therefore call it before Raft admission, while `apply` calls
+    /// it again defensively for recovered or remotely received entries.
+    pub fn validate_proposal(
+        &self,
+        envelope: &TabletCommandEnvelope,
+    ) -> Result<(), TabletCommandApplyError> {
         envelope.validate()?;
 
         let local_tablet_id = self.tablet.id();
-
         if envelope.tablet_id != local_tablet_id {
             return Err(TabletCommandApplyError::TabletIdMismatch {
                 local_tablet_id,
                 requested_tablet_id: envelope.tablet_id,
             });
         }
-
         if envelope.expected_epoch != self.epoch {
             return Err(TabletCommandApplyError::TabletEpochMismatch {
                 current_epoch: self.epoch,
                 expected_epoch: envelope.expected_epoch,
             });
         }
+        if envelope.request_id.raft_group_id != self.raft_group_id {
+            return Err(TabletCommandApplyError::RaftGroupMismatch {
+                local_raft_group_id: self.raft_group_id,
+                requested_raft_group_id: envelope.request_id.raft_group_id,
+            });
+        }
+
+        match &envelope.command {
+            TabletCommand::Prewrite(command) => {
+                self.validate_encoded_key(&command.primary_key)?;
+                for write in &command.writes {
+                    self.validate_owned_key(&write.key)?;
+                }
+            }
+            TabletCommand::SingleShardCommit(command) => {
+                for write in &command.writes {
+                    self.validate_owned_key(&write.key)?;
+                }
+            }
+            TabletCommand::Commit(command) => {
+                self.validate_owned_key_slice(&command.keys)?;
+            }
+            TabletCommand::Rollback(command) => {
+                self.validate_owned_key_slice(&command.keys)?;
+            }
+            TabletCommand::ResolveIntent(command) => {
+                self.validate_owned_key_slice(&command.keys)?;
+            }
+            TabletCommand::Catalog(_) | TabletCommand::Noop(_) => {}
+        }
+
+        Ok(())
+    }
+
+    /// Apply one committed command after deterministic target validation.
+    ///
+    /// Target validation runs before request deduplication so a command sent to
+    /// the wrong tablet generation cannot consume a client sequence. Successful
+    /// deterministic command outcomes, including business rejections, consume
+    /// and cache the request sequence. Routing and malformed-envelope failures
+    /// occur before deduplication and leave sequence state untouched.
+    pub fn apply(
+        &mut self,
+        envelope: TabletCommandEnvelope,
+    ) -> Result<TabletCommandApplyOutcome, TabletCommandApplyError> {
+        self.validate_proposal(&envelope)?;
 
         let client_id = envelope.request_id.client_id;
+        let deduplication_key = ClientDeduplicationKey {
+            client_id,
+            raft_group_id: envelope.request_id.raft_group_id,
+        };
         let sequence = envelope.request_id.sequence;
 
-        if let Some(deduplication) = self.client_deduplication.get(&client_id) {
+        if let Some(deduplication) = self.client_deduplication.get(&deduplication_key) {
             if sequence == deduplication.last_sequence_applied {
-                return Ok(TabletCommandApplyOutcome::deduplicated(
-                    deduplication.cached_result,
-                ));
+                return match &deduplication.cached_outcome {
+                    CachedTabletCommandOutcome::Applied(result) => {
+                        Ok(TabletCommandApplyOutcome::deduplicated((*result).into()))
+                    }
+                    CachedTabletCommandOutcome::Rejected(rejection) => {
+                        Err(error_from_cached_rejection(rejection))
+                    }
+                };
             }
 
             if sequence < deduplication.last_sequence_applied {
@@ -184,25 +257,39 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             });
         }
 
-        let result = match envelope.command {
-            TabletCommand::Noop(_) => TabletCommandApplyResult::Noop,
-            TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command)?,
-            TabletCommand::Prewrite(command) => self.apply_prewrite(command)?,
-            TabletCommand::Commit(command) => self.apply_commit(command)?,
-            TabletCommand::Rollback(command) => self.apply_rollback(command)?,
-            TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command)?,
-            command => {
-                return Err(TabletCommandApplyError::UnsupportedCommand {
-                    command: command_name(&command),
-                });
+        let dispatched = match envelope.command {
+            TabletCommand::Noop(_) => Ok(TabletCommandApplyResult::Noop),
+            TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command),
+            TabletCommand::Prewrite(command) => self.apply_prewrite(command),
+            TabletCommand::Commit(command) => self.apply_commit(command),
+            TabletCommand::Rollback(command) => self.apply_rollback(command),
+            TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
+            command => Err(TabletCommandApplyError::UnsupportedCommand {
+                command: command_name(&command).to_string(),
+            }),
+        };
+
+        let result = match dispatched {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(rejection) = cached_rejection_from_error(&error) {
+                    self.client_deduplication.insert(
+                        deduplication_key,
+                        ClientDeduplicationState {
+                            last_sequence_applied: sequence,
+                            cached_outcome: CachedTabletCommandOutcome::Rejected(rejection),
+                        },
+                    );
+                }
+                return Err(error);
             }
         };
 
         self.client_deduplication.insert(
-            client_id,
+            deduplication_key,
             ClientDeduplicationState {
                 last_sequence_applied: sequence,
-                cached_result: result,
+                cached_outcome: CachedTabletCommandOutcome::Applied(result.into()),
             },
         );
 
@@ -250,17 +337,23 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &mut self,
         command: PrewriteCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        self.validate_owned_key(&command.key)?;
-
-        let mutation = mutation_from_command(command.op, command.row)?;
+        let mut mutations = BTreeMap::new();
+        for write in command.writes {
+            self.validate_owned_key(&write.key)?;
+            let mutation = mutation_from_command(write.op, write.row)?;
+            if mutations.insert(write.key, mutation).is_some() {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "prewrite contains a duplicate row key".to_string(),
+                });
+            }
+        }
 
         self.tablet
             .storage
-            .prewrite(
+            .prewrite_batch(
                 command.txn_id,
                 command.start_timestamp,
-                &command.key,
-                &mutation,
+                &mutations,
                 &command.primary_key,
                 command.ttl_ms,
             )
@@ -270,7 +363,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
     }
 
     fn validate_owned_key(&self, key: &[u8]) -> Result<(), TabletCommandApplyError> {
-        let row_key = decode_row_key(key).map_err(map_database_error)?;
+        let row_key =
+            decode_row_key(key).map_err(|error| TabletCommandApplyError::InvalidCommand {
+                reason: format!("malformed encoded row key: {error}"),
+            })?;
 
         if row_key.table_id != self.tablet.table_id() {
             return Err(TabletCommandApplyError::InvalidCommand {
@@ -286,19 +382,34 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         Ok(())
     }
 
+    fn validate_encoded_key(&self, key: &[u8]) -> Result<(), TabletCommandApplyError> {
+        decode_row_key(key)
+            .map(|_| ())
+            .map_err(|error| TabletCommandApplyError::InvalidCommand {
+                reason: format!("malformed encoded row key: {error}"),
+            })
+    }
+
+    fn validate_owned_key_slice(&self, keys: &[Vec<u8>]) -> Result<(), TabletCommandApplyError> {
+        for key in keys {
+            self.validate_owned_key(key)?;
+        }
+        Ok(())
+    }
+
     fn apply_commit(
         &mut self,
         command: CommitCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        self.validate_owned_key(&command.key)?;
+        let keys = self.validate_owned_keys(command.keys)?;
 
         self.tablet
             .storage
-            .commit_intent(
+            .commit_intents_batch(
                 command.txn_id,
                 command.start_timestamp,
                 command.commit_timestamp,
-                &command.key,
+                &keys,
             )
             .map_err(map_database_error)?;
 
@@ -309,11 +420,11 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &mut self,
         command: RollbackCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        self.validate_owned_key(&command.key)?;
+        let keys = self.validate_owned_keys(command.keys)?;
 
         self.tablet
             .storage
-            .rollback_intent(command.txn_id, command.start_timestamp, &command.key)
+            .rollback_intents_batch(command.txn_id, command.start_timestamp, &keys)
             .map_err(map_database_error)?;
 
         Ok(TabletCommandApplyResult::Rollback)
@@ -323,24 +434,24 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &mut self,
         command: ResolveIntentCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        self.validate_owned_key(&command.key)?;
+        let keys = self.validate_owned_keys(command.keys)?;
 
         match (command.resolved_status, command.commit_timestamp) {
             (TxnStatus::Committed, Some(commit_timestamp)) => self
                 .tablet
                 .storage
-                .commit_intent(
+                .commit_intents_batch(
                     command.txn_id,
                     command.start_timestamp,
                     commit_timestamp,
-                    &command.key,
+                    &keys,
                 )
                 .map_err(map_database_error)?,
 
             (TxnStatus::Aborted, None) => self
                 .tablet
                 .storage
-                .rollback_intent(command.txn_id, command.start_timestamp, &command.key)
+                .rollback_intents_batch(command.txn_id, command.start_timestamp, &keys)
                 .map_err(map_database_error)?,
 
             (TxnStatus::Pending, _) => {
@@ -364,6 +475,27 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         }
 
         Ok(TabletCommandApplyResult::ResolveIntent)
+    }
+
+    fn validate_owned_keys(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<BTreeSet<Vec<u8>>, TabletCommandApplyError> {
+        if keys.is_empty() {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "participant command requires at least one row key".to_string(),
+            });
+        }
+        let mut unique = BTreeSet::new();
+        for key in keys {
+            self.validate_owned_key(&key)?;
+            if !unique.insert(key) {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "participant command contains a duplicate row key".to_string(),
+                });
+            }
+        }
+        Ok(unique)
     }
 }
 
@@ -406,12 +538,59 @@ fn map_database_error(error: Error) -> TabletCommandApplyError {
     }
 }
 
+fn cached_rejection_from_error(
+    error: &TabletCommandApplyError,
+) -> Option<CachedTabletCommandRejection> {
+    let (kind, reason) = match error {
+        TabletCommandApplyError::InvalidCommand { reason } => (
+            CachedTabletCommandRejectionKind::InvalidCommand,
+            reason.clone(),
+        ),
+        TabletCommandApplyError::WriteConflict { reason } => (
+            CachedTabletCommandRejectionKind::WriteConflict,
+            reason.clone(),
+        ),
+        TabletCommandApplyError::UnsupportedCommand { command } => (
+            CachedTabletCommandRejectionKind::UnsupportedCommand,
+            command.clone(),
+        ),
+        _ => return None,
+    };
+    Some(CachedTabletCommandRejection { kind, reason })
+}
+
+fn error_from_cached_rejection(
+    rejection: &CachedTabletCommandRejection,
+) -> TabletCommandApplyError {
+    match rejection.kind {
+        CachedTabletCommandRejectionKind::InvalidCommand => {
+            TabletCommandApplyError::InvalidCommand {
+                reason: rejection.reason.clone(),
+            }
+        }
+        CachedTabletCommandRejectionKind::WriteConflict => TabletCommandApplyError::WriteConflict {
+            reason: rejection.reason.clone(),
+        },
+        CachedTabletCommandRejectionKind::UnsupportedCommand => {
+            TabletCommandApplyError::UnsupportedCommand {
+                command: rejection.reason.clone(),
+            }
+        }
+    }
+}
+
 /// last successfully applied request and result for one client in this Raft
 /// group’s sequence namespace
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientDeduplicationState {
     last_sequence_applied: u64,
-    cached_result: TabletCommandApplyResult,
+    cached_outcome: CachedTabletCommandOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClientDeduplicationKey {
+    client_id: u128,
+    raft_group_id: RaftGroupId,
 }
 
 /// result and provenance for one state machine apply attempt
@@ -506,10 +685,21 @@ pub enum TabletStateMachineRestoreError {
 }
 
 /// deterministic rejection returned by the tablet apply boundary
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum TabletCommandApplyError {
     #[error("tablet state-machine epoch must be non-zero")]
     ZeroTabletEpoch,
+
+    #[error("tablet state-machine Raft group ID must be non-zero")]
+    ZeroRaftGroupId,
+
+    #[error(
+        "request targets Raft group {requested_raft_group_id:?}, but this state machine owns {local_raft_group_id:?}"
+    )]
+    RaftGroupMismatch {
+        local_raft_group_id: RaftGroupId,
+        requested_raft_group_id: RaftGroupId,
+    },
 
     #[error(
         "tablet command targets tablet {requested_tablet_id:?}, but this state machine owns {local_tablet_id:?}"
@@ -560,7 +750,7 @@ pub enum TabletCommandApplyError {
     StorageFailure { reason: String },
 
     #[error("tablet command payload {command} is not implemented by this state machine")]
-    UnsupportedCommand { command: &'static str },
+    UnsupportedCommand { command: String },
 
     #[error("invalid tablet command envelope: {0}")]
     InvalidEnvelope(#[from] TabletCommandEnvelopeError),
@@ -587,7 +777,7 @@ mod tests {
             CommitCommand, NoopCommand, PrewriteCommand, ResolveIntentCommand, RollbackCommand,
             SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
         },
-        ids::{RequestId, TableId, TabletId, Timestamp, TxnId},
+        ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
     };
     use ragnordb_storage::key::{encode_row_key, make_row_key};
     use ragnordb_txn::Transaction;
@@ -600,14 +790,22 @@ mod tests {
 
     const LOCAL_TABLET_ID: TabletId = TabletId(41);
     const LOCAL_TABLET_EPOCH: u64 = 7;
+    const LOCAL_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(91);
 
     fn state_machine() -> TabletStateMachine {
         state_machine_for(LOCAL_TABLET_ID)
     }
 
     fn state_machine_for(tablet_id: TabletId) -> TabletStateMachine {
+        state_machine_for_group(tablet_id, LOCAL_RAFT_GROUP_ID)
+    }
+
+    fn state_machine_for_group(
+        tablet_id: TabletId,
+        raft_group_id: RaftGroupId,
+    ) -> TabletStateMachine {
         let tablet = Tablet::new(tablet_id, TableId(9)).unwrap();
-        TabletStateMachine::new(tablet, LOCAL_TABLET_EPOCH).unwrap()
+        TabletStateMachine::new(tablet, LOCAL_TABLET_EPOCH, raft_group_id).unwrap()
     }
 
     fn noop_envelope(tablet_id: TabletId, expected_epoch: u64) -> TabletCommandEnvelope {
@@ -637,10 +835,27 @@ mod tests {
         sequence: u64,
         command: TabletCommand,
     ) -> TabletCommandEnvelope {
+        command_envelope_for_group(
+            tablet_id,
+            expected_epoch,
+            LOCAL_RAFT_GROUP_ID,
+            sequence,
+            command,
+        )
+    }
+
+    fn command_envelope_for_group(
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        raft_group_id: RaftGroupId,
+        sequence: u64,
+        command: TabletCommand,
+    ) -> TabletCommandEnvelope {
         TabletCommandEnvelope::new(
             RequestId {
                 client_id: 0xf5b4_81ab_9b67_4418_ba82_b49c_e371_007d,
                 sequence,
+                raft_group_id,
             },
             tablet_id,
             expected_epoch,
@@ -788,10 +1003,11 @@ mod tests {
     }
 
     #[test]
-    fn client_request_sequences_are_scoped_to_each_state_machine() {
+    fn client_request_sequences_are_scoped_to_each_raft_group() {
         let second_tablet_id = TabletId(LOCAL_TABLET_ID.0 + 1);
+        let second_group_id = RaftGroupId(LOCAL_RAFT_GROUP_ID.0 + 1);
         let mut first_group = state_machine_for(LOCAL_TABLET_ID);
-        let mut second_group = state_machine_for(second_tablet_id);
+        let mut second_group = state_machine_for_group(second_tablet_id, second_group_id);
 
         let first_result = first_group
             .apply(noop_envelope_for_sequence(
@@ -802,15 +1018,78 @@ mod tests {
             .unwrap();
 
         let second_result = second_group
-            .apply(noop_envelope_for_sequence(
+            .apply(command_envelope_for_group(
                 second_tablet_id,
                 LOCAL_TABLET_EPOCH,
+                second_group_id,
                 1,
+                TabletCommand::Noop(NoopCommand),
             ))
             .unwrap();
 
         assert!(!first_result.deduplicated);
         assert!(!second_result.deduplicated);
+
+        let wrong_group = command_envelope_for_group(
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            second_group_id,
+            2,
+            TabletCommand::Noop(NoopCommand),
+        );
+        assert!(matches!(
+            first_group.apply(wrong_group),
+            Err(TabletCommandApplyError::RaftGroupMismatch { .. })
+        ));
+
+        // Routing rejection does not consume sequence two in the local group.
+        first_group
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                2,
+            ))
+            .unwrap();
+    }
+
+    /// Realistic bug caught: malformed storage-key bytes pass protobuf checks,
+    /// enter the Raft log, and are later mistaken for group-fatal corruption
+    /// during committed apply.
+    #[test]
+    fn proposal_validation_rejects_malformed_storage_key_without_consuming_sequence() {
+        let mut state_machine = state_machine();
+        let malformed = vec![0xff];
+        let invalid = command_envelope(
+            1,
+            TabletCommand::Prewrite(PrewriteCommand {
+                txn_id: TxnId(88),
+                start_timestamp: Timestamp(500),
+                writes: vec![WriteEntry {
+                    key: malformed.clone(),
+                    row: Some(test_row(88, "invalid")),
+                    op: WriteKind::Put,
+                }],
+                primary_key: malformed,
+                ttl_ms: 30_000,
+            }),
+        );
+
+        assert!(matches!(
+            state_machine.validate_proposal(&invalid),
+            Err(TabletCommandApplyError::InvalidCommand { .. })
+        ));
+        assert!(matches!(
+            state_machine.apply(invalid),
+            Err(TabletCommandApplyError::InvalidCommand { .. })
+        ));
+
+        state_machine
+            .apply(noop_envelope_for_sequence(
+                LOCAL_TABLET_ID,
+                LOCAL_TABLET_EPOCH,
+                1,
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -936,10 +1215,12 @@ mod tests {
         let command = PrewriteCommand {
             txn_id: TxnId(12),
             start_timestamp: Timestamp(40),
-            key: encoded_key.clone(),
-            row: Some(test_row(7, "Lin")),
+            writes: vec![WriteEntry {
+                key: encoded_key.clone(),
+                row: Some(test_row(7, "Lin")),
+                op: WriteKind::Put,
+            }],
             primary_key: encoded_key,
-            op: WriteKind::Put,
             ttl_ms: 30_000,
         };
 
@@ -959,6 +1240,128 @@ mod tests {
         ));
     }
 
+    /// Realistic bug caught: a coordinator sends one phase request for two
+    /// keys on the same participant tablet, and deduplication must not discard
+    /// the second key as an apparent retry of the first.
+    #[test]
+    fn participant_phase_batches_all_keys_under_one_request_id() {
+        let mut state_machine = state_machine();
+        let first_key = make_row_key(TableId(9), &[Value::Int(70)]).unwrap();
+        let second_key = make_row_key(TableId(9), &[Value::Int(71)]).unwrap();
+        let first_encoded = encode_row_key(&first_key).unwrap();
+        let second_encoded = encode_row_key(&second_key).unwrap();
+
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: TxnId(120),
+                    start_timestamp: Timestamp(400),
+                    writes: vec![
+                        WriteEntry {
+                            key: first_encoded.clone(),
+                            row: Some(test_row(70, "first")),
+                            op: WriteKind::Put,
+                        },
+                        WriteEntry {
+                            key: second_encoded.clone(),
+                            row: Some(test_row(71, "second")),
+                            op: WriteKind::Put,
+                        },
+                    ],
+                    primary_key: first_encoded.clone(),
+                    ttl_ms: 30_000,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(state_machine.tablet().stats().locks, 2);
+        state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::Commit(CommitCommand {
+                    txn_id: TxnId(120),
+                    start_timestamp: Timestamp(400),
+                    commit_timestamp: Timestamp(410),
+                    keys: vec![first_encoded, second_encoded],
+                }),
+            ))
+            .unwrap();
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(state_machine.tablet().stats().write_records, 2);
+    }
+
+    /// Realistic bug caught: a batch installs the first intent before a later
+    /// key reports a conflict, leaving a partially executed participant phase
+    /// that an exact request retry cannot safely interpret.
+    #[test]
+    fn participant_prewrite_conflict_is_atomic_and_cached_for_the_whole_batch() {
+        let mut state_machine = state_machine();
+        let first_key = make_row_key(TableId(9), &[Value::Int(72)]).unwrap();
+        let second_key = make_row_key(TableId(9), &[Value::Int(73)]).unwrap();
+        let first_encoded = encode_row_key(&first_key).unwrap();
+        let second_encoded = encode_row_key(&second_key).unwrap();
+
+        // A different transaction owns the second key before the participant
+        // batch arrives.
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: TxnId(121),
+                    start_timestamp: Timestamp(420),
+                    writes: vec![WriteEntry {
+                        key: second_encoded.clone(),
+                        row: Some(test_row(73, "owner")),
+                        op: WriteKind::Put,
+                    }],
+                    primary_key: second_encoded.clone(),
+                    ttl_ms: 30_000,
+                }),
+            ))
+            .unwrap();
+
+        let participant = command_envelope(
+            2,
+            TabletCommand::Prewrite(PrewriteCommand {
+                txn_id: TxnId(122),
+                start_timestamp: Timestamp(430),
+                writes: vec![
+                    WriteEntry {
+                        key: first_encoded,
+                        row: Some(test_row(72, "must-not-leak")),
+                        op: WriteKind::Put,
+                    },
+                    WriteEntry {
+                        key: second_encoded,
+                        row: Some(test_row(73, "contender")),
+                        op: WriteKind::Put,
+                    },
+                ],
+                primary_key: encode_row_key(&first_key).unwrap(),
+                ttl_ms: 30_000,
+            }),
+        );
+
+        let first_error = state_machine.apply(participant.clone()).unwrap_err();
+        assert!(matches!(
+            first_error,
+            TabletCommandApplyError::WriteConflict { .. }
+        ));
+        assert_eq!(state_machine.tablet().stats().locks, 1);
+        assert_eq!(state_machine.tablet().stats().default_versions, 1);
+
+        let reader = Transaction::new(TxnId(999), Timestamp(440)).unwrap();
+        assert_eq!(
+            state_machine.tablet().get(&reader, &first_key).unwrap(),
+            None
+        );
+
+        assert_eq!(state_machine.apply(participant).unwrap_err(), first_error);
+        assert_eq!(state_machine.tablet().stats().locks, 1);
+        assert_eq!(state_machine.tablet().stats().default_versions, 1);
+    }
+
     #[test]
     fn commit_resolves_prewrite_and_is_safe_to_replay() {
         let mut state_machine = state_machine();
@@ -972,10 +1375,12 @@ mod tests {
                 TabletCommand::Prewrite(PrewriteCommand {
                     txn_id: TxnId(13),
                     start_timestamp: Timestamp(60),
-                    key: encoded_key.clone(),
-                    row: Some(row.clone()),
+                    writes: vec![WriteEntry {
+                        key: encoded_key.clone(),
+                        row: Some(row.clone()),
+                        op: WriteKind::Put,
+                    }],
                     primary_key: encoded_key.clone(),
-                    op: WriteKind::Put,
                     ttl_ms: 30_000,
                 }),
             ))
@@ -985,7 +1390,7 @@ mod tests {
             txn_id: TxnId(13),
             start_timestamp: Timestamp(60),
             commit_timestamp: Timestamp(70),
-            key: encoded_key,
+            keys: vec![encoded_key],
         };
 
         let outcome = state_machine
@@ -1022,10 +1427,12 @@ mod tests {
         let prewrite = PrewriteCommand {
             txn_id: TxnId(14),
             start_timestamp: Timestamp(80),
-            key: encoded_key.clone(),
-            row: Some(test_row(9, "Barbara")),
+            writes: vec![WriteEntry {
+                key: encoded_key.clone(),
+                row: Some(test_row(9, "Barbara")),
+                op: WriteKind::Put,
+            }],
             primary_key: encoded_key.clone(),
-            op: WriteKind::Put,
             ttl_ms: 30_000,
         };
 
@@ -1042,7 +1449,7 @@ mod tests {
                 TabletCommand::Rollback(RollbackCommand {
                     txn_id: TxnId(14),
                     start_timestamp: Timestamp(80),
-                    key: encoded_key,
+                    keys: vec![encoded_key],
                 }),
             ))
             .unwrap();
@@ -1052,14 +1459,33 @@ mod tests {
         assert_eq!(state_machine.tablet().stats().locks, 0);
         assert_eq!(state_machine.tablet().stats().write_records, 1);
 
-        let error = state_machine
-            .apply(command_envelope(3, TabletCommand::Prewrite(prewrite)))
-            .unwrap_err();
+        let delayed = command_envelope(3, TabletCommand::Prewrite(prewrite));
+        let error = state_machine.apply(delayed.clone()).unwrap_err();
 
         assert!(matches!(
             error,
             TabletCommandApplyError::WriteConflict { .. }
         ));
+
+        // The deterministic rejection consumes sequence three and survives in
+        // the replicated snapshot, so an exact retry cannot execute again.
+        assert_eq!(state_machine.apply(delayed.clone()).unwrap_err(), error);
+        let snapshot = state_machine.encode_snapshot_state().unwrap();
+        let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
+        let mut restored = TabletStateMachine::restore_from_snapshot(tablet, &snapshot).unwrap();
+        assert_eq!(restored.apply(delayed).unwrap_err(), error);
+
+        assert_eq!(
+            state_machine
+                .apply(noop_envelope_for_sequence(
+                    LOCAL_TABLET_ID,
+                    LOCAL_TABLET_EPOCH,
+                    4,
+                ))
+                .unwrap()
+                .result,
+            TabletCommandApplyResult::Noop
+        );
     }
 
     #[test]
@@ -1074,10 +1500,12 @@ mod tests {
                 TabletCommand::Prewrite(PrewriteCommand {
                     txn_id: TxnId(15),
                     start_timestamp: Timestamp(90),
-                    key: encoded_key.clone(),
-                    row: Some(test_row(10, "Margaret")),
+                    writes: vec![WriteEntry {
+                        key: encoded_key.clone(),
+                        row: Some(test_row(10, "Margaret")),
+                        op: WriteKind::Put,
+                    }],
                     primary_key: encoded_key.clone(),
-                    op: WriteKind::Put,
                     ttl_ms: 30_000,
                 }),
             ))
@@ -1089,7 +1517,7 @@ mod tests {
                 TabletCommand::ResolveIntent(ResolveIntentCommand {
                     txn_id: TxnId(15),
                     start_timestamp: Timestamp(90),
-                    key: encoded_key,
+                    keys: vec![encoded_key],
                     resolved_status: TxnStatus::Aborted,
                     commit_timestamp: None,
                 }),

@@ -4,17 +4,6 @@
 //! needs that term to validate the entry immediately following a snapshot or
 //! compacted prefix without exposing the removed entry itself
 
-use prost::Message;
-use ragnordb_common::{
-    ids::{RaftGroupId, ReplicaId},
-    proto::raft as raft_proto,
-};
-
-use super::codec::{RaftLogEntryCodecError, RaftReplicaIdentity};
-
-/// durable format accepted for Raft progress records
-pub const RAFT_PROGRESS_RECORD_VERSION: u32 = 1;
-
 /// logical frontiers acknowledged for one Raft replica lifetime
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RaftProgress {
@@ -98,106 +87,9 @@ impl RaftProgress {
     }
 }
 
-/// identity bound durable representation of one logical frontier update
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RaftProgressRecord {
-    pub format_version: u32,
-    pub identity: RaftReplicaIdentity,
-    pub progress: RaftProgress,
-}
-
-impl RaftProgressRecord {
-    /// bind validated progress to one immutable replica lifetime
-    pub fn new(
-        identity: RaftReplicaIdentity,
-        progress: RaftProgress,
-    ) -> Result<Self, RaftProgressError> {
-        let record = Self {
-            format_version: RAFT_PROGRESS_RECORD_VERSION,
-            identity,
-            progress,
-        };
-
-        record.validate()?;
-        Ok(record)
-    }
-
-    /// encode a validated progress record for shared A-WAL
-    pub fn encode(self) -> Result<Vec<u8>, RaftProgressError> {
-        self.validate()?;
-
-        Ok(raft_proto::RaftProgressRecord {
-            format_version: self.format_version,
-            raft_group_id: Some(self.identity.raft_group_id.to_proto()),
-            replica_id: Some(self.identity.replica_id.to_proto()),
-            truncated_through_index: self.progress.truncated_through_index,
-            truncated_through_term: self.progress.truncated_through_term,
-            applied_index: self.progress.applied_index,
-        }
-        .encode_to_vec())
-    }
-
-    /// decode and validate a record encountered during recovery
-    pub fn decode(bytes: &[u8]) -> Result<Self, RaftProgressError> {
-        let proto = raft_proto::RaftProgressRecord::decode(bytes)
-            .map_err(|error| RaftProgressError::Decode(error.to_string()))?;
-
-        let raft_group_id = RaftGroupId::from_proto(
-            proto
-                .raft_group_id
-                .ok_or(RaftProgressError::MissingField("raft_group_id"))?,
-        );
-
-        let replica_id = ReplicaId::from_proto(
-            proto
-                .replica_id
-                .ok_or(RaftProgressError::MissingField("replica_id"))?,
-        );
-
-        let identity = RaftReplicaIdentity::new(raft_group_id, replica_id)
-            .map_err(RaftProgressError::InvalidIdentity)?;
-
-        let progress = RaftProgress {
-            truncated_through_index: proto.truncated_through_index,
-            truncated_through_term: proto.truncated_through_term,
-            applied_index: proto.applied_index,
-        };
-
-        let record = Self {
-            format_version: proto.format_version,
-            identity,
-            progress,
-        };
-
-        record.validate()?;
-        Ok(record)
-    }
-
-    fn validate(self) -> Result<(), RaftProgressError> {
-        if self.format_version != RAFT_PROGRESS_RECORD_VERSION {
-            return Err(RaftProgressError::UnsupportedVersion(self.format_version));
-        }
-
-        self.identity
-            .validate()
-            .map_err(RaftProgressError::InvalidIdentity)?;
-
-        self.progress.validate()
-    }
-}
-
 /// invalid or corrupt durable Raft frontier state
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RaftProgressError {
-    #[error("unsupported Raft progress record version {0}")]
-    UnsupportedVersion(u32),
-
-    #[error("Raft progress record is missing required field {0}")]
-    MissingField(&'static str),
-
-    #[error("invalid Raft progress identity: {0}")]
-    InvalidIdentity(RaftLogEntryCodecError),
-
     #[error(
         "truncation boundary index zero carries \
          nonzero term {term}"

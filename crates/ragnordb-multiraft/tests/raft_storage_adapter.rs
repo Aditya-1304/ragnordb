@@ -1,6 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use raft::{
+    core::node::RaftNode,
     entry::{EntryPayload, LogEntry},
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{ConfState, HardState, ReplicaId as CoreReplicaId},
@@ -8,18 +9,15 @@ use raft::{
 use ragnordb_common::ids::{RaftGroupId, ReplicaId};
 use ragnordb_multiraft::storage::{
     adapter::RaftStorageAdapters,
-    codec::RaftReplicaIdentity,
-    frontier::RaftProgress,
-    persistence::{
-        RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalRecordType, RaftWalStorage,
-    },
+    codec::{RAFT_SNAPSHOT_POINTER_RECORD_VERSION, RaftReplicaIdentity, RaftSnapshotPointerRecord},
+    persistence::{RaftPersistenceBatch, RaftWal, RaftWalRecordType, RaftWalStorage},
     recovery::{RaftWalRecoverySource, recover_raft_storage},
 };
 use wal::{
-    error::{AppendFailure, WalError},
+    error::{BatchAppendFailure, WalError},
     lsn::Lsn,
     types::RecordType,
-    wal::{AppendResult, iterator::WalRecord},
+    wal::{AppendResult, BatchAppendResult, iterator::WalRecord},
 };
 
 struct RecordingWal {
@@ -27,7 +25,7 @@ struct RecordingWal {
     records: Vec<WalRecord>,
     synced_through: Vec<Lsn>,
     sync_calls: usize,
-    fail_sync_call: Option<usize>,
+    fail_sync: bool,
 }
 
 impl RecordingWal {
@@ -37,49 +35,48 @@ impl RecordingWal {
             records: Vec::new(),
             synced_through: Vec::new(),
             sync_calls: 0,
-            fail_sync_call: None,
-        }
-    }
-
-    fn failing_progress_sync() -> Self {
-        Self {
-            fail_sync_call: Some(2),
-            ..Self::new()
+            fail_sync: false,
         }
     }
 }
 
 impl RaftWal for RecordingWal {
-    fn append(
+    fn append_batch_and_sync(
         &mut self,
-        record_type: RecordType,
-        payload: &[u8],
-    ) -> Result<AppendResult, AppendFailure> {
-        let start_lsn = self.next_lsn;
-        let end_lsn = start_lsn
-            .checked_add_bytes(payload.len() as u64 + 32)
-            .unwrap();
-
-        self.records.push(WalRecord {
-            lsn: start_lsn,
-            record_type,
-            payload: payload.to_vec(),
-            total_len: (payload.len() + 32) as u32,
-        });
-        self.next_lsn = end_lsn;
-
-        Ok(AppendResult { start_lsn, end_lsn })
-    }
-
-    fn sync_through(&mut self, end_lsn: Lsn) -> Result<(), WalError> {
-        self.sync_calls += 1;
-        self.synced_through.push(end_lsn);
-
-        if self.fail_sync_call == Some(self.sync_calls) {
-            return Err(WalError::BrokenDurabilityContract);
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        let mut extents = Vec::new();
+        for (record_type, payload) in records {
+            let start_lsn = self.next_lsn;
+            let end_lsn = start_lsn
+                .checked_add_bytes(payload.len() as u64 + 32)
+                .unwrap();
+            self.records.push(WalRecord {
+                lsn: start_lsn,
+                record_type: *record_type,
+                payload: payload.to_vec(),
+                total_len: (payload.len() + 32) as u32,
+            });
+            self.next_lsn = end_lsn;
+            extents.push(AppendResult { start_lsn, end_lsn });
         }
-
-        Ok(())
+        self.sync_calls += 1;
+        if let Some(last) = extents.last() {
+            self.synced_through.push(last.end_lsn);
+        }
+        if self.fail_sync {
+            return Err(BatchAppendFailure::OutcomeUnknown {
+                result: BatchAppendResult {
+                    final_end_lsn: extents.last().unwrap().end_lsn,
+                    record_extents: extents,
+                },
+                source: WalError::BrokenDurabilityContract,
+            });
+        }
+        Ok(BatchAppendResult {
+            final_end_lsn: extents.last().unwrap().end_lsn,
+            record_extents: extents,
+        })
     }
 }
 
@@ -118,12 +115,19 @@ fn durable_storage_with(wal: RecordingWal) -> RaftWalStorage<RecordingWal> {
 
     storage
         .persist(RaftPersistenceBatch {
-            entries: vec![
-                LogEntry::normal_with_size(1, 1, b"one".to_vec(), 3),
-                LogEntry::normal_with_size(2, 1, b"two".to_vec(), 3),
-                LogEntry::normal_with_size(3, 2, b"three".to_vec(), 5),
-            ],
-            conf_state: Some(conf_state()),
+            snapshot: Some(RaftSnapshotPointerRecord {
+                format_version: RAFT_SNAPSHOT_POINTER_RECORD_VERSION,
+                identity: identity(),
+                snapshot_id: 2,
+                last_included_index: 2,
+                last_included_term: 1,
+                applied_index: 2,
+                conf_state: conf_state(),
+                size_bytes: 1024,
+                checksum: [7; 32],
+                file_name: "raft-81-91-2.snapshot".to_string(),
+            }),
+            entries: vec![LogEntry::normal_with_size(3, 2, b"three".to_vec(), 5)],
             hard_state: Some(HardState {
                 current_term: 2,
                 voted_for: Some(CoreReplicaId::must(91)),
@@ -136,18 +140,11 @@ fn durable_storage_with(wal: RecordingWal) -> RaftWalStorage<RecordingWal> {
 }
 
 #[test]
-fn durable_progress_recovers_into_public_raft_storage_adapters() {
-    let mut storage = durable_storage();
-    let progress = RaftProgress::new(2, 1, 3).unwrap();
-
-    let persisted = storage.persist_progress(progress).unwrap();
-    let progress_end_lsn = persisted.end_lsn.unwrap();
-
-    assert_eq!(storage.progress(), progress);
-    assert_eq!(storage.wal().synced_through.last(), Some(&progress_end_lsn));
+fn snapshot_boundary_recovers_into_public_raft_storage_adapters() {
+    let storage = durable_storage();
     assert_eq!(
-        storage.wal().records.last().unwrap().record_type,
-        RaftWalRecordType::Progress.as_wal_record_type()
+        storage.wal().records.first().unwrap().record_type,
+        RaftWalRecordType::SnapshotPointer.as_wal_record_type()
     );
 
     let mut source = RecordSource::new(storage.wal().records.clone());
@@ -155,7 +152,8 @@ fn durable_progress_recovers_into_public_raft_storage_adapters() {
     let replica = recovered.replica(identity()).unwrap();
     let adapters = RaftStorageAdapters::from_recovered(replica).unwrap();
 
-    assert_eq!(replica.progress(), progress);
+    assert_eq!(replica.progress().truncated_through_index, 2);
+    assert_eq!(replica.progress().applied_index, 2);
 
     // Index two remains available only as the snapshot/compaction boundary.
     assert_eq!(adapters.log.first_index(), 3);
@@ -169,38 +167,6 @@ fn durable_progress_recovers_into_public_raft_storage_adapters() {
     );
     assert_eq!(adapters.stable.hard_state().commit, 3);
     assert_eq!(adapters.stable.conf_state(), Some(conf_state()));
-}
-
-#[test]
-fn progress_cannot_move_applied_state_beyond_the_durable_commit() {
-    let mut storage = durable_storage();
-
-    let error = storage
-        .persist_progress(RaftProgress::new(2, 1, 4).unwrap())
-        .unwrap_err();
-
-    assert_eq!(
-        error,
-        RaftPersistenceError::AppliedBeyondDurableCommit {
-            applied_index: 4,
-            durable_commit: 3,
-        }
-    );
-    assert_eq!(storage.progress(), RaftProgress::default());
-    assert_eq!(storage.wal().records.len(), 5);
-}
-
-#[test]
-fn failed_progress_sync_does_not_publish_the_frontier() {
-    let mut storage = durable_storage_with(RecordingWal::failing_progress_sync());
-
-    let error = storage
-        .persist_progress(RaftProgress::new(2, 1, 3).unwrap())
-        .unwrap_err();
-
-    assert!(matches!(error, RaftPersistenceError::OutcomeUnknown { .. }));
-    assert_eq!(storage.progress(), RaftProgress::default());
-    assert!(storage.recovery_required());
 }
 
 #[test]
@@ -223,4 +189,23 @@ fn raft_log_adapter_rejects_hidden_trait_persistence() {
 
     assert!(result.is_err());
     assert_eq!(adapters.log.last_index(), 3);
+}
+
+/// Realistic bug caught: the read-only acknowledged-durability adapters look
+/// correct in isolation but cannot actually initialize a restarted Raft core
+/// from a compacted snapshot boundary and retained suffix.
+#[test]
+fn recovered_adapters_restart_a_real_raft_node() {
+    let storage = durable_storage();
+    let mut source = RecordSource::new(storage.wal().records.clone());
+    let recovered = recover_raft_storage(&mut source).unwrap();
+    let adapters =
+        RaftStorageAdapters::from_recovered(recovered.replica(identity()).unwrap()).unwrap();
+
+    let node: RaftNode<Vec<u8>, (), _, _> =
+        RaftNode::restart(CoreReplicaId::must(91), adapters.log, adapters.stable, 5, 2).unwrap();
+
+    assert_eq!(node.commit_index(), 3);
+    assert_eq!(node.last_log_index(), 3);
+    assert_eq!(node.conf_state(), &conf_state());
 }

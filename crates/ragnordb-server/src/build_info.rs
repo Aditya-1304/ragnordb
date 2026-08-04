@@ -8,8 +8,11 @@ pub struct BuildInfo {
     pub built_at: &'static str,
     pub rust_version: &'static str,
     pub raft_version: &'static str,
+    pub raft_revision: &'static str,
     pub wal_version: &'static str,
+    pub wal_revision: &'static str,
     pub bloom_version: &'static str,
+    pub bloom_revision: &'static str,
     pub feature_flags: &'static str,
 }
 
@@ -20,8 +23,11 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
     built_at: env!("BUILT_AT"),
     rust_version: env!("RUSTC_VERSION"),
     raft_version: env!("RAFT_VERSION"),
+    raft_revision: env!("RAFT_REVISION"),
     wal_version: env!("WAL_VERSION"),
+    wal_revision: env!("WAL_REVISION"),
     bloom_version: env!("BLOOM_VERSION"),
+    bloom_revision: env!("BLOOM_REVISION"),
     feature_flags: env!("RAGNORDB_FEATURES"),
 };
 
@@ -35,17 +41,20 @@ impl std::fmt::Display for BuildInfo {
   Rust:          {}
   Features:      {}
   Infrastructure:
-    raft:        {} (path: ../Papers/raft)
-    wal:         {} (path: ../wal)
-    bloom-bloom: {} (path: ../bloom-bloom)",
+    raft:        {} @ {} (path: ../Papers/raft)
+    wal:         {} @ {} (path: ../wal)
+    bloom-bloom: {} @ {} (path: ../bloom-bloom)",
             self.ragnordb_version,
             self.target,
             self.built_at,
             self.rust_version,
             self.feature_flags,
             self.raft_version,
+            self.raft_revision,
             self.wal_version,
+            self.wal_revision,
             self.bloom_version,
+            self.bloom_revision,
         )
     }
 }
