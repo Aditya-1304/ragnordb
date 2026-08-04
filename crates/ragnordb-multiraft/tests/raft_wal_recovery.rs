@@ -188,6 +188,46 @@ fn recovery_rejects_same_term_same_index_with_different_payload() {
     ));
 }
 
+/// Realistic bug caught: a crash after a higher-term entry is staged but before
+/// its trailing HardState leaves restart with an unsafe older current term or
+/// vote from the earlier durable prefix.
+#[test]
+fn recovery_normalizes_hard_state_to_the_highest_recovered_log_term() {
+    let crash_identity = identity(78, 151);
+    let mut source = RecordSource::new(vec![
+        hard_state(10, crash_identity, 4, 0),
+        entry(20, crash_identity, 1, 5, b"higher-term-entry"),
+    ]);
+
+    let recovered = recover_raft_storage(&mut source).unwrap();
+    let replica = recovered.replica(crash_identity).unwrap();
+    let hard_state = replica.hard_state().unwrap();
+
+    assert_eq!(hard_state.current_term, 5);
+    assert_eq!(hard_state.voted_for, None);
+    assert_eq!(hard_state.commit, 0);
+
+    let identity_without_hard_state = identity(79, 161);
+    let mut source_without_hard_state = RecordSource::new(vec![entry(
+        30,
+        identity_without_hard_state,
+        1,
+        6,
+        b"entry-without-hard-state",
+    )]);
+    let recovered_without_hard_state =
+        recover_raft_storage(&mut source_without_hard_state).unwrap();
+    let hard_state_without_hard_state = recovered_without_hard_state
+        .replica(identity_without_hard_state)
+        .unwrap()
+        .hard_state()
+        .unwrap();
+
+    assert_eq!(hard_state_without_hard_state.current_term, 6);
+    assert_eq!(hard_state_without_hard_state.voted_for, None);
+    assert_eq!(hard_state_without_hard_state.commit, 0);
+}
+
 #[test]
 fn recovery_rejects_hard_state_before_its_committed_entry() {
     let identity = identity(73, 101);

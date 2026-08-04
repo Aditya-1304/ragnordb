@@ -210,3 +210,29 @@ fn filesystem_bootstrap_store_survives_process_reopen() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+/// Realistic bug caught: a process crash can leave the counter-selected
+/// temporary bootstrap file behind, causing the next process to fail before
+/// it can reconcile or install durable bootstrap state.
+#[test]
+fn filesystem_bootstrap_store_cleans_abandoned_temporary_files_on_open() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("ragnordb-bootstrap-stale-{unique}"));
+    fs::create_dir_all(&directory).unwrap();
+    let stale = directory.join(".raft-group-100.bootstrap.1.tmp");
+    fs::write(&stale, b"abandoned temporary bootstrap").unwrap();
+
+    let requested = bootstrap();
+    let mut store = FileBootstrapStore::open(&directory).unwrap();
+
+    assert_eq!(
+        bootstrap_group_exactly_once(&mut store, &requested).unwrap(),
+        BootstrapOutcome::Installed
+    );
+    assert!(!stale.exists());
+
+    fs::remove_dir_all(directory).unwrap();
+}

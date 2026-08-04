@@ -61,23 +61,23 @@ fn same_index_and_term_with_different_payload_is_corruption() {
     let identity = identity(42);
     let mut view = RaftReplicaLogView::new(identity);
 
-    view.replay(entry(identity, 7, 3, b"original"), Lsn::new(50))
+    view.replay(entry(identity, 1, 3, b"original"), Lsn::new(50))
         .unwrap();
 
     let error = view
-        .replay(entry(identity, 7, 3, b"different"), Lsn::new(60))
+        .replay(entry(identity, 1, 3, b"different"), Lsn::new(60))
         .unwrap_err();
 
     assert_eq!(
         error,
-        RaftLogViewError::ConflictingPayload { index: 7, term: 3 }
+        RaftLogViewError::ConflictingPayload { index: 1, term: 3 }
     );
 
     // The rejected record must not advance or mutate recovered state.
     assert_eq!(view.last_replayed_lsn(), Some(Lsn::new(50)));
 
     assert_eq!(
-        view.entry(7).unwrap().record.payload,
+        view.entry(1).unwrap().record.payload,
         DurableRaftEntryPayload::Normal(b"original".to_vec())
     );
 }
@@ -87,16 +87,16 @@ fn identical_entry_replay_is_idempotent_and_refreshes_its_lsn() {
     let identity = identity(43);
     let mut view = RaftReplicaLogView::new(identity);
 
-    view.replay(entry(identity, 9, 4, b"command"), Lsn::new(70))
+    view.replay(entry(identity, 1, 4, b"command"), Lsn::new(70))
         .unwrap();
 
     let outcome = view
-        .replay(entry(identity, 9, 4, b"command"), Lsn::new(80))
+        .replay(entry(identity, 1, 4, b"command"), Lsn::new(80))
         .unwrap();
 
     assert_eq!(outcome, RaftLogReplayOutcome::IdempotentReplay);
     assert_eq!(view.len(), 1);
-    assert_eq!(view.entry(9).unwrap().lsn, Lsn::new(80));
+    assert_eq!(view.entry(1).unwrap().lsn, Lsn::new(80));
 }
 
 #[test]
@@ -119,4 +119,77 @@ fn view_rejects_an_entry_from_another_replica_lifetime() {
 
     assert!(view.is_empty());
     assert_eq!(view.last_replayed_lsn(), None);
+}
+
+/// Realistic bug caught: accepting index 100 as the first recovered entry
+/// without a snapshot hides the loss or accidental deletion of entries 1..99.
+#[test]
+fn view_rejects_a_missing_log_prefix_without_a_snapshot() {
+    let identity = identity(45);
+    let mut view = RaftReplicaLogView::new(identity);
+
+    let error = view
+        .replay(entry(identity, 100, 1, b"orphaned-suffix"), Lsn::new(100))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RaftLogViewError::MissingLogPrefix {
+            expected_first_index: 1,
+            received_first_index: 100,
+        }
+    );
+    assert!(view.is_empty());
+    assert_eq!(view.last_replayed_lsn(), None);
+}
+
+/// Realistic bug caught: rejecting a valid snapshot below the current commit
+/// frontier prevents compaction when applied state trails committed state.
+#[test]
+fn view_allows_snapshot_below_commit_and_retains_the_uncompacted_suffix() {
+    let identity = identity(46);
+    let mut view = RaftReplicaLogView::new(identity);
+
+    for index in 1..=120 {
+        view.replay(entry(identity, index, 1, b"entry"), Lsn::new(index * 10))
+            .unwrap();
+    }
+    view.advance_commit(120).unwrap();
+
+    view.install_snapshot(100, 1, Lsn::new(2_000)).unwrap();
+
+    assert_eq!(view.snapshot_boundary(), Some((100, 1)));
+    assert_eq!(view.committed_index(), 120);
+    assert!(view.entry(100).is_none());
+    assert!(view.entry(101).is_some());
+    assert!(view.entry(120).is_some());
+    assert_eq!(view.first_index(), Some(101));
+    assert_eq!(view.last_index(), Some(120));
+}
+
+/// Realistic bug caught: accepting a snapshot pointer whose boundary term
+/// disagrees with a retained entry would make the recovered Raft log ambiguous.
+#[test]
+fn view_rejects_a_snapshot_boundary_term_mismatch() {
+    let identity = identity(47);
+    let mut view = RaftReplicaLogView::new(identity);
+    for index in 1..5 {
+        view.replay(entry(identity, index, 3, b"entry"), Lsn::new(index * 10))
+            .unwrap();
+    }
+    view.replay(entry(identity, 5, 3, b"entry"), Lsn::new(50))
+        .unwrap();
+
+    let error = view.install_snapshot(5, 4, Lsn::new(60)).unwrap_err();
+
+    assert_eq!(
+        error,
+        RaftLogViewError::SnapshotBoundaryTermMismatch {
+            index: 5,
+            expected_term: 3,
+            received_term: 4,
+        }
+    );
+    assert_eq!(view.snapshot_boundary(), None);
+    assert!(view.entry(5).is_some());
 }

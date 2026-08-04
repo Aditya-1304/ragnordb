@@ -88,6 +88,44 @@ impl RecoveredRaftReplica {
     pub fn snapshot(&self) -> Option<&RaftSnapshotPointerRecord> {
         self.snapshot.as_ref()
     }
+
+    /// Normalize restart term state after the complete recoverable prefix is
+    /// known. A crash can preserve a higher-term entry while losing the
+    /// trailing HardState that originally carried that term, so restarting
+    /// with the older term or vote would violate Raft term/vote safety.
+    fn normalize_hard_state_term(&mut self) {
+        let snapshot_term = self
+            .log_view
+            .snapshot_boundary()
+            .map(|(_, term)| term)
+            .unwrap_or(0);
+        let retained_entry_term = self
+            .log_view
+            .entries()
+            .map(|entry| entry.record.term)
+            .max()
+            .unwrap_or(0);
+        let maximum_observed_term = snapshot_term.max(retained_entry_term);
+
+        if maximum_observed_term == 0 {
+            return;
+        }
+
+        match self.hard_state.as_mut() {
+            Some(state) if state.current_term < maximum_observed_term => {
+                state.current_term = maximum_observed_term;
+                state.voted_for = None;
+            }
+            Some(_) => {}
+            None => {
+                self.hard_state = Some(HardState {
+                    current_term: maximum_observed_term,
+                    voted_for: None,
+                    commit: self.log_view.committed_index(),
+                });
+            }
+        }
+    }
 }
 
 /// every Raft replica lifetime reconstructed by one shared WAL scan
@@ -240,6 +278,7 @@ impl RecoveredRaftStorage {
         initial_configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
     ) -> Result<(), RaftStorageRecoveryError> {
         for (identity, replica) in &mut self.replicas {
+            replica.normalize_hard_state_term();
             let mut conf_state = replica
                 .conf_state
                 .clone()

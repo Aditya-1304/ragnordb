@@ -4,7 +4,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    process,
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ragnordb_common::{
@@ -61,6 +63,12 @@ impl FileBootstrapStore {
                 directory.display()
             ))
         })?;
+        cleanup_temporary_files(&directory).map_err(|error| {
+            BootstrapStoreError::Unavailable(format!(
+                "clean bootstrap temporary files in {}: {error}",
+                directory.display()
+            ))
+        })?;
         sync_directory(&directory).map_err(|error| {
             BootstrapStoreError::Unavailable(format!(
                 "synchronize bootstrap directory {}: {error}",
@@ -69,7 +77,7 @@ impl FileBootstrapStore {
         })?;
         Ok(Self {
             directory,
-            next_temporary_id: AtomicU64::new(1),
+            next_temporary_id: AtomicU64::new(temporary_id_seed()),
         })
     }
 
@@ -117,8 +125,10 @@ impl BootstrapStore for FileBootstrapStore {
 
         let temporary_id = self.next_temporary_id.fetch_add(1, Ordering::Relaxed);
         let temporary_path = self.directory.join(format!(
-            ".raft-group-{}.bootstrap.{}.tmp",
-            raft_group_id.0, temporary_id
+            ".raft-group-{}.bootstrap.{}.{}.tmp",
+            raft_group_id.0,
+            process::id(),
+            temporary_id,
         ));
         let mut temporary = OpenOptions::new()
             .write(true)
@@ -174,6 +184,48 @@ impl BootstrapStore for FileBootstrapStore {
 
 fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
+}
+
+/// Remove only files in the bootstrap directory's private temporary namespace.
+/// These files are never authoritative: successful installation creates the
+/// final name before the temporary hard link is removed, so an orphaned temp
+/// file can be discarded safely during the next node-owned startup.
+fn cleanup_temporary_files(directory: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_temporary_bootstrap_name(name) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn is_temporary_bootstrap_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".raft-group-") else {
+        return false;
+    };
+    let Some((group_id, suffix)) = rest.split_once(".bootstrap.") else {
+        return false;
+    };
+
+    group_id.parse::<u64>().is_ok() && suffix.ends_with(".tmp")
+}
+
+fn temporary_id_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

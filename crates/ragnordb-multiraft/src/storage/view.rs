@@ -121,10 +121,19 @@ impl RaftReplicaLogView {
         if index == 0 || term == 0 {
             return Err(RaftLogViewError::InvalidSnapshotBoundary { index, term });
         }
-        if index < self.committed_index || index < self.snapshot_index {
+        if index < self.snapshot_index {
             return Err(RaftLogViewError::SnapshotRegression {
-                current: self.snapshot_index.max(self.committed_index),
+                current: self.snapshot_index,
                 received: index,
+            });
+        }
+        if let Some(entry) = self.entries.get(&index)
+            && entry.record.term != term
+        {
+            return Err(RaftLogViewError::SnapshotBoundaryTermMismatch {
+                index,
+                expected_term: entry.record.term,
+                received_term: term,
             });
         }
         if let Some(previous_lsn) = self.last_replayed_lsn
@@ -228,6 +237,13 @@ impl RaftReplicaLogView {
                 RaftLogReplayOutcome::ReplacedSuffix { removed_entries }
             }
         } else {
+            if self.entries.is_empty() && self.snapshot_index == 0 && index != 1 {
+                return Err(RaftLogViewError::MissingLogPrefix {
+                    expected_first_index: 1,
+                    received_first_index: index,
+                });
+            }
+
             if let Some(last_index) = self.last_index() {
                 let expected_index = last_index
                     .checked_add(1)
@@ -282,6 +298,15 @@ pub enum RaftLogViewError {
         received_index: u64,
     },
 
+    #[error(
+        "Raft log has no snapshot base and starts at index {received_first_index}; \
+         expected {expected_first_index}"
+    )]
+    MissingLogPrefix {
+        expected_first_index: u64,
+        received_first_index: u64,
+    },
+
     #[error("Raft log index space is exhausted after index {last_index}")]
     LogIndexExhausted { last_index: u64 },
 
@@ -315,4 +340,14 @@ pub enum RaftLogViewError {
 
     #[error("Raft snapshot boundary regressed from {current} to {received}")]
     SnapshotRegression { current: u64, received: u64 },
+
+    #[error(
+        "Raft snapshot boundary at index {index} has term {received_term}, \
+         but the retained entry has term {expected_term}"
+    )]
+    SnapshotBoundaryTermMismatch {
+        index: u64,
+        expected_term: u64,
+        received_term: u64,
+    },
 }
