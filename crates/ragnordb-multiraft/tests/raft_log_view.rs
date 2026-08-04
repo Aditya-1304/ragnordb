@@ -193,3 +193,47 @@ fn view_rejects_a_snapshot_boundary_term_mismatch() {
     assert_eq!(view.snapshot_boundary(), None);
     assert!(view.entry(5).is_some());
 }
+
+#[test]
+fn view_rejects_term_regression_across_log_and_snapshot_boundaries() {
+    let identity = identity(48);
+
+    let mut log_view = RaftReplicaLogView::new(identity);
+    log_view
+        .replay(entry(identity, 1, 5, b"term-five"), Lsn::new(10))
+        .unwrap();
+
+    let error = log_view
+        .replay(entry(identity, 2, 4, b"term-four"), Lsn::new(20))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RaftLogViewError::LogTermRegression {
+            previous_index: 1,
+            previous_term: 5,
+            received_index: 2,
+            received_term: 4,
+        }
+    );
+
+    let mut snapshot_view = RaftReplicaLogView::new(identity);
+    snapshot_view
+        .replay(entry(identity, 1, 5, b"term-five"), Lsn::new(30))
+        .unwrap();
+    snapshot_view.install_snapshot(1, 5, Lsn::new(40)).unwrap();
+
+    let error = snapshot_view
+        .replay(entry(identity, 2, 4, b"term-four"), Lsn::new(50))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RaftLogViewError::LogTermRegression {
+            previous_index: 1,
+            previous_term: 5,
+            received_index: 2,
+            received_term: 4,
+        }
+    );
+}

@@ -5,7 +5,8 @@ use raft::{
 use ragnordb_common::ids::{RaftGroupId, ReplicaId};
 use ragnordb_multiraft::storage::{
     codec::{
-        DurableRaftEntryPayload, RaftHardStateRecord, RaftLogEntryRecord, RaftReplicaIdentity,
+        DurableRaftEntryPayload, RAFT_SNAPSHOT_POINTER_RECORD_VERSION, RaftHardStateRecord,
+        RaftLogEntryRecord, RaftReplicaIdentity, RaftSnapshotPointerRecord,
     },
     persistence::RaftWalRecordType,
     recovery::{
@@ -31,6 +32,31 @@ impl RaftWalRecoverySource for RecordSource {
     fn next_record(&mut self) -> Result<Option<WalRecord>, WalError> {
         Ok(self.records.next())
     }
+}
+
+fn snapshot_pointer(
+    lsn: u64,
+    identity: RaftReplicaIdentity,
+    term: u64,
+    conf_state: ConfState,
+    checksum: [u8; 32],
+) -> WalRecord {
+    let payload = RaftSnapshotPointerRecord {
+        format_version: RAFT_SNAPSHOT_POINTER_RECORD_VERSION,
+        identity,
+        snapshot_id: 1,
+        last_included_index: 10,
+        last_included_term: term,
+        applied_index: 10,
+        conf_state,
+        size_bytes: 4096,
+        checksum,
+        file_name: "raft-80-181-10.snapshot".to_owned(),
+    }
+    .encode()
+    .unwrap();
+
+    wal_record(lsn, RaftWalRecordType::SnapshotPointer, payload)
 }
 
 fn identity(group: u64, replica: u64) -> RaftReplicaIdentity {
@@ -347,3 +373,49 @@ fn recovery_rejects_same_term_vote_change_and_commit_regression() {
     ));
 }
 use std::collections::BTreeMap;
+
+#[test]
+fn recovery_enforces_same_index_snapshot_pointer_identity() {
+    let identity = identity(80, 181);
+
+    let conf_a = ConfState::new(1, [CoreReplicaId::must(181)], []).unwrap();
+
+    let mut conf_b = conf_a.clone();
+    conf_b.version = 2;
+
+    let cases = [
+        ("different term", 6, conf_a.clone(), [9; 32], false),
+        ("different ConfState", 5, conf_b, [9; 32], false),
+        ("different checksum", 5, conf_a.clone(), [8; 32], false),
+        ("exact duplicate", 5, conf_a, [9; 32], true),
+    ];
+
+    for (name, second_term, second_conf, second_checksum, should_succeed) in cases {
+        let mut source = RecordSource::new(vec![
+            snapshot_pointer(10, identity, 5, conf_state(identity), [9; 32]),
+            snapshot_pointer(20, identity, second_term, second_conf, second_checksum),
+        ]);
+
+        let result = recover_raft_storage(&mut source);
+
+        if should_succeed {
+            assert!(result.is_ok(), "{name} should be idempotent");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(RaftStorageRecoveryError::ConflictingSnapshotPointer {
+                        identity: received,
+                        index: 10,
+                        ..
+                    }) if received == identity
+                ),
+                "{name} should be rejected as durable corruption"
+            );
+        }
+    }
+}
+
+fn conf_state(identity: RaftReplicaIdentity) -> ConfState {
+    ConfState::new(1, [CoreReplicaId::must(identity.replica_id.0)], []).unwrap()
+}

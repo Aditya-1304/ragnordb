@@ -237,7 +237,20 @@ impl RecoveredRaftStorage {
             }
             RaftWalRecordType::SnapshotPointer => {
                 let snapshot = RaftSnapshotPointerRecord::decode(&record.payload)?;
-                let replica = self.replica_mut(snapshot.identity);
+                let identity = snapshot.identity;
+                let replica = self.replica_mut(identity);
+
+                if let Some(previous) = replica.snapshot.as_ref()
+                    && snapshot.last_included_index == previous.last_included_index
+                    && &snapshot != previous
+                {
+                    return Err(RaftStorageRecoveryError::ConflictingSnapshotPointer {
+                        identity,
+                        index: snapshot.last_included_index,
+                        lsn: record.lsn,
+                    });
+                }
+
                 replica
                     .log_view
                     .install_snapshot(
@@ -249,11 +262,13 @@ impl RecoveredRaftStorage {
                         lsn: record.lsn,
                         source,
                     })?;
+
                 replica.progress = RaftProgress {
                     truncated_through_index: snapshot.last_included_index,
                     truncated_through_term: snapshot.last_included_term,
                     applied_index: snapshot.applied_index,
                 };
+
                 replica.hard_state = Some(match replica.hard_state.take() {
                     Some(mut state) if state.current_term >= snapshot.last_included_term => {
                         state.commit = state.commit.max(snapshot.last_included_index);
@@ -265,6 +280,7 @@ impl RecoveredRaftStorage {
                         commit: snapshot.last_included_index,
                     },
                 });
+
                 replica.conf_state = Some(snapshot.conf_state.clone());
                 replica.snapshot = Some(snapshot);
             }
@@ -402,5 +418,15 @@ pub enum RaftStorageRecoveryError {
         identity: RaftReplicaIdentity,
         index: u64,
         reason: String,
+    },
+
+    #[error(
+        "conflicting Raft snapshot pointers for {identity:?} at index {index} \
+     encountered at WAL LSN {lsn:?}"
+    )]
+    ConflictingSnapshotPointer {
+        identity: RaftReplicaIdentity,
+        index: u64,
+        lsn: Lsn,
     },
 }

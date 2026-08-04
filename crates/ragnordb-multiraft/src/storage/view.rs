@@ -127,6 +127,24 @@ impl RaftReplicaLogView {
                 received: index,
             });
         }
+
+        if index == self.snapshot_index && term != self.snapshot_term {
+            return Err(RaftLogViewError::SnapshotBoundaryTermChanged {
+                index,
+                previous_term: self.snapshot_term,
+                received_term: term,
+            });
+        }
+
+        if index > self.snapshot_index && self.snapshot_term != 0 && term < self.snapshot_term {
+            return Err(RaftLogViewError::SnapshotTermRegression {
+                previous_index: self.snapshot_index,
+                previous_term: self.snapshot_term,
+                received_index: index,
+                received_term: term,
+            });
+        }
+
         if let Some(entry) = self.entries.get(&index)
             && entry.record.term != term
         {
@@ -136,6 +154,7 @@ impl RaftReplicaLogView {
                 received_term: term,
             });
         }
+
         if let Some(previous_lsn) = self.last_replayed_lsn
             && lsn <= previous_lsn
         {
@@ -195,6 +214,21 @@ impl RaftReplicaLogView {
             return Err(RaftLogViewError::EntryAtOrBelowSnapshot {
                 index,
                 snapshot_index: self.snapshot_index,
+            });
+        }
+
+        let previous_term = self
+            .entries
+            .last_key_value()
+            .map(|(_, entry)| entry.record.term)
+            .unwrap_or(self.snapshot_term);
+
+        if previous_term != 0 && record.term < previous_term {
+            return Err(RaftLogViewError::LogTermRegression {
+                previous_index: index - 1,
+                previous_term,
+                received_index: index,
+                received_term: record.term,
             });
         }
 
@@ -348,6 +382,38 @@ pub enum RaftLogViewError {
     SnapshotBoundaryTermMismatch {
         index: u64,
         expected_term: u64,
+        received_term: u64,
+    },
+
+    #[error(
+        "Raft log term regressed from index {previous_index} term {previous_term} \
+     to index {received_index} term {received_term}"
+    )]
+    LogTermRegression {
+        previous_index: u64,
+        previous_term: u64,
+        received_index: u64,
+        received_term: u64,
+    },
+
+    #[error(
+        "Raft snapshot boundary term changed at index {index}: \
+     previous {previous_term}, received {received_term}"
+    )]
+    SnapshotBoundaryTermChanged {
+        index: u64,
+        previous_term: u64,
+        received_term: u64,
+    },
+
+    #[error(
+        "Raft snapshot term regressed from index {previous_index} term {previous_term} \
+     to index {received_index} term {received_term}"
+    )]
+    SnapshotTermRegression {
+        previous_index: u64,
+        previous_term: u64,
+        received_index: u64,
         received_term: u64,
     },
 }
