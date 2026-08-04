@@ -217,22 +217,7 @@ impl RaftReplicaLogView {
             });
         }
 
-        let previous_term = self
-            .entries
-            .last_key_value()
-            .map(|(_, entry)| entry.record.term)
-            .unwrap_or(self.snapshot_term);
-
-        if previous_term != 0 && record.term < previous_term {
-            return Err(RaftLogViewError::LogTermRegression {
-                previous_index: index - 1,
-                previous_term,
-                received_index: index,
-                received_term: record.term,
-            });
-        }
-
-        let outcome = if let Some(existing) = self.entries.get(&index) {
+        if let Some(existing) = self.entries.get(&index) {
             if record.term == existing.record.term {
                 if record.payload != existing.record.payload {
                     return Err(RaftLogViewError::ConflictingPayload {
@@ -244,61 +229,96 @@ impl RaftReplicaLogView {
                 self.entries
                     .insert(index, RecoveredRaftLogEntry { record, lsn });
 
-                RaftLogReplayOutcome::IdempotentReplay
-            } else {
-                if record.term < existing.record.term {
-                    return Err(RaftLogViewError::TermRegression {
-                        index,
-                        current_term: existing.record.term,
-                        received_term: record.term,
-                    });
-                }
-
-                if index <= self.committed_index {
-                    return Err(RaftLogViewError::CommittedPrefixOverwrite {
-                        index,
-                        committed_index: self.committed_index,
-                    });
-                }
-
-                let removed_entries = self.entries.range(index..).count();
-
-                self.entries.split_off(&index);
-
-                self.entries
-                    .insert(index, RecoveredRaftLogEntry { record, lsn });
-
-                RaftLogReplayOutcome::ReplacedSuffix { removed_entries }
+                self.last_replayed_lsn = Some(lsn);
+                return Ok(RaftLogReplayOutcome::IdempotentReplay);
             }
-        } else {
-            if self.entries.is_empty() && self.snapshot_index == 0 && index != 1 {
-                return Err(RaftLogViewError::MissingLogPrefix {
-                    expected_first_index: 1,
-                    received_first_index: index,
+
+            if record.term < existing.record.term {
+                return Err(RaftLogViewError::TermRegression {
+                    index,
+                    current_term: existing.record.term,
+                    received_term: record.term,
                 });
             }
 
-            if let Some(last_index) = self.last_index() {
-                let expected_index = last_index
-                    .checked_add(1)
-                    .ok_or(RaftLogViewError::LogIndexExhausted { last_index })?;
+            // A suffix replacement may not introduce a term below a later
+            // term already observed in the retained suffix. Exact replay is
+            // handled above because its term need not match that suffix tail.
+            let (maximum_retained_index, maximum_retained_term) = self
+                .entries
+                .last_key_value()
+                .map(|(retained_index, entry)| (*retained_index, entry.record.term))
+                .unwrap_or((self.snapshot_index, self.snapshot_term));
 
-                if index != expected_index {
-                    return Err(RaftLogViewError::NonContiguousAppend {
-                        expected_index,
-                        received_index: index,
-                    });
-                }
+            if record.term < maximum_retained_term {
+                return Err(RaftLogViewError::LogTermRegression {
+                    previous_index: maximum_retained_index,
+                    previous_term: maximum_retained_term,
+                    received_index: index,
+                    received_term: record.term,
+                });
             }
+
+            if index <= self.committed_index {
+                return Err(RaftLogViewError::CommittedPrefixOverwrite {
+                    index,
+                    committed_index: self.committed_index,
+                });
+            }
+
+            let removed_entries = self.entries.range(index..).count();
+
+            self.entries.split_off(&index);
 
             self.entries
                 .insert(index, RecoveredRaftLogEntry { record, lsn });
 
-            RaftLogReplayOutcome::Appended
-        };
+            self.last_replayed_lsn = Some(lsn);
+            return Ok(RaftLogReplayOutcome::ReplacedSuffix { removed_entries });
+        }
+
+        if self.entries.is_empty() && self.snapshot_index == 0 && index != 1 {
+            return Err(RaftLogViewError::MissingLogPrefix {
+                expected_first_index: 1,
+                received_first_index: index,
+            });
+        }
+
+        if let Some(last_index) = self.last_index() {
+            let expected_index = last_index
+                .checked_add(1)
+                .ok_or(RaftLogViewError::LogIndexExhausted { last_index })?;
+
+            if index != expected_index {
+                return Err(RaftLogViewError::NonContiguousAppend {
+                    expected_index,
+                    received_index: index,
+                });
+            }
+        }
+
+        let predecessor_term = self
+            .entries
+            .get(&(index - 1))
+            .map(|entry| entry.record.term)
+            .or_else(|| (index == self.snapshot_index + 1).then_some(self.snapshot_term));
+
+        if let Some(previous_term) = predecessor_term
+            && record.term < previous_term
+        {
+            return Err(RaftLogViewError::LogTermRegression {
+                previous_index: index - 1,
+                previous_term,
+                received_index: index,
+                received_term: record.term,
+            });
+        }
+
+        self.entries
+            .insert(index, RecoveredRaftLogEntry { record, lsn });
 
         self.last_replayed_lsn = Some(lsn);
-        Ok(outcome)
+        Ok(RaftLogReplayOutcome::Appended)
     }
 }
 

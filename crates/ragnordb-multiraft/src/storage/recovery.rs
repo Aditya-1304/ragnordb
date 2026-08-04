@@ -18,7 +18,7 @@ use super::{
     codec::{
         DurableRaftEntryPayload, RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord,
         RaftReplicaIdentity, RaftSnapshotPointerRecord, RaftStableStateCodecError,
-        validate_hard_state_successor,
+        SnapshotTransitionError, validate_hard_state_successor, validate_snapshot_successor,
     },
     frontier::RaftProgress,
     persistence::RaftWalRecordType,
@@ -240,16 +240,26 @@ impl RecoveredRaftStorage {
                 let identity = snapshot.identity;
                 let replica = self.replica_mut(identity);
 
-                if let Some(previous) = replica.snapshot.as_ref()
-                    && snapshot.last_included_index == previous.last_included_index
-                    && &snapshot != previous
-                {
-                    return Err(RaftStorageRecoveryError::ConflictingSnapshotPointer {
-                        identity,
-                        index: snapshot.last_included_index,
-                        lsn: record.lsn,
-                    });
-                }
+                validate_snapshot_successor(replica.snapshot.as_ref(), &snapshot).map_err(
+                    |error| match error {
+                        SnapshotTransitionError::ConflictingPointer { index } => {
+                            RaftStorageRecoveryError::ConflictingSnapshotPointer {
+                                identity,
+                                index,
+                                lsn: record.lsn,
+                            }
+                        }
+                        SnapshotTransitionError::IndexRegression { previous, received } => {
+                            RaftStorageRecoveryError::InvalidLogTransition {
+                                lsn: record.lsn,
+                                source: RaftLogViewError::SnapshotRegression {
+                                    current: previous,
+                                    received,
+                                },
+                            }
+                        }
+                    },
+                )?;
 
                 replica
                     .log_view

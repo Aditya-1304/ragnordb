@@ -19,7 +19,8 @@ use wal::{
 use super::{
     codec::{
         RaftHardStateRecord, RaftLogEntryCodecError, RaftLogEntryRecord, RaftReplicaIdentity,
-        RaftSnapshotPointerRecord, RaftStableStateCodecError, validate_hard_state_successor,
+        RaftSnapshotPointerRecord, RaftStableStateCodecError, SnapshotTransitionError,
+        validate_hard_state_successor, validate_snapshot_successor,
     },
     view::{RaftLogViewError, RaftReplicaLogView},
 };
@@ -394,6 +395,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
                     received: snapshot.identity,
                 });
             }
+            validate_snapshot_successor(self.snapshot.as_ref(), &snapshot)?;
             preview_lsn = preview_lsn
                 .checked_add(1)
                 .ok_or(RaftPersistenceError::PreviewLsnExhausted)?;
@@ -495,6 +497,9 @@ pub enum RaftPersistenceError {
 
     #[error("invalid Raft stable state: {0}")]
     InvalidStableState(#[from] RaftStableStateCodecError),
+
+    #[error("invalid Raft snapshot transition: {0}")]
+    InvalidSnapshotTransition(#[from] SnapshotTransitionError),
 
     #[error("invalid Raft log transition: {0}")]
     InvalidLogTransition(#[from] RaftLogViewError),

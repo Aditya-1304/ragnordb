@@ -201,6 +201,42 @@ fn sync_failure_does_not_publish_unacknowledged_raft_state() {
     );
 }
 
+/// Realistic bug caught: live persistence must reject the same conflicting
+/// snapshot pointer that recovery would reject, before a second WAL batch can
+/// make the inconsistent history durable.
+#[test]
+fn persistence_rejects_conflicting_same_index_snapshot_before_wal_append() {
+    let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+    let first_snapshot = snapshot_pointer();
+
+    storage
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(first_snapshot.clone()),
+            entries: Vec::new(),
+            hard_state: None,
+        })
+        .unwrap();
+
+    let mut conflicting_snapshot = first_snapshot;
+    conflicting_snapshot.checksum = [8; 32];
+
+    let error = storage
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(conflicting_snapshot),
+            entries: Vec::new(),
+            hard_state: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RaftPersistenceError::InvalidSnapshotTransition(_)
+    ));
+    assert_eq!(storage.wal().operations.len(), 1);
+    assert_eq!(storage.snapshot().unwrap().checksum, [9; 32]);
+    assert_eq!(storage.log_view().snapshot_boundary(), Some((19, 7)));
+}
+
 /// Realistic bug caught: one group observes an uncertain shared-WAL outcome,
 /// but another group continues consuming Ready generations through a separate
 /// per-replica writer.

@@ -99,6 +99,28 @@ fn identical_entry_replay_is_idempotent_and_refreshes_its_lsn() {
     assert_eq!(view.entry(1).unwrap().lsn, Lsn::new(80));
 }
 
+/// Realistic bug caught: a replayed older entry must remain idempotent even
+/// when a later retained entry has a newer term. Rejecting it would turn a
+/// valid WAL replay into false corruption during recovery.
+#[test]
+fn exact_replay_of_an_older_entry_is_idempotent() {
+    let identity = identity(49);
+    let mut view = RaftReplicaLogView::new(identity);
+
+    view.replay(entry(identity, 1, 1, b"one"), Lsn::new(90))
+        .unwrap();
+    view.replay(entry(identity, 2, 2, b"two"), Lsn::new(100))
+        .unwrap();
+
+    let outcome = view
+        .replay(entry(identity, 1, 1, b"one"), Lsn::new(110))
+        .unwrap();
+
+    assert_eq!(outcome, RaftLogReplayOutcome::IdempotentReplay);
+    assert_eq!(view.entry(1).unwrap().lsn, Lsn::new(110));
+    assert_eq!(view.entry(2).unwrap().record.term, 2);
+}
+
 #[test]
 fn view_rejects_an_entry_from_another_replica_lifetime() {
     let owner = identity(44);

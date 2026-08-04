@@ -122,6 +122,43 @@ impl RaftSnapshotPointerRecord {
     }
 }
 
+/// Validate that a new snapshot pointer is a legal successor of the pointer
+/// already admitted for the same replica lifetime. Live persistence and
+/// recovery share this rule so a running node cannot emit a snapshot history
+/// that its restart path would later reject.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SnapshotTransitionError {
+    #[error("Raft snapshot index regressed from {previous} to {received}")]
+    IndexRegression { previous: u64, received: u64 },
+
+    #[error("conflicting Raft snapshot pointer at index {index}")]
+    ConflictingPointer { index: u64 },
+}
+
+pub fn validate_snapshot_successor(
+    previous: Option<&RaftSnapshotPointerRecord>,
+    next: &RaftSnapshotPointerRecord,
+) -> Result<(), SnapshotTransitionError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+
+    if next.last_included_index < previous.last_included_index {
+        return Err(SnapshotTransitionError::IndexRegression {
+            previous: previous.last_included_index,
+            received: next.last_included_index,
+        });
+    }
+
+    if next.last_included_index == previous.last_included_index && next != previous {
+        return Err(SnapshotTransitionError::ConflictingPointer {
+            index: next.last_included_index,
+        });
+    }
+
+    Ok(())
+}
+
 /// one Raft replica lifetime inside a logical Raft group
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RaftReplicaIdentity {
