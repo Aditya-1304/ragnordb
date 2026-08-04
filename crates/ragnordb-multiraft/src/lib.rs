@@ -1,6 +1,7 @@
 use ragnordb_common::ids::NodeId;
 
 pub mod bootstrap;
+pub mod runtime;
 pub mod storage;
 
 /// Hosts all Raft group replicas assigned to one physical database node.
