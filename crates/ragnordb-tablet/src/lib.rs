@@ -10,6 +10,7 @@
 //! This right now does not replicate commands or persist them to WAL.
 
 pub mod command;
+pub mod read;
 use std::collections::BTreeMap;
 
 use ragnordb_common::{
