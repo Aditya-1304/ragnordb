@@ -627,7 +627,9 @@ where
         Ok(())
     }
 
-    fn quarantine(&mut self) {
+    /// Permanently quarantine this Raft group after a state-machine or runtime
+    /// invariant failure. The group must not accept more work in this lifetime.
+    pub fn quarantine(&mut self) {
         self.state = RuntimeState::GroupQuarantined;
     }
 }

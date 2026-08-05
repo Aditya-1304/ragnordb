@@ -5,6 +5,7 @@ pub mod proposal;
 pub mod runtime;
 pub mod storage;
 pub mod tablet_apply;
+pub mod tablet_cluster;
 
 /// Hosts all Raft group replicas assigned to one physical database node.
 ///

@@ -1312,6 +1312,7 @@ dependencies = [
  "ragnordb-common",
  "ragnordb-storage",
  "ragnordb-tablet",
+ "ragnordb-txn",
  "thiserror",
  "wal",
 ]

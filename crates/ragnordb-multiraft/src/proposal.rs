@@ -273,6 +273,11 @@ impl<R> ProposalRegistry<R> {
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
+
+    /// return whether a request already has an outstanding response waiter.
+    pub fn is_pending(&self, request_id: &RequestId) -> bool {
+        self.pending.contains_key(request_id)
+    }
 }
 
 impl<R> Default for ProposalRegistry<R> {
