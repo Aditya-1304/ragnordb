@@ -166,6 +166,20 @@ impl CapturedMvccState {
             writes: self.writes,
         }
     }
+
+    /// detach the captured MVCC records for inclusion in a tablet snapshot
+    ///
+    /// the tablet snapshot owns its table identity separately, so this method
+    /// deliberately returns the records without fabricating a catalog definition
+    pub fn into_snapshot_entries(
+        self,
+    ) -> (
+        Vec<snapshot_proto::DefaultValueEntry>,
+        Vec<snapshot_proto::LockEntry>,
+        Vec<snapshot_proto::WriteEntry>,
+    ) {
+        (self.default_values, self.locks, self.writes)
+    }
 }
 
 /// durably publish a captured snapshot beneath the database data directory

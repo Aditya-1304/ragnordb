@@ -75,6 +75,16 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &self.tablet
     }
 
+    /// return the tablet descriptor epoch represented by this state machine
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// return the Raft group that owns this tablet state machine
+    pub fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
     /// Encode replicated command metadata that must accompany a tablet snapshot.
     ///
     /// MVCC data is intentionally owned by the surrounding tablet snapshot. This

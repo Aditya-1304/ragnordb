@@ -112,3 +112,22 @@ pub struct TabletSnapshotFile {
     #[prost(bytes = "vec", tag = "2")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+/// complete logical state for one tablet snapshot image
+///
+/// catalog definitions remain owned by the metadata authority. This payload
+/// contains the tablet's MVCC state and replicated command deduplication state
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletSnapshotPayload {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub table_id: ::core::option::Option<super::ids::TableId>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub tablet_state_machine: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    pub default_values: ::prost::alloc::vec::Vec<DefaultValueEntry>,
+    #[prost(message, repeated, tag = "5")]
+    pub locks: ::prost::alloc::vec::Vec<LockEntry>,
+    #[prost(message, repeated, tag = "6")]
+    pub writes: ::prost::alloc::vec::Vec<WriteEntry>,
+}

@@ -5,6 +5,8 @@
 //! snapshot image to the exact cluster, tablet generation, configuration,
 //! applied boundary, and payload checksum that produced it
 
+use crate::command::TabletStateMachine;
+use ragnordb_storage::mvcc::InMemoryMvcc;
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -26,6 +28,126 @@ pub const TABLET_SNAPSHOT_STORAGE_FORMAT_VERSION: u32 = 1;
 const MAX_CLUSTER_ID_BYTES: usize = 256;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// current payload format for a tablet state image
+pub const TABLET_SNAPSHOT_PAYLOAD_VERSION: u32 = 1;
+
+/// the exact Raft boundary through which the tablet state machine has applied
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedTabletFrontier {
+    pub index: u64,
+    pub term: u64,
+}
+
+impl AppliedTabletFrontier {
+    pub const fn new(index: u64, term: u64) -> Self {
+        Self { index, term }
+    }
+}
+
+/// generate one immutable tablet snapshot image
+///
+/// the caller must obtain this frontier only after the corresponding Raft
+/// entries have been successfully applied. This function captures the
+/// replicated deduplication state and detached MVCC records into one
+/// deterministic protobuf payload before metadata computes its checksum
+pub fn generate_local_snapshot(
+    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    cluster_id: impl Into<String>,
+    replica_id: ReplicaId,
+    snapshot_id: u64,
+    conf_state: TabletSnapshotConfState,
+    applied_frontier: AppliedTabletFrontier,
+) -> Result<TabletSnapshotImage, TabletSnapshotGenerationError> {
+    if applied_frontier.index == 0 {
+        return Err(TabletSnapshotGenerationError::ZeroAppliedIndex);
+    }
+
+    if applied_frontier.term == 0 {
+        return Err(TabletSnapshotGenerationError::ZeroAppliedTerm);
+    }
+
+    let tablet_state_machine = state_machine
+        .encode_snapshot_state()
+        .map_err(|error| TabletSnapshotGenerationError::StateMachineSnapshot(error.to_string()))?;
+
+    let (default_values, locks, writes) = state_machine
+        .tablet()
+        .storage()
+        .capture_snapshot_state()
+        .into_snapshot_entries();
+
+    let payload = snapshot_proto::TabletSnapshotPayload {
+        format_version: TABLET_SNAPSHOT_PAYLOAD_VERSION,
+        table_id: Some(state_machine.tablet().table_id().to_proto()),
+        tablet_state_machine,
+        default_values,
+        locks,
+        writes,
+    }
+    .encode_to_vec();
+
+    let metadata = TabletSnapshotMetadata::for_payload(
+        cluster_id,
+        state_machine.raft_group_id(),
+        replica_id,
+        state_machine.tablet().id(),
+        state_machine.epoch(),
+        snapshot_id,
+        applied_frontier.index,
+        applied_frontier.term,
+        conf_state,
+        &payload,
+    )?;
+
+    TabletSnapshotImage::new(metadata, payload).map_err(TabletSnapshotGenerationError::Metadata)
+}
+
+/// generate and durably publish a local tablet snapshot
+///
+/// the file store performs the synchronized temporary-file write and atomic
+/// publication already established by Slice 1. Raft pointer persistence is
+/// intentionally left to the next integration step
+pub fn generate_and_publish_local_snapshot(
+    store: &FileTabletSnapshotStore,
+    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    cluster_id: impl Into<String>,
+    replica_id: ReplicaId,
+    snapshot_id: u64,
+    conf_state: TabletSnapshotConfState,
+    applied_frontier: AppliedTabletFrontier,
+) -> Result<TabletSnapshotPointer, TabletSnapshotGenerationError> {
+    let image = generate_local_snapshot(
+        state_machine,
+        cluster_id,
+        replica_id,
+        snapshot_id,
+        conf_state,
+        applied_frontier,
+    )?;
+
+    store
+        .publish(&image)
+        .map_err(TabletSnapshotGenerationError::Store)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletSnapshotGenerationError {
+    #[error("local tablet snapshot has no applied index")]
+    ZeroAppliedIndex,
+
+    #[error("local tablet snapshot has no applied term")]
+    ZeroAppliedTerm,
+
+    #[error("tablet state-machine snapshot encoding failed: {0}")]
+    StateMachineSnapshot(String),
+
+    #[error("tablet snapshot metadata validation failed: {0}")]
+    Metadata(#[from] TabletSnapshotMetadataError),
+
+    #[error("tablet snapshot publication failed: {0}")]
+    Store(#[from] TabletSnapshotStoreError),
+}
 
 /// Configuration state captured together with a tablet snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]

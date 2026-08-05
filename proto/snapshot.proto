@@ -79,3 +79,16 @@ message TabletSnapshotFile {
     TabletSnapshotMetadata metadata = 1;
     bytes data = 2;
 }
+
+// complete logical state for one tablet snapshot image
+//
+// catalog definitions remain owned by the metadata authority. This payload
+// contains the tablet's MVCC state and replicated command deduplication state
+message TabletSnapshotPayload {
+    uint32 format_version = 1;
+    ragnordb.ids.TableId table_id = 2;
+    bytes tablet_state_machine = 3;
+    repeated DefaultValueEntry default_values = 4;
+    repeated LockEntry locks = 5;
+    repeated WriteEntry writes = 6;
+}
