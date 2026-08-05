@@ -4,7 +4,11 @@
 //! persistence boundary, transfers outbound messages through an in-memory
 //! transport, and applies committed tablet commands on every replica
 
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::RecvTimeoutError,
+    time::{Duration, Instant},
+};
 
 use raft::{
     core::node::RaftNode,
@@ -15,17 +19,23 @@ use raft::{
 };
 
 use ragnordb_common::{
-    command_codec::{TabletCommandEnvelope, TabletCommandEnvelopeError},
+    command_codec::{
+        NoopCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
+    },
     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
 };
 
 use ragnordb_tablet::{
     Tablet,
-    command::{TabletCommandApplyError, TabletStateMachine},
+    command::{TabletCommandApplyError, TabletCommandApplyResult, TabletStateMachine},
+    read::{LeaderReadGate, LeaderReadGateError, ReadBarrierPosition},
 };
 
 use crate::{
-    proposal::{ProposalRegistry, ProposalRegistryError, ProposalTicket},
+    proposal::{
+        ProposalCompletion, ProposalFailure, ProposalRegistry, ProposalRegistryError,
+        ProposalTicket,
+    },
     runtime::{RaftReadyLoop, ReadyLoopError},
     storage::{
         codec::RaftReplicaIdentity,
@@ -37,6 +47,7 @@ use crate::{
 const REPLICA_IDS: [u64; 3] = [1, 2, 3];
 const ELECTION_TIMEOUT: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 2;
+const INTERNAL_READ_BARRIER_CLIENT_ID: u128 = 1_u128 << 127;
 
 type CoreRaftNode =
     RaftNode<Vec<u8>, Vec<u8>, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
@@ -108,6 +119,21 @@ pub enum TabletClusterError {
 
     #[error("proposal {request_id:?} expired before Raft admission")]
     ProposalDeadlineExceeded { request_id: RequestId },
+
+    #[error("leader read barrier state error: {0}")]
+    ReadBarrier(#[from] LeaderReadGateError),
+
+    #[error("leader read barrier response timed out")]
+    ReadBarrierTimeout,
+
+    #[error("leader read barrier response channel closed")]
+    ReadBarrierChannelClosed,
+
+    #[error("leader read barrier became retryable: {failure:?}")]
+    ReadBarrierRetryable { failure: ProposalFailure },
+
+    #[error("leader read barrier applied an unexpected tablet result")]
+    UnexpectedReadBarrierResult,
 }
 
 /// one in memory three-node Raft group owning one tablet
@@ -116,6 +142,10 @@ pub struct InMemoryTabletCluster<W: RaftWal> {
     transport: VecDeque<Envelope<Vec<u8>, Vec<u8>>>,
     proposals: ProposalRegistry<ragnordb_tablet::command::TabletCommandApplyOutcome>,
     raft_group_id: RaftGroupId,
+    tablet_id: TabletId,
+    tablet_epoch: u64,
+    read_gate: LeaderReadGate,
+    next_read_barrier_sequence: u64,
 }
 
 impl<W: RaftWal> InMemoryTabletCluster<W> {
@@ -179,6 +209,10 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             transport: VecDeque::new(),
             proposals: ProposalRegistry::new(),
             raft_group_id,
+            tablet_id,
+            tablet_epoch,
+            read_gate: LeaderReadGate::new(),
+            next_read_barrier_sequence: 1,
         };
 
         for replica_index in 0..REPLICA_IDS.len() {
@@ -475,5 +509,100 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
     /// Return the Raft group hosted by this deterministic cluster.
     pub const fn raft_group_id(&self) -> RaftGroupId {
         self.raft_group_id
+    }
+
+    /// Return whether the current leader has established and applied its
+    /// current-term read barrier.
+    pub fn latest_reads_ready(&self) -> Result<bool, TabletClusterError> {
+        let leader_index = self.leader_index()?;
+        let leader_term = self.replicas[leader_index].raft.raft().current_term();
+
+        Ok(self.read_gate.can_serve_latest(leader_term))
+    }
+
+    /// Propose and apply the current-term no-op required before latest reads.
+    ///
+    /// The barrier is registered only after the proposal completion comes from the
+    /// tablet state-machine apply path. Raft proposal acceptance or commit-index
+    /// movement alone never opens the read gate.
+    pub fn prepare_leader_for_latest_reads(
+        &mut self,
+    ) -> Result<ReadBarrierPosition, TabletClusterError> {
+        let leader_id = self.leader_id()?;
+        let leader_index = self.replica_index(leader_id)?;
+        let leader_term = self.replicas[leader_index].raft.raft().current_term();
+
+        if self.read_gate.leader_term() != Some(leader_term) {
+            self.read_gate.on_leader_elected(leader_term)?;
+        }
+
+        if self.read_gate.can_serve_latest(leader_term) {
+            return Ok(self
+                .read_gate
+                .pending_barrier()
+                .ok_or(LeaderReadGateError::NoPendingBarrier)?);
+        }
+
+        let sequence = self.next_read_barrier_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            TabletClusterError::Configuration(
+                "read barrier RequestId sequence exhausted".to_string(),
+            )
+        })?;
+
+        let request_id = RequestId {
+            client_id: INTERNAL_READ_BARRIER_CLIENT_ID,
+            sequence,
+            raft_group_id: self.raft_group_id,
+        };
+
+        let command = TabletCommandEnvelope::new(
+            request_id.clone(),
+            self.tablet_id,
+            self.tablet_epoch,
+            TabletCommand::Noop(NoopCommand),
+        )?
+        .encode()?;
+
+        let ticket = self.propose(
+            request_id,
+            command,
+            Instant::now() + Duration::from_secs(30),
+        )?;
+
+        let completion = match ticket.recv_timeout(Duration::from_secs(1)) {
+            Ok(completion) => completion,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(TabletClusterError::ReadBarrierTimeout);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(TabletClusterError::ReadBarrierChannelClosed);
+            }
+        };
+
+        match completion {
+            ProposalCompletion::Applied {
+                position, result, ..
+            } => {
+                if result.result != TabletCommandApplyResult::Noop {
+                    return Err(TabletClusterError::UnexpectedReadBarrierResult);
+                }
+
+                let barrier = ReadBarrierPosition {
+                    term: position.term,
+                    index: position.index,
+                };
+
+                self.read_gate.register_barrier(barrier)?;
+                self.read_gate.mark_barrier_applied(barrier)?;
+                self.next_read_barrier_sequence = next_sequence;
+
+                Ok(barrier)
+            }
+
+            ProposalCompletion::Retryable { failure, .. } => {
+                Err(TabletClusterError::ReadBarrierRetryable { failure })
+            }
+        }
     }
 }

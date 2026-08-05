@@ -361,3 +361,61 @@ fn expired_proposal_is_rejected_before_raft_admission() {
         assert_eq!(cluster.last_applied(replica_id).unwrap(), 0);
     }
 }
+
+/// Realistic bug caught:
+///
+/// A newly elected leader must not serve latest reads until a current-term
+/// no-op has committed and been applied on the tablet replicas.
+#[test]
+fn leader_requires_an_applied_current_term_barrier_before_latest_reads() {
+    let mut cluster = cluster();
+    let leader_id = cluster.elect_leader().unwrap();
+
+    assert!(!cluster.latest_reads_ready().unwrap());
+
+    let barrier = cluster.prepare_leader_for_latest_reads().unwrap();
+
+    assert!(cluster.latest_reads_ready().unwrap());
+    assert!(barrier.term > 0);
+    assert!(barrier.index > 0);
+    assert_eq!(cluster.last_applied(leader_id).unwrap(), barrier.index);
+
+    for replica_id in [1, 2, 3] {
+        assert_eq!(cluster.last_applied(replica_id).unwrap(), barrier.index);
+
+        // A no-op must not mutate MVCC state.
+        assert_eq!(
+            cluster
+                .tablet(replica_id)
+                .unwrap()
+                .state_machine()
+                .tablet()
+                .stats()
+                .write_records,
+            0
+        );
+    }
+}
+
+/// Realistic bug caught:
+///
+/// A barrier from the previous leader term must never authorize reads after a
+/// new leader is elected.
+#[test]
+fn new_leader_requires_a_new_current_term_barrier() {
+    let mut cluster = cluster();
+    let old_leader = cluster.elect_leader().unwrap();
+
+    cluster.prepare_leader_for_latest_reads().unwrap();
+    assert!(cluster.latest_reads_ready().unwrap());
+
+    cluster.kill_replica(old_leader).unwrap();
+
+    let new_leader = cluster.elect_leader().unwrap();
+    assert_ne!(new_leader, old_leader);
+    assert!(!cluster.latest_reads_ready().unwrap());
+
+    cluster.prepare_leader_for_latest_reads().unwrap();
+
+    assert!(cluster.latest_reads_ready().unwrap());
+}
