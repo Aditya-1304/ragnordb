@@ -12,14 +12,14 @@ use ragnordb_multiraft::storage::{
         NodeRaftWal, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalRecordType,
         RaftWalStorage,
     },
+    recovery::{RaftWalRecoverySource, recover_raft_storage},
 };
 use wal::{
     error::{BatchAppendFailure, WalError},
     lsn::Lsn,
     types::RecordType,
-    wal::{AppendResult, BatchAppendResult},
+    wal::{AppendResult, BatchAppendResult, iterator::WalRecord},
 };
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WalOperation {
     Batch(Vec<RecordType>),
@@ -28,6 +28,7 @@ enum WalOperation {
 struct FakeWal {
     next_lsn: Lsn,
     operations: Vec<WalOperation>,
+    records: Vec<WalRecord>,
     fail_sync: bool,
 }
 
@@ -36,6 +37,7 @@ impl FakeWal {
         Self {
             next_lsn: Lsn::new(100),
             operations: Vec::new(),
+            records: Vec::new(),
             fail_sync: false,
         }
     }
@@ -57,11 +59,17 @@ impl RaftWal for FakeWal {
             records.iter().map(|(kind, _)| *kind).collect(),
         ));
         let mut extents = Vec::new();
-        for (_, payload) in records {
+        for (record_type, payload) in records {
             let start_lsn = self.next_lsn;
             let end_lsn = start_lsn
                 .checked_add_bytes(payload.len() as u64 + 32)
                 .unwrap();
+            self.records.push(WalRecord {
+                lsn: start_lsn,
+                record_type: *record_type,
+                payload: payload.to_vec(),
+                total_len: (payload.len() + 32) as u32,
+            });
             self.next_lsn = end_lsn;
             extents.push(AppendResult { start_lsn, end_lsn });
         }
@@ -79,6 +87,41 @@ impl RaftWal for FakeWal {
             record_extents: extents,
         })
     }
+}
+struct RecordSource {
+    records: std::vec::IntoIter<WalRecord>,
+}
+
+impl RecordSource {
+    fn new(records: Vec<WalRecord>) -> Self {
+        Self {
+            records: records.into_iter(),
+        }
+    }
+}
+
+impl RaftWalRecoverySource for RecordSource {
+    fn next_record(&mut self) -> Result<Option<WalRecord>, WalError> {
+        Ok(self.records.next())
+    }
+}
+
+fn durable_storage() -> RaftWalStorage<FakeWal> {
+    let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+
+    storage
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(snapshot_pointer()),
+            entries: vec![LogEntry::normal_with_size(20, 8, b"twenty".to_vec(), 6)],
+            hard_state: Some(HardState {
+                current_term: 8,
+                voted_for: Some(CoreReplicaId::must(61)),
+                commit: 20,
+            }),
+        })
+        .unwrap();
+
+    storage
 }
 
 fn identity() -> RaftReplicaIdentity {
@@ -302,4 +345,54 @@ fn uncertain_batch_fences_every_group_writer_on_the_node() {
             ..
         }
     ));
+}
+
+/// Realistic bug caught:
+///
+/// A process crash may preserve any prefix of the ordered Ready batch. Every
+/// such prefix must recover without exposing a HardState, log suffix, snapshot
+/// boundary, or applied frontier that depends on a later record.
+#[test]
+fn every_ready_record_prefix_recovers_without_dangling_dependencies() {
+    let storage = durable_storage();
+    let records = storage.wal().records.clone();
+
+    assert_eq!(records.len(), 3);
+
+    for prefix_len in 0..=records.len() {
+        let mut source = RecordSource::new(records[..prefix_len].to_vec());
+        let recovered = recover_raft_storage(&mut source).unwrap();
+
+        let Some(replica) = recovered.replica(identity()) else {
+            assert_eq!(prefix_len, 0);
+            continue;
+        };
+
+        let snapshot_boundary_index = replica
+            .log_view()
+            .snapshot_boundary()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+
+        let mut expected_index = snapshot_boundary_index.saturating_add(1);
+
+        for entry in replica.log_view().entries() {
+            assert_eq!(entry.record.index, expected_index);
+
+            expected_index = expected_index
+                .checked_add(1)
+                .expect("test log index must not overflow");
+        }
+
+        let recovered_last_index = replica
+            .log_view()
+            .last_index()
+            .unwrap_or(snapshot_boundary_index);
+
+        if let Some(hard_state) = replica.hard_state() {
+            assert!(hard_state.commit <= recovered_last_index);
+        }
+
+        assert!(replica.progress().applied_index <= recovered_last_index);
+    }
 }

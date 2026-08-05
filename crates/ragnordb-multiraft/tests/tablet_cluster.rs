@@ -13,11 +13,35 @@ use ragnordb_storage::key::{encode_row_key, make_row_key};
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
 use ragnordb_txn::Transaction;
 use wal::{
-    error::BatchAppendFailure,
+    error::{BatchAppendFailure, WalError},
     lsn::Lsn,
     types::RecordType,
-    wal::{AppendResult, BatchAppendResult},
+    wal::{AppendResult, BatchAppendResult, iterator::WalRecord},
 };
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+use raft::{
+    core::node::RaftNode,
+    storage::mem::MemStorage,
+    traits::{log_store::LogStore, stable_store::StableStore},
+    types::{ConfState, ReplicaId as CoreReplicaId},
+};
+
+use ragnordb_multiraft::{
+    proposal::ProposalPosition,
+    storage::{
+        codec::{DurableRaftEntryPayload, RaftReplicaIdentity},
+        persistence::{RaftWal, RaftWalStorage},
+        recovery::{RaftWalRecoverySource, recover_raft_storage_with_configurations},
+    },
+    tablet_apply::TabletCommandApplier,
+    tablet_cluster::TabletRaftReadyLoop,
+};
+use ragnordb_tablet::{Tablet, command::TabletStateMachine};
 
 const TABLET_ID: TabletId = TabletId(41);
 const TABLE_ID: TableId = TableId(9);
@@ -61,6 +85,221 @@ impl ragnordb_multiraft::storage::persistence::RaftWal for TestWal {
             record_extents: extents,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct DurableTestWal {
+    state: Arc<Mutex<DurableTestWalState>>,
+}
+
+#[derive(Debug)]
+struct DurableTestWalState {
+    next_lsn: Lsn,
+    records: Vec<WalRecord>,
+}
+
+impl DurableTestWal {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DurableTestWalState {
+                next_lsn: Lsn::new(100),
+                records: Vec::new(),
+            })),
+        }
+    }
+
+    fn records(&self) -> Vec<WalRecord> {
+        self.state
+            .lock()
+            .expect("durable test WAL mutex must not be poisoned")
+            .records
+            .clone()
+    }
+
+    fn durable_end_lsn(&self) -> Lsn {
+        self.state
+            .lock()
+            .expect("durable test WAL mutex must not be poisoned")
+            .next_lsn
+    }
+}
+
+impl RaftWal for DurableTestWal {
+    fn append_batch_and_sync(
+        &mut self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("durable test WAL mutex must not be poisoned");
+
+        let mut extents = Vec::with_capacity(records.len());
+
+        for (record_type, payload) in records {
+            let start_lsn = state.next_lsn;
+            let end_lsn = start_lsn
+                .checked_add_bytes(payload.len() as u64 + 32)
+                .expect("test WAL LSN must not overflow");
+
+            state.records.push(WalRecord {
+                lsn: start_lsn,
+                record_type: *record_type,
+                payload: payload.to_vec(),
+                total_len: (payload.len() + 32) as u32,
+            });
+
+            state.next_lsn = end_lsn;
+            extents.push(AppendResult { start_lsn, end_lsn });
+        }
+
+        Ok(BatchAppendResult {
+            final_end_lsn: extents
+                .last()
+                .map(|extent| extent.end_lsn)
+                .unwrap_or(Lsn::ZERO),
+            record_extents: extents,
+        })
+    }
+}
+
+struct DurableRecordSource {
+    records: std::vec::IntoIter<WalRecord>,
+}
+
+impl DurableRecordSource {
+    fn new(records: Vec<WalRecord>) -> Self {
+        Self {
+            records: records.into_iter(),
+        }
+    }
+}
+
+impl RaftWalRecoverySource for DurableRecordSource {
+    fn next_record(&mut self) -> Result<Option<WalRecord>, WalError> {
+        Ok(self.records.next())
+    }
+}
+
+type RestartableCoreRaftNode =
+    RaftNode<Vec<u8>, Vec<u8>, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+fn durable_cluster() -> InMemoryTabletCluster<DurableTestWal> {
+    InMemoryTabletCluster::new(
+        [
+            DurableTestWal::new(),
+            DurableTestWal::new(),
+            DurableTestWal::new(),
+        ],
+        TABLET_ID,
+        TABLE_ID,
+        RAFT_GROUP_ID,
+        TABLET_EPOCH,
+    )
+    .unwrap()
+}
+
+fn initial_conf_state() -> ConfState {
+    ConfState::new(
+        1,
+        [
+            CoreReplicaId::must(1),
+            CoreReplicaId::must(2),
+            CoreReplicaId::must(3),
+        ],
+        [],
+    )
+    .unwrap()
+}
+
+fn rebuild_replica_from_durable_wal(
+    wal: DurableTestWal,
+    node_id: u64,
+) -> (TabletRaftReadyLoop<DurableTestWal>, TabletCommandApplier) {
+    let identity =
+        RaftReplicaIdentity::new(RAFT_GROUP_ID, ragnordb_common::ids::ReplicaId(node_id)).unwrap();
+
+    let mut source = DurableRecordSource::new(wal.records());
+
+    let configurations = BTreeMap::from([(identity, initial_conf_state())]);
+
+    let recovered = recover_raft_storage_with_configurations(&mut source, &configurations).unwrap();
+
+    let replica = recovered
+        .replica(identity)
+        .expect("the replica must have durable Raft records");
+
+    let committed_through = replica
+        .hard_state()
+        .map(|hard_state| hard_state.commit)
+        .unwrap_or(0);
+
+    // Reconstruct the core Raft stores from the recovered durable view.  The
+    // ready loop owns the WAL-backed persistence boundary, while the core
+    // Raft node only needs an in-memory view of the already recovered state.
+    let mut log = MemStorage::<Vec<u8>, Vec<u8>>::new();
+
+    if let Some((snapshot_index, snapshot_term)) = replica.log_view().snapshot_boundary() {
+        log.install_snapshot(snapshot_index, snapshot_term);
+    }
+
+    let recovered_entries = replica
+        .log_view()
+        .entries()
+        .map(|entry| {
+            entry
+                .record
+                .to_core()
+                .expect("recovered durable entry must decode as a core Raft entry")
+        })
+        .collect::<Vec<_>>();
+    log.append(&recovered_entries);
+
+    let mut stable = MemStorage::<Vec<u8>, Vec<u8>>::new();
+    stable.set_conf_state(
+        replica
+            .conf_state()
+            .cloned()
+            .expect("recovered replica must have a configuration"),
+    );
+    stable.set_hard_state(replica.hard_state().cloned().unwrap_or_default());
+
+    let node: RestartableCoreRaftNode =
+        RaftNode::restart(CoreReplicaId::must(node_id), log, stable, 5, 2).unwrap();
+
+    let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
+    let state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let mut tablet_applier = TabletCommandApplier::new(state_machine);
+
+    for entry in replica.log_view().entries() {
+        if entry.record.index > committed_through {
+            break;
+        }
+
+        if let DurableRaftEntryPayload::Normal(command) = &entry.record.payload {
+            tablet_applier
+                .apply_committed(
+                    ProposalPosition {
+                        term: entry.record.term,
+                        index: entry.record.index,
+                    },
+                    command,
+                )
+                .expect("durable committed tablet commands must replay");
+        }
+    }
+
+    let durable_end_lsn = wal.durable_end_lsn();
+
+    let persistence = RaftWalStorage::from_recovered(wal, replica, durable_end_lsn).unwrap();
+
+    let mut ready_loop = TabletRaftReadyLoop::new(node, persistence);
+
+    ready_loop
+        .advance_applied(committed_through)
+        .expect("recovered applied frontier must be acknowledged");
+
+    (ready_loop, tablet_applier)
 }
 
 fn request_id_with_sequence(sequence: u64) -> RequestId {
@@ -522,4 +761,87 @@ fn latest_read_requires_a_new_barrier_after_leader_failover() {
 
     assert_eq!(visible_row, Some(row));
     assert!(cluster.latest_reads_ready().unwrap());
+}
+
+/// Realistic bug caught:
+///
+/// Restarting a replica must reconstruct a new Raft core and tablet state
+/// machine from acknowledged durable records. Reattaching the old in-memory
+/// objects would hide lost state and would not prove the restart contract.
+#[test]
+fn restarted_replica_reconstructs_from_durable_wal_and_catches_up() {
+    let mut cluster = durable_cluster();
+    let old_leader = cluster.elect_leader().unwrap();
+
+    let first_request_id = request_id();
+    let (first_command, _, _) = single_shard_command(first_request_id.clone());
+
+    let first_ticket = cluster
+        .propose(
+            first_request_id,
+            first_command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        first_ticket.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ProposalCompletion::Applied { .. }
+    ));
+
+    cluster.kill_replica(old_leader).unwrap();
+
+    let new_leader = cluster.elect_leader().unwrap();
+    assert_ne!(new_leader, old_leader);
+
+    let second_request_id = request_id_with_sequence(2);
+    let (second_command, second_key, second_row) =
+        single_shard_command_for(second_request_id.clone(), 2, 12, 40);
+
+    let second_ticket = cluster
+        .propose(
+            second_request_id,
+            second_command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    let second_position = match second_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Applied { position, .. } => position,
+        ProposalCompletion::Retryable { failure, .. } => {
+            panic!("replacement leader proposal failed: {failure:?}");
+        }
+    };
+
+    let durable_wal = cluster.replica_wal(old_leader).unwrap();
+
+    let (restarted_raft, restarted_tablet) =
+        rebuild_replica_from_durable_wal(durable_wal, old_leader);
+
+    cluster
+        .restart_replica_from_durable_state(old_leader, restarted_raft, restarted_tablet)
+        .unwrap();
+
+    // The replacement leader must publish the missing committed suffix to the
+    // newly reconstructed follower through the normal Raft message path.
+    cluster.tick_replica(new_leader, 2).unwrap();
+
+    for replica_id in [1, 2, 3] {
+        assert_eq!(
+            cluster.last_applied(replica_id).unwrap(),
+            second_position.index
+        );
+    }
+
+    let reader = Transaction::new(TxnId(99), Timestamp(41)).unwrap();
+
+    let restored_row = cluster
+        .tablet(old_leader)
+        .unwrap()
+        .state_machine()
+        .tablet()
+        .get(&reader, &second_key)
+        .unwrap();
+
+    assert_eq!(restored_row, Some(second_row));
 }

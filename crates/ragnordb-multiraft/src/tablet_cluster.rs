@@ -54,8 +54,12 @@ const INTERNAL_READ_BARRIER_CLIENT_ID: u128 = 1_u128 << 127;
 type CoreRaftNode =
     RaftNode<Vec<u8>, Vec<u8>, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
 
-type ReplicaReadyLoop<W> =
+/// public Ready loop type used when a deterministic tablet replica is
+/// reconstructed from acknowledged durable Raft state
+pub type TabletRaftReadyLoop<W> =
     RaftReadyLoop<W, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+type ReplicaReadyLoop<W> = TabletRaftReadyLoop<W>;
 
 struct TabletReplica<W>
 where
@@ -267,6 +271,88 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
     pub fn restart_replica(&mut self, node_id: u64) -> Result<(), TabletClusterError> {
         let replica_index = self.replica_index(node_id)?;
         self.replicas[replica_index].available = true;
+        Ok(())
+    }
+
+    /// Return a clone of the replica's WAL handle for startup recovery tests or
+    /// host-controlled restart orchestration.
+    ///
+    /// The returned WAL must be recovered before constructing a replacement
+    /// `RaftReadyLoop`. This method intentionally does not expose mutable storage
+    /// internals or create a second persistence path.
+    pub fn replica_wal(&self, node_id: u64) -> Result<W, TabletClusterError>
+    where
+        W: Clone,
+    {
+        let replica_index = self.replica_index(node_id)?;
+
+        Ok(self.replicas[replica_index]
+            .raft
+            .persistence()
+            .wal()
+            .clone())
+    }
+
+    /// replace an unavailable replica with a newly reconstructed Raft loop and
+    /// tablet applier
+    ///
+    /// the caller must build both objects exclusively from acknowledged durable
+    /// state. The method validates group identity, tablet identity, epoch, and
+    /// replica identity before making the replacement visible to transport
+    pub fn restart_replica_from_durable_state(
+        &mut self,
+        node_id: u64,
+        raft: TabletRaftReadyLoop<W>,
+        tablet: TabletCommandApplier,
+    ) -> Result<(), TabletClusterError> {
+        let replica_index = self.replica_index(node_id)?;
+
+        if self.replicas[replica_index].available {
+            return Err(TabletClusterError::Configuration(format!(
+                "replica {node_id} must be unavailable before durable restart"
+            )));
+        }
+
+        let expected_identity = RaftReplicaIdentity::new(self.raft_group_id, ReplicaId(node_id))
+            .map_err(|error| TabletClusterError::Configuration(error.to_string()))?;
+
+        if raft.persistence().log_view().identity() != expected_identity {
+            return Err(TabletClusterError::Configuration(format!(
+                "restarted replica {node_id} has the wrong Raft identity"
+            )));
+        }
+
+        if tablet.state_machine().tablet().id() != self.tablet_id {
+            return Err(TabletClusterError::Configuration(format!(
+                "restarted replica {node_id} owns the wrong tablet"
+            )));
+        }
+
+        if tablet.state_machine().raft_group_id() != self.raft_group_id {
+            return Err(TabletClusterError::Configuration(format!(
+                "restarted replica {node_id} owns the wrong Raft group"
+            )));
+        }
+
+        if tablet.state_machine().epoch() != self.tablet_epoch {
+            return Err(TabletClusterError::Configuration(format!(
+                "restarted replica {node_id} owns the wrong tablet epoch"
+            )));
+        }
+
+        // discard messages generated for the old in-memory process. The active
+        // leader will publish the current suffix and commit frontier through a
+        // fresh heartbeat after restart
+        self.transport
+            .retain(|message| message.from.get() != node_id && message.to.get() != node_id);
+
+        self.replicas[replica_index] = TabletReplica {
+            node_id,
+            raft,
+            tablet,
+            available: true,
+        };
+
         Ok(())
     }
 
