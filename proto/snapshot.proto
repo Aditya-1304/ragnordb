@@ -53,3 +53,29 @@ message WriteEntry {
     ragnordb.ids.Timestamp write_timestamp = 2;
     ragnordb.mvcc.WriteRecord record = 3;
 }
+
+// versioned identity and integrity metadata for one immutable tablet snapshot
+message TabletSnapshotMetadata {
+    uint32 format_version = 1;
+    string cluster_id = 2;
+    ragnordb.ids.RaftGroupId raft_group_id = 3;
+    ragnordb.ids.ReplicaId replica_id = 4;
+    ragnordb.ids.TabletId tablet_id = 5;
+    uint64 tablet_epoch = 6;
+    uint64 snapshot_id = 7;
+    uint64 last_included_index = 8;
+    uint64 last_included_term = 9;
+    uint64 configuration_version = 10;
+    repeated ragnordb.ids.ReplicaId voters = 11;
+    repeated ragnordb.ids.ReplicaId learners = 12;
+    repeated ragnordb.ids.ReplicaId outgoing_voters = 13;
+    uint32 storage_format_version = 14;
+    uint64 total_length = 15;
+    bytes checksum = 16;
+}
+
+// the on-disk artifact contains metadata and the immutable state payload
+message TabletSnapshotFile {
+    TabletSnapshotMetadata metadata = 1;
+    bytes data = 2;
+}

@@ -68,3 +68,47 @@ pub struct WriteEntry {
     #[prost(message, optional, tag = "3")]
     pub record: ::core::option::Option<super::mvcc::WriteRecord>,
 }
+/// versioned identity and integrity metadata for one immutable tablet snapshot
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletSnapshotMetadata {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "4")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(message, optional, tag = "5")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "6")]
+    pub tablet_epoch: u64,
+    #[prost(uint64, tag = "7")]
+    pub snapshot_id: u64,
+    #[prost(uint64, tag = "8")]
+    pub last_included_index: u64,
+    #[prost(uint64, tag = "9")]
+    pub last_included_term: u64,
+    #[prost(uint64, tag = "10")]
+    pub configuration_version: u64,
+    #[prost(message, repeated, tag = "11")]
+    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "12")]
+    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "13")]
+    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(uint32, tag = "14")]
+    pub storage_format_version: u32,
+    #[prost(uint64, tag = "15")]
+    pub total_length: u64,
+    #[prost(bytes = "vec", tag = "16")]
+    pub checksum: ::prost::alloc::vec::Vec<u8>,
+}
+/// the on-disk artifact contains metadata and the immutable state payload
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletSnapshotFile {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<TabletSnapshotMetadata>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}

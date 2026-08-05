@@ -10,3 +10,5 @@ ragnordb-common = { path = "../ragnordb-common" }
 ragnordb-storage = { path = "../ragnordb-storage" }
 ragnordb-txn = { path = "../ragnordb-txn" }
 thiserror.workspace = true
+prost.workspace = true
+blake3.workspace = true

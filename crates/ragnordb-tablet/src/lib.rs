@@ -11,6 +11,7 @@
 
 pub mod command;
 pub mod read;
+pub mod snapshot;
 use std::collections::BTreeMap;
 
 use ragnordb_common::{

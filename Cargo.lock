@@ -1368,6 +1368,8 @@ dependencies = [
 name = "ragnordb-tablet"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "prost",
  "ragnordb-common",
  "ragnordb-storage",
  "ragnordb-txn",
