@@ -3,6 +3,7 @@ use ragnordb_common::ids::NodeId;
 pub mod bootstrap;
 pub mod proposal;
 pub mod runtime;
+pub mod snapshot;
 pub mod storage;
 pub mod tablet_apply;
 pub mod tablet_cluster;
