@@ -5,8 +5,10 @@
 //! snapshot image to the exact cluster, tablet generation, configuration,
 //! applied boundary, and payload checksum that produced it
 
-use crate::command::TabletStateMachine;
+use crate::{Tablet, command::TabletStateMachine};
+
 use ragnordb_storage::mvcc::InMemoryMvcc;
+
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -17,8 +19,10 @@ use std::{
 };
 
 use prost::Message;
+
 use ragnordb_common::{
-    ids::{RaftGroupId, ReplicaId, TabletId},
+    command_codec::TabletStateMachineSnapshot,
+    ids::{RaftGroupId, ReplicaId, TableId, TabletId},
     proto::{ids as id_proto, snapshot as snapshot_proto},
 };
 
@@ -785,4 +789,421 @@ pub enum TabletSnapshotStoreError {
 
     #[error("maximum snapshot file size must be non-zero")]
     InvalidMaxFileBytes,
+}
+
+/// Receives one incoming snapshot through bounded sequential chunks.
+///
+/// Chunks are written to a temporary file. The temporary file is synchronized
+/// and checksum-verified before the image is handed to the final publisher.
+pub struct IncomingTabletSnapshotReceiver {
+    metadata: TabletSnapshotMetadata,
+    max_chunk_bytes: u64,
+    max_file_bytes: u64,
+    received_bytes: u64,
+    temporary_path: PathBuf,
+    file: Option<File>,
+}
+
+impl IncomingTabletSnapshotReceiver {
+    pub fn begin(
+        store: &FileTabletSnapshotStore,
+        metadata: TabletSnapshotMetadata,
+        max_chunk_bytes: u64,
+    ) -> Result<Self, TabletSnapshotReceiveError> {
+        metadata.validate()?;
+
+        if max_chunk_bytes == 0 {
+            return Err(TabletSnapshotReceiveError::InvalidChunkLimit);
+        }
+
+        if metadata.total_length > store.max_file_bytes {
+            return Err(TabletSnapshotReceiveError::PayloadTooLarge {
+                actual: metadata.total_length,
+                limit: store.max_file_bytes,
+            });
+        }
+
+        let temporary_path = store.temporary_path("incoming-tablet-snapshot");
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(incoming_io_error)?;
+
+        Ok(Self {
+            metadata,
+            max_chunk_bytes,
+            max_file_bytes: store.max_file_bytes,
+            received_bytes: 0,
+            temporary_path,
+            file: Some(file),
+        })
+    }
+
+    /// Append one bounded chunk to the temporary snapshot image.
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), TabletSnapshotReceiveError> {
+        let chunk_bytes =
+            u64::try_from(chunk.len()).map_err(|_| TabletSnapshotReceiveError::LengthOverflow)?;
+
+        if chunk_bytes > self.max_chunk_bytes {
+            return Err(TabletSnapshotReceiveError::ChunkTooLarge {
+                actual: chunk_bytes,
+                limit: self.max_chunk_bytes,
+            });
+        }
+
+        let next_received = self
+            .received_bytes
+            .checked_add(chunk_bytes)
+            .ok_or(TabletSnapshotReceiveError::LengthOverflow)?;
+
+        if next_received > self.metadata.total_length {
+            return Err(TabletSnapshotReceiveError::ChunkExceedsDeclaredLength {
+                received: self.received_bytes,
+                chunk: chunk_bytes,
+                total: self.metadata.total_length,
+            });
+        }
+
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(TabletSnapshotReceiveError::ReceiverClosed)?;
+
+        file.write_all(chunk).map_err(incoming_io_error)?;
+        self.received_bytes = next_received;
+
+        Ok(())
+    }
+
+    /// Finish the transfer and return a verified immutable image.
+    pub fn finish(mut self) -> Result<TabletSnapshotImage, TabletSnapshotReceiveError> {
+        if self.received_bytes != self.metadata.total_length {
+            return Err(TabletSnapshotReceiveError::Incomplete {
+                received: self.received_bytes,
+                expected: self.metadata.total_length,
+            });
+        }
+
+        let file = self
+            .file
+            .take()
+            .ok_or(TabletSnapshotReceiveError::ReceiverClosed)?;
+
+        file.sync_all().map_err(incoming_io_error)?;
+        drop(file);
+
+        let file = File::open(&self.temporary_path).map_err(incoming_io_error)?;
+        let mut bounded_file = file.take(self.max_file_bytes.saturating_add(1));
+        let mut bytes = Vec::new();
+
+        bounded_file
+            .read_to_end(&mut bytes)
+            .map_err(incoming_io_error)?;
+
+        let actual_length =
+            u64::try_from(bytes.len()).map_err(|_| TabletSnapshotReceiveError::LengthOverflow)?;
+
+        if actual_length != self.metadata.total_length {
+            return Err(TabletSnapshotReceiveError::TemporaryFileLengthMismatch {
+                expected: self.metadata.total_length,
+                actual: actual_length,
+            });
+        }
+
+        let metadata = self.metadata.clone();
+
+        TabletSnapshotImage::new(metadata, bytes).map_err(TabletSnapshotReceiveError::Metadata)
+    }
+}
+
+impl Drop for IncomingTabletSnapshotReceiver {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = fs::remove_file(&self.temporary_path);
+    }
+}
+
+/// Identity and generation expected by the receiving tablet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletSnapshotInstallTarget {
+    pub cluster_id: String,
+    pub raft_group_id: RaftGroupId,
+    pub tablet_id: TabletId,
+    pub table_id: TableId,
+    pub tablet_epoch: u64,
+}
+
+/// Successfully restored tablet state after durable boundary persistence.
+#[derive(Debug)]
+pub struct InstalledTabletSnapshot {
+    pub pointer: TabletSnapshotPointer,
+    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub frontier: AppliedTabletFrontier,
+}
+
+/// Receive, validate, publish, restore, and durably acknowledge a tablet
+/// snapshot.
+///
+/// The persistence callback must append the snapshot pointer, `ConfState`,
+/// boundary, and required Raft stable state through the exact A-WAL frontier.
+/// Installation is not reported as successful until that callback succeeds.
+pub fn install_incoming_snapshot<F, E>(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+    persist_boundary: F,
+) -> Result<InstalledTabletSnapshot, TabletSnapshotInstallError>
+where
+    F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    validate_install_target(&receiver.metadata, target)?;
+
+    let image = receiver
+        .finish()
+        .map_err(TabletSnapshotInstallError::Receive)?;
+
+    let payload = snapshot_proto::TabletSnapshotPayload::decode(image.data.as_slice())
+        .map_err(|error| TabletSnapshotInstallError::PayloadDecode(error.to_string()))?;
+
+    if payload.format_version != TABLET_SNAPSHOT_PAYLOAD_VERSION {
+        return Err(TabletSnapshotInstallError::UnsupportedPayloadVersion(
+            payload.format_version,
+        ));
+    }
+
+    let payload_table_id = TableId::from_proto(
+        payload
+            .table_id
+            .ok_or(TabletSnapshotInstallError::MissingPayloadTableId)?,
+    );
+
+    if payload_table_id != target.table_id {
+        return Err(TabletSnapshotInstallError::TableMismatch {
+            expected: target.table_id,
+            received: payload_table_id,
+        });
+    }
+
+    let state_machine_snapshot =
+        TabletStateMachineSnapshot::decode(payload.tablet_state_machine.as_slice())
+            .map_err(|error| TabletSnapshotInstallError::StateMachineDecode(error.to_string()))?;
+
+    if state_machine_snapshot.tablet_id != target.tablet_id
+        || state_machine_snapshot.raft_group_id != target.raft_group_id
+        || state_machine_snapshot.tablet_epoch != target.tablet_epoch
+    {
+        return Err(TabletSnapshotInstallError::StateMachineIdentityMismatch);
+    }
+
+    // Publish the verified immutable image before restoring live state. If
+    // restoration fails, the group remains quarantined and the durable image
+    // remains an unreferenced recovery artifact.
+    let pointer = store
+        .publish(&image)
+        .map_err(TabletSnapshotInstallError::Store)?;
+
+    let storage = InMemoryMvcc::restore_from_snapshot_entries(
+        target.table_id,
+        payload.default_values,
+        payload.locks,
+        payload.writes,
+    )
+    .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
+
+    let tablet = Tablet::with_storage(target.tablet_id, target.table_id, storage)
+        .map_err(|error| TabletSnapshotInstallError::TabletRestore(error.to_string()))?;
+
+    let state_machine =
+        TabletStateMachine::restore_from_snapshot(tablet, &payload.tablet_state_machine)
+            .map_err(|error| TabletSnapshotInstallError::StateMachineRestore(error.to_string()))?;
+
+    let frontier = AppliedTabletFrontier::new(
+        image.metadata.last_included_index,
+        image.metadata.last_included_term,
+    );
+
+    persist_boundary(&pointer, frontier)
+        .map_err(|error| TabletSnapshotInstallError::BoundaryPersistence(error.to_string()))?;
+
+    Ok(InstalledTabletSnapshot {
+        pointer,
+        state_machine,
+        frontier,
+    })
+}
+
+fn validate_install_target(
+    metadata: &TabletSnapshotMetadata,
+    target: &TabletSnapshotInstallTarget,
+) -> Result<(), TabletSnapshotInstallError> {
+    if target.cluster_id.trim().is_empty() {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "cluster ID must not be empty",
+        ));
+    }
+
+    if target.raft_group_id.0 == 0 {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "Raft group ID must be non-zero",
+        ));
+    }
+
+    if target.tablet_id.0 == 0 {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "tablet ID must be non-zero",
+        ));
+    }
+
+    if target.table_id.0 == 0 {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "table ID must be non-zero",
+        ));
+    }
+
+    if target.tablet_epoch == 0 {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "tablet epoch must be non-zero",
+        ));
+    }
+
+    if metadata.cluster_id != target.cluster_id {
+        return Err(TabletSnapshotInstallError::TargetClusterMismatch {
+            expected: target.cluster_id.clone(),
+            received: metadata.cluster_id.clone(),
+        });
+    }
+
+    if metadata.raft_group_id != target.raft_group_id {
+        return Err(TabletSnapshotInstallError::TargetGroupMismatch {
+            expected: target.raft_group_id,
+            received: metadata.raft_group_id,
+        });
+    }
+
+    if metadata.tablet_id != target.tablet_id {
+        return Err(TabletSnapshotInstallError::TargetTabletMismatch {
+            expected: target.tablet_id,
+            received: metadata.tablet_id,
+        });
+    }
+
+    if metadata.tablet_epoch != target.tablet_epoch {
+        return Err(TabletSnapshotInstallError::TargetEpochMismatch {
+            expected: target.tablet_epoch,
+            received: metadata.tablet_epoch,
+        });
+    }
+
+    Ok(())
+}
+
+fn incoming_io_error(error: io::Error) -> TabletSnapshotReceiveError {
+    TabletSnapshotReceiveError::Io(error.to_string())
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletSnapshotReceiveError {
+    #[error("incoming snapshot metadata is invalid: {0}")]
+    Metadata(#[from] TabletSnapshotMetadataError),
+
+    #[error("incoming snapshot chunk limit must be non-zero")]
+    InvalidChunkLimit,
+
+    #[error("incoming snapshot payload is too large: {actual} > {limit}")]
+    PayloadTooLarge { actual: u64, limit: u64 },
+
+    #[error("incoming snapshot chunk is too large: {actual} > {limit}")]
+    ChunkTooLarge { actual: u64, limit: u64 },
+
+    #[error(
+        "incoming snapshot chunk exceeds declared length: received {received}, chunk {chunk}, total {total}"
+    )]
+    ChunkExceedsDeclaredLength {
+        received: u64,
+        chunk: u64,
+        total: u64,
+    },
+
+    #[error("incoming snapshot length overflowed u64")]
+    LengthOverflow,
+
+    #[error("incoming snapshot receiver is already closed")]
+    ReceiverClosed,
+
+    #[error("incoming snapshot is incomplete: received {received}, expected {expected}")]
+    Incomplete { received: u64, expected: u64 },
+
+    #[error(
+        "incoming snapshot temporary file length mismatch: expected {expected}, actual {actual}"
+    )]
+    TemporaryFileLengthMismatch { expected: u64, actual: u64 },
+
+    #[error("incoming snapshot temporary file I/O failed: {0}")]
+    Io(String),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TabletSnapshotInstallError {
+    #[error("incoming snapshot receive failed: {0}")]
+    Receive(#[from] TabletSnapshotReceiveError),
+
+    #[error("incoming snapshot publication failed: {0}")]
+    Store(#[from] TabletSnapshotStoreError),
+
+    #[error("incoming snapshot target is invalid: {0}")]
+    InvalidTarget(&'static str),
+
+    #[error("incoming snapshot cluster mismatch: expected {expected}, received {received}")]
+    TargetClusterMismatch { expected: String, received: String },
+
+    #[error("incoming snapshot Raft group mismatch: expected {expected:?}, received {received:?}")]
+    TargetGroupMismatch {
+        expected: RaftGroupId,
+        received: RaftGroupId,
+    },
+
+    #[error("incoming snapshot tablet mismatch: expected {expected:?}, received {received:?}")]
+    TargetTabletMismatch {
+        expected: TabletId,
+        received: TabletId,
+    },
+
+    #[error("incoming snapshot tablet epoch mismatch: expected {expected}, received {received}")]
+    TargetEpochMismatch { expected: u64, received: u64 },
+
+    #[error("incoming snapshot payload decode failed: {0}")]
+    PayloadDecode(String),
+
+    #[error("unsupported incoming snapshot payload version {0}")]
+    UnsupportedPayloadVersion(u32),
+
+    #[error("incoming snapshot payload is missing its table ID")]
+    MissingPayloadTableId,
+
+    #[error("incoming snapshot table mismatch: expected {expected:?}, received {received:?}")]
+    TableMismatch {
+        expected: TableId,
+        received: TableId,
+    },
+
+    #[error("incoming state-machine snapshot decode failed: {0}")]
+    StateMachineDecode(String),
+
+    #[error("incoming state-machine identity does not match the install target")]
+    StateMachineIdentityMismatch,
+
+    #[error("incoming MVCC restore failed: {0}")]
+    MvccRestore(String),
+
+    #[error("incoming tablet reconstruction failed: {0}")]
+    TabletRestore(String),
+
+    #[error("incoming state-machine restore failed: {0}")]
+    StateMachineRestore(String),
+
+    #[error("incoming snapshot boundary persistence failed: {0}")]
+    BoundaryPersistence(String),
 }

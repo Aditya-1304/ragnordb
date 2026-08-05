@@ -730,6 +730,27 @@ impl InMemoryMvcc {
             start_ts.0, commit_ts.0
         )))
     }
+
+    /// restore one tablet's complete MVCC state from validated snapshot entries
+    ///
+    /// the tablet owns its table identity separately from the catalog definition,
+    /// so this path intentionally restores only the MVCC records required by the
+    /// tablet state machine
+    pub fn restore_from_snapshot_entries(
+        table_id: TableId,
+        default_values: Vec<snapshot_proto::DefaultValueEntry>,
+        locks: Vec<snapshot_proto::LockEntry>,
+        writes: Vec<snapshot_proto::WriteEntry>,
+    ) -> Result<Self> {
+        let table = snapshot_proto::SnapshotTable {
+            definition: None,
+            default_values,
+            locks,
+            writes,
+        };
+
+        Ok(Self::from_snapshot_table(table_id, &table)?.storage)
+    }
 }
 
 impl MvccStorage for InMemoryMvcc {
