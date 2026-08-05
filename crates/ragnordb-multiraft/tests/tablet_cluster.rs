@@ -63,25 +63,34 @@ impl ragnordb_multiraft::storage::persistence::RaftWal for TestWal {
     }
 }
 
-fn request_id() -> RequestId {
+fn request_id_with_sequence(sequence: u64) -> RequestId {
     RequestId {
         client_id: 41,
-        sequence: 1,
+        sequence,
         raft_group_id: RAFT_GROUP_ID,
     }
 }
 
-fn single_shard_command(request_id: RequestId) -> (Vec<u8>, ragnordb_common::ids::RowKey, Row) {
-    let key = make_row_key(TABLE_ID, &[Value::Int(1)]).unwrap();
+fn request_id() -> RequestId {
+    request_id_with_sequence(1)
+}
+
+fn single_shard_command_for(
+    request_id: RequestId,
+    key_value: i64,
+    txn_id: u64,
+    commit_timestamp: u64,
+) -> (Vec<u8>, ragnordb_common::ids::RowKey, Row) {
+    let key = make_row_key(TABLE_ID, &[Value::Int(key_value)]).unwrap();
 
     let row = Row {
-        values: vec![Value::Int(1), Value::Text("Ada".to_string())],
+        values: vec![Value::Int(key_value), Value::Text("Ada".to_string())],
     };
 
     let command = SingleShardCommitCommand {
-        txn_id: TxnId(11),
-        start_timestamp: Timestamp(20),
-        commit_timestamp: Timestamp(30),
+        txn_id: TxnId(txn_id),
+        start_timestamp: Timestamp(commit_timestamp.saturating_sub(10)),
+        commit_timestamp: Timestamp(commit_timestamp),
         writes: vec![WriteEntry {
             key: encode_row_key(&key).unwrap(),
             row: Some(row.clone()),
@@ -98,6 +107,10 @@ fn single_shard_command(request_id: RequestId) -> (Vec<u8>, ragnordb_common::ids
     .unwrap();
 
     (envelope.encode().unwrap(), key, row)
+}
+
+fn single_shard_command(request_id: RequestId) -> (Vec<u8>, ragnordb_common::ids::RowKey, Row) {
+    single_shard_command_for(request_id, 1, 11, 30)
 }
 
 fn cluster() -> InMemoryTabletCluster<TestWal> {
@@ -197,4 +210,154 @@ fn proposal_requires_an_elected_leader() {
         ),
         Err(TabletClusterError::NoLeader)
     ));
+}
+
+/// Realistic bug caught:
+///
+/// A leader may disappear after a successful attempt, so the client must retry
+/// the same RequestId. The replicated tablet state must return the cached result
+/// instead of applying the MVCC mutation twice. A rejoined replica must also
+/// catch up with writes committed by the replacement leader.
+#[test]
+fn leader_failover_preserves_request_identity_and_catches_up_rejoined_replica() {
+    let mut cluster = cluster();
+    let old_leader = cluster.elect_leader().unwrap();
+
+    let first_request_id = request_id();
+    let (first_command, _, _) = single_shard_command(first_request_id.clone());
+
+    let first_ticket = cluster
+        .propose(
+            first_request_id.clone(),
+            first_command.clone(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    match first_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Applied { result, .. } => {
+            assert_eq!(
+                result,
+                TabletCommandApplyOutcome {
+                    result: TabletCommandApplyResult::SingleShardCommit,
+                    deduplicated: false,
+                }
+            );
+        }
+        ProposalCompletion::Retryable { failure, .. } => {
+            panic!("initial proposal unexpectedly failed: {failure:?}");
+        }
+    }
+
+    cluster.kill_replica(old_leader).unwrap();
+
+    let new_leader = cluster.elect_leader().unwrap();
+    assert_ne!(new_leader, old_leader);
+
+    // Retrying the original request must return the replicated cached outcome.
+    let retry_ticket = cluster
+        .propose(
+            first_request_id.clone(),
+            first_command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    match retry_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Applied { result, .. } => {
+            assert_eq!(
+                result,
+                TabletCommandApplyOutcome {
+                    result: TabletCommandApplyResult::SingleShardCommit,
+                    deduplicated: true,
+                }
+            );
+        }
+        ProposalCompletion::Retryable { failure, .. } => {
+            panic!("same-RequestId retry unexpectedly failed: {failure:?}");
+        }
+    }
+
+    assert_eq!(
+        cluster
+            .tablet(new_leader)
+            .unwrap()
+            .state_machine()
+            .tablet()
+            .stats()
+            .write_records,
+        1
+    );
+
+    // A later request must be accepted by the replacement leader.
+    let second_request_id = request_id_with_sequence(2);
+    let (second_command, _, _) = single_shard_command_for(second_request_id.clone(), 2, 12, 40);
+
+    let second_ticket = cluster
+        .propose(
+            second_request_id,
+            second_command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    let second_position = match second_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Applied {
+            position, result, ..
+        } => {
+            assert_eq!(
+                result,
+                TabletCommandApplyOutcome {
+                    result: TabletCommandApplyResult::SingleShardCommit,
+                    deduplicated: false,
+                }
+            );
+            position
+        }
+        ProposalCompletion::Retryable { failure, .. } => {
+            panic!("replacement leader proposal failed: {failure:?}");
+        }
+    };
+
+    // Rejoin the old replica and publish the replacement leader's commit
+    // frontier through a heartbeat so the stale replica receives the missing log.
+    cluster.restart_replica(old_leader).unwrap();
+    cluster.tick_replica(new_leader, 2).unwrap();
+
+    assert_eq!(cluster.leader_id().unwrap(), new_leader);
+
+    for replica_id in [1, 2, 3] {
+        assert_eq!(
+            cluster.last_applied(replica_id).unwrap(),
+            second_position.index
+        );
+    }
+}
+
+/// Realistic bug caught:
+///
+/// An already-expired request must not create a Raft entry that has no valid
+/// client response deadline.
+#[test]
+fn expired_proposal_is_rejected_before_raft_admission() {
+    let mut cluster = cluster();
+    cluster.elect_leader().unwrap();
+
+    let request_id = request_id();
+    let (command, _, _) = single_shard_command(request_id.clone());
+
+    assert!(matches!(
+        cluster.propose(
+            request_id.clone(),
+            command,
+            Instant::now() - Duration::from_secs(1),
+        ),
+        Err(TabletClusterError::ProposalDeadlineExceeded {
+            request_id: actual
+        }) if actual == request_id
+    ));
+
+    for replica_id in [1, 2, 3] {
+        assert_eq!(cluster.last_applied(replica_id).unwrap(), 0);
+    }
 }

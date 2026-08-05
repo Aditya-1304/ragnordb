@@ -51,6 +51,7 @@ where
     node_id: u64,
     raft: ReplicaReadyLoop<W>,
     tablet: TabletCommandApplier,
+    available: bool,
 }
 
 /// errors raised by the deterministic tablet cluster runtime
@@ -101,6 +102,12 @@ pub enum TabletClusterError {
 
     #[error("proposal registry failed: {0}")]
     Registry(#[from] ProposalRegistryError),
+
+    #[error("replica {replica_id} is unavailable")]
+    ReplicaUnavailable { replica_id: u64 },
+
+    #[error("proposal {request_id:?} expired before Raft admission")]
+    ProposalDeadlineExceeded { request_id: RequestId },
 }
 
 /// one in memory three-node Raft group owning one tablet
@@ -154,6 +161,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
                 Ok(TabletReplica {
                     node_id,
+                    available: true,
                     raft: RaftReadyLoop::new(raft_node, RaftWalStorage::new(wal, identity)),
                     tablet: TabletCommandApplier::new(state_machine),
                 })
@@ -180,11 +188,44 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         Ok(cluster)
     }
 
+    /// remove one replica from the in-memory transport and election path
+    ///
+    /// this models a crashed process without deleting its Raft or tablet
+    /// state, allowing the replica to rejoin and catch up later
+    pub fn kill_replica(&mut self, node_id: u64) -> Result<(), TabletClusterError> {
+        let replica_index = self.replica_index(node_id)?;
+        let was_leader = self.replicas[replica_index].available
+            && matches!(
+                self.replicas[replica_index].raft.raft().role(),
+                Role::Leader
+            );
+        let observed_term = self.replicas[replica_index].raft.raft().current_term();
+
+        self.replicas[replica_index].available = false;
+
+        if was_leader {
+            self.proposals.mark_leadership_lost(observed_term);
+        }
+
+        Ok(())
+    }
+
+    /// reattach a previously killed replica to the in memory transport
+    pub fn restart_replica(&mut self, node_id: u64) -> Result<(), TabletClusterError> {
+        let replica_index = self.replica_index(node_id)?;
+        self.replicas[replica_index].available = true;
+        Ok(())
+    }
+
     /// elect one leader through the actual Raft message path
     pub fn elect_leader(&mut self) -> Result<u64, TabletClusterError> {
         for _ in 0..16 {
             for node_id in REPLICA_IDS {
                 let replica_index = self.replica_index(node_id)?;
+                if !self.replicas[replica_index].available {
+                    continue;
+                }
+
                 let ticks = self.replicas[replica_index]
                     .raft
                     .raft()
@@ -208,7 +249,9 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         let leaders = self
             .replicas
             .iter()
-            .filter(|replica| matches!(replica.raft.raft().role(), Role::Leader))
+            .filter(|replica| {
+                replica.available && matches!(replica.raft.raft().role(), Role::Leader)
+            })
             .map(|replica| replica.node_id)
             .collect::<Vec<_>>();
 
@@ -233,6 +276,10 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
         if envelope.request_id != request_id {
             return Err(TabletClusterError::RequestIdentityMismatch);
+        }
+
+        if deadline <= Instant::now() {
+            return Err(TabletClusterError::ProposalDeadlineExceeded { request_id });
         }
 
         if self.proposals.is_pending(&request_id) {
@@ -289,6 +336,11 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
     /// advance one replica's Raft clock and process resulting Ready output
     pub fn tick_replica(&mut self, node_id: u64, ticks: u64) -> Result<(), TabletClusterError> {
         let replica_index = self.replica_index(node_id)?;
+        if !self.replicas[replica_index].available {
+            return Err(TabletClusterError::ReplicaUnavailable {
+                replica_id: node_id,
+            });
+        }
 
         self.replicas[replica_index]
             .raft
@@ -383,6 +435,14 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         while let Some(message) = self.transport.pop_front() {
             let target_id = message.to.get();
             let target_index = self.replica_index(target_id)?;
+            let source_index = self.replica_index(message.from.get())?;
+
+            // Messages involving a crashed replica are discarded. Once that
+            // replica rejoins, the active leader publishes the current log
+            // and commit frontier through its normal heartbeat path.
+            if !self.replicas[source_index].available || !self.replicas[target_index].available {
+                continue;
+            }
 
             self.replicas[target_index]
                 .raft
