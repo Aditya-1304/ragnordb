@@ -7,8 +7,9 @@ use ragnordb_common::ids::{RaftGroupId, ReplicaId, TabletId};
 use ragnordb_multiraft::{
     runtime::{RaftReadyLoop, RaftReadyStateMachine, RaftSnapshotStore},
     snapshot::{
-        TabletSnapshotRaftStore, TabletSnapshotTransfer, generate_tablet_snapshot_from_ready_loop,
-        persist_tablet_snapshot_boundary,
+        SnapshotWorkController, SnapshotWorkError, SnapshotWorkKind, SnapshotWorkLimits,
+        TabletSnapshotRaftStore, TabletSnapshotReceiveSession, TabletSnapshotTransfer,
+        generate_tablet_snapshot_from_ready_loop, persist_tablet_snapshot_boundary,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
@@ -185,6 +186,87 @@ fn tablet_transfer_derives_core_metadata_without_transporting_core_snapshot_stat
     assert_eq!(snapshot.size_bytes, b"tablet-state".len() as u64);
 }
 
+/// Catches an unbounded sender that would allow multiple follower catch-ups to
+/// consume memory and bandwidth beyond the configured node-local budget.
+#[test]
+fn tablet_snapshot_sender_is_bounded_and_reports_progress() {
+    let work = SnapshotWorkController::new(SnapshotWorkLimits {
+        max_generations: 1,
+        max_sends: 1,
+        max_receives: 1,
+        max_installs: 1,
+    })
+    .unwrap();
+    let expected = image();
+    let expected_data = expected.data.clone();
+
+    let mut sender = TabletSnapshotTransfer::from_image(expected.clone())
+        .unwrap()
+        .into_sender(&work, 3)
+        .unwrap();
+
+    assert_eq!(work.progress().active_sends, 1);
+    assert_eq!(work.progress().send_bytes_total, expected_data.len() as u64);
+
+    assert!(matches!(
+        TabletSnapshotTransfer::from_image(expected)
+            .unwrap()
+            .into_sender(&work, 3),
+        Err(
+            ragnordb_multiraft::snapshot::TabletSnapshotIntegrationError::Work(
+                SnapshotWorkError::LimitReached {
+                    kind: SnapshotWorkKind::Send,
+                    limit: 1,
+                }
+            )
+        )
+    ));
+
+    let mut received = Vec::new();
+    while let Some(chunk) = sender.next_chunk() {
+        assert!(chunk.len() <= 3);
+        received.extend_from_slice(&chunk);
+    }
+
+    assert!(sender.is_complete());
+    assert_eq!(received, expected_data);
+    assert_eq!(work.progress().send_bytes_completed, received.len() as u64);
+
+    drop(sender);
+    assert_eq!(work.progress().active_sends, 0);
+    assert_eq!(work.progress().rejected_operations, 1);
+}
+
+/// Catches a receiver that bypasses the shared admission controller or counts
+/// bytes before the tablet receiver has accepted a bounded chunk.
+#[test]
+fn tablet_snapshot_receiver_is_bounded_and_reports_verified_progress() {
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-multiraft-tablet-receive-session-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+
+    let work = SnapshotWorkController::default();
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    let expected = image();
+    let mut receiver =
+        TabletSnapshotReceiveSession::begin(&work, &store, expected.metadata.clone(), 3).unwrap();
+
+    for chunk in expected.data.chunks(3) {
+        receiver.push_chunk(chunk).unwrap();
+    }
+
+    assert_eq!(receiver.finish().unwrap(), expected);
+
+    let progress = work.progress();
+    assert_eq!(progress.active_receives, 0);
+    assert_eq!(progress.receive_bytes_total, 12);
+    assert_eq!(progress.receive_bytes_completed, 12);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn incoming_tablet_boundary_persists_pointer_before_hard_state() {
     let identity = RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap();
@@ -253,6 +335,7 @@ fn raft_snapshot_store_reads_tablet_envelopes_as_core_payloads() {
 fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
     let mut loop_ = ready_loop();
     prepare_leader(&mut loop_);
+    let work = SnapshotWorkController::default();
 
     let tablet =
         ragnordb_tablet::Tablet::new(TabletId(31), ragnordb_common::ids::TableId(9)).unwrap();
@@ -265,6 +348,7 @@ fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
 
     assert!(matches!(
         generate_tablet_snapshot_from_ready_loop(
+            &work,
             &loop_,
             &state_machine,
             "ragnordb-test",
@@ -285,6 +369,7 @@ fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
         .unwrap();
 
     let image = generate_tablet_snapshot_from_ready_loop(
+        &work,
         &loop_,
         &state_machine,
         "ragnordb-test",

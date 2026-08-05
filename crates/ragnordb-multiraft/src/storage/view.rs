@@ -181,6 +181,15 @@ impl RaftReplicaLogView {
         self.last_replayed_lsn
     }
 
+    /// return the physical WAL location of the oldest retained log entry
+    ///
+    /// snapshot publication pins from this location so a shared WAL
+    /// reclamation pass cannot remove a record still needed to recover the
+    /// replica before its new snapshot pointer is durable
+    pub fn first_retained_lsn(&self) -> Option<Lsn> {
+        self.entries.values().next().map(|entry| entry.lsn)
+    }
+
     /// apply one decoded WAL record using V1 suffix-overwrite rules
     ///
     /// every fallible check occurs before changing the view. A rejected record

@@ -12,8 +12,8 @@ use ragnordb_tablet::{
         AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
         InstalledTabletSnapshot, TabletSnapshotConfState, TabletSnapshotGenerationError,
         TabletSnapshotImage, TabletSnapshotInstallError, TabletSnapshotInstallTarget,
-        TabletSnapshotMetadata, TabletSnapshotPointer, generate_local_snapshot,
-        install_incoming_snapshot,
+        TabletSnapshotMetadata, TabletSnapshotPointer, TabletSnapshotReceiveError,
+        generate_local_snapshot, install_incoming_snapshot,
     },
 };
 
@@ -25,6 +25,245 @@ use crate::storage::{
     },
 };
 use raft::traits::{log_store::LogStore, stable_store::StableStore};
+use std::{
+    cell::Cell,
+    sync::{Arc, Mutex},
+};
+
+/// snapshot operation classes covered by the node-local concurrency budget
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotWorkKind {
+    Generation,
+    Send,
+    Receive,
+    Install,
+}
+
+impl SnapshotWorkKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::Generation => 0,
+            Self::Send => 1,
+            Self::Receive => 2,
+            Self::Install => 3,
+        }
+    }
+
+    const fn limit(self, limits: SnapshotWorkLimits) -> usize {
+        match self {
+            Self::Generation => limits.max_generations,
+            Self::Send => limits.max_sends,
+            Self::Receive => limits.max_receives,
+            Self::Install => limits.max_installs,
+        }
+    }
+}
+
+/// maximum number of simultaneous operations for each snapshot stage
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotWorkLimits {
+    pub max_generations: usize,
+    pub max_sends: usize,
+    pub max_receives: usize,
+    pub max_installs: usize,
+}
+
+impl Default for SnapshotWorkLimits {
+    fn default() -> Self {
+        Self {
+            max_generations: 1,
+            max_sends: 1,
+            max_receives: 1,
+            max_installs: 1,
+        }
+    }
+}
+
+impl SnapshotWorkLimits {
+    pub fn validate(self) -> Result<Self, SnapshotWorkError> {
+        if self.max_generations == 0
+            || self.max_sends == 0
+            || self.max_receives == 0
+            || self.max_installs == 0
+        {
+            return Err(SnapshotWorkError::ZeroLimit);
+        }
+
+        Ok(self)
+    }
+}
+
+/// public byte and concurrency counters for one MultiRaft snapshot host
+///
+/// Byte counters are cumulative for the lifetime of the controller; active
+/// operation counters describe the work currently holding an admission permit
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotWorkProgress {
+    pub active_generations: usize,
+    pub active_sends: usize,
+    pub active_receives: usize,
+    pub active_installs: usize,
+    pub generation_bytes_total: u64,
+    pub generation_bytes_completed: u64,
+    pub send_bytes_total: u64,
+    pub send_bytes_completed: u64,
+    pub receive_bytes_total: u64,
+    pub receive_bytes_completed: u64,
+    pub install_bytes_total: u64,
+    pub install_bytes_completed: u64,
+    pub rejected_operations: u64,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SnapshotWorkError {
+    #[error("all snapshot concurrency limits must be non-zero")]
+    ZeroLimit,
+
+    #[error("snapshot {kind:?} concurrency limit {limit} has been reached")]
+    LimitReached {
+        kind: SnapshotWorkKind,
+        limit: usize,
+    },
+
+    #[error("snapshot chunk size must be non-zero")]
+    ZeroChunkSize,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotWorkState {
+    active: [usize; 4],
+    bytes_total: [u64; 4],
+    bytes_completed: [u64; 4],
+    rejected_operations: u64,
+}
+
+/// node local admission controller for snapshot generation and transfer work
+#[derive(Debug, Clone)]
+pub struct SnapshotWorkController {
+    limits: SnapshotWorkLimits,
+    state: Arc<Mutex<SnapshotWorkState>>,
+}
+
+impl SnapshotWorkController {
+    pub fn new(limits: SnapshotWorkLimits) -> Result<Self, SnapshotWorkError> {
+        Ok(Self {
+            limits: limits.validate()?,
+            state: Arc::new(Mutex::new(SnapshotWorkState::default())),
+        })
+    }
+
+    pub fn limits(&self) -> SnapshotWorkLimits {
+        self.limits
+    }
+
+    pub fn acquire(&self, kind: SnapshotWorkKind) -> Result<SnapshotWorkPermit, SnapshotWorkError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = kind.index();
+        let limit = kind.limit(self.limits);
+
+        if state.active[index] >= limit {
+            state.rejected_operations = state.rejected_operations.saturating_add(1);
+            return Err(SnapshotWorkError::LimitReached { kind, limit });
+        }
+
+        state.active[index] += 1;
+
+        Ok(SnapshotWorkPermit {
+            controller: self.clone(),
+            kind,
+            total_bytes: Cell::new(0),
+            completed_bytes: Cell::new(0),
+        })
+    }
+
+    pub fn progress(&self) -> SnapshotWorkProgress {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        SnapshotWorkProgress {
+            active_generations: state.active[0],
+            active_sends: state.active[1],
+            active_receives: state.active[2],
+            active_installs: state.active[3],
+            generation_bytes_total: state.bytes_total[0],
+            generation_bytes_completed: state.bytes_completed[0],
+            send_bytes_total: state.bytes_total[1],
+            send_bytes_completed: state.bytes_completed[1],
+            receive_bytes_total: state.bytes_total[2],
+            receive_bytes_completed: state.bytes_completed[2],
+            install_bytes_total: state.bytes_total[3],
+            install_bytes_completed: state.bytes_completed[3],
+            rejected_operations: state.rejected_operations,
+        }
+    }
+}
+
+impl Default for SnapshotWorkController {
+    fn default() -> Self {
+        Self::new(SnapshotWorkLimits::default())
+            .expect("the default snapshot work limits are valid")
+    }
+}
+
+/// Permit held for the entire lifetime of one bounded snapshot operation.
+#[derive(Debug)]
+pub struct SnapshotWorkPermit {
+    controller: SnapshotWorkController,
+    kind: SnapshotWorkKind,
+    total_bytes: Cell<u64>,
+    completed_bytes: Cell<u64>,
+}
+
+impl SnapshotWorkPermit {
+    pub fn set_total_bytes(&self, total_bytes: u64) {
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = self.kind.index();
+        let previous_total = self.total_bytes.get();
+        let new_total = previous_total.max(total_bytes);
+
+        self.total_bytes.set(new_total);
+        state.bytes_total[index] =
+            state.bytes_total[index].saturating_add(new_total.saturating_sub(previous_total));
+    }
+
+    pub fn note_bytes(&self, completed_bytes: u64) {
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = self.kind.index();
+        let remaining = self
+            .total_bytes
+            .get()
+            .saturating_sub(self.completed_bytes.get());
+        let admitted = completed_bytes.min(remaining);
+
+        state.bytes_completed[index] = state.bytes_completed[index].saturating_add(admitted);
+        self.completed_bytes
+            .set(self.completed_bytes.get().saturating_add(admitted));
+    }
+}
+
+impl Drop for SnapshotWorkPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active[self.kind.index()] = state.active[self.kind.index()].saturating_sub(1);
+    }
+}
 
 /// verified tablet image after it crosses the database/Raft integration
 /// boundary
@@ -61,6 +300,15 @@ impl TabletSnapshotTransfer {
         &self.image
     }
 
+    /// open a bounded outgoing stream for follower catch up
+    pub fn into_sender(
+        self,
+        work: &SnapshotWorkController,
+        max_chunk_bytes: u64,
+    ) -> Result<TabletSnapshotSender, TabletSnapshotIntegrationError> {
+        TabletSnapshotSender::new(work, self.image, max_chunk_bytes)
+    }
+
     /// convert only an already verified local image into the core Raft value
     pub fn into_core_snapshot(self) -> Snapshot<Vec<u8>> {
         Snapshot {
@@ -72,6 +320,99 @@ impl TabletSnapshotTransfer {
             checksum: self.raft_metadata.checksum,
             data: self.image.data,
         }
+    }
+}
+
+/// bounded outgoing snapshot stream. Chunks are copied so the sender can be
+/// handed to a transport without exposing mutable access to the immutable
+/// snapshot image
+pub struct TabletSnapshotSender {
+    image: TabletSnapshotImage,
+    next_offset: usize,
+    max_chunk_bytes: usize,
+    permit: SnapshotWorkPermit,
+}
+
+impl TabletSnapshotSender {
+    pub fn new(
+        work: &SnapshotWorkController,
+        image: TabletSnapshotImage,
+        max_chunk_bytes: u64,
+    ) -> Result<Self, TabletSnapshotIntegrationError> {
+        let max_chunk_bytes = usize::try_from(max_chunk_bytes)
+            .map_err(|_| TabletSnapshotIntegrationError::ChunkSizeOverflow)?;
+        if max_chunk_bytes == 0 {
+            return Err(SnapshotWorkError::ZeroChunkSize.into());
+        }
+
+        let permit = work.acquire(SnapshotWorkKind::Send)?;
+        permit.set_total_bytes(image.data.len() as u64);
+
+        Ok(Self {
+            image,
+            next_offset: 0,
+            max_chunk_bytes,
+            permit,
+        })
+    }
+
+    pub fn metadata(&self) -> &TabletSnapshotMetadata {
+        &self.image.metadata
+    }
+
+    pub fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        if self.next_offset == self.image.data.len() {
+            return None;
+        }
+
+        let end = self
+            .next_offset
+            .saturating_add(self.max_chunk_bytes)
+            .min(self.image.data.len());
+        let chunk = self.image.data[self.next_offset..end].to_vec();
+        self.next_offset = end;
+        self.permit.note_bytes(chunk.len() as u64);
+        Some(chunk)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.next_offset == self.image.data.len()
+    }
+}
+
+/// bounded incoming snapshot stream used by follower catch up
+pub struct TabletSnapshotReceiveSession {
+    receiver: IncomingTabletSnapshotReceiver,
+    permit: SnapshotWorkPermit,
+}
+
+impl TabletSnapshotReceiveSession {
+    pub fn begin(
+        work: &SnapshotWorkController,
+        store: &FileTabletSnapshotStore,
+        metadata: TabletSnapshotMetadata,
+        max_chunk_bytes: u64,
+    ) -> Result<Self, TabletSnapshotIntegrationError> {
+        let permit = work.acquire(SnapshotWorkKind::Receive)?;
+        permit.set_total_bytes(metadata.total_length);
+        let receiver = IncomingTabletSnapshotReceiver::begin(store, metadata, max_chunk_bytes)
+            .map_err(TabletSnapshotIntegrationError::Receive)?;
+
+        Ok(Self { receiver, permit })
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), TabletSnapshotIntegrationError> {
+        self.receiver
+            .push_chunk(chunk)
+            .map_err(TabletSnapshotIntegrationError::Receive)?;
+        self.permit.note_bytes(chunk.len() as u64);
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<TabletSnapshotImage, TabletSnapshotIntegrationError> {
+        self.receiver
+            .finish()
+            .map_err(TabletSnapshotIntegrationError::Receive)
     }
 }
 
@@ -178,6 +519,7 @@ pub fn raft_pointer_for_tablet(
 /// comes only from successful Ready application or explicit recovery seeding;
 /// a commit index or current term is never substituted
 pub fn generate_tablet_snapshot_from_ready_loop<W, LS, SS>(
+    work: &SnapshotWorkController,
     ready_loop: &RaftReadyLoop<W, LS, SS>,
     state_machine: &TabletStateMachine<InMemoryMvcc>,
     cluster_id: impl Into<String>,
@@ -193,8 +535,9 @@ where
     let frontier = ready_loop
         .applied_frontier()
         .ok_or(TabletSnapshotIntegrationError::AppliedFrontierUnavailable)?;
+    let permit = work.acquire(SnapshotWorkKind::Generation)?;
 
-    generate_local_snapshot(
+    let image = generate_local_snapshot(
         state_machine,
         cluster_id,
         replica_id,
@@ -202,7 +545,11 @@ where
         conf_state,
         AppliedTabletFrontier::new(frontier.index, frontier.term),
     )
-    .map_err(TabletSnapshotIntegrationError::Generation)
+    .map_err(TabletSnapshotIntegrationError::Generation)?;
+
+    permit.set_total_bytes(image.data.len() as u64);
+    permit.note_bytes(image.data.len() as u64);
+    Ok(image)
 }
 
 /// adapter used by the Ready loop for a published tablet snapshot
@@ -270,6 +617,14 @@ pub fn persist_tablet_snapshot_boundary<W: RaftWal>(
         return Err(TabletSnapshotIntegrationError::FrontierMismatch);
     }
 
+    let retention_floor = storage
+        .log_view()
+        .first_retained_lsn()
+        .unwrap_or(wal::lsn::Lsn::ZERO);
+    let _retention_pin = storage
+        .acquire_retention_pin("tablet-snapshot-boundary", retention_floor)
+        .map_err(TabletSnapshotIntegrationError::Retention)?;
+
     let identity = storage.log_view().identity();
     let raft_pointer = raft_pointer_for_tablet(identity, pointer)?;
 
@@ -288,17 +643,21 @@ pub fn persist_tablet_snapshot_boundary<W: RaftWal>(
 
 /// concrete incoming install path using the actual WAL backed storage
 pub fn install_incoming_tablet_snapshot<W: RaftWal>(
+    work: &SnapshotWorkController,
     store: &FileTabletSnapshotStore,
     receiver: IncomingTabletSnapshotReceiver,
     target: &TabletSnapshotInstallTarget,
     storage: &mut RaftWalStorage<W>,
     hard_state: HardState,
 ) -> Result<DurableTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    let install_permit = work.acquire(SnapshotWorkKind::Install)?;
     let mut persisted = None;
 
     let installed = install_incoming_snapshot(store, receiver, target, |pointer, frontier| {
         let batch =
             persist_tablet_snapshot_boundary(storage, pointer, frontier, hard_state.clone())?;
+
+        install_permit.set_total_bytes(pointer.metadata.total_length);
 
         persisted = Some(batch);
 
@@ -307,6 +666,7 @@ pub fn install_incoming_tablet_snapshot<W: RaftWal>(
     .map_err(TabletSnapshotIntegrationError::Install)?;
 
     let persisted = persisted.ok_or(TabletSnapshotIntegrationError::PersistenceShape)?;
+    install_permit.note_bytes(installed.pointer.metadata.total_length);
 
     Ok(DurableTabletSnapshotInstall {
         installed,
@@ -322,6 +682,9 @@ pub struct DurableTabletSnapshotInstall {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TabletSnapshotIntegrationError {
+    #[error("snapshot work admission failed: {0}")]
+    Work(#[from] SnapshotWorkError),
+
     #[error("tablet snapshot metadata validation failed: {0}")]
     TabletMetadata(#[from] ragnordb_tablet::snapshot::TabletSnapshotMetadataError),
 
@@ -345,6 +708,15 @@ pub enum TabletSnapshotIntegrationError {
 
     #[error("tablet snapshot pointer validation failed: {0}")]
     RaftPointer(String),
+
+    #[error("tablet snapshot retention pin failed: {0}")]
+    Retention(String),
+
+    #[error("tablet snapshot receive failed: {0}")]
+    Receive(#[from] TabletSnapshotReceiveError),
+
+    #[error("snapshot chunk size does not fit in the host usize")]
+    ChunkSizeOverflow,
 
     #[error("tablet snapshot boundary does not match its applied frontier")]
     FrontierMismatch,

@@ -10,9 +10,13 @@ use ragnordb_multiraft::storage::{
     },
     persistence::{
         NodeRaftWal, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalRecordType,
-        RaftWalStorage,
+        RaftWalRetentionPin, RaftWalStorage,
     },
     recovery::{RaftWalRecoverySource, recover_raft_storage},
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use wal::{
     error::{BatchAppendFailure, WalError},
@@ -88,6 +92,41 @@ impl RaftWal for FakeWal {
         })
     }
 }
+
+#[derive(Debug)]
+struct TestRetentionPin(Arc<AtomicUsize>);
+
+impl Drop for TestRetentionPin {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct PinTrackingWal {
+    active_pins: Arc<AtomicUsize>,
+}
+
+impl RaftWal for PinTrackingWal {
+    fn append_batch_and_sync(
+        &mut self,
+        _records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        Ok(BatchAppendResult {
+            final_end_lsn: Lsn::ZERO,
+            record_extents: Vec::new(),
+        })
+    }
+
+    fn acquire_retention_pin(
+        &self,
+        _holder_name: &str,
+        _min_lsn: Lsn,
+    ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        self.active_pins.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TestRetentionPin(Arc::clone(&self.active_pins))))
+    }
+}
+
 struct RecordSource {
     records: std::vec::IntoIter<WalRecord>,
 }
@@ -199,6 +238,25 @@ fn snapshot_pointer_rejects_unsafe_file_identity_and_mismatched_applied_frontier
         snapshot.validate(),
         Err(ragnordb_multiraft::storage::codec::RaftStableStateCodecError::SnapshotAppliedIndexMismatch { .. })
     ));
+}
+
+/// Catches a node-wide WAL wrapper that silently drops snapshot retention pins
+/// instead of forwarding them to the shared WAL owner.
+#[test]
+fn node_wide_wal_forwards_snapshot_retention_pins() {
+    let active_pins = Arc::new(AtomicUsize::new(0));
+    let node_wal = NodeRaftWal::new(PinTrackingWal {
+        active_pins: Arc::clone(&active_pins),
+    });
+    let handle = node_wal.group_writer();
+
+    let pin = handle
+        .acquire_retention_pin("tablet-snapshot", Lsn::new(100))
+        .unwrap();
+
+    assert_eq!(active_pins.load(Ordering::SeqCst), 1);
+    drop(pin);
+    assert_eq!(active_pins.load(Ordering::SeqCst), 0);
 }
 
 #[test]

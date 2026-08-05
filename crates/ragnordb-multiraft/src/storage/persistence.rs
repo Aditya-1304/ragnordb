@@ -64,12 +64,32 @@ impl RaftWalRecordType {
     }
 }
 
-/// minimal public A-WAL boundary required by Raft persistence
+/// Opaque lifetime guard for one shared-WAL retention pin.
+///
+/// The database layer intentionally does not depend on the sibling WAL
+/// implementation's concrete guard type. Holding this value keeps the
+/// corresponding physical WAL prefix protected until the snapshot boundary
+/// operation has completed.
+pub trait RaftWalRetentionPin: std::fmt::Debug {}
+
+impl<T: std::fmt::Debug> RaftWalRetentionPin for T {}
+
+/// Minimal public A-WAL boundary required by Raft persistence.
 pub trait RaftWal {
     fn append_batch_and_sync(
         &mut self,
         records: &[(RecordType, &[u8])],
     ) -> Result<BatchAppendResult, BatchAppendFailure>;
+
+    /// protect the WAL prefix needed by a snapshot or follower catch-up
+    /// operation. Lightweight test WALs use the default no op guard
+    fn acquire_retention_pin(
+        &self,
+        _holder_name: &str,
+        _min_lsn: Lsn,
+    ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        Ok(Box::new(()))
+    }
 }
 
 impl<D, C> RaftWal for WalHandle<D, C>
@@ -81,6 +101,16 @@ where
         records: &[(RecordType, &[u8])],
     ) -> Result<BatchAppendResult, BatchAppendFailure> {
         WalHandle::append_batch_and_sync(self, records)
+    }
+
+    fn acquire_retention_pin(
+        &self,
+        holder_name: &str,
+        min_lsn: Lsn,
+    ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        WalHandle::acquire_retention_pin(self, holder_name, min_lsn)
+            .map(|guard| Box::new(guard) as Box<dyn RaftWalRetentionPin>)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -166,6 +196,19 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
         }
         result
     }
+
+    fn acquire_retention_pin(
+        &self,
+        holder_name: &str,
+        min_lsn: Lsn,
+    ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+
+        state.wal.acquire_retention_pin(holder_name, min_lsn)
+    }
 }
 
 /// one logical persistence generation supplied by the future Ready loop
@@ -234,6 +277,16 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
     pub fn durable_end_lsn(&self) -> Option<Lsn> {
         self.durable_end_lsn
+    }
+
+    /// retain the physical WAL prefix required by this replica while a
+    /// snapshot boundary or follower catch-up operation is in flight
+    pub fn acquire_retention_pin(
+        &self,
+        holder_name: &str,
+        min_lsn: Lsn,
+    ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        self.wal.acquire_retention_pin(holder_name, min_lsn)
     }
 
     pub fn recovery_required(&self) -> bool {
