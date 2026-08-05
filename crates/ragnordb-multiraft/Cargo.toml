@@ -13,3 +13,4 @@ raft.workspace = true
 wal.workspace = true
 thiserror.workspace = true
 prost.workspace = true
+blake3.workspace = true
