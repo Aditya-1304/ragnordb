@@ -2,8 +2,9 @@ use std::{fs, process};
 
 use ragnordb_common::ids::{RaftGroupId, ReplicaId, TabletId};
 use ragnordb_tablet::snapshot::{
-    FileTabletSnapshotStore, TabletSnapshotConfState, TabletSnapshotImage, TabletSnapshotMetadata,
-    TabletSnapshotMetadataError, TabletSnapshotStoreError,
+    AppliedTabletFrontier, FileTabletSnapshotStore, TabletSnapshotConfState, TabletSnapshotImage,
+    TabletSnapshotMetadata, TabletSnapshotMetadataError, TabletSnapshotMetadataInput,
+    TabletSnapshotStoreError,
 };
 
 fn snapshot_image() -> TabletSnapshotImage {
@@ -14,15 +15,16 @@ fn snapshot_image() -> TabletSnapshotImage {
             .unwrap();
 
     let metadata = TabletSnapshotMetadata::for_payload(
-        "ragnordb-test",
-        RaftGroupId(17),
-        ReplicaId(2),
-        TabletId(31),
-        4,
-        9,
-        12,
-        3,
-        conf_state,
+        TabletSnapshotMetadataInput {
+            cluster_id: "ragnordb-test".to_string(),
+            raft_group_id: RaftGroupId(17),
+            replica_id: ReplicaId(2),
+            tablet_id: TabletId(31),
+            tablet_epoch: 4,
+            snapshot_id: 9,
+            applied_frontier: AppliedTabletFrontier::new(12, 3),
+            conf_state,
+        },
         &payload,
     )
     .unwrap();

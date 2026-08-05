@@ -5,20 +5,26 @@
 //! shape and provides the concrete A-WAL boundary used by incoming installs
 
 use raft::types::{ConfState, HardState, Snapshot, SnapshotMetadata};
-use ragnordb_tablet::snapshot::{
-    AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
-    InstalledTabletSnapshot, TabletSnapshotImage, TabletSnapshotInstallError,
-    TabletSnapshotInstallTarget, TabletSnapshotMetadata, TabletSnapshotPointer,
-    install_incoming_snapshot,
+use ragnordb_storage::mvcc::InMemoryMvcc;
+use ragnordb_tablet::{
+    command::TabletStateMachine,
+    snapshot::{
+        AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
+        InstalledTabletSnapshot, TabletSnapshotConfState, TabletSnapshotGenerationError,
+        TabletSnapshotImage, TabletSnapshotInstallError, TabletSnapshotInstallTarget,
+        TabletSnapshotMetadata, TabletSnapshotPointer, generate_local_snapshot,
+        install_incoming_snapshot,
+    },
 };
 
-use crate::runtime::RaftSnapshotStore;
+use crate::runtime::{RaftReadyLoop, RaftSnapshotStore};
 use crate::storage::{
     codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
     persistence::{
         RaftPersistedBatch, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage,
     },
 };
+use raft::traits::{log_store::LogStore, stable_store::StableStore};
 
 /// verified tablet image after it crosses the database/Raft integration
 /// boundary
@@ -161,6 +167,42 @@ pub fn raft_pointer_for_tablet(
         .map_err(|error| TabletSnapshotIntegrationError::RaftPointer(error.to_string()))?;
 
     Ok(pointer)
+}
+
+/// generate a tablet snapshot from the Ready loop's recorded applied
+/// frontier
+///
+/// the shared references make snapshot capture a single-threaded read-side
+/// operation: the caller cannot apply another Ready generation while this
+/// function is borrowing the runtime and state machine. The frontier itself
+/// comes only from successful Ready application or explicit recovery seeding;
+/// a commit index or current term is never substituted
+pub fn generate_tablet_snapshot_from_ready_loop<W, LS, SS>(
+    ready_loop: &RaftReadyLoop<W, LS, SS>,
+    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    cluster_id: impl Into<String>,
+    replica_id: ragnordb_common::ids::ReplicaId,
+    snapshot_id: u64,
+    conf_state: TabletSnapshotConfState,
+) -> Result<TabletSnapshotImage, TabletSnapshotIntegrationError>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let frontier = ready_loop
+        .applied_frontier()
+        .ok_or(TabletSnapshotIntegrationError::AppliedFrontierUnavailable)?;
+
+    generate_local_snapshot(
+        state_machine,
+        cluster_id,
+        replica_id,
+        snapshot_id,
+        conf_state,
+        AppliedTabletFrontier::new(frontier.index, frontier.term),
+    )
+    .map_err(TabletSnapshotIntegrationError::Generation)
 }
 
 /// adapter used by the Ready loop for a published tablet snapshot
@@ -306,6 +348,12 @@ pub enum TabletSnapshotIntegrationError {
 
     #[error("tablet snapshot boundary does not match its applied frontier")]
     FrontierMismatch,
+
+    #[error("the Ready loop has not recorded an applied frontier")]
+    AppliedFrontierUnavailable,
+
+    #[error("tablet snapshot generation failed: {0}")]
+    Generation(#[from] TabletSnapshotGenerationError),
 
     #[error("tablet snapshot install failed: {0}")]
     Install(#[from] TabletSnapshotInstallError),

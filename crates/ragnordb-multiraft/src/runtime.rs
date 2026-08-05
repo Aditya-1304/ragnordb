@@ -38,7 +38,7 @@ use raft::{
     entry::EntryPayload,
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, Snapshot, SnapshotMetadata},
+    types::{LogIndex, Snapshot, SnapshotMetadata, Term},
 };
 
 use crate::storage::{
@@ -97,6 +97,34 @@ pub enum ReadyLoopError {
 
     #[error("Raft proposal failed: {0:?}")]
     Proposal(ProposeError),
+
+    #[error("invalid applied Raft frontier: index {index}, term {term}")]
+    InvalidAppliedFrontier { index: LogIndex, term: Term },
+
+    #[error(
+        "applied Raft frontier conflicts with the recorded boundary: current={current:?}, attempted={attempted:?}"
+    )]
+    AppliedFrontierConflict {
+        current: AppliedRaftFrontier,
+        attempted: AppliedRaftFrontier,
+    },
+}
+
+/// exact Raft log boundary already applied to the host state machine
+///
+/// this value is recorded from the committed Ready entries or from a verified
+/// snapshot. It is not reconstructed from the current term or commit index,
+/// because neither one proves which term belongs to the applied index
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedRaftFrontier {
+    pub index: LogIndex,
+    pub term: Term,
+}
+
+impl AppliedRaftFrontier {
+    pub const fn new(index: LogIndex, term: Term) -> Self {
+        Self { index, term }
+    }
 }
 
 /// Host owned snapshot file boundary used by the Ready runtime
@@ -334,6 +362,7 @@ where
     raft: RaftNode<Vec<u8>, Vec<u8>, LS, SS>,
     persistence: RaftWalStorage<W>,
     state: RuntimeState,
+    applied_frontier: Option<AppliedRaftFrontier>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -351,6 +380,7 @@ where
             raft,
             persistence,
             state: RuntimeState::Active,
+            applied_frontier: None,
         }
     }
 
@@ -360,6 +390,15 @@ where
 
     pub fn persistence(&self) -> &RaftWalStorage<W> {
         &self.persistence
+    }
+
+    /// returns the exact applied boundary observed by this ready loop
+    ///
+    /// `None` is intentional for a newly created or restarted loop until the
+    /// host applies a Ready generation or seeds the recovered frontier. A
+    /// caller must not substitute the commit index for this value
+    pub fn applied_frontier(&self) -> Option<AppliedRaftFrontier> {
+        self.applied_frontier
     }
 
     /// advances the Raft clock only when no previous Ready is pending
@@ -502,6 +541,43 @@ where
             .map_err(ReadyLoopError::Advance)
     }
 
+    /// seeds the applied frontier during restart recovery when the recovery
+    /// layer has already restored the corresponding state machine image
+    ///
+    /// the ordinary live path records this value from Ready entries. Recovery
+    /// must provide both index and term explicitly because the core public API
+    /// exposes no safe way to infer a historical term from an index
+    pub fn advance_applied_frontier(
+        &mut self,
+        frontier: AppliedRaftFrontier,
+    ) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+
+        if frontier.index == 0 || frontier.term == 0 {
+            return Err(ReadyLoopError::InvalidAppliedFrontier {
+                index: frontier.index,
+                term: frontier.term,
+            });
+        }
+
+        if let Some(current) = self.applied_frontier
+            && (frontier.index < current.index
+                || (frontier.index == current.index && frontier.term != current.term)
+                || (frontier.index > current.index && frontier.term < current.term))
+        {
+            return Err(ReadyLoopError::AppliedFrontierConflict {
+                current,
+                attempted: frontier,
+            });
+        }
+
+        self.raft
+            .advance_applied(frontier.index)
+            .map_err(ReadyLoopError::Advance)?;
+        self.applied_frontier = Some(frontier);
+        Ok(())
+    }
+
     /// persists the next Ready, restores any verified snapshot, applies
     /// committed commands in order, and acknowledges the applied frontier
     pub fn persist_and_apply_next_ready<SM, SF>(
@@ -561,6 +637,7 @@ where
             .expect("the pending Ready was observed immediately before persistence");
 
         let mut applied_through = self.raft.last_applied();
+        let mut applied_frontier = self.applied_frontier;
 
         if let Some((_, snapshot)) = verified_snapshot {
             if let Err(error) = state_machine.restore_snapshot(&snapshot) {
@@ -575,6 +652,15 @@ where
                 .as_ref()
                 .expect("snapshot persistence must retain the Ready snapshot")
                 .last_included_index;
+
+            let snapshot = ready
+                .snapshot
+                .as_ref()
+                .expect("snapshot persistence must retain the Ready snapshot");
+            applied_frontier = Some(AppliedRaftFrontier::new(
+                snapshot.last_included_index,
+                snapshot.last_included_term,
+            ));
         }
 
         for entry in &ready.committed_entries {
@@ -599,6 +685,7 @@ where
             }
 
             applied_through = entry.index;
+            applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
         }
 
         if applied_through > self.raft.last_applied()
@@ -607,6 +694,8 @@ where
             self.quarantine();
             return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
         }
+
+        self.applied_frontier = applied_frontier;
 
         Ok(Some(ready))
     }

@@ -49,6 +49,26 @@ impl AppliedTabletFrontier {
     }
 }
 
+/// all consensus and tablet identity needed to build one snapshot metadata
+/// envelope
+///
+/// keeping this input as a named value prevents the metadata constructor from
+/// accepting a positional mixture of IDs, epochs, and Raft boundaries. The
+/// applied frontier is deliberately carried as one value so callers cannot
+/// accidentally pair an index from one Ready generation with a term from
+/// another
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletSnapshotMetadataInput {
+    pub cluster_id: String,
+    pub raft_group_id: RaftGroupId,
+    pub replica_id: ReplicaId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub snapshot_id: u64,
+    pub applied_frontier: AppliedTabletFrontier,
+    pub conf_state: TabletSnapshotConfState,
+}
+
 /// generate one immutable tablet snapshot image
 ///
 /// the caller must obtain this frontier only after the corresponding Raft
@@ -92,15 +112,16 @@ pub fn generate_local_snapshot(
     .encode_to_vec();
 
     let metadata = TabletSnapshotMetadata::for_payload(
-        cluster_id,
-        state_machine.raft_group_id(),
-        replica_id,
-        state_machine.tablet().id(),
-        state_machine.epoch(),
-        snapshot_id,
-        applied_frontier.index,
-        applied_frontier.term,
-        conf_state,
+        TabletSnapshotMetadataInput {
+            cluster_id: cluster_id.into(),
+            raft_group_id: state_machine.raft_group_id(),
+            replica_id,
+            tablet_id: state_machine.tablet().id(),
+            tablet_epoch: state_machine.epoch(),
+            snapshot_id,
+            applied_frontier,
+            conf_state,
+        },
         &payload,
     )?;
 
@@ -272,30 +293,33 @@ pub struct TabletSnapshotMetadata {
 impl TabletSnapshotMetadata {
     /// Build metadata from the exact immutable payload that will be stored.
     pub fn for_payload(
-        cluster_id: impl Into<String>,
-        raft_group_id: RaftGroupId,
-        replica_id: ReplicaId,
-        tablet_id: TabletId,
-        tablet_epoch: u64,
-        snapshot_id: u64,
-        last_included_index: u64,
-        last_included_term: u64,
-        conf_state: TabletSnapshotConfState,
+        input: TabletSnapshotMetadataInput,
         payload: &[u8],
     ) -> Result<Self, TabletSnapshotMetadataError> {
         let total_length = u64::try_from(payload.len())
             .map_err(|_| TabletSnapshotMetadataError::PayloadLengthOverflow)?;
 
-        let metadata = Self {
-            format_version: TABLET_SNAPSHOT_METADATA_VERSION,
-            cluster_id: cluster_id.into(),
+        let TabletSnapshotMetadataInput {
+            cluster_id,
             raft_group_id,
             replica_id,
             tablet_id,
             tablet_epoch,
             snapshot_id,
-            last_included_index,
-            last_included_term,
+            applied_frontier,
+            conf_state,
+        } = input;
+
+        let metadata = Self {
+            format_version: TABLET_SNAPSHOT_METADATA_VERSION,
+            cluster_id,
+            raft_group_id,
+            replica_id,
+            tablet_id,
+            tablet_epoch,
+            snapshot_id,
+            last_included_index: applied_frontier.index,
+            last_included_term: applied_frontier.term,
             conf_state,
             storage_format_version: TABLET_SNAPSHOT_STORAGE_FORMAT_VERSION,
             total_length,

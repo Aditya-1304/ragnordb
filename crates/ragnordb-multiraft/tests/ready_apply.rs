@@ -9,8 +9,8 @@ use raft::{
 use ragnordb_common::ids::{RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
     runtime::{
-        FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine, RaftSnapshotStore,
-        ReadyApplyError, ReadyLoopError,
+        AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
+        RaftSnapshotStore, ReadyApplyError, ReadyLoopError,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
@@ -193,6 +193,10 @@ fn persisted_ready_applies_committed_entries_before_acknowledging_applied_fronti
     assert_eq!(state_machine.applied, vec![(1, b"command".to_vec())]);
     assert_eq!(loop_.raft().last_applied(), 1);
     assert_eq!(ready.committed_entries.len(), 1);
+    assert_eq!(
+        loop_.applied_frontier(),
+        Some(AppliedRaftFrontier::new(1, ready.committed_entries[0].term))
+    );
 }
 
 /// Catches an application failure after WAL persistence from being treated as
@@ -215,6 +219,7 @@ fn state_machine_failure_quarantines_the_group_without_advancing_applied_frontie
     ));
 
     assert_eq!(loop_.raft().last_applied(), 0);
+    assert_eq!(loop_.applied_frontier(), None);
     assert_eq!(loop_.tick(1), Err(ReadyLoopError::GroupQuarantined));
 }
 

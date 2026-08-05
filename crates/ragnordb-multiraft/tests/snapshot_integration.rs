@@ -1,16 +1,23 @@
-use raft::types::{HardState, ReplicaId as CoreReplicaId};
+use raft::{
+    core::node::RaftNode,
+    storage::mem::MemStorage,
+    types::{HardState, ReplicaId as CoreReplicaId, Snapshot},
+};
 use ragnordb_common::ids::{RaftGroupId, ReplicaId, TabletId};
 use ragnordb_multiraft::{
-    runtime::RaftSnapshotStore,
-    snapshot::{TabletSnapshotRaftStore, TabletSnapshotTransfer, persist_tablet_snapshot_boundary},
+    runtime::{RaftReadyLoop, RaftReadyStateMachine, RaftSnapshotStore},
+    snapshot::{
+        TabletSnapshotRaftStore, TabletSnapshotTransfer, generate_tablet_snapshot_from_ready_loop,
+        persist_tablet_snapshot_boundary,
+    },
     storage::{
-        codec::RaftReplicaIdentity,
+        codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
         persistence::{RaftWal, RaftWalRecordType, RaftWalStorage},
     },
 };
 use ragnordb_tablet::snapshot::{
     AppliedTabletFrontier, FileTabletSnapshotStore, TabletSnapshotConfState, TabletSnapshotImage,
-    TabletSnapshotMetadata, TabletSnapshotPointer,
+    TabletSnapshotMetadata, TabletSnapshotMetadataInput, TabletSnapshotPointer,
 };
 use std::{fs, process};
 use wal::{
@@ -24,16 +31,22 @@ fn pointer() -> TabletSnapshotPointer {
     let payload = b"tablet-state".to_vec();
 
     let metadata = TabletSnapshotMetadata::for_payload(
-        "ragnordb-test",
-        RaftGroupId(17),
-        ReplicaId(2),
-        TabletId(31),
-        4,
-        9,
-        12,
-        5,
-        TabletSnapshotConfState::new(7, [ReplicaId(1), ReplicaId(2), ReplicaId(3)], [], [])
+        TabletSnapshotMetadataInput {
+            cluster_id: "ragnordb-test".to_string(),
+            raft_group_id: RaftGroupId(17),
+            replica_id: ReplicaId(2),
+            tablet_id: TabletId(31),
+            tablet_epoch: 4,
+            snapshot_id: 9,
+            applied_frontier: AppliedTabletFrontier::new(12, 5),
+            conf_state: TabletSnapshotConfState::new(
+                7,
+                [ReplicaId(1), ReplicaId(2), ReplicaId(3)],
+                [],
+                [],
+            )
             .unwrap(),
+        },
         &payload,
     )
     .unwrap();
@@ -54,6 +67,68 @@ fn image() -> TabletSnapshotImage {
 struct RecordingWal {
     next_lsn: Lsn,
     record_types: Vec<RecordType>,
+}
+
+type TestReadyLoop =
+    RaftReadyLoop<RecordingWal, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+#[derive(Default)]
+struct RecordingStateMachine;
+
+impl RaftReadyStateMachine for RecordingStateMachine {
+    type Error = &'static str;
+
+    fn restore_snapshot(&mut self, _snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn apply(&mut self, _index: u64, _command: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct UnusedSnapshotStore;
+
+impl RaftSnapshotStore for UnusedSnapshotStore {
+    type Error = &'static str;
+
+    fn publish(
+        &mut self,
+        _identity: RaftReplicaIdentity,
+        _snapshot: &Snapshot<Vec<u8>>,
+    ) -> Result<RaftSnapshotPointerRecord, Self::Error> {
+        Err("snapshot publication is not used by this test")
+    }
+
+    fn load_verified(
+        &mut self,
+        _pointer: &RaftSnapshotPointerRecord,
+    ) -> Result<Snapshot<Vec<u8>>, Self::Error> {
+        Err("snapshot loading is not used by this test")
+    }
+}
+
+fn ready_loop() -> TestReadyLoop {
+    let node = RaftNode::new(2, Vec::new(), MemStorage::new(), MemStorage::new(), 5, 2);
+
+    RaftReadyLoop::new(
+        node,
+        RaftWalStorage::new(
+            RecordingWal {
+                next_lsn: Lsn::new(100),
+                record_types: Vec::new(),
+            },
+            RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap(),
+        ),
+    )
+}
+
+fn prepare_leader(loop_: &mut TestReadyLoop) {
+    loop_.persist_next_ready(None).unwrap();
+    let ticks = loop_.raft().current_election_timeout();
+    loop_.tick(ticks).unwrap();
+    loop_.persist_next_ready(None).unwrap();
 }
 
 impl RaftWal for RecordingWal {
@@ -170,4 +245,56 @@ fn raft_snapshot_store_reads_tablet_envelopes_as_core_payloads() {
     assert_eq!(loaded, core_snapshot);
 
     let _ = fs::remove_dir_all(root);
+}
+
+/// Catches constructing a tablet snapshot from a commit index or current term
+/// before the state machine has actually acknowledged the corresponding Ready.
+#[test]
+fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
+    let mut loop_ = ready_loop();
+    prepare_leader(&mut loop_);
+
+    let tablet =
+        ragnordb_tablet::Tablet::new(TabletId(31), ragnordb_common::ids::TableId(9)).unwrap();
+    let state_machine =
+        ragnordb_tablet::command::TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
+
+    let conf_state =
+        TabletSnapshotConfState::new(7, [ReplicaId(1), ReplicaId(2), ReplicaId(3)], [], [])
+            .unwrap();
+
+    assert!(matches!(
+        generate_tablet_snapshot_from_ready_loop(
+            &loop_,
+            &state_machine,
+            "ragnordb-test",
+            ReplicaId(2),
+            9,
+            conf_state.clone(),
+        ),
+        Err(
+            ragnordb_multiraft::snapshot::TabletSnapshotIntegrationError::AppliedFrontierUnavailable
+        )
+    ));
+
+    loop_.propose(b"command".to_vec(), 7).unwrap();
+    let mut snapshot_store = UnusedSnapshotStore;
+    let mut applied_state_machine = RecordingStateMachine;
+    loop_
+        .persist_and_apply_next_ready(&mut snapshot_store, &mut applied_state_machine)
+        .unwrap();
+
+    let image = generate_tablet_snapshot_from_ready_loop(
+        &loop_,
+        &state_machine,
+        "ragnordb-test",
+        ReplicaId(2),
+        9,
+        conf_state,
+    )
+    .unwrap();
+
+    let frontier = loop_.applied_frontier().unwrap();
+    assert_eq!(image.metadata.last_included_index, frontier.index);
+    assert_eq!(image.metadata.last_included_term, frontier.term);
 }
