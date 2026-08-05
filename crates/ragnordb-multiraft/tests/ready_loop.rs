@@ -1,8 +1,4 @@
-use raft::{
-    core::node::RaftNode,
-    storage::mem::MemStorage,
-    traits::{log_store::LogStore, stable_store::StableStore},
-};
+use raft::{core::node::RaftNode, storage::mem::MemStorage};
 use ragnordb_common::ids::{RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
     runtime::{RaftReadyLoop, ReadyLoopError},

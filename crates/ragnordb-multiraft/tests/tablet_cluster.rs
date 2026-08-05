@@ -419,3 +419,107 @@ fn new_leader_requires_a_new_current_term_barrier() {
 
     assert!(cluster.latest_reads_ready().unwrap());
 }
+
+/// Realistic bug caught:
+///
+/// A latest read must establish a fresh Raft barrier before reading MVCC.
+/// Reading the leader's local tablet directly could observe state without a
+/// quorum-confirmed current-term ordering point.
+#[test]
+fn latest_read_routes_through_leader_barrier_before_reading_mvcc() {
+    let mut cluster = cluster();
+    let leader_id = cluster.elect_leader().unwrap();
+
+    let request_id = request_id();
+    let (command, key, row) = single_shard_command(request_id.clone());
+
+    let ticket = cluster
+        .propose(
+            request_id,
+            command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    ticket.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let reader = Transaction::new(TxnId(99), Timestamp(31)).unwrap();
+
+    let visible_row = cluster
+        .latest_read(&reader, &key, Instant::now() + Duration::from_secs(30))
+        .unwrap();
+
+    assert_eq!(visible_row, Some(row));
+    assert_eq!(cluster.leader_id().unwrap(), leader_id);
+    assert!(cluster.latest_reads_ready().unwrap());
+}
+
+/// Realistic bug caught:
+///
+/// An expired latest-read request must not append a read barrier or return
+/// local MVCC data after the client's deadline has already elapsed.
+#[test]
+fn expired_latest_read_is_rejected_before_barrier_proposal() {
+    let mut cluster = cluster();
+    let leader_id = cluster.elect_leader().unwrap();
+
+    let request_id = request_id();
+    let (command, key, _) = single_shard_command(request_id.clone());
+
+    let ticket = cluster
+        .propose(
+            request_id,
+            command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    ticket.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let reader = Transaction::new(TxnId(99), Timestamp(31)).unwrap();
+    let applied_before = cluster.last_applied(leader_id).unwrap();
+
+    assert!(matches!(
+        cluster.latest_read(&reader, &key, Instant::now() - Duration::from_secs(1),),
+        Err(TabletClusterError::LatestReadDeadlineExceeded)
+    ));
+
+    assert_eq!(cluster.last_applied(leader_id).unwrap(), applied_before);
+}
+
+/// Realistic bug caught:
+///
+/// After leader failover, the old term's read barrier must not authorize a
+/// read. The replacement leader must establish a new barrier first.
+#[test]
+fn latest_read_requires_a_new_barrier_after_leader_failover() {
+    let mut cluster = cluster();
+    let old_leader = cluster.elect_leader().unwrap();
+
+    let request_id = request_id();
+    let (command, key, row) = single_shard_command(request_id.clone());
+
+    let ticket = cluster
+        .propose(
+            request_id,
+            command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    ticket.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    cluster.kill_replica(old_leader).unwrap();
+
+    let new_leader = cluster.elect_leader().unwrap();
+    assert_ne!(old_leader, new_leader);
+
+    let reader = Transaction::new(TxnId(99), Timestamp(31)).unwrap();
+
+    let visible_row = cluster
+        .latest_read(&reader, &key, Instant::now() + Duration::from_secs(30))
+        .unwrap();
+
+    assert_eq!(visible_row, Some(row));
+    assert!(cluster.latest_reads_ready().unwrap());
+}

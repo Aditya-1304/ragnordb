@@ -22,8 +22,10 @@ use ragnordb_common::{
     command_codec::{
         NoopCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
     },
-    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    ids::{RaftGroupId, ReplicaId, RequestId, RowKey, TableId, TabletId},
 };
+
+use ragnordb_txn::Transaction;
 
 use ragnordb_tablet::{
     Tablet,
@@ -134,6 +136,23 @@ pub enum TabletClusterError {
 
     #[error("leader read barrier applied an unexpected tablet result")]
     UnexpectedReadBarrierResult,
+
+    #[error("latest read deadline expired before its barrier was applied")]
+    LatestReadDeadlineExceeded,
+
+    #[error(
+        "latest read lost leadership: expected replica {expected_leader} term \
+     {expected_term}, observed replica {observed_leader} term {observed_term}"
+    )]
+    LatestReadLeadershipLost {
+        expected_leader: u64,
+        expected_term: u64,
+        observed_leader: u64,
+        observed_term: u64,
+    },
+
+    #[error("latest tablet read failed: {0}")]
+    LatestRead(#[from] ragnordb_common::Error),
 }
 
 /// one in memory three-node Raft group owning one tablet
@@ -520,27 +539,32 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         Ok(self.read_gate.can_serve_latest(leader_term))
     }
 
-    /// Propose and apply the current-term no-op required before latest reads.
-    ///
-    /// The barrier is registered only after the proposal completion comes from the
-    /// tablet state-machine apply path. Raft proposal acceptance or commit-index
-    /// movement alone never opens the read gate.
+    /// establish a fresh current-term barrier using the default barrier deadline
     pub fn prepare_leader_for_latest_reads(
         &mut self,
     ) -> Result<ReadBarrierPosition, TabletClusterError> {
+        self.prepare_leader_for_latest_reads_until(Instant::now() + Duration::from_secs(30))
+    }
+
+    /// establish a fresh current-term barrier before a latest read
+    ///
+    /// every invocation proposes a new no-op. Reusing an older applied barrier
+    /// would allow a later read to bypass the exact ordering point required by the
+    /// current request
+    fn prepare_leader_for_latest_reads_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<ReadBarrierPosition, TabletClusterError> {
+        if deadline <= Instant::now() {
+            return Err(TabletClusterError::LatestReadDeadlineExceeded);
+        }
+
         let leader_id = self.leader_id()?;
         let leader_index = self.replica_index(leader_id)?;
         let leader_term = self.replicas[leader_index].raft.raft().current_term();
 
         if self.read_gate.leader_term() != Some(leader_term) {
             self.read_gate.on_leader_elected(leader_term)?;
-        }
-
-        if self.read_gate.can_serve_latest(leader_term) {
-            return Ok(self
-                .read_gate
-                .pending_barrier()
-                .ok_or(LeaderReadGateError::NoPendingBarrier)?);
         }
 
         let sequence = self.next_read_barrier_sequence;
@@ -564,15 +588,20 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         )?
         .encode()?;
 
-        let ticket = self.propose(
-            request_id,
-            command,
-            Instant::now() + Duration::from_secs(30),
-        )?;
+        let ticket = self.propose(request_id, command, deadline)?;
 
-        let completion = match ticket.recv_timeout(Duration::from_secs(1)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TabletClusterError::LatestReadDeadlineExceeded);
+        }
+
+        let completion = match ticket.recv_timeout(remaining.min(Duration::from_secs(1))) {
             Ok(completion) => completion,
             Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return Err(TabletClusterError::LatestReadDeadlineExceeded);
+                }
+
                 return Err(TabletClusterError::ReadBarrierTimeout);
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -604,5 +633,51 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                 Err(TabletClusterError::ReadBarrierRetryable { failure })
             }
         }
+    }
+
+    /// execute a latest read through the current tablet leader
+    ///
+    /// the method never reads a follower directly. It first establishes a fresh
+    /// current-term Raft barrier, verifies that leadership remained stable, and
+    /// only then reads the leader's MVCC state
+    pub fn latest_read(
+        &mut self,
+        transaction: &Transaction,
+        key: &RowKey,
+        deadline: Instant,
+    ) -> Result<Option<ragnordb_common::codec::Row>, TabletClusterError> {
+        if deadline <= Instant::now() {
+            return Err(TabletClusterError::LatestReadDeadlineExceeded);
+        }
+
+        let expected_leader = self.leader_id()?;
+        let barrier = self.prepare_leader_for_latest_reads_until(deadline)?;
+
+        if deadline <= Instant::now() {
+            return Err(TabletClusterError::LatestReadDeadlineExceeded);
+        }
+
+        let observed_leader = self.leader_id()?;
+        let observed_index = self.replica_index(observed_leader)?;
+        let observed_term = self.replicas[observed_index].raft.raft().current_term();
+
+        if observed_leader != expected_leader
+            || observed_term != barrier.term
+            || !self.read_gate.can_serve_latest(observed_term)
+        {
+            return Err(TabletClusterError::LatestReadLeadershipLost {
+                expected_leader,
+                expected_term: barrier.term,
+                observed_leader,
+                observed_term,
+            });
+        }
+
+        self.replicas[observed_index]
+            .tablet
+            .state_machine()
+            .tablet()
+            .get(transaction, key)
+            .map_err(TabletClusterError::LatestRead)
     }
 }
