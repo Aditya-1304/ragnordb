@@ -1,6 +1,7 @@
 use ragnordb_common::ids::NodeId;
 
 pub mod bootstrap;
+pub mod proposal;
 pub mod runtime;
 pub mod storage;
 
