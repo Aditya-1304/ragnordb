@@ -365,6 +365,17 @@ fn database_checkpoint_retention_cannot_pass_a_raft_replica_floor() {
 #[test]
 fn snapshot_pointer_remains_the_recovery_floor_before_and_after_restart() {
     let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+    storage
+        .persist(RaftPersistenceBatch {
+            snapshot: None,
+            entries: Vec::new(),
+            hard_state: Some(HardState {
+                current_term: 8,
+                voted_for: Some(CoreReplicaId::must(61)),
+                commit: 0,
+            }),
+        })
+        .unwrap();
     let persisted = storage
         .persist(RaftPersistenceBatch {
             snapshot: Some(snapshot_pointer()),
@@ -386,7 +397,15 @@ fn snapshot_pointer_remains_the_recovery_floor_before_and_after_restart() {
     assert!(storage.log_view().first_retained_lsn().unwrap() > pointer_lsn);
     assert_eq!(storage.minimum_recovery_lsn(), Some(pointer_lsn));
 
-    let records = storage.wal().records.clone();
+    // Simulate physical segment pruning by restarting from exactly the floor
+    // published by the replica, without the older stable-state record.
+    let records = storage
+        .wal()
+        .records
+        .iter()
+        .filter(|record| record.lsn >= pointer_lsn)
+        .cloned()
+        .collect();
     let durable_end_lsn = storage.wal().next_lsn;
     let mut source = RecordSource::new(records);
     let recovered = recover_raft_storage(&mut source).unwrap();
@@ -498,7 +517,11 @@ fn persistence_rejects_conflicting_same_index_snapshot_before_wal_append() {
         .persist(RaftPersistenceBatch {
             snapshot: Some(first_snapshot.clone()),
             entries: Vec::new(),
-            hard_state: None,
+            hard_state: Some(HardState {
+                current_term: 7,
+                voted_for: Some(CoreReplicaId::must(61)),
+                commit: 19,
+            }),
         })
         .unwrap();
 
@@ -509,7 +532,11 @@ fn persistence_rejects_conflicting_same_index_snapshot_before_wal_append() {
         .persist(RaftPersistenceBatch {
             snapshot: Some(conflicting_snapshot),
             entries: Vec::new(),
-            hard_state: None,
+            hard_state: Some(HardState {
+                current_term: 7,
+                voted_for: Some(CoreReplicaId::must(61)),
+                commit: 19,
+            }),
         })
         .unwrap_err();
 
@@ -520,6 +547,27 @@ fn persistence_rejects_conflicting_same_index_snapshot_before_wal_append() {
     assert_eq!(storage.wal().operations.len(), 1);
     assert_eq!(storage.snapshot().unwrap().checksum, [9; 32]);
     assert_eq!(storage.log_view().snapshot_boundary(), Some((19, 7)));
+}
+
+/// Realistic bug caught: retaining an older HardState while pruning its log
+/// dependencies can make recovery fail before it reaches a later snapshot
+/// pointer. Requiring the matching HardState after the pointer makes the new
+/// snapshot batch independently replayable from its own physical boundary.
+#[test]
+fn snapshot_pointer_without_matching_hard_state_is_rejected_before_append() {
+    let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+
+    let error = storage
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(snapshot_pointer()),
+            entries: Vec::new(),
+            hard_state: None,
+        })
+        .unwrap_err();
+
+    assert_eq!(error, RaftPersistenceError::SnapshotWithoutHardState);
+    assert!(storage.wal().operations.is_empty());
+    assert!(storage.snapshot().is_none());
 }
 
 /// Realistic bug caught: a batch must not durably publish a log term that is

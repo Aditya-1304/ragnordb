@@ -495,8 +495,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         let leader_retention_floor = self.replicas[leader_index]
             .raft
             .persistence()
-            .log_view()
-            .first_retained_lsn()
+            .minimum_recovery_lsn()
             .unwrap_or(Lsn::ZERO);
         let _leader_retention_pin = self.replicas[leader_index]
             .raft
@@ -507,8 +506,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         let follower_retention_floor = self.replicas[follower_index]
             .raft
             .persistence()
-            .log_view()
-            .first_retained_lsn()
+            .minimum_recovery_lsn()
             .unwrap_or(Lsn::ZERO);
         let _follower_retention_pin = self.replicas[follower_index]
             .raft
@@ -993,14 +991,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         let floor = self.replicas[replica_index]
             .raft
             .persistence()
-            .log_view()
-            .first_retained_lsn()
-            .or_else(|| {
-                self.replicas[replica_index]
-                    .raft
-                    .persistence()
-                    .durable_end_lsn()
-            })
+            .minimum_recovery_lsn()
             .unwrap_or(Lsn::ZERO);
 
         self.replicas[replica_index]

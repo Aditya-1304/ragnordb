@@ -651,6 +651,10 @@ impl<W: RaftWal> RaftWalStorage<W> {
         &self,
         batch: RaftPersistenceBatch,
     ) -> Result<PreparedBatch, RaftPersistenceError> {
+        if batch.snapshot.is_some() && batch.hard_state.is_none() {
+            return Err(RaftPersistenceError::SnapshotWithoutHardState);
+        }
+
         let mut records = Vec::new();
         let mut entry_records = Vec::with_capacity(batch.entries.len());
         let mut preview = self.log_view.clone();
@@ -819,6 +823,9 @@ struct PreparedBatch {
 pub enum RaftPersistenceError {
     #[error("Raft WAL storage requires restart and recovery")]
     RecoveryRequired,
+
+    #[error("a durable Raft snapshot pointer requires HardState in the same batch")]
+    SnapshotWithoutHardState,
 
     #[error("invalid Raft log entry: {0}")]
     InvalidLogEntry(#[from] RaftLogEntryCodecError),

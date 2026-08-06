@@ -574,8 +574,7 @@ where
 
         let retention_floor = self
             .persistence
-            .log_view()
-            .first_retained_lsn()
+            .minimum_recovery_lsn()
             .unwrap_or(wal::lsn::Lsn::ZERO);
         let _retention_pin = self
             .persistence
