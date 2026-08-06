@@ -39,12 +39,23 @@ pub enum ProposalFailure {
 
 /// Completion delivered to the proposal response waiter
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProposalCompletion<R> {
+pub enum ProposalCompletion<R, E = ()> {
     /// The matching committed entry was applied by the state machine
     Applied {
         request_id: RequestId,
         position: ProposalPosition,
         result: R,
+    },
+
+    /// matching committed entry was applied as a deterministic rejection
+    ///
+    /// this is a known, non-retryable database outcome. It is distinct from a
+    /// retryable host failure because replaying the same `RequestId` must return
+    /// the same rejection from replicated deduplication state
+    Rejected {
+        request_id: RequestId,
+        position: ProposalPosition,
+        rejection: E,
     },
 
     /// The proposal did not produce a known apply result on this attempt
@@ -78,15 +89,15 @@ pub enum ProposalRegistryError {
     ResponseChannelClosed { request_id: RequestId },
 }
 
-/// Client-side handle for one tracked proposal.
-pub struct ProposalTicket<R> {
+/// client side handle for one tracked proposal
+pub struct ProposalTicket<R, E = ()> {
     request_id: RequestId,
     position: ProposalPosition,
     deadline: Instant,
-    receiver: Receiver<ProposalCompletion<R>>,
+    receiver: Receiver<ProposalCompletion<R, E>>,
 }
 
-impl<R> ProposalTicket<R> {
+impl<R, E> ProposalTicket<R, E> {
     /// Return the request identity associated with this response waiter.
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
@@ -103,7 +114,7 @@ impl<R> ProposalTicket<R> {
     }
 
     /// Wait for the apply result or an explicit retryable completion.
-    pub fn recv(self) -> Result<ProposalCompletion<R>, RecvError> {
+    pub fn recv(self) -> Result<ProposalCompletion<R, E>, RecvError> {
         self.receiver.recv()
     }
 
@@ -111,28 +122,28 @@ impl<R> ProposalTicket<R> {
     pub fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<ProposalCompletion<R>, RecvTimeoutError> {
+    ) -> Result<ProposalCompletion<R, E>, RecvTimeoutError> {
         self.receiver.recv_timeout(timeout)
     }
 
     /// Inspect the proposal without blocking the caller.
-    pub fn try_recv(&self) -> Result<ProposalCompletion<R>, TryRecvError> {
+    pub fn try_recv(&self) -> Result<ProposalCompletion<R, E>, TryRecvError> {
         self.receiver.try_recv()
     }
 }
 
-struct PendingProposal<R> {
+struct PendingProposal<R, E> {
     position: ProposalPosition,
     deadline: Instant,
-    sender: Sender<ProposalCompletion<R>>,
+    sender: Sender<ProposalCompletion<R, E>>,
 }
 
 /// Tracks proposals admitted by one Raft group.
-pub struct ProposalRegistry<R> {
-    pending: HashMap<RequestId, PendingProposal<R>>,
+pub struct ProposalRegistry<R, E = ()> {
+    pending: HashMap<RequestId, PendingProposal<R, E>>,
 }
 
-impl<R> ProposalRegistry<R> {
+impl<R, E> ProposalRegistry<R, E> {
     /// Construct an empty proposal registry.
     pub fn new() -> Self {
         Self {
@@ -149,7 +160,7 @@ impl<R> ProposalRegistry<R> {
         request_id: RequestId,
         position: ProposalPosition,
         deadline: Instant,
-    ) -> Result<ProposalTicket<R>, ProposalRegistryError> {
+    ) -> Result<ProposalTicket<R, E>, ProposalRegistryError> {
         if self.pending.contains_key(&request_id) {
             return Err(ProposalRegistryError::DuplicateRequest { request_id });
         }
@@ -208,6 +219,52 @@ impl<R> ProposalRegistry<R> {
             request_id: request_id.clone(),
             position: applied_position,
             result,
+        };
+
+        pending
+            .sender
+            .send(completion)
+            .map_err(|_| ProposalRegistryError::ResponseChannelClosed {
+                request_id: request_id.clone(),
+            })
+    }
+
+    /// resolve a proposal after its committed entry reaches a deterministic,
+    /// non retryable state machine rejection
+    ///
+    /// position validation is identical to the successful apply path: an
+    /// unrelated entry must never consume the client's actual response waiter
+    pub fn resolve_rejected(
+        &mut self,
+        request_id: &RequestId,
+        applied_position: ProposalPosition,
+        rejection: E,
+    ) -> Result<(), ProposalRegistryError> {
+        let Some(expected_position) = self.pending.get(request_id).map(|pending| pending.position)
+        else {
+            return Err(ProposalRegistryError::UnknownRequest {
+                request_id: request_id.clone(),
+            });
+        };
+
+        if expected_position != applied_position {
+            return Err(ProposalRegistryError::ApplyPositionMismatch {
+                request_id: request_id.clone(),
+                expected: expected_position,
+                received: applied_position,
+            });
+        }
+
+        let Some(pending) = self.pending.remove(request_id) else {
+            return Err(ProposalRegistryError::UnknownRequest {
+                request_id: request_id.clone(),
+            });
+        };
+
+        let completion = ProposalCompletion::Rejected {
+            request_id: request_id.clone(),
+            position: applied_position,
+            rejection,
         };
 
         pending
@@ -280,7 +337,7 @@ impl<R> ProposalRegistry<R> {
     }
 }
 
-impl<R> Default for ProposalRegistry<R> {
+impl<R, E> Default for ProposalRegistry<R, E> {
     fn default() -> Self {
         Self::new()
     }

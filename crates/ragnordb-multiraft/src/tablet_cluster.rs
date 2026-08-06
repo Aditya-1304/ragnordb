@@ -53,7 +53,7 @@ use crate::{
         codec::RaftReplicaIdentity,
         persistence::{RaftWal, RaftWalStorage},
     },
-    tablet_apply::{AppliedTabletCommand, TabletApplyError, TabletCommandApplier},
+    tablet_apply::{CommittedTabletCommandDisposition, TabletApplyError, TabletCommandApplier},
 };
 
 const REPLICA_IDS: [u64; 3] = [1, 2, 3];
@@ -169,6 +169,9 @@ pub enum TabletClusterError {
     #[error("leader read barrier became retryable: {failure:?}")]
     ReadBarrierRetryable { failure: ProposalFailure },
 
+    #[error("leader read barrier was deterministically rejected: {rejection}")]
+    ReadBarrierRejected { rejection: TabletCommandApplyError },
+
     #[error("leader read barrier applied an unexpected tablet result")]
     UnexpectedReadBarrierResult,
 
@@ -197,7 +200,10 @@ pub enum TabletClusterError {
 pub struct InMemoryTabletCluster<W: RaftWal> {
     replicas: [TabletReplica<W>; 3],
     transport: VecDeque<Envelope<Vec<u8>, Vec<u8>>>,
-    proposals: ProposalRegistry<ragnordb_tablet::command::TabletCommandApplyOutcome>,
+    proposals: ProposalRegistry<
+        ragnordb_tablet::command::TabletCommandApplyOutcome,
+        TabletCommandApplyError,
+    >,
     raft_group_id: RaftGroupId,
     tablet_id: TabletId,
     tablet_epoch: u64,
@@ -426,7 +432,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     term: entry.term,
                     index: entry.index,
                 };
-                let applied = self.replicas[leader_index]
+                let disposition = self.replicas[leader_index]
                     .tablet
                     .apply_committed(position, command)
                     .map_err(|source| TabletClusterError::Apply {
@@ -434,7 +440,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                         index: entry.index,
                         source,
                     })?;
-                self.resolve_applied(applied)?;
+                self.resolve_committed(disposition)?;
             }
         }
 
@@ -605,7 +611,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     term: entry.term,
                     index: entry.index,
                 };
-                let applied = self.replicas[follower_index]
+                let disposition = self.replicas[follower_index]
                     .tablet
                     .apply_committed(position, command)
                     .map_err(|source| TabletClusterError::Apply {
@@ -613,7 +619,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                         index: entry.index,
                         source,
                     })?;
-                self.resolve_applied(applied)?;
+                self.resolve_committed(disposition)?;
             }
         }
 
@@ -768,7 +774,10 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         command: Vec<u8>,
         deadline: Instant,
     ) -> Result<
-        ProposalTicket<ragnordb_tablet::command::TabletCommandApplyOutcome>,
+        ProposalTicket<
+            ragnordb_tablet::command::TabletCommandApplyOutcome,
+            TabletCommandApplyError,
+        >,
         TabletClusterError,
     > {
         let envelope = TabletCommandEnvelope::decode(&command)?;
@@ -886,7 +895,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     index: entry.index,
                 };
 
-                let applied = match self.replicas[replica_index]
+                let disposition = match self.replicas[replica_index]
                     .tablet
                     .apply_committed(position, command)
                 {
@@ -902,7 +911,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     }
                 };
 
-                if let Err(error) = self.resolve_applied(applied) {
+                if let Err(error) = self.resolve_committed(disposition) {
                     self.replicas[replica_index].raft.quarantine();
                     return Err(error);
                 }
@@ -939,8 +948,11 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         Ok(())
     }
 
-    fn resolve_applied(&mut self, applied: AppliedTabletCommand) -> Result<(), TabletClusterError> {
-        match applied.resolve(&mut self.proposals) {
+    fn resolve_committed(
+        &mut self,
+        disposition: CommittedTabletCommandDisposition,
+    ) -> Result<(), TabletClusterError> {
+        match disposition.resolve(&mut self.proposals) {
             Ok(()) => Ok(()),
 
             // followers apply the same command but do not own the originating
@@ -1128,6 +1140,10 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
             ProposalCompletion::Retryable { failure, .. } => {
                 Err(TabletClusterError::ReadBarrierRetryable { failure })
+            }
+
+            ProposalCompletion::Rejected { rejection, .. } => {
+                Err(TabletClusterError::ReadBarrierRejected { rejection })
             }
         }
     }

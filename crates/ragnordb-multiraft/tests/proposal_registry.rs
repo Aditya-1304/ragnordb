@@ -53,6 +53,39 @@ fn proposal_completes_only_after_matching_apply_result() {
 
 /// Realistic bug caught:
 ///
+/// A deterministic database rejection must complete the exact proposal as a
+/// known non-retryable result. Treating it as retryable could make a client
+/// issue a new request identity and execute a logically rejected command again.
+#[test]
+fn deterministic_rejection_completes_the_matching_proposal() {
+    let mut registry = ProposalRegistry::<&'static str, &'static str>::new();
+    let request_id = request_id();
+    let position = ProposalPosition { term: 3, index: 7 };
+
+    let ticket = registry
+        .register(
+            request_id.clone(),
+            position,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    registry
+        .resolve_rejected(&request_id, position, "write conflict")
+        .unwrap();
+
+    assert_eq!(
+        ticket.try_recv().unwrap(),
+        ProposalCompletion::Rejected {
+            request_id,
+            position,
+            rejection: "write conflict",
+        }
+    );
+}
+
+/// Realistic bug caught:
+///
 /// An apply event for the wrong term or index must not consume the pending
 /// proposal, otherwise the real apply result could be lost permanently.
 #[test]

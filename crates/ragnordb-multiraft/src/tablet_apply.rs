@@ -33,9 +33,57 @@ impl AppliedTabletCommand {
     /// resolve the matching proposal waiter after tablet apply succeeds
     pub fn resolve(
         self,
-        registry: &mut ProposalRegistry<TabletCommandApplyOutcome>,
+        registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     ) -> Result<(), ProposalRegistryError> {
         registry.resolve_applied(&self.request_id, self.position, self.outcome)
+    }
+}
+
+/// deterministic database rejection produced while applying a committed entry
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedTabletCommand {
+    /// client identity preserved from the durable command envelope
+    pub request_id: RequestId,
+
+    /// exact Raft term and index of the applied entry
+    pub position: ProposalPosition,
+
+    /// stable rejection returned to the proposal owner
+    pub rejection: TabletCommandApplyError,
+}
+
+impl RejectedTabletCommand {
+    /// resolve the matching proposal waiter with a known non-retryable result
+    pub fn resolve(
+        self,
+        registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    ) -> Result<(), ProposalRegistryError> {
+        registry.resolve_rejected(&self.request_id, self.position, self.rejection)
+    }
+}
+
+/// disposition of one valid committed tablet command envelope
+///
+/// Both variants have consumed their Raft log position. `Rejected` represents
+/// an ordinary deterministic database result, so callers must advance the
+/// applied frontier after handling it just as they do for `Applied`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommittedTabletCommandDisposition {
+    Applied(AppliedTabletCommand),
+    Rejected(RejectedTabletCommand),
+}
+
+impl CommittedTabletCommandDisposition {
+    /// resolve a leader-owned waiter while allowing follower-only apply events
+    /// to be ignored by the higher-level runtime.
+    pub fn resolve(
+        self,
+        registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    ) -> Result<(), ProposalRegistryError> {
+        match self {
+            Self::Applied(applied) => applied.resolve(registry),
+            Self::Rejected(rejected) => rejected.resolve(registry),
+        }
     }
 }
 
@@ -48,8 +96,8 @@ pub enum TabletApplyError {
     #[error("committed tablet command envelope is invalid: {0}")]
     InvalidEnvelope(#[from] TabletCommandEnvelopeError),
 
-    #[error("tablet command apply failed: {0}")]
-    Apply(#[from] TabletCommandApplyError),
+    #[error("tablet command apply encountered a fatal state-machine failure: {0}")]
+    FatalApply(TabletCommandApplyError),
 }
 
 /// applies committed command bytes to one replicated tablet state machine
@@ -84,7 +132,7 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         &mut self,
         position: ProposalPosition,
         command: &[u8],
-    ) -> Result<AppliedTabletCommand, TabletApplyError> {
+    ) -> Result<CommittedTabletCommandDisposition, TabletApplyError> {
         if position.term == 0 || position.index == 0 {
             return Err(TabletApplyError::InvalidRaftPosition {
                 term: position.term,
@@ -94,12 +142,40 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
 
         let envelope = TabletCommandEnvelope::decode(command)?;
         let request_id = envelope.request_id.clone();
-        let outcome = self.state_machine.apply(envelope)?;
-
-        Ok(AppliedTabletCommand {
-            request_id,
-            position,
-            outcome,
-        })
+        match self.state_machine.apply(envelope) {
+            Ok(outcome) => Ok(CommittedTabletCommandDisposition::Applied(
+                AppliedTabletCommand {
+                    request_id,
+                    position,
+                    outcome,
+                },
+            )),
+            Err(rejection) if is_deterministic_rejection(&rejection) => Ok(
+                CommittedTabletCommandDisposition::Rejected(RejectedTabletCommand {
+                    request_id,
+                    position,
+                    rejection,
+                }),
+            ),
+            Err(source) => Err(TabletApplyError::FatalApply(source)),
+        }
     }
+}
+
+/// Return whether a state-machine error is a normal deterministic result of a
+/// valid committed envelope rather than evidence that local replica state can
+/// no longer be trusted.
+fn is_deterministic_rejection(error: &TabletCommandApplyError) -> bool {
+    matches!(
+        error,
+        TabletCommandApplyError::RaftGroupMismatch { .. }
+            | TabletCommandApplyError::TabletIdMismatch { .. }
+            | TabletCommandApplyError::TabletEpochMismatch { .. }
+            | TabletCommandApplyError::StaleRequestSequence { .. }
+            | TabletCommandApplyError::RequestSequenceGap { .. }
+            | TabletCommandApplyError::RequestSequenceExhausted { .. }
+            | TabletCommandApplyError::InvalidCommand { .. }
+            | TabletCommandApplyError::WriteConflict { .. }
+            | TabletCommandApplyError::UnsupportedCommand { .. }
+    )
 }

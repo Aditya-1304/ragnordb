@@ -2,7 +2,11 @@ use std::time::{Duration, Instant};
 
 use ragnordb_common::{
     codec::{Row, Value, WriteKind},
-    command_codec::{SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry},
+    command_codec::{
+        CachedTabletCommandOutcome, CachedTabletCommandRejectionKind, NoopCommand, PrewriteCommand,
+        SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletStateMachineSnapshot,
+        WriteEntry,
+    },
     ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
 };
 use ragnordb_multiraft::{
@@ -13,7 +17,10 @@ use ragnordb_multiraft::{
 use ragnordb_storage::key::{encode_row_key, make_row_key};
 use ragnordb_tablet::{
     Tablet,
-    command::{TabletCommandApplyOutcome, TabletCommandApplyResult, TabletStateMachine},
+    command::{
+        TabletCommandApplyError, TabletCommandApplyOutcome, TabletCommandApplyResult,
+        TabletStateMachine,
+    },
     snapshot::FileTabletSnapshotStore,
 };
 use ragnordb_txn::Transaction;
@@ -452,6 +459,47 @@ fn single_shard_command(request_id: RequestId) -> (Vec<u8>, ragnordb_common::ids
     single_shard_command_for(request_id, 1, 11, 30)
 }
 
+fn prewrite_command(
+    request_id: RequestId,
+    txn_id: u64,
+    start_timestamp: u64,
+    key: &ragnordb_common::ids::RowKey,
+    row: Row,
+) -> Vec<u8> {
+    let encoded_key = encode_row_key(key).unwrap();
+    TabletCommandEnvelope::new(
+        request_id,
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: TxnId(txn_id),
+            start_timestamp: Timestamp(start_timestamp),
+            writes: vec![WriteEntry {
+                key: encoded_key.clone(),
+                row: Some(row),
+                op: WriteKind::Put,
+            }],
+            primary_key: encoded_key,
+            ttl_ms: 30_000,
+        }),
+    )
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
+fn noop_command(request_id: RequestId) -> Vec<u8> {
+    TabletCommandEnvelope::new(
+        request_id,
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Noop(NoopCommand),
+    )
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
 fn cluster() -> InMemoryTabletCluster<TestWal> {
     InMemoryTabletCluster::new(
         [TestWal::new(), TestWal::new(), TestWal::new()],
@@ -506,6 +554,10 @@ fn three_node_cluster_replicates_and_applies_one_tablet_write() {
         ProposalCompletion::Retryable { failure, .. } => {
             panic!("proposal unexpectedly became retryable: {failure:?}");
         }
+
+        ProposalCompletion::Rejected { rejection, .. } => {
+            panic!("valid proposal was unexpectedly rejected: {rejection}");
+        }
     };
 
     assert_eq!(cluster.leader_id().unwrap(), elected_leader);
@@ -527,6 +579,159 @@ fn three_node_cluster_replicates_and_applies_one_tablet_write() {
             .unwrap();
 
         assert_eq!(visible_row, Some(row.clone()));
+    }
+}
+
+/// Realistic bug caught:
+///
+/// A committed write conflict is a deterministic database result, not replica
+/// corruption. Every replica must consume the entry, preserve the same cached
+/// rejection, remain available for an exact retry, and accept the client's next
+/// valid sequence.
+#[test]
+fn committed_write_conflict_advances_apply_without_quarantining_the_group() {
+    let mut cluster = cluster();
+    cluster.elect_leader().unwrap();
+
+    let key = make_row_key(TABLE_ID, &[Value::Int(88)]).unwrap();
+    let owner_row = Row {
+        values: vec![Value::Int(88), Value::Text("owner".to_string())],
+    };
+    let contender_row = Row {
+        values: vec![Value::Int(88), Value::Text("contender".to_string())],
+    };
+
+    let owner_request = request_id_with_sequence(1);
+    let owner_ticket = cluster
+        .propose(
+            owner_request.clone(),
+            prewrite_command(owner_request, 501, 100, &key, owner_row),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        owner_ticket.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ProposalCompletion::Applied {
+            result: TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Prewrite,
+                deduplicated: false,
+            },
+            ..
+        }
+    ));
+
+    let conflict_request = request_id_with_sequence(2);
+    let conflict_command =
+        prewrite_command(conflict_request.clone(), 502, 110, &key, contender_row);
+    let conflict_ticket = cluster
+        .propose(
+            conflict_request.clone(),
+            conflict_command.clone(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    let (conflict_position, first_rejection) = match conflict_ticket
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+    {
+        ProposalCompletion::Rejected {
+            request_id,
+            position,
+            rejection,
+        } => {
+            assert_eq!(request_id, conflict_request);
+            assert!(matches!(
+                rejection,
+                TabletCommandApplyError::WriteConflict { .. }
+            ));
+            (position, rejection)
+        }
+        completion => panic!("conflicting prewrite returned {completion:?}"),
+    };
+
+    let mut replicated_rejection = None;
+    for replica_id in [1, 2, 3] {
+        assert_eq!(
+            cluster.last_applied(replica_id).unwrap(),
+            conflict_position.index
+        );
+
+        let snapshot = TabletStateMachineSnapshot::decode(
+            &cluster
+                .tablet(replica_id)
+                .unwrap()
+                .state_machine()
+                .encode_snapshot_state()
+                .unwrap(),
+        )
+        .unwrap();
+        let client = snapshot.clients.get(&conflict_request.client_id).unwrap();
+
+        assert_eq!(client.last_sequence_applied, conflict_request.sequence);
+        assert!(matches!(
+            &client.cached_outcome,
+            CachedTabletCommandOutcome::Rejected(rejection)
+                if rejection.kind == CachedTabletCommandRejectionKind::WriteConflict
+        ));
+
+        if let CachedTabletCommandOutcome::Rejected(rejection) = &client.cached_outcome {
+            if let Some(expected) = &replicated_rejection {
+                assert_eq!(rejection, expected);
+            } else {
+                replicated_rejection = Some(rejection.clone());
+            }
+        }
+    }
+
+    let retry_ticket = cluster
+        .propose(
+            conflict_request.clone(),
+            conflict_command,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    match retry_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Rejected {
+            request_id,
+            rejection,
+            ..
+        } => {
+            assert_eq!(request_id, conflict_request);
+            assert_eq!(rejection, first_rejection);
+        }
+        completion => panic!("exact conflict retry returned {completion:?}"),
+    }
+
+    let next_request = request_id_with_sequence(3);
+    let next_ticket = cluster
+        .propose(
+            next_request.clone(),
+            noop_command(next_request),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    let next_position = match next_ticket.recv_timeout(Duration::from_secs(1)).unwrap() {
+        ProposalCompletion::Applied {
+            position,
+            result:
+                TabletCommandApplyOutcome {
+                    result: TabletCommandApplyResult::Noop,
+                    deduplicated: false,
+                },
+            ..
+        } => position,
+        completion => panic!("valid sequence after conflict returned {completion:?}"),
+    };
+
+    for replica_id in [1, 2, 3] {
+        assert_eq!(
+            cluster.last_applied(replica_id).unwrap(),
+            next_position.index
+        );
     }
 }
 
@@ -586,6 +791,9 @@ fn leader_failover_preserves_request_identity_and_catches_up_rejoined_replica() 
         ProposalCompletion::Retryable { failure, .. } => {
             panic!("initial proposal unexpectedly failed: {failure:?}");
         }
+        ProposalCompletion::Rejected { rejection, .. } => {
+            panic!("initial proposal was unexpectedly rejected: {rejection}");
+        }
     }
 
     cluster.kill_replica(old_leader).unwrap();
@@ -614,6 +822,9 @@ fn leader_failover_preserves_request_identity_and_catches_up_rejoined_replica() 
         }
         ProposalCompletion::Retryable { failure, .. } => {
             panic!("same-RequestId retry unexpectedly failed: {failure:?}");
+        }
+        ProposalCompletion::Rejected { rejection, .. } => {
+            panic!("successful retry was unexpectedly rejected: {rejection}");
         }
     }
 
@@ -655,6 +866,9 @@ fn leader_failover_preserves_request_identity_and_catches_up_rejoined_replica() 
         }
         ProposalCompletion::Retryable { failure, .. } => {
             panic!("replacement leader proposal failed: {failure:?}");
+        }
+        ProposalCompletion::Rejected { rejection, .. } => {
+            panic!("replacement leader proposal was rejected: {rejection}");
         }
     };
 
@@ -910,6 +1124,9 @@ fn restarted_replica_reconstructs_from_durable_wal_and_catches_up() {
         ProposalCompletion::Applied { position, .. } => position,
         ProposalCompletion::Retryable { failure, .. } => {
             panic!("replacement leader proposal failed: {failure:?}");
+        }
+        ProposalCompletion::Rejected { rejection, .. } => {
+            panic!("replacement leader proposal was rejected: {rejection}");
         }
     };
 

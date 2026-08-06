@@ -6,7 +6,7 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::{
     proposal::{ProposalCompletion, ProposalPosition, ProposalRegistry},
-    tablet_apply::{TabletApplyError, TabletCommandApplier},
+    tablet_apply::{CommittedTabletCommandDisposition, TabletApplyError, TabletCommandApplier},
 };
 use ragnordb_tablet::{
     Tablet,
@@ -59,7 +59,8 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
     let position = ProposalPosition { term: 3, index: 7 };
     let command = noop_bytes(request_id.clone(), TABLET_ID);
 
-    let mut registry = ProposalRegistry::<TabletCommandApplyOutcome>::new();
+    let mut registry =
+        ProposalRegistry::<TabletCommandApplyOutcome, TabletCommandApplyError>::new();
     let ticket = registry
         .register(
             request_id.clone(),
@@ -68,7 +69,11 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
         )
         .unwrap();
 
-    let applied = applier.apply_committed(position, &command).unwrap();
+    let CommittedTabletCommandDisposition::Applied(applied) =
+        applier.apply_committed(position, &command).unwrap()
+    else {
+        panic!("valid no-op was unexpectedly rejected");
+    };
 
     assert_eq!(applied.request_id, request_id);
     assert_eq!(applied.position, position);
@@ -111,27 +116,32 @@ fn malformed_committed_entry_does_not_consume_request_sequence() {
     ));
 
     let command = noop_bytes(request_id(), TABLET_ID);
-    let applied = applier.apply_committed(position, &command).unwrap();
+    let disposition = applier.apply_committed(position, &command).unwrap();
 
-    assert!(!applied.outcome.deduplicated);
+    assert!(matches!(
+        disposition,
+        CommittedTabletCommandDisposition::Applied(applied) if !applied.outcome.deduplicated
+    ));
 }
 
 /// Realistic bug caught:
 ///
 /// The bridge must not bypass TabletStateMachine routing checks. A command for
-/// another tablet must remain a deterministic apply error, not a successful
-/// proposal completion.
+/// another tablet consumes its committed Raft position as a deterministic
+/// rejection, but must never be reported as a successful proposal.
 #[test]
 fn committed_entry_for_another_tablet_is_rejected() {
     let mut applier = applier();
     let position = ProposalPosition { term: 3, index: 7 };
     let command = noop_bytes(request_id(), TabletId(TABLET_ID.0 + 1));
 
-    assert_eq!(
-        applier.apply_committed(position, &command).unwrap_err(),
-        TabletApplyError::Apply(TabletCommandApplyError::TabletIdMismatch {
-            local_tablet_id: TABLET_ID,
-            requested_tablet_id: TabletId(TABLET_ID.0 + 1),
-        })
-    );
+    assert!(matches!(
+        applier.apply_committed(position, &command).unwrap(),
+        CommittedTabletCommandDisposition::Rejected(rejected)
+            if rejected.rejection
+                == TabletCommandApplyError::TabletIdMismatch {
+                    local_tablet_id: TABLET_ID,
+                    requested_tablet_id: TabletId(TABLET_ID.0 + 1),
+                }
+    ));
 }
