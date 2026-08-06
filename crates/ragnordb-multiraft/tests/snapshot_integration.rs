@@ -9,7 +9,8 @@ use ragnordb_multiraft::{
     snapshot::{
         SnapshotWorkController, SnapshotWorkError, SnapshotWorkKind, SnapshotWorkLimits,
         TabletSnapshotRaftStore, TabletSnapshotReceiveSession, TabletSnapshotTransfer,
-        generate_tablet_snapshot_from_ready_loop, persist_tablet_snapshot_boundary,
+        generate_tablet_snapshot_from_ready_loop, install_incoming_tablet_snapshot,
+        persist_tablet_snapshot_boundary,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
@@ -18,8 +19,10 @@ use ragnordb_multiraft::{
 };
 use ragnordb_tablet::snapshot::{
     AppliedTabletFrontier, FileTabletSnapshotStore, TabletSnapshotConfState, TabletSnapshotImage,
-    TabletSnapshotMetadata, TabletSnapshotMetadataInput, TabletSnapshotPointer,
+    TabletSnapshotInstallTarget, TabletSnapshotMetadata, TabletSnapshotMetadataInput,
+    TabletSnapshotPointer, generate_local_snapshot,
 };
+use ragnordb_tablet::{Tablet, command::TabletStateMachine};
 use std::{fs, process};
 use wal::{
     error::BatchAppendFailure,
@@ -62,6 +65,22 @@ fn image() -> TabletSnapshotImage {
     let pointer = pointer();
 
     TabletSnapshotImage::new(pointer.metadata, b"tablet-state".to_vec()).unwrap()
+}
+
+fn installable_image() -> TabletSnapshotImage {
+    let tablet = Tablet::new(TabletId(31), ragnordb_common::ids::TableId(9)).unwrap();
+    let state_machine = TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
+
+    generate_local_snapshot(
+        &state_machine,
+        "ragnordb-test",
+        ReplicaId(2),
+        9,
+        TabletSnapshotConfState::new(7, [ReplicaId(1), ReplicaId(2), ReplicaId(3)], [], [])
+            .unwrap(),
+        AppliedTabletFrontier::new(12, 5),
+    )
+    .unwrap()
 }
 
 #[derive(Debug)]
@@ -263,6 +282,79 @@ fn tablet_snapshot_receiver_is_bounded_and_reports_verified_progress() {
     assert_eq!(progress.active_receives, 0);
     assert_eq!(progress.receive_bytes_total, 12);
     assert_eq!(progress.receive_bytes_completed, 12);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Realistic bug caught:
+///
+/// The durable install boundary must consume the bounded receive session, not
+/// a raw receiver that lets callers bypass the shared receive admission and
+/// progress accounting. Otherwise concurrent snapshot ingestion can exceed
+/// the host budget even though the standalone receiver tests remain green.
+#[test]
+fn durable_install_requires_the_bounded_receive_session() {
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-multiraft-tablet-install-session-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+
+    let work = SnapshotWorkController::default();
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    let expected = installable_image();
+    let mut receiver =
+        TabletSnapshotReceiveSession::begin(&work, &store, expected.metadata.clone(), 3).unwrap();
+
+    for chunk in expected.data.chunks(3) {
+        receiver.push_chunk(chunk).unwrap();
+    }
+
+    let identity = RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap();
+    let mut storage = RaftWalStorage::new(
+        RecordingWal {
+            next_lsn: Lsn::new(100),
+            record_types: Vec::new(),
+        },
+        identity,
+    );
+
+    let installed = install_incoming_tablet_snapshot(
+        &work,
+        &store,
+        receiver,
+        &TabletSnapshotInstallTarget {
+            cluster_id: "ragnordb-test".to_string(),
+            raft_group_id: RaftGroupId(17),
+            tablet_id: TabletId(31),
+            table_id: ragnordb_common::ids::TableId(9),
+            tablet_epoch: 4,
+        },
+        &mut storage,
+        HardState {
+            current_term: 5,
+            voted_for: Some(CoreReplicaId::must(2)),
+            commit: 12,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        installed.installed.frontier,
+        AppliedTabletFrontier::new(12, 5)
+    );
+    assert_eq!(installed.persisted.record_count, 2);
+
+    let progress = work.progress();
+    assert_eq!(progress.active_receives, 0);
+    assert_eq!(progress.active_installs, 0);
+    assert_eq!(progress.receive_bytes_total, expected.data.len() as u64);
+    assert_eq!(progress.receive_bytes_completed, expected.data.len() as u64);
+    assert_eq!(progress.install_bytes_total, expected.metadata.total_length);
+    assert_eq!(
+        progress.install_bytes_completed,
+        expected.metadata.total_length
+    );
 
     let _ = fs::remove_dir_all(root);
 }

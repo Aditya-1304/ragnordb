@@ -7,7 +7,10 @@ use raft::{
     entry::LogEntry,
     types::{ConfState, HardState},
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use wal::{
     error::{BatchAppendFailure, WalError},
     io::directory::SegmentDirectory,
@@ -90,6 +93,15 @@ pub trait RaftWal {
     ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
         Ok(Box::new(()))
     }
+
+    /// prune physical WAL segments after a node-wide owner has established
+    /// that every registered Raft group has advanced beyond `floor`.
+    ///
+    /// The default is deliberately inert for lightweight test WALs and for
+    /// storage implementations that do not own physical segment reclamation.
+    fn prune_before(&mut self, _floor: Lsn) -> Result<usize, String> {
+        Ok(0)
+    }
 }
 
 impl<D, C> RaftWal for WalHandle<D, C>
@@ -112,6 +124,11 @@ where
             .map(|guard| Box::new(guard) as Box<dyn RaftWalRetentionPin>)
             .map_err(|error| error.to_string())
     }
+
+    fn prune_before(&mut self, floor: Lsn) -> Result<usize, String> {
+        WalHandle::set_min_retention_lsn(self, floor).map_err(|error| error.to_string())?;
+        WalHandle::truncate_segments_before(self, floor).map_err(|error| error.to_string())
+    }
 }
 
 /// Node-wide owner of the single serialized Raft persistence boundary.
@@ -125,6 +142,9 @@ pub struct NodeRaftWal<W> {
 struct NodeRaftWalState<W> {
     wal: W,
     recovery_required: bool,
+    retention_floors: BTreeMap<RaftReplicaIdentity, Option<Lsn>>,
+    retention_registry_sealed: bool,
+    last_pruned_floor: Lsn,
 }
 
 impl<W> NodeRaftWal<W> {
@@ -133,6 +153,9 @@ impl<W> NodeRaftWal<W> {
             state: Arc::new(Mutex::new(NodeRaftWalState {
                 wal,
                 recovery_required: false,
+                retention_floors: BTreeMap::new(),
+                retention_registry_sealed: false,
+                last_pruned_floor: Lsn::ZERO,
             })),
         }
     }
@@ -140,7 +163,45 @@ impl<W> NodeRaftWal<W> {
     pub fn group_writer(&self) -> NodeRaftWalHandle<W> {
         NodeRaftWalHandle {
             state: Arc::clone(&self.state),
+            owner: None,
         }
+    }
+
+    /// register one replica lifetime before a shared-WAL retention pass.
+    ///
+    /// Registration is explicit because a shared WAL can contain groups that
+    /// are not currently active in a local runtime. Such groups must remain
+    /// part of the minimum-floor calculation until recovery has reconstructed
+    /// the complete local group set.
+    pub fn group_writer_for(
+        &self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<NodeRaftWalHandle<W>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        if state.retention_registry_sealed {
+            return Err(
+                "cannot register a Raft group after retention registry sealing".to_string(),
+            );
+        }
+        state.retention_floors.entry(identity).or_insert(None);
+        Ok(NodeRaftWalHandle {
+            state: Arc::clone(&self.state),
+            owner: Some(identity),
+        })
+    }
+
+    /// seal registration after shared recovery has discovered every local
+    /// Raft replica lifetime that may be represented in candidate segments.
+    pub fn seal_retention_registry(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        state.retention_registry_sealed = true;
+        Ok(())
     }
 
     pub fn recovery_required(&self) -> bool {
@@ -161,12 +222,14 @@ impl<W> Clone for NodeRaftWal<W> {
 
 pub struct NodeRaftWalHandle<W> {
     state: Arc<Mutex<NodeRaftWalState<W>>>,
+    owner: Option<RaftReplicaIdentity>,
 }
 
 impl<W> Clone for NodeRaftWalHandle<W> {
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
+            owner: self.owner,
         }
     }
 }
@@ -208,6 +271,50 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
 
         state.wal.acquire_retention_pin(holder_name, min_lsn)
+    }
+
+    fn prune_before(&mut self, floor: Lsn) -> Result<usize, String> {
+        let owner = self.owner.ok_or_else(|| {
+            "retention pruning requires an identity-bound group writer".to_string()
+        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+
+        if state.recovery_required {
+            return Err("shared Raft WAL requires recovery before retention pruning".to_string());
+        }
+        if !state.retention_registry_sealed {
+            return Err("retention registry must be sealed before pruning".to_string());
+        }
+
+        let registered_floor = state
+            .retention_floors
+            .get_mut(&owner)
+            .ok_or_else(|| "group writer is not registered for retention pruning".to_string())?;
+        if registered_floor.is_some_and(|previous| floor < previous) {
+            return Err("Raft retention floor cannot move backwards".to_string());
+        }
+        *registered_floor = Some(floor);
+
+        let Some(slowest_floor) = state
+            .retention_floors
+            .values()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .and_then(|floors| floors.into_iter().min())
+        else {
+            return Ok(0);
+        };
+
+        if slowest_floor <= state.last_pruned_floor {
+            return Ok(0);
+        }
+
+        let removed = state.wal.prune_before(slowest_floor)?;
+        state.last_pruned_floor = slowest_floor;
+        Ok(removed)
     }
 }
 
@@ -287,6 +394,12 @@ impl<W: RaftWal> RaftWalStorage<W> {
         min_lsn: Lsn,
     ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
         self.wal.acquire_retention_pin(holder_name, min_lsn)
+    }
+
+    /// release the WAL prefix below a snapshot boundary after every local
+    /// group has supplied its durable retention floor.
+    pub fn release_retention(&mut self, floor: Lsn) -> Result<usize, String> {
+        self.wal.prune_before(floor)
     }
 
     pub fn recovery_required(&self) -> bool {

@@ -7,10 +7,15 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::{
     proposal::ProposalCompletion,
+    snapshot::SnapshotWorkController,
     tablet_cluster::{InMemoryTabletCluster, TabletClusterError},
 };
 use ragnordb_storage::key::{encode_row_key, make_row_key};
-use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
+use ragnordb_tablet::{
+    Tablet,
+    command::{TabletCommandApplyOutcome, TabletCommandApplyResult, TabletStateMachine},
+    snapshot::FileTabletSnapshotStore,
+};
 use ragnordb_txn::Transaction;
 use wal::{
     error::{BatchAppendFailure, WalError},
@@ -21,6 +26,7 @@ use wal::{
 
 use std::{
     collections::BTreeMap,
+    fs, process,
     sync::{Arc, Mutex},
 };
 
@@ -41,8 +47,6 @@ use ragnordb_multiraft::{
     tablet_apply::TabletCommandApplier,
     tablet_cluster::TabletRaftReadyLoop,
 };
-use ragnordb_tablet::{Tablet, command::TabletStateMachine};
-
 const TABLET_ID: TabletId = TabletId(41);
 const TABLE_ID: TableId = TableId(9);
 const RAFT_GROUP_ID: RaftGroupId = RaftGroupId(91);
@@ -312,6 +316,102 @@ fn request_id_with_sequence(sequence: u64) -> RequestId {
 
 fn request_id() -> RequestId {
     request_id_with_sequence(1)
+}
+
+/// Realistic bug caught:
+///
+/// A follower whose Raft suffix is no longer retained must not remain
+/// permanently behind or be marked caught up merely because ordinary
+/// AppendEntries delivery stopped. The leader must publish a verified tablet
+/// snapshot and the follower must restore it before applying later entries.
+#[test]
+fn far_behind_follower_catches_up_through_a_tablet_snapshot() {
+    let mut cluster = durable_cluster();
+    let leader_id = cluster.elect_leader().unwrap();
+    let follower_id = [1, 2, 3]
+        .into_iter()
+        .find(|node_id| *node_id != leader_id)
+        .unwrap();
+
+    cluster.kill_replica(follower_id).unwrap();
+
+    let mut last_key = None;
+    let mut last_row = None;
+
+    for sequence in 1..=4 {
+        let request_id = request_id_with_sequence(sequence);
+        let (command, key, row) = single_shard_command_for(
+            request_id.clone(),
+            sequence as i64,
+            100 + sequence,
+            1_000 + sequence,
+        );
+
+        let ticket = cluster
+            .propose(
+                request_id,
+                command,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ticket.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ProposalCompletion::Applied { .. }
+        ));
+
+        last_key = Some(key);
+        last_row = Some(row);
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-multiraft-cluster-snapshot-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    let work = SnapshotWorkController::default();
+
+    cluster
+        .publish_tablet_snapshot(leader_id, "ragnordb-test", &store, &work, 3)
+        .unwrap();
+
+    cluster.restart_replica(follower_id).unwrap();
+    cluster
+        .catch_up_replica_with_snapshot(leader_id, follower_id, &store, &work, 3)
+        .unwrap();
+
+    assert_eq!(
+        cluster.last_applied(follower_id).unwrap(),
+        cluster.last_applied(leader_id).unwrap()
+    );
+
+    let reader = Transaction::new(TxnId(999), Timestamp(2_000)).unwrap();
+    let restored = cluster
+        .tablet(follower_id)
+        .unwrap()
+        .state_machine()
+        .tablet()
+        .get(&reader, &last_key.unwrap())
+        .unwrap();
+
+    assert_eq!(restored, Some(last_row.unwrap()));
+
+    let progress = work.progress();
+    assert!(progress.receive_bytes_completed > 0);
+    assert_eq!(
+        progress.receive_bytes_completed,
+        progress.receive_bytes_total
+    );
+    assert!(progress.install_bytes_completed > 0);
+    assert_eq!(
+        progress.install_bytes_completed,
+        progress.install_bytes_total
+    );
+    assert_eq!(progress.active_receives, 0);
+    assert_eq!(progress.active_installs, 0);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 fn single_shard_command_for(

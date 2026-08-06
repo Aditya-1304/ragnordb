@@ -15,7 +15,7 @@ use ragnordb_multiraft::storage::{
     recovery::{RaftWalRecoverySource, recover_raft_storage},
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use wal::{
@@ -124,6 +124,28 @@ impl RaftWal for PinTrackingWal {
     ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
         self.active_pins.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(TestRetentionPin(Arc::clone(&self.active_pins))))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RetentionTrackingWal {
+    pruned_through: Arc<Mutex<Vec<Lsn>>>,
+}
+
+impl RaftWal for RetentionTrackingWal {
+    fn append_batch_and_sync(
+        &mut self,
+        _records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        Ok(BatchAppendResult {
+            final_end_lsn: Lsn::ZERO,
+            record_extents: Vec::new(),
+        })
+    }
+
+    fn prune_before(&mut self, floor: Lsn) -> Result<usize, String> {
+        self.pruned_through.lock().unwrap().push(floor);
+        Ok(1)
     }
 }
 
@@ -257,6 +279,38 @@ fn node_wide_wal_forwards_snapshot_retention_pins() {
     assert_eq!(active_pins.load(Ordering::SeqCst), 1);
     drop(pin);
     assert_eq!(active_pins.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a shared-WAL collector pruning a segment as soon as one Raft group
+/// advances, even though another registered group still needs that segment.
+#[test]
+fn node_wide_retention_prunes_only_through_the_slowest_registered_group() {
+    let pruned_through = Arc::new(Mutex::new(Vec::new()));
+    let node_wal = NodeRaftWal::new(RetentionTrackingWal {
+        pruned_through: Arc::clone(&pruned_through),
+    });
+    let first_identity = identity();
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+
+    let first_wal = node_wal.group_writer_for(first_identity).unwrap();
+    let second_wal = node_wal.group_writer_for(second_identity).unwrap();
+    node_wal.seal_retention_registry().unwrap();
+
+    let mut first = RaftWalStorage::new(first_wal, first_identity);
+    let mut second = RaftWalStorage::new(second_wal, second_identity);
+
+    first.release_retention(Lsn::new(400)).unwrap();
+    assert!(pruned_through.lock().unwrap().is_empty());
+
+    second.release_retention(Lsn::new(200)).unwrap();
+    assert_eq!(*pruned_through.lock().unwrap(), vec![Lsn::new(200)]);
+
+    first.release_retention(Lsn::new(500)).unwrap();
+    second.release_retention(Lsn::new(500)).unwrap();
+    assert_eq!(
+        *pruned_through.lock().unwrap(),
+        vec![Lsn::new(200), Lsn::new(500)]
+    );
 }
 
 #[test]

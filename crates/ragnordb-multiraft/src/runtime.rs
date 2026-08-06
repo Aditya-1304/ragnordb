@@ -46,6 +46,10 @@ use crate::storage::{
     persistence::{RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage},
 };
 
+type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
+type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
+type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
     Active,
@@ -71,13 +75,16 @@ pub enum ReadyLoopError {
     #[error("a snapshot pointer was supplied without a corresponding Ready snapshot")]
     UnexpectedSnapshotPointer,
 
+    #[error("the supplied snapshot boundary is not the durable boundary owned by this Ready loop")]
+    SnapshotBoundaryNotPersisted,
+
     #[error("incoming snapshot installation failed: {0:?}")]
     SnapshotInstall(SnapshotInstallError),
 
     #[error("Ready snapshot metadata does not match the published snapshot pointer")]
     SnapshotMetadataMismatch {
-        expected: SnapshotMetadata,
-        received: SnapshotMetadata,
+        expected: Box<SnapshotMetadata>,
+        received: Box<SnapshotMetadata>,
     },
 
     #[error("Raft WAL persistence can be retried: {0}")]
@@ -167,8 +174,8 @@ pub enum ReadyApplyError {
 
     #[error("verified snapshot metadata does not match the Ready snapshot")]
     SnapshotMetadataMismatch {
-        expected: SnapshotMetadata,
-        received: SnapshotMetadata,
+        expected: Box<SnapshotMetadata>,
+        received: Box<SnapshotMetadata>,
     },
 
     #[error("state-machine snapshot restore failed: {0}")]
@@ -392,6 +399,10 @@ where
         &self.persistence
     }
 
+    pub(crate) fn persistence_mut(&mut self) -> &mut RaftWalStorage<W> {
+        &mut self.persistence
+    }
+
     /// returns the exact applied boundary observed by this ready loop
     ///
     /// `None` is intentional for a newly created or restarted loop until the
@@ -442,7 +453,7 @@ where
     pub fn persist_next_ready(
         &mut self,
         snapshot_pointer: Option<RaftSnapshotPointerRecord>,
-    ) -> Result<Option<Ready<Vec<u8>, Vec<u8>>>, ReadyLoopError> {
+    ) -> ReadyLoopResult {
         self.ensure_active()?;
 
         let Some(ready) = self.raft.ready() else {
@@ -531,6 +542,120 @@ where
             .map_err(ReadyLoopError::SnapshotInstall)
     }
 
+    /// install a locally generated snapshot after its pointer and stable
+    /// boundary have already been synchronized through this loop's WAL
+    ///
+    /// The core snapshot is only made authoritative after the durable pointer
+    /// exists. This prevents a leader from advertising a compacted log range
+    /// that cannot be reconstructed after restart
+    pub(crate) fn restore_persisted_snapshot(
+        &mut self,
+        pointer: &RaftSnapshotPointerRecord,
+        snapshot: Snapshot<Vec<u8>>,
+    ) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+
+        if self.persistence.snapshot() != Some(pointer) {
+            return Err(ReadyLoopError::SnapshotBoundaryNotPersisted);
+        }
+
+        validate_snapshot_pointer(pointer, &snapshot)?;
+
+        let frontier =
+            AppliedRaftFrontier::new(snapshot.last_included_index, snapshot.last_included_term);
+        if frontier.index == 0 || frontier.term == 0 {
+            return Err(ReadyLoopError::InvalidAppliedFrontier {
+                index: frontier.index,
+                term: frontier.term,
+            });
+        }
+
+        self.raft.restore_snapshot(snapshot);
+        self.raft
+            .advance_applied(frontier.index)
+            .map_err(ReadyLoopError::Advance)?;
+        self.applied_frontier = Some(frontier);
+        Ok(())
+    }
+
+    /// persist the entries and HardState from a Ready whose snapshot pointer
+    /// was already durably published by the incoming tablet installer
+    ///
+    /// incoming tablet installation must restore and publish the database
+    /// image before the core acknowledges the external snapshot transfer. The
+    /// pointer is therefore intentionally omitted from this second batch, but
+    /// all post-snapshot entries and the final HardState still cross the normal
+    /// exact A-WAL acknowledgement boundary
+    pub(crate) fn persist_ready_after_snapshot_boundary(
+        &mut self,
+        pointer: &RaftSnapshotPointerRecord,
+    ) -> ReadyLoopResult {
+        self.ensure_active()?;
+
+        let Some(ready) = self.raft.ready() else {
+            return Ok(None);
+        };
+
+        let Some(snapshot) = ready.snapshot.as_ref() else {
+            return Err(ReadyLoopError::UnexpectedSnapshotPointer);
+        };
+
+        if self.persistence.snapshot() != Some(pointer) {
+            return Err(ReadyLoopError::SnapshotBoundaryNotPersisted);
+        }
+
+        validate_snapshot_pointer(pointer, snapshot)?;
+
+        let batch = RaftPersistenceBatch {
+            snapshot: None,
+            entries: ready.entries_to_persist.clone(),
+            hard_state: ready.hard_state.clone(),
+        };
+
+        match self.persistence.persist(batch) {
+            Ok(_) => {}
+            Err(RaftPersistenceError::OutcomeUnknown { .. }) => {
+                let report_result = self.raft.report_persistence_outcome_unknown(ready.id);
+
+                self.state = RuntimeState::RecoveryRequired;
+
+                if let Err(error) = report_result {
+                    return Err(ReadyLoopError::Advance(error));
+                }
+
+                return Err(ReadyLoopError::RecoveryRequired);
+            }
+            Err(RaftPersistenceError::RecoveryRequired)
+            | Err(RaftPersistenceError::NotStaged {
+                recovery_required: true,
+                ..
+            })
+            | Err(RaftPersistenceError::PostSyncInvariant(_))
+            | Err(RaftPersistenceError::InternalInvariant(_)) => {
+                self.state = RuntimeState::RecoveryRequired;
+                return Err(ReadyLoopError::RecoveryRequired);
+            }
+            Err(
+                error @ RaftPersistenceError::NotStaged {
+                    recovery_required: false,
+                    ..
+                },
+            ) => return Err(ReadyLoopError::RetryablePersistence(error)),
+            Err(error) => {
+                self.state = RuntimeState::GroupQuarantined;
+                return Err(ReadyLoopError::PersistenceRejected(error));
+            }
+        }
+
+        self.raft.advance_persisted(ready.id).map_err(|error| {
+            self.state = RuntimeState::RecoveryRequired;
+            ReadyLoopError::Advance(error)
+        })?;
+
+        Ok(Some(ready))
+    }
+
     /// marks the state machine frontier recovered from an already durable
     /// state-machine snapshot before live Ready processing begins
     pub fn advance_applied(&mut self, applied_through: LogIndex) -> Result<(), ReadyLoopError> {
@@ -584,7 +709,7 @@ where
         &mut self,
         snapshot_store: &mut SF,
         state_machine: &mut SM,
-    ) -> Result<Option<Ready<Vec<u8>, Vec<u8>>>, ReadyApplyError>
+    ) -> ReadyApplyResult
     where
         SM: RaftReadyStateMachine,
         SF: RaftSnapshotStore,
@@ -617,8 +742,8 @@ where
             if verified.metadata() != snapshot.metadata() {
                 self.quarantine();
                 return Err(ReadyApplyError::SnapshotMetadataMismatch {
-                    expected: snapshot.metadata(),
-                    received: verified.metadata(),
+                    expected: Box::new(snapshot.metadata()),
+                    received: Box::new(verified.metadata()),
                 });
             }
 
@@ -739,7 +864,10 @@ fn validate_snapshot_pointer(
     };
 
     if expected != received {
-        return Err(ReadyLoopError::SnapshotMetadataMismatch { expected, received });
+        return Err(ReadyLoopError::SnapshotMetadataMismatch {
+            expected: Box::new(expected),
+            received: Box::new(received),
+        });
     }
 
     Ok(())

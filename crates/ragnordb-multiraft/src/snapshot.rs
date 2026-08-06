@@ -414,6 +414,14 @@ impl TabletSnapshotReceiveSession {
             .finish()
             .map_err(TabletSnapshotIntegrationError::Receive)
     }
+
+    /// Transfer the receiver and its admission permit to the durable install
+    /// boundary. The permit must remain alive until installation finishes so
+    /// receive accounting cannot report completion while restoration or WAL
+    /// publication is still using the same incoming image.
+    fn into_parts(self) -> (IncomingTabletSnapshotReceiver, SnapshotWorkPermit) {
+        (self.receiver, self.permit)
+    }
 }
 
 /// convert tablet configuration IDs into the independent core Raft ID type
@@ -642,15 +650,20 @@ pub fn persist_tablet_snapshot_boundary<W: RaftWal>(
 }
 
 /// concrete incoming install path using the actual WAL backed storage
+///
+/// The bounded receive session is consumed here instead of accepting a raw
+/// receiver. This keeps the receive admission permit alive across verification,
+/// publication, state restoration, and the exact A-WAL boundary acknowledgement.
 pub fn install_incoming_tablet_snapshot<W: RaftWal>(
     work: &SnapshotWorkController,
     store: &FileTabletSnapshotStore,
-    receiver: IncomingTabletSnapshotReceiver,
+    receiver: TabletSnapshotReceiveSession,
     target: &TabletSnapshotInstallTarget,
     storage: &mut RaftWalStorage<W>,
     hard_state: HardState,
 ) -> Result<DurableTabletSnapshotInstall, TabletSnapshotIntegrationError> {
     let install_permit = work.acquire(SnapshotWorkKind::Install)?;
+    let (receiver, _receive_permit) = receiver.into_parts();
     let mut persisted = None;
 
     let installed = install_incoming_snapshot(store, receiver, target, |pointer, frontier| {
