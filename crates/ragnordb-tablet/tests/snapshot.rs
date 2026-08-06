@@ -95,3 +95,68 @@ fn file_store_publishes_idempotently_and_rejects_foreign_epoch() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// Realistic bug caught:
+///
+/// A process crash can leave a private snapshot temporary file behind. Store
+/// reopen must remove that file without deleting published snapshots or
+/// unrelated operator-owned files in the same directory.
+#[test]
+fn file_store_reopen_cleans_only_managed_temporary_files() {
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-tablet-snapshot-cleanup-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    let managed = root.join(".ragnordb-tablet-snapshot-tmp-crash.tmp");
+    let unrelated = root.join("operator-note.tmp");
+    fs::write(&managed, b"partial snapshot").unwrap();
+    fs::write(&unrelated, b"keep me").unwrap();
+
+    FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+
+    assert!(!managed.exists());
+    assert!(unrelated.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Realistic bug caught:
+///
+/// Restarting after snapshot publication must not reuse an older identity for
+/// different bytes. The allocator reservation must survive store reopen even
+/// when an allocated ID was never published before the crash.
+#[test]
+fn snapshot_id_reservation_is_monotonic_across_reopen() {
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-tablet-snapshot-allocator-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    assert_eq!(
+        store
+            .allocate_snapshot_id(RaftGroupId(17), ReplicaId(2), TabletId(31))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .allocate_snapshot_id(RaftGroupId(17), ReplicaId(2), TabletId(31))
+            .unwrap(),
+        2
+    );
+    drop(store);
+
+    let reopened = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    assert_eq!(
+        reopened
+            .allocate_snapshot_id(RaftGroupId(17), ReplicaId(2), TabletId(31))
+            .unwrap(),
+        3
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

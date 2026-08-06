@@ -85,6 +85,30 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         self.raft_group_id
     }
 
+    /// return the next admissible request sequence for one client in this
+    /// replicated tablet group
+    ///
+    /// Runtime-owned clients, such as the leader read-barrier client, must use
+    /// this state after snapshot restore or WAL replay. Restarting a volatile
+    /// counter at one would otherwise make the first post-restart command stale.
+    pub fn next_sequence_for_client(
+        &self,
+        client_id: u128,
+    ) -> Result<u64, TabletCommandApplyError> {
+        let key = ClientDeduplicationKey {
+            client_id,
+            raft_group_id: self.raft_group_id,
+        };
+
+        match self.client_deduplication.get(&key) {
+            Some(state) => state
+                .last_sequence_applied
+                .checked_add(1)
+                .ok_or(TabletCommandApplyError::RequestSequenceExhausted { client_id }),
+            None => Ok(1),
+        }
+    }
+
     /// Encode replicated command metadata that must accompany a tablet snapshot.
     ///
     /// MVCC data is intentionally owned by the surrounding tablet snapshot. This

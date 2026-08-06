@@ -21,7 +21,7 @@ use ragnordb_multiraft::{
         bootstrap_tablet_replica, initial_recovery_configuration, recover_tablet_replica,
     },
     runtime::AppliedRaftFrontier,
-    snapshot::persist_tablet_snapshot_boundary,
+    snapshot::raft_pointer_for_tablet,
     storage::{
         persistence::{RaftPersistenceBatch, RaftWal, RaftWalStorage},
         recovery::{RaftWalRecoverySource, recover_raft_storage_with_configurations},
@@ -294,17 +294,19 @@ fn restart_restores_snapshot_then_replays_committed_suffix() {
     )
     .unwrap();
     let pointer = snapshot_store.publish(&image).unwrap();
-    persist_tablet_snapshot_boundary(
-        &mut persistence,
-        &pointer,
-        AppliedTabletFrontier::new(1, 1),
-        HardState {
-            current_term: 1,
-            voted_for: Some(CoreReplicaId::must(1)),
-            commit: 1,
-        },
-    )
-    .unwrap();
+    let raft_pointer =
+        raft_pointer_for_tablet(persistence.log_view().identity(), &pointer).unwrap();
+    persistence
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(raft_pointer),
+            entries: Vec::new(),
+            hard_state: Some(HardState {
+                current_term: 1,
+                voted_for: Some(CoreReplicaId::must(1)),
+                commit: 1,
+            }),
+        })
+        .unwrap();
 
     let (second_command, second_key, second_row) = command(42, 1, 2, 12, 40);
     persistence

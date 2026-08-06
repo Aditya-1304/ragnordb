@@ -10,7 +10,7 @@ use ragnordb_common::{
     ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
 };
 use ragnordb_multiraft::{
-    proposal::ProposalCompletion,
+    proposal::{ProposalCompletion, ProposalFailure},
     snapshot::SnapshotWorkController,
     tablet_cluster::{InMemoryTabletCluster, TabletClusterError},
 };
@@ -380,7 +380,7 @@ fn far_behind_follower_catches_up_through_a_tablet_snapshot() {
     let work = SnapshotWorkController::default();
 
     cluster
-        .publish_tablet_snapshot(leader_id, "ragnordb-test", &store, &work, 3)
+        .publish_tablet_snapshot(leader_id, "ragnordb-test", &store, &work)
         .unwrap();
 
     cluster.restart_replica(follower_id).unwrap();
@@ -1075,6 +1075,79 @@ fn latest_read_requires_a_new_barrier_after_leader_failover() {
 
     assert_eq!(visible_row, Some(row));
     assert!(cluster.latest_reads_ready().unwrap());
+}
+
+/// Realistic bug caught:
+///
+/// A proposal that cannot reach quorum must be removed when its deadline
+/// expires. Otherwise a retry with the same durable RequestId collides with a
+/// permanently registered waiter.
+#[test]
+fn group_timer_expires_a_proposal_that_cannot_reach_quorum() {
+    let mut cluster = cluster();
+    let leader = cluster.elect_leader().unwrap();
+
+    for replica_id in [1, 2, 3] {
+        if replica_id != leader {
+            cluster.kill_replica(replica_id).unwrap();
+        }
+    }
+
+    let request_id = request_id();
+    let (command, _, _) = single_shard_command(request_id.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ticket = cluster.propose(request_id, command, deadline).unwrap();
+
+    assert_eq!(cluster.expire_proposal_deadlines(deadline), 1);
+    assert!(matches!(
+        ticket.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ProposalCompletion::Retryable {
+            failure: ProposalFailure::DeadlineExceeded,
+            ..
+        }
+    ));
+}
+
+/// Realistic bug caught:
+///
+/// The internal read-barrier client sequence is replicated deduplication state.
+/// Restoring that state while resetting a volatile counter to one would make
+/// the first post-restart latest read fail as stale.
+#[test]
+fn restored_tablet_resumes_the_internal_read_barrier_sequence() {
+    const INTERNAL_READ_BARRIER_CLIENT_ID: u128 = 1_u128 << 127;
+
+    let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
+    let mut state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+
+    for sequence in 1..=3 {
+        state_machine
+            .apply(
+                TabletCommandEnvelope::new(
+                    RequestId {
+                        client_id: INTERNAL_READ_BARRIER_CLIENT_ID,
+                        sequence,
+                        raft_group_id: RAFT_GROUP_ID,
+                    },
+                    TABLET_ID,
+                    TABLET_EPOCH,
+                    TabletCommand::Noop(NoopCommand),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    let snapshot = state_machine.encode_snapshot_state().unwrap();
+    let restored_tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
+    let restored = TabletStateMachine::restore_from_snapshot(restored_tablet, &snapshot).unwrap();
+
+    assert_eq!(
+        restored
+            .next_sequence_for_client(INTERNAL_READ_BARRIER_CLIENT_ID)
+            .unwrap(),
+        4
+    );
 }
 
 /// Realistic bug caught:

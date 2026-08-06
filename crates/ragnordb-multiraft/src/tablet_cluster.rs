@@ -46,7 +46,7 @@ use crate::{
     runtime::{AppliedRaftFrontier, RaftReadyLoop, ReadyLoopError},
     snapshot::{
         SnapshotWorkController, TabletSnapshotTransfer, generate_tablet_snapshot_from_ready_loop,
-        install_incoming_tablet_snapshot, persist_tablet_snapshot_boundary,
+        install_incoming_tablet_snapshot, persist_tablet_snapshot_boundary_via_ready_loop,
         raft_pointer_for_tablet,
     },
     storage::{
@@ -208,7 +208,6 @@ pub struct InMemoryTabletCluster<W: RaftWal> {
     tablet_id: TabletId,
     tablet_epoch: u64,
     read_gate: LeaderReadGate,
-    next_read_barrier_sequence: u64,
     latest_snapshot: Option<TabletSnapshotImage>,
 }
 
@@ -276,7 +275,6 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             tablet_id,
             tablet_epoch,
             read_gate: LeaderReadGate::new(),
-            next_read_barrier_sequence: 1,
             latest_snapshot: None,
         };
 
@@ -347,7 +345,6 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         cluster_id: impl Into<String>,
         store: &FileTabletSnapshotStore,
         work: &SnapshotWorkController,
-        snapshot_id: u64,
     ) -> Result<(), TabletClusterError> {
         let leader_index = self.leader_index()?;
         if self.replicas[leader_index].node_id != leader_id {
@@ -366,6 +363,12 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             })?;
 
         let conf_state = tablet_conf_state(self.replicas[leader_index].raft.raft().conf_state())?;
+        let snapshot_id = store
+            .allocate_snapshot_id(self.raft_group_id, ReplicaId(leader_id), self.tablet_id)
+            .map_err(|error| {
+                self.replicas[leader_index].raft.quarantine();
+                TabletClusterError::Snapshot(error.to_string())
+            })?;
         let image = generate_tablet_snapshot_from_ready_loop(
             work,
             &self.replicas[leader_index].raft,
@@ -375,11 +378,15 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             snapshot_id,
             conf_state,
         )
-        .map_err(|error| TabletClusterError::Snapshot(error.to_string()))?;
+        .map_err(|error| {
+            self.replicas[leader_index].raft.quarantine();
+            TabletClusterError::Snapshot(error.to_string())
+        })?;
 
-        let pointer = store
-            .publish(&image)
-            .map_err(|error| TabletClusterError::Snapshot(error.to_string()))?;
+        let pointer = store.publish(&image).map_err(|error| {
+            self.replicas[leader_index].raft.quarantine();
+            TabletClusterError::Snapshot(error.to_string())
+        })?;
         let identity = self.replicas[leader_index]
             .raft
             .persistence()
@@ -389,8 +396,8 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             .map_err(|error| TabletClusterError::Snapshot(error.to_string()))?;
         let hard_state = self.replicas[leader_index].raft.raft().hard_state();
 
-        persist_tablet_snapshot_boundary(
-            self.replicas[leader_index].raft.persistence_mut(),
+        persist_tablet_snapshot_boundary_via_ready_loop(
+            &mut self.replicas[leader_index].raft,
             &pointer,
             AppliedTabletFrontier::new(frontier.index, frontier.term),
             hard_state,
@@ -565,7 +572,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             store,
             receiver,
             &target,
-            self.replicas[follower_index].raft.persistence_mut(),
+            &mut self.replicas[follower_index].raft,
             hard_state,
         )
         .map_err(|error| TabletClusterError::Snapshot(error.to_string()))?;
@@ -780,6 +787,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         >,
         TabletClusterError,
     > {
+        self.expire_proposal_deadlines(Instant::now());
         let envelope = TabletCommandEnvelope::decode(&command)?;
 
         if envelope.request_id != request_id {
@@ -843,6 +851,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
     /// advance one replica's Raft clock and process resulting Ready output
     pub fn tick_replica(&mut self, node_id: u64, ticks: u64) -> Result<(), TabletClusterError> {
+        self.expire_proposal_deadlines(Instant::now());
         let replica_index = self.replica_index(node_id)?;
         if !self.replicas[replica_index].available {
             return Err(TabletClusterError::ReplicaUnavailable {
@@ -860,6 +869,15 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
         self.drain_ready(replica_index)?;
         self.deliver_messages()
+    }
+
+    /// Drive proposal deadline completion from the group runtime.
+    ///
+    /// Production event loops call this from their timer branch; the
+    /// deterministic runtime also invokes it on proposal and tick activity so
+    /// expired waiters cannot remain registered indefinitely.
+    pub fn expire_proposal_deadlines(&mut self, now: Instant) -> usize {
+        self.proposals.expire_deadlines(now)
     }
 
     /// return the applied index for one replica
@@ -987,10 +1005,12 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
         self.replicas[replica_index]
             .raft
-            .persistence_mut()
             .release_retention(floor)
             .map(|_| ())
-            .map_err(TabletClusterError::Snapshot)
+            .map_err(|source| TabletClusterError::Ready {
+                node_id: self.replicas[replica_index].node_id,
+                source: Box::new(source),
+            })
     }
 
     fn deliver_messages(&mut self) -> Result<(), TabletClusterError> {
@@ -1076,12 +1096,14 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             self.read_gate.on_leader_elected(leader_term)?;
         }
 
-        let sequence = self.next_read_barrier_sequence;
-        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
-            TabletClusterError::Configuration(
-                "read barrier RequestId sequence exhausted".to_string(),
-            )
-        })?;
+        let sequence = self.replicas[leader_index]
+            .tablet
+            .state_machine()
+            .next_sequence_for_client(INTERNAL_READ_BARRIER_CLIENT_ID)
+            .map_err(|source| TabletClusterError::ProposalValidation {
+                node_id: leader_id,
+                source,
+            })?;
 
         let request_id = RequestId {
             client_id: INTERNAL_READ_BARRIER_CLIENT_ID,
@@ -1104,14 +1126,11 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             return Err(TabletClusterError::LatestReadDeadlineExceeded);
         }
 
-        let completion = match ticket.recv_timeout(remaining.min(Duration::from_secs(1))) {
+        let completion = match ticket.recv_timeout(remaining) {
             Ok(completion) => completion,
             Err(RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    return Err(TabletClusterError::LatestReadDeadlineExceeded);
-                }
-
-                return Err(TabletClusterError::ReadBarrierTimeout);
+                self.expire_proposal_deadlines(Instant::now());
+                return Err(TabletClusterError::LatestReadDeadlineExceeded);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(TabletClusterError::ReadBarrierChannelClosed);
@@ -1133,8 +1152,6 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
 
                 self.read_gate.register_barrier(barrier)?;
                 self.read_gate.mark_barrier_applied(barrier)?;
-                self.next_read_barrier_sequence = next_sequence;
-
                 Ok(barrier)
             }
 

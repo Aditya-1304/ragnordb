@@ -10,7 +10,7 @@ use ragnordb_multiraft::{
         SnapshotWorkController, SnapshotWorkError, SnapshotWorkKind, SnapshotWorkLimits,
         TabletSnapshotRaftStore, TabletSnapshotReceiveSession, TabletSnapshotTransfer,
         generate_tablet_snapshot_from_ready_loop, install_incoming_tablet_snapshot,
-        persist_tablet_snapshot_boundary,
+        persist_tablet_snapshot_boundary_via_ready_loop,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
@@ -23,9 +23,15 @@ use ragnordb_tablet::snapshot::{
     TabletSnapshotPointer, generate_local_snapshot,
 };
 use ragnordb_tablet::{Tablet, command::TabletStateMachine};
-use std::{fs, process};
+use std::{
+    fs, process,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use wal::{
-    error::BatchAppendFailure,
+    error::{BatchAppendFailure, WalError},
     lsn::Lsn,
     types::RecordType,
     wal::{AppendResult, BatchAppendResult},
@@ -87,6 +93,7 @@ fn installable_image() -> TabletSnapshotImage {
 struct RecordingWal {
     next_lsn: Lsn,
     record_types: Vec<RecordType>,
+    fail_with_unknown_outcome: Arc<AtomicBool>,
 }
 
 type TestReadyLoop =
@@ -138,10 +145,26 @@ fn ready_loop() -> TestReadyLoop {
             RecordingWal {
                 next_lsn: Lsn::new(100),
                 record_types: Vec::new(),
+                fail_with_unknown_outcome: Arc::new(AtomicBool::new(false)),
             },
             RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap(),
         ),
     )
+}
+
+fn ready_loop_with_failure_flag() -> (TestReadyLoop, Arc<AtomicBool>) {
+    let fail_with_unknown_outcome = Arc::new(AtomicBool::new(false));
+    let node = RaftNode::new(2, Vec::new(), MemStorage::new(), MemStorage::new(), 5, 2);
+    let storage = RaftWalStorage::new(
+        RecordingWal {
+            next_lsn: Lsn::new(100),
+            record_types: Vec::new(),
+            fail_with_unknown_outcome: Arc::clone(&fail_with_unknown_outcome),
+        },
+        RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap(),
+    );
+
+    (RaftReadyLoop::new(node, storage), fail_with_unknown_outcome)
 }
 
 fn prepare_leader(loop_: &mut TestReadyLoop) {
@@ -170,13 +193,22 @@ impl RaftWal for RecordingWal {
             extents.push(AppendResult { start_lsn, end_lsn });
         }
 
-        Ok(BatchAppendResult {
+        let result = BatchAppendResult {
             final_end_lsn: extents
                 .last()
                 .map(|extent| extent.end_lsn)
                 .unwrap_or(Lsn::ZERO),
             record_extents: extents,
-        })
+        };
+
+        if self.fail_with_unknown_outcome.load(Ordering::SeqCst) {
+            return Err(BatchAppendFailure::OutcomeUnknown {
+                result,
+                source: WalError::BrokenDurabilityContract,
+            });
+        }
+
+        Ok(result)
     }
 }
 
@@ -310,14 +342,7 @@ fn durable_install_requires_the_bounded_receive_session() {
         receiver.push_chunk(chunk).unwrap();
     }
 
-    let identity = RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap();
-    let mut storage = RaftWalStorage::new(
-        RecordingWal {
-            next_lsn: Lsn::new(100),
-            record_types: Vec::new(),
-        },
-        identity,
-    );
+    let mut loop_ = ready_loop();
 
     let installed = install_incoming_tablet_snapshot(
         &work,
@@ -330,7 +355,7 @@ fn durable_install_requires_the_bounded_receive_session() {
             table_id: ragnordb_common::ids::TableId(9),
             tablet_epoch: 4,
         },
-        &mut storage,
+        &mut loop_,
         HardState {
             current_term: 5,
             voted_for: Some(CoreReplicaId::must(2)),
@@ -359,19 +384,64 @@ fn durable_install_requires_the_bounded_receive_session() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Realistic bug caught:
+///
+/// An uncertain A-WAL result while persisting an incoming snapshot boundary
+/// must immediately fence the Ready loop. Returning an ordinary snapshot error
+/// would allow later ticks or proposals against storage whose durable contents
+/// are unknown.
+#[test]
+fn uncertain_snapshot_boundary_persistence_fences_the_ready_loop() {
+    let root = std::env::temp_dir().join(format!(
+        "ragnordb-multiraft-tablet-install-unknown-{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+
+    let work = SnapshotWorkController::default();
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    let expected = installable_image();
+    let mut receiver =
+        TabletSnapshotReceiveSession::begin(&work, &store, expected.metadata.clone(), 64).unwrap();
+    receiver.push_chunk(&expected.data).unwrap();
+
+    let (mut loop_, fail_with_unknown_outcome) = ready_loop_with_failure_flag();
+    fail_with_unknown_outcome.store(true, Ordering::SeqCst);
+
+    assert!(
+        install_incoming_tablet_snapshot(
+            &work,
+            &store,
+            receiver,
+            &TabletSnapshotInstallTarget {
+                cluster_id: "ragnordb-test".to_string(),
+                raft_group_id: RaftGroupId(17),
+                tablet_id: TabletId(31),
+                table_id: ragnordb_common::ids::TableId(9),
+                tablet_epoch: 4,
+            },
+            &mut loop_,
+            HardState {
+                current_term: 5,
+                voted_for: Some(CoreReplicaId::must(2)),
+                commit: 12,
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(
+        loop_.tick(1).unwrap_err(),
+        ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn incoming_tablet_boundary_persists_pointer_before_hard_state() {
-    let identity = RaftReplicaIdentity::new(RaftGroupId(17), ReplicaId(2)).unwrap();
-
-    let wal = RecordingWal {
-        next_lsn: Lsn::new(100),
-        record_types: Vec::new(),
-    };
-
-    let mut storage = RaftWalStorage::new(wal, identity);
-
-    let persisted = persist_tablet_snapshot_boundary(
-        &mut storage,
+    let mut loop_ = ready_loop();
+    let persisted = persist_tablet_snapshot_boundary_via_ready_loop(
+        &mut loop_,
         &pointer(),
         AppliedTabletFrontier::new(12, 5),
         HardState {
@@ -385,7 +455,7 @@ fn incoming_tablet_boundary_persists_pointer_before_hard_state() {
     assert_eq!(persisted.record_count, 2);
 
     assert_eq!(
-        storage.wal().record_types,
+        loop_.persistence().wal().record_types,
         vec![
             RaftWalRecordType::SnapshotPointer.as_wal_record_type(),
             RaftWalRecordType::HardState.as_wal_record_type(),

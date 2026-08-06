@@ -20,9 +20,7 @@ use ragnordb_tablet::{
 use crate::runtime::{RaftReadyLoop, RaftSnapshotStore};
 use crate::storage::{
     codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
-    persistence::{
-        RaftPersistedBatch, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage,
-    },
+    persistence::{RaftPersistedBatch, RaftWal},
 };
 use raft::traits::{log_store::LogStore, stable_store::StableStore};
 use std::{
@@ -612,41 +610,34 @@ impl RaftSnapshotStore for TabletSnapshotRaftStore {
     }
 }
 
-/// persist the snapshot pointer and HardState in one ordered A-WAL batch
-pub fn persist_tablet_snapshot_boundary<W: RaftWal>(
-    storage: &mut RaftWalStorage<W>,
+/// persist a tablet snapshot boundary through the Ready loop that owns group
+/// quarantine and node wide recovery transitions
+pub fn persist_tablet_snapshot_boundary_via_ready_loop<W, LS, SS>(
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     pointer: &TabletSnapshotPointer,
     frontier: AppliedTabletFrontier,
     hard_state: HardState,
-) -> Result<RaftPersistedBatch, TabletSnapshotIntegrationError> {
+) -> Result<RaftPersistedBatch, TabletSnapshotIntegrationError>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
     if pointer.metadata.last_included_index != frontier.index
         || pointer.metadata.last_included_term != frontier.term
     {
+        ready_loop.quarantine();
         return Err(TabletSnapshotIntegrationError::FrontierMismatch);
     }
 
-    let retention_floor = storage
-        .log_view()
-        .first_retained_lsn()
-        .unwrap_or(wal::lsn::Lsn::ZERO);
-    let _retention_pin = storage
-        .acquire_retention_pin("tablet-snapshot-boundary", retention_floor)
-        .map_err(TabletSnapshotIntegrationError::Retention)?;
-
-    let identity = storage.log_view().identity();
-    let raft_pointer = raft_pointer_for_tablet(identity, pointer)?;
-
-    let persisted = storage.persist(RaftPersistenceBatch {
-        snapshot: Some(raft_pointer),
-        entries: Vec::new(),
-        hard_state: Some(hard_state),
+    let identity = ready_loop.persistence().log_view().identity();
+    let raft_pointer = raft_pointer_for_tablet(identity, pointer).inspect_err(|_| {
+        ready_loop.quarantine();
     })?;
 
-    if persisted.record_count != 2 || persisted.end_lsn.is_none() {
-        return Err(TabletSnapshotIntegrationError::PersistenceShape);
-    }
-
-    Ok(persisted)
+    ready_loop
+        .persist_external_snapshot_boundary(raft_pointer, hard_state)
+        .map_err(TabletSnapshotIntegrationError::ReadyLoop)
 }
 
 /// concrete incoming install path using the actual WAL backed storage
@@ -654,21 +645,30 @@ pub fn persist_tablet_snapshot_boundary<W: RaftWal>(
 /// The bounded receive session is consumed here instead of accepting a raw
 /// receiver. This keeps the receive admission permit alive across verification,
 /// publication, state restoration, and the exact A-WAL boundary acknowledgement.
-pub fn install_incoming_tablet_snapshot<W: RaftWal>(
+pub fn install_incoming_tablet_snapshot<W, LS, SS>(
     work: &SnapshotWorkController,
     store: &FileTabletSnapshotStore,
     receiver: TabletSnapshotReceiveSession,
     target: &TabletSnapshotInstallTarget,
-    storage: &mut RaftWalStorage<W>,
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     hard_state: HardState,
-) -> Result<DurableTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+) -> Result<DurableTabletSnapshotInstall, TabletSnapshotIntegrationError>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
     let install_permit = work.acquire(SnapshotWorkKind::Install)?;
     let (receiver, _receive_permit) = receiver.into_parts();
     let mut persisted = None;
 
     let installed = install_incoming_snapshot(store, receiver, target, |pointer, frontier| {
-        let batch =
-            persist_tablet_snapshot_boundary(storage, pointer, frontier, hard_state.clone())?;
+        let batch = persist_tablet_snapshot_boundary_via_ready_loop(
+            ready_loop,
+            pointer,
+            frontier,
+            hard_state.clone(),
+        )?;
 
         install_permit.set_total_bytes(pointer.metadata.total_length);
 
@@ -676,7 +676,10 @@ pub fn install_incoming_tablet_snapshot<W: RaftWal>(
 
         Ok::<(), TabletSnapshotIntegrationError>(())
     })
-    .map_err(TabletSnapshotIntegrationError::Install)?;
+    .map_err(|error| {
+        ready_loop.quarantine();
+        TabletSnapshotIntegrationError::Install(error)
+    })?;
 
     let persisted = persisted.ok_or(TabletSnapshotIntegrationError::PersistenceShape)?;
     install_permit.note_bytes(installed.pointer.metadata.total_length);
@@ -722,9 +725,6 @@ pub enum TabletSnapshotIntegrationError {
     #[error("tablet snapshot pointer validation failed: {0}")]
     RaftPointer(String),
 
-    #[error("tablet snapshot retention pin failed: {0}")]
-    Retention(String),
-
     #[error("tablet snapshot receive failed: {0}")]
     Receive(#[from] TabletSnapshotReceiveError),
 
@@ -743,8 +743,8 @@ pub enum TabletSnapshotIntegrationError {
     #[error("tablet snapshot install failed: {0}")]
     Install(#[from] TabletSnapshotInstallError),
 
-    #[error("Raft WAL boundary persistence failed: {0}")]
-    Persistence(#[from] RaftPersistenceError),
+    #[error("Ready-loop snapshot transition failed: {0}")]
+    ReadyLoop(#[from] crate::runtime::ReadyLoopError),
 
     #[error("Raft WAL boundary did not contain exactly pointer plus HardState")]
     PersistenceShape,

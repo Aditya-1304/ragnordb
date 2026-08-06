@@ -38,12 +38,14 @@ use raft::{
     entry::EntryPayload,
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, Snapshot, SnapshotMetadata, Term},
+    types::{HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
 };
 
 use crate::storage::{
     codec::{RAFT_SNAPSHOT_POINTER_RECORD_VERSION, RaftReplicaIdentity, RaftSnapshotPointerRecord},
-    persistence::{RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage},
+    persistence::{
+        RaftPersistedBatch, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage,
+    },
 };
 
 type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
@@ -77,6 +79,12 @@ pub enum ReadyLoopError {
 
     #[error("the supplied snapshot boundary is not the durable boundary owned by this Ready loop")]
     SnapshotBoundaryNotPersisted,
+
+    #[error("the durable snapshot boundary did not contain pointer plus HardState")]
+    SnapshotPersistenceShape,
+
+    #[error("Raft WAL retention release failed: {0}")]
+    Retention(String),
 
     #[error("incoming snapshot installation failed: {0:?}")]
     SnapshotInstall(SnapshotInstallError),
@@ -399,10 +407,6 @@ where
         &self.persistence
     }
 
-    pub(crate) fn persistence_mut(&mut self) -> &mut RaftWalStorage<W> {
-        &mut self.persistence
-    }
-
     /// returns the exact applied boundary observed by this ready loop
     ///
     /// `None` is intentional for a newly created or restarted loop until the
@@ -410,6 +414,18 @@ where
     /// caller must not substitute the commit index for this value
     pub fn applied_frontier(&self) -> Option<AppliedRaftFrontier> {
         self.applied_frontier
+    }
+
+    /// Release storage retention through the group lifecycle owner.
+    pub(crate) fn release_retention(
+        &mut self,
+        floor: wal::lsn::Lsn,
+    ) -> Result<usize, ReadyLoopError> {
+        self.ensure_active()?;
+        self.persistence.release_retention(floor).map_err(|error| {
+            self.quarantine();
+            ReadyLoopError::Retention(error)
+        })
     }
 
     /// advances the Raft clock only when no previous Ready is pending
@@ -539,7 +555,76 @@ where
 
         self.raft
             .complete_snapshot_install(snapshot)
-            .map_err(ReadyLoopError::SnapshotInstall)
+            .map_err(|error| {
+                self.quarantine();
+                ReadyLoopError::SnapshotInstall(error)
+            })
+    }
+
+    /// persist an externally published tablet snapshot boundary through the
+    /// Ready loop's failure state owner
+    ///
+    /// this operation intentionally permits an incoming snapshot Ready to be
+    /// pending: the external image must become durable before the core can
+    /// acknowledge that Ready. Every persistence outcome is classified here so
+    /// high-level snapshot code cannot leave an uncertain WAL result active
+    pub(crate) fn persist_external_snapshot_boundary(
+        &mut self,
+        pointer: RaftSnapshotPointerRecord,
+        hard_state: HardState,
+    ) -> Result<RaftPersistedBatch, ReadyLoopError> {
+        self.ensure_active()?;
+
+        let retention_floor = self
+            .persistence
+            .log_view()
+            .first_retained_lsn()
+            .unwrap_or(wal::lsn::Lsn::ZERO);
+        let _retention_pin = self
+            .persistence
+            .acquire_retention_pin("tablet-snapshot-boundary", retention_floor)
+            .map_err(|_| {
+                self.quarantine();
+                ReadyLoopError::GroupQuarantined
+            })?;
+
+        let batch = RaftPersistenceBatch {
+            snapshot: Some(pointer),
+            entries: Vec::new(),
+            hard_state: Some(hard_state),
+        };
+
+        let persisted = match self.persistence.persist(batch) {
+            Ok(persisted) => persisted,
+            Err(RaftPersistenceError::OutcomeUnknown { .. })
+            | Err(RaftPersistenceError::RecoveryRequired)
+            | Err(RaftPersistenceError::NotStaged {
+                recovery_required: true,
+                ..
+            })
+            | Err(RaftPersistenceError::PostSyncInvariant(_))
+            | Err(RaftPersistenceError::InternalInvariant(_)) => {
+                self.state = RuntimeState::RecoveryRequired;
+                return Err(ReadyLoopError::RecoveryRequired);
+            }
+            Err(
+                error @ RaftPersistenceError::NotStaged {
+                    recovery_required: false,
+                    ..
+                },
+            ) => return Err(ReadyLoopError::RetryablePersistence(error)),
+            Err(error) => {
+                self.quarantine();
+                return Err(ReadyLoopError::PersistenceRejected(error));
+            }
+        };
+
+        if persisted.record_count != 2 || persisted.end_lsn.is_none() {
+            self.state = RuntimeState::RecoveryRequired;
+            return Err(ReadyLoopError::SnapshotPersistenceShape);
+        }
+
+        Ok(persisted)
     }
 
     /// install a locally generated snapshot after its pointer and stable
@@ -557,14 +642,19 @@ where
         self.ensure_no_pending_ready()?;
 
         if self.persistence.snapshot() != Some(pointer) {
+            self.quarantine();
             return Err(ReadyLoopError::SnapshotBoundaryNotPersisted);
         }
 
-        validate_snapshot_pointer(pointer, &snapshot)?;
+        if let Err(error) = validate_snapshot_pointer(pointer, &snapshot) {
+            self.quarantine();
+            return Err(error);
+        }
 
         let frontier =
             AppliedRaftFrontier::new(snapshot.last_included_index, snapshot.last_included_term);
         if frontier.index == 0 || frontier.term == 0 {
+            self.quarantine();
             return Err(ReadyLoopError::InvalidAppliedFrontier {
                 index: frontier.index,
                 term: frontier.term,
@@ -572,9 +662,10 @@ where
         }
 
         self.raft.restore_snapshot(snapshot);
-        self.raft
-            .advance_applied(frontier.index)
-            .map_err(ReadyLoopError::Advance)?;
+        self.raft.advance_applied(frontier.index).map_err(|error| {
+            self.quarantine();
+            ReadyLoopError::Advance(error)
+        })?;
         self.applied_frontier = Some(frontier);
         Ok(())
     }
@@ -844,7 +935,11 @@ where
     /// Permanently quarantine this Raft group after a state-machine or runtime
     /// invariant failure. The group must not accept more work in this lifetime.
     pub fn quarantine(&mut self) {
-        self.state = RuntimeState::GroupQuarantined;
+        // Node-wide uncertain durability is strictly stronger than a local
+        // quarantine and must never be downgraded by outer error decoration.
+        if self.state != RuntimeState::RecoveryRequired {
+            self.state = RuntimeState::GroupQuarantined;
+        }
     }
 }
 

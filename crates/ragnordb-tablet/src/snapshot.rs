@@ -15,7 +15,11 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use prost::Message;
@@ -32,6 +36,7 @@ pub const TABLET_SNAPSHOT_STORAGE_FORMAT_VERSION: u32 = 1;
 const MAX_CLUSTER_ID_BYTES: usize = 256;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+const TEMP_FILE_PREFIX: &str = ".ragnordb-tablet-snapshot-tmp-";
 
 /// current payload format for a tablet state image
 pub const TABLET_SNAPSHOT_PAYLOAD_VERSION: u32 = 1;
@@ -523,6 +528,8 @@ pub struct TabletSnapshotPointer {
 pub struct FileTabletSnapshotStore {
     root: PathBuf,
     max_file_bytes: u64,
+    boot_identity: u128,
+    allocator_lock: Mutex<()>,
 }
 
 impl FileTabletSnapshotStore {
@@ -537,10 +544,150 @@ impl FileTabletSnapshotStore {
         let root = root.into();
         fs::create_dir_all(&root).map_err(io_error)?;
 
+        let boot_identity = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TabletSnapshotStoreError::Clock(error.to_string()))?
+            .as_nanos()
+            ^ u128::from(process::id());
+
+        let mut removed_temporary_file = false;
+        for entry in fs::read_dir(&root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+
+            // Only the store's current and legacy private temporary namespaces
+            // are eligible for restart cleanup. Published snapshots, allocator
+            // state, and unrelated operator files are never removed.
+            let managed_temporary_file = file_name.starts_with(TEMP_FILE_PREFIX)
+                || ((file_name.starts_with(".tablet-")
+                    || file_name.starts_with(".incoming-tablet-snapshot."))
+                    && file_name.ends_with(".tmp"));
+
+            if managed_temporary_file && entry.file_type().map_err(io_error)?.is_file() {
+                fs::remove_file(entry.path()).map_err(io_error)?;
+                removed_temporary_file = true;
+            }
+        }
+
+        if removed_temporary_file {
+            File::open(&root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)?;
+        }
+
         Ok(Self {
             root,
             max_file_bytes,
+            boot_identity,
+            allocator_lock: Mutex::new(()),
         })
+    }
+
+    /// Durably reserve the next monotonic snapshot identity for one replica
+    /// lifetime before snapshot generation begins.
+    ///
+    /// The reservation file is synchronized before the ID is returned. A crash
+    /// may therefore leave an unused gap, but can never reuse an identity for a
+    /// different immutable snapshot image.
+    pub fn allocate_snapshot_id(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        tablet_id: TabletId,
+    ) -> Result<u64, TabletSnapshotStoreError> {
+        let _allocator_guard = self
+            .allocator_lock
+            .lock()
+            .map_err(|_| TabletSnapshotStoreError::SnapshotIdAllocatorPoisoned)?;
+
+        if raft_group_id.0 == 0 || replica_id.0 == 0 || tablet_id.0 == 0 {
+            return Err(TabletSnapshotStoreError::InvalidSnapshotAllocatorIdentity);
+        }
+
+        let allocator_name = format!(
+            "tablet-{}-{}-{}.next-snapshot-id",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let allocator_path = self.root.join(&allocator_name);
+
+        let next_id = match fs::read_to_string(&allocator_path) {
+            Ok(value) => value.trim().parse::<u64>().map_err(|error| {
+                TabletSnapshotStoreError::InvalidSnapshotIdState(error.to_string())
+            })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.next_id_after_published_snapshots(raft_group_id, replica_id, tablet_id)?
+            }
+            Err(error) => return Err(io_error(error)),
+        };
+
+        if next_id == 0 {
+            return Err(TabletSnapshotStoreError::InvalidSnapshotIdState(
+                "next snapshot ID is zero".to_string(),
+            ));
+        }
+
+        let successor = next_id
+            .checked_add(1)
+            .ok_or(TabletSnapshotStoreError::SnapshotIdExhausted)?;
+        let temporary_path = self.temporary_path(&allocator_name);
+
+        let result = (|| -> Result<(), TabletSnapshotStoreError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .map_err(io_error)?;
+            writeln!(file, "{successor}").map_err(io_error)?;
+            file.sync_all().map_err(io_error)?;
+            drop(file);
+
+            fs::rename(&temporary_path, &allocator_path).map_err(io_error)?;
+            File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result?;
+        Ok(next_id)
+    }
+
+    fn next_id_after_published_snapshots(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        tablet_id: TabletId,
+    ) -> Result<u64, TabletSnapshotStoreError> {
+        let prefix = format!(
+            "tablet-{}-{}-{}-",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let mut maximum = 0_u64;
+
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                continue;
+            }
+
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(id) = file_name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".snapshot"))
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            maximum = maximum.max(id);
+        }
+
+        maximum
+            .checked_add(1)
+            .ok_or(TabletSnapshotStoreError::SnapshotIdExhausted)
     }
 
     pub fn publish(
@@ -751,8 +898,11 @@ impl FileTabletSnapshotStore {
     fn temporary_path(&self, file_name: &str) -> PathBuf {
         let sequence = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
 
-        self.root
-            .join(format!(".{file_name}.{}.{}.tmp", process::id(), sequence))
+        self.root.join(format!(
+            "{TEMP_FILE_PREFIX}{}-{}-{sequence}-{file_name}.tmp",
+            self.boot_identity,
+            process::id()
+        ))
     }
 }
 
@@ -860,6 +1010,21 @@ pub enum TabletSnapshotStoreError {
 
     #[error("maximum snapshot file size must be non-zero")]
     InvalidMaxFileBytes,
+
+    #[error("system clock is unavailable while opening the snapshot store: {0}")]
+    Clock(String),
+
+    #[error("snapshot allocator identity contains a zero component")]
+    InvalidSnapshotAllocatorIdentity,
+
+    #[error("durable snapshot allocator state is invalid: {0}")]
+    InvalidSnapshotIdState(String),
+
+    #[error("tablet snapshot identity space is exhausted")]
+    SnapshotIdExhausted,
+
+    #[error("tablet snapshot allocator lock is poisoned")]
+    SnapshotIdAllocatorPoisoned,
 }
 
 /// Receives one incoming snapshot through bounded sequential chunks.
