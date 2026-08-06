@@ -131,15 +131,17 @@ fn wait_for_successful_write(
 /// An in-process cluster can hide missing CLI/server wiring, port binding, data
 /// directory recovery, and process-lifetime failures. This test crosses the
 /// public SQL and admin sockets of three OS processes, kills the leader,
-/// commits on its replacement, restarts the old process, and verifies that its
-/// durable Raft apply frontier catches up.
+/// commits on its replacement, and restarts the old process after the retained
+/// log has been compacted. This catches premature leader serving, missing
+/// out-of-band snapshot wiring, and snapshot recovery that loses SQL catalog
+/// metadata even when the tablet rows themselves survive.
 #[test]
 fn sql_survives_process_leader_failure_and_restart_catchup() {
     let root = tempfile::tempdir().unwrap();
     // Hold every reservation until the complete unique address set is known.
     // Dropping one port-zero listener at a time allows the OS to immediately
     // recycle its port for a different endpoint in the same test.
-    let reservations = (0..9)
+    let reservations = (0..12)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>();
     let reserved = reservations
@@ -147,8 +149,8 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
         .map(|listener| listener.local_addr().unwrap())
         .collect::<Vec<_>>();
     let addresses = reserved
-        .chunks_exact(3)
-        .map(|chunk| (chunk[0], chunk[1], chunk[2]))
+        .chunks_exact(4)
+        .map(|chunk| (chunk[0], chunk[1], chunk[2], chunk[3]))
         .collect::<Vec<_>>();
     drop(reservations);
     let mut nodes = Vec::new();
@@ -160,14 +162,15 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
         let mut config = format!(
             "node_id = {node_id}\ndata_dir = \"{}\"\nlisten_addr = \"{}\"\nadmin_addr = \"{}\"\ncluster_id = \"process-test\"\nbootstrap = true\nstatement_timeout_ms = 5000\nshutdown_grace_period_ms = 1000\n",
             data_dir.display(),
-            addresses[index].1,
             addresses[index].2,
+            addresses[index].3,
         );
-        for (seed_index, (raft, sql, admin)) in addresses.iter().enumerate() {
+        for (seed_index, (raft, snapshot, sql, admin)) in addresses.iter().enumerate() {
             config.push_str(&format!(
-                "\n[[seed_nodes]]\nid = {}\nraft_addr = \"{}\"\nsql_addr = \"{}\"\nadmin_addr = \"{}\"\n",
+                "\n[[seed_nodes]]\nid = {}\nraft_addr = \"{}\"\nsnapshot_addr = \"{}\"\nsql_addr = \"{}\"\nadmin_addr = \"{}\"\n",
                 seed_index + 1,
                 raft,
+                snapshot,
                 sql,
                 admin,
             ));
@@ -175,8 +178,8 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
         fs::write(&config_path, config).unwrap();
         let mut node = ProcessNode {
             config_path,
-            sql_addr: addresses[index].1,
-            admin_addr: addresses[index].2,
+            sql_addr: addresses[index].2,
+            admin_addr: addresses[index].3,
             child: None,
         };
         node.start();
@@ -200,27 +203,15 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
         .unwrap()["ok"],
         true
     );
+    let failed_replica_index =
+        nodes[first_leader].status().unwrap()["replication"]["applied_index"]
+            .as_u64()
+            .unwrap();
 
-    let committed_index = nodes[first_leader].status().unwrap()["replication"]["applied_index"]
-        .as_u64()
-        .unwrap();
-    let replication_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let fully_applied = nodes.iter().all(|node| {
-            node.status()
-                .and_then(|status| status["replication"]["applied_index"].as_u64())
-                .is_some_and(|index| index >= committed_index)
-        });
-        if fully_applied {
-            break;
-        }
-        assert!(
-            Instant::now() < replication_deadline,
-            "all followers must apply the acknowledged write before the stable failover case"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-
+    // Kill immediately after the acknowledged response. The surviving quorum
+    // may have persisted the entry without yet learning the advanced commit
+    // index; replacement-term progress must commit and apply that durable
+    // prefix without relying on another heartbeat from the failed leader.
     nodes[first_leader].kill();
     let second_leader = wait_for_successful_write(
         &nodes,
@@ -230,14 +221,25 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
     let target_index = nodes[second_leader].status().unwrap()["replication"]["applied_index"]
         .as_u64()
         .unwrap();
+    let snapshot_index = nodes[second_leader].status().unwrap()["replication"]["snapshot_index"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        snapshot_index > failed_replica_index,
+        "replacement leader must compact beyond the failed replica before restart"
+    );
 
     nodes[first_leader].start();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let caught_up = nodes[first_leader]
-            .status()
-            .and_then(|status| status["replication"]["applied_index"].as_u64())
-            .is_some_and(|index| index >= target_index);
+        let caught_up = nodes[first_leader].status().is_some_and(|status| {
+            status["replication"]["applied_index"]
+                .as_u64()
+                .is_some_and(|index| index >= target_index)
+                && status["replication"]["snapshot_index"]
+                    .as_u64()
+                    .is_some_and(|index| index >= snapshot_index)
+        });
         if caught_up {
             break;
         }
@@ -249,6 +251,24 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
     }
 
     let response = sql(nodes[second_leader].sql_addr, "SELECT id, name FROM users").unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["rows"].as_array().unwrap().len(), 2);
+
+    // Restart every process after compaction. The tablet snapshot restores the
+    // replicated rows, while the derived local catalog cache restores the SQL
+    // schema whose original Raft entry is now below the snapshot boundary.
+    for node in &mut nodes {
+        node.kill();
+    }
+    for node in &mut nodes {
+        node.start();
+    }
+    let recovered_leader = wait_for_leader(&nodes, None);
+    let response = sql(
+        nodes[recovered_leader].sql_addr,
+        "SELECT id, name FROM users",
+    )
+    .unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["rows"].as_array().unwrap().len(), 2);
 }

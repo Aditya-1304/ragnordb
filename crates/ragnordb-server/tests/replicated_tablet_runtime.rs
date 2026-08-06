@@ -32,6 +32,7 @@ async fn sql_commit_crosses_three_node_tcp_raft_and_updates_followers() {
         .map(|id| SeedNodeConfig {
             id: NodeId(id),
             raft_addr: unused_address(),
+            snapshot_addr: unused_address(),
             sql_addr: unused_address(),
             admin_addr: unused_address(),
         })

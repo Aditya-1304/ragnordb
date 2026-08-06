@@ -417,10 +417,7 @@ where
     }
 
     /// Release storage retention through the group lifecycle owner.
-    pub(crate) fn release_retention(
-        &mut self,
-        floor: wal::lsn::Lsn,
-    ) -> Result<usize, ReadyLoopError> {
+    pub fn release_retention(&mut self, floor: wal::lsn::Lsn) -> Result<usize, ReadyLoopError> {
         self.ensure_active()?;
         self.persistence.release_retention(floor).map_err(|error| {
             self.quarantine();
@@ -633,7 +630,7 @@ where
     /// The core snapshot is only made authoritative after the durable pointer
     /// exists. This prevents a leader from advertising a compacted log range
     /// that cannot be reconstructed after restart
-    pub(crate) fn restore_persisted_snapshot(
+    pub fn restore_persisted_snapshot(
         &mut self,
         pointer: &RaftSnapshotPointerRecord,
         snapshot: Snapshot<Vec<u8>>,
@@ -678,7 +675,7 @@ where
     /// pointer is therefore intentionally omitted from this second batch, but
     /// all post-snapshot entries and the final HardState still cross the normal
     /// exact A-WAL acknowledgement boundary
-    pub(crate) fn persist_ready_after_snapshot_boundary(
+    pub fn persist_ready_after_snapshot_boundary(
         &mut self,
         pointer: &RaftSnapshotPointerRecord,
     ) -> ReadyLoopResult {

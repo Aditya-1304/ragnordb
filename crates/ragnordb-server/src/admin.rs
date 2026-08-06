@@ -107,8 +107,11 @@ async fn handle_status(
         serde_json::json!({
             "leader_replica_id": status.leader_replica_id,
             "term": status.term,
+            "commit_index": status.commit_index,
+            "last_log_index": status.last_log_index,
             "applied_index": status.applied_index,
-            "is_leader": runtime.is_leader(),
+            "snapshot_index": status.snapshot_index,
+            "is_leader": status.serving_leader,
             "runtime_error": status.runtime_error,
         })
     });

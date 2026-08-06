@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
+use ragnordb_catalog::Catalog;
 use ragnordb_common::{
     Error, Result, command_codec::SingleShardCommitCommand, durability::DurabilityGate,
     ids::NodeId, proto::snapshot as snapshot_proto,
@@ -369,6 +370,17 @@ impl LocalDatabase {
         command: &ragnordb_common::command_codec::CatalogCommand,
         update_timestamp: ragnordb_common::ids::Timestamp,
     ) -> Result<()> {
+        let ragnordb_common::command_codec::CatalogOperation::CreateTable(operation) =
+            &command.operation;
+        let table_id = ragnordb_common::ids::TableId(operation.table_def.table_id);
+        // The local catalog WAL is a derived recovery cache. Startup can see
+        // the cached definition before replaying the still-retained Raft entry,
+        // so repeated installation must be an exact no-op.
+        if self.executor.catalog().table_by_id(table_id).is_some() {
+            self.transaction_manager
+                .observe_replicated_high_water(ragnordb_common::ids::TxnId(0), update_timestamp);
+            return Ok(());
+        }
         self.executor.apply_replicated_catalog(command)?;
         self.transaction_manager
             .observe_replicated_high_water(ragnordb_common::ids::TxnId(0), update_timestamp);

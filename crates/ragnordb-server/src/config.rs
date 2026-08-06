@@ -50,6 +50,9 @@ const fn default_statement_logging() -> StatementLogging {
 pub struct SeedNodeConfig {
     pub id: NodeId,
     pub raft_addr: SocketAddr,
+    /// Dedicated endpoint for bounded tablet snapshot streams. Snapshot bytes
+    /// never share the latency-sensitive Raft control connection.
+    pub snapshot_addr: SocketAddr,
     pub sql_addr: SocketAddr,
     pub admin_addr: SocketAddr,
 }
@@ -281,6 +284,7 @@ impl NodeConfig {
 
         let mut node_ids = HashSet::new();
         let mut raft_addresses = HashSet::new();
+        let mut snapshot_addresses = HashSet::new();
         let mut sql_addresses = HashSet::new();
         let mut admin_addresses = HashSet::new();
 
@@ -305,6 +309,13 @@ impl NodeConfig {
                 )));
             }
 
+            if !snapshot_addresses.insert(seed.snapshot_addr) {
+                return Err(Error::Configuration(format!(
+                    "duplicate seed snapshot address: {}",
+                    seed.snapshot_addr
+                )));
+            }
+
             if !sql_addresses.insert(seed.sql_addr) {
                 return Err(Error::Configuration(format!(
                     "duplicate seed SQL address: {}",
@@ -319,12 +330,15 @@ impl NodeConfig {
                 )));
             }
 
-            if seed.raft_addr == seed.sql_addr
+            if seed.raft_addr == seed.snapshot_addr
+                || seed.raft_addr == seed.sql_addr
                 || seed.raft_addr == seed.admin_addr
+                || seed.snapshot_addr == seed.sql_addr
+                || seed.snapshot_addr == seed.admin_addr
                 || seed.sql_addr == seed.admin_addr
             {
                 return Err(Error::Configuration(format!(
-                    "seed node {} must use distinct Raft, SQL, and admin addresses",
+                    "seed node {} must use distinct Raft, snapshot, SQL, and admin addresses",
                     seed.id.0
                 )));
             }
@@ -406,18 +420,21 @@ bootstrap = true
 [[seed_nodes]]
 id = 1
 raft_addr = "127.0.0.1:7001"
+snapshot_addr = "127.0.0.1:7051"
 sql_addr = "127.0.0.1:7101"
 admin_addr = "127.0.0.1:7201"
 
 [[seed_nodes]]
 id = 2
 raft_addr = "127.0.0.1:7002"
+snapshot_addr = "127.0.0.1:7052"
 sql_addr = "127.0.0.1:7102"
 admin_addr = "127.0.0.1:7202"
 
 [[seed_nodes]]
 id = 3
 raft_addr = "127.0.0.1:7003"
+snapshot_addr = "127.0.0.1:7053"
 sql_addr = "127.0.0.1:7103"
 admin_addr = "127.0.0.1:7203"
 "#,
@@ -446,12 +463,14 @@ cluster_id = "ragnordb-dev"
 [[seed_nodes]]
 id = 1
 raft_addr = "127.0.0.1:7001"
+snapshot_addr = "127.0.0.1:7051"
 sql_addr = "127.0.0.1:7101"
 admin_addr = "127.0.0.1:7201"
 
 [[seed_nodes]]
 id = 1
 raft_addr = "127.0.0.1:7002"
+snapshot_addr = "127.0.0.1:7052"
 sql_addr = "127.0.0.1:7102"
 admin_addr = "127.0.0.1:7202"
 "#,

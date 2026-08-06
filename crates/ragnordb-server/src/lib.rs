@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod protocol;
 pub mod replicated_tablet;
 pub mod session;
+mod snapshot_transport;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
