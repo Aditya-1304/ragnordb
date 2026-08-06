@@ -152,6 +152,23 @@ impl RaftWal for RetentionTrackingWal {
     }
 }
 
+struct FailingPruneWal {
+    inner: FakeWal,
+}
+
+impl RaftWal for FailingPruneWal {
+    fn append_batch_and_sync(
+        &mut self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        self.inner.append_batch_and_sync(records)
+    }
+
+    fn prune_before(&mut self, _floor: Lsn) -> Result<usize, String> {
+        Err("injected partial retention mutation".to_string())
+    }
+}
+
 struct RecordSource {
     records: std::vec::IntoIter<WalRecord>,
 }
@@ -339,6 +356,91 @@ fn database_checkpoint_retention_cannot_pass_a_raft_replica_floor() {
 
     replica.release_retention(Lsn::new(20_000)).unwrap();
     assert_eq!(*pruned_through.lock().unwrap(), vec![Lsn::new(20_000)]);
+}
+
+/// Realistic bug caught: after compaction the first retained log entry may be
+/// in a later segment than the snapshot pointer that makes the suffix
+/// recoverable. Publishing the entry LSN as the group floor can delete the
+/// pointer and make a valid snapshot file undiscoverable after restart.
+#[test]
+fn snapshot_pointer_remains_the_recovery_floor_before_and_after_restart() {
+    let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
+    let persisted = storage
+        .persist(RaftPersistenceBatch {
+            snapshot: Some(snapshot_pointer()),
+            entries: vec![LogEntry::normal_with_size(
+                20,
+                8,
+                b"retained-suffix".to_vec(),
+                15,
+            )],
+            hard_state: Some(HardState {
+                current_term: 8,
+                voted_for: Some(CoreReplicaId::must(61)),
+                commit: 20,
+            }),
+        })
+        .unwrap();
+    let pointer_lsn = persisted.start_lsn.unwrap();
+
+    assert!(storage.log_view().first_retained_lsn().unwrap() > pointer_lsn);
+    assert_eq!(storage.minimum_recovery_lsn(), Some(pointer_lsn));
+
+    let records = storage.wal().records.clone();
+    let durable_end_lsn = storage.wal().next_lsn;
+    let mut source = RecordSource::new(records);
+    let recovered = recover_raft_storage(&mut source).unwrap();
+    let restarted = RaftWalStorage::from_recovered(
+        FakeWal::healthy(),
+        recovered.replica(identity()).unwrap(),
+        durable_end_lsn,
+    )
+    .unwrap();
+
+    assert_eq!(restarted.snapshot().unwrap(), &snapshot_pointer());
+    assert_eq!(restarted.minimum_recovery_lsn(), Some(pointer_lsn));
+}
+
+/// Realistic bug caught: physical pruning can mutate several segments and then
+/// fail, while the database and other Raft groups continue treating the shared
+/// WAL as healthy. The fail-stop model requires one node-wide fence.
+#[test]
+fn retention_mutation_failure_fences_every_shared_wal_user() {
+    let gate = DurabilityGate::new();
+    let node_wal = NodeRaftWal::with_durability_gate(
+        FailingPruneWal {
+            inner: FakeWal::healthy(),
+        },
+        gate.clone(),
+    );
+    let replica_identity = identity();
+    let replica_wal = node_wal.group_writer_for(replica_identity).unwrap();
+    node_wal.seal_retention_registry().unwrap();
+    let mut replica = RaftWalStorage::new(replica_wal, replica_identity);
+
+    node_wal
+        .advance_database_retention(Lsn::new(50_000))
+        .unwrap();
+    assert!(replica.release_retention(Lsn::new(20_000)).is_err());
+    assert!(node_wal.recovery_required());
+    assert!(matches!(
+        gate.state(),
+        NodeDurabilityState::RecoveryRequired(_)
+    ));
+
+    assert!(matches!(
+        replica.persist(batch()),
+        Err(RaftPersistenceError::NotStaged {
+            recovery_required: true,
+            ..
+        })
+    ));
+    assert!(
+        node_wal
+            .advance_database_retention(Lsn::new(60_000))
+            .is_err()
+    );
+    assert!(gate.ensure_healthy().is_err());
 }
 
 #[test]

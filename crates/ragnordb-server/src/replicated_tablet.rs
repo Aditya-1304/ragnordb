@@ -1335,9 +1335,7 @@ where
 {
     let floor = ready_loop
         .persistence()
-        .log_view()
-        .first_retained_lsn()
-        .or_else(|| ready_loop.persistence().durable_end_lsn())
+        .minimum_recovery_lsn()
         .unwrap_or(Lsn::ZERO);
     ready_loop
         .release_retention(floor)

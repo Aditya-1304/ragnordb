@@ -271,4 +271,21 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
     .unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["rows"].as_array().unwrap().len(), 2);
+
+    assert_eq!(
+        sql(
+            nodes[recovered_leader].sql_addr,
+            "INSERT INTO users (id, name) VALUES (3, 'after-restart')",
+        )
+        .unwrap()["ok"],
+        true,
+        "the fully restarted cluster must accept a new replicated write"
+    );
+    let response = sql(
+        nodes[recovered_leader].sql_addr,
+        "SELECT id, name FROM users",
+    )
+    .unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["rows"].as_array().unwrap().len(), 3);
 }

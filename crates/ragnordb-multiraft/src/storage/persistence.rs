@@ -371,9 +371,28 @@ fn prune_to_slowest_floor<W: RaftWal>(state: &mut NodeRaftWalState<W>) -> Result
     if slowest_floor <= state.last_pruned_floor {
         return Ok(0);
     }
-    let removed = state.wal.prune_before(slowest_floor)?;
-    state.last_pruned_floor = slowest_floor;
-    Ok(removed)
+    match state.wal.prune_before(slowest_floor) {
+        Ok(removed) => {
+            state.last_pruned_floor = slowest_floor;
+            Ok(removed)
+        }
+        Err(reason) => {
+            // Physical pruning may have removed a safe prefix before reporting
+            // failure. The current fail-stop model cannot prove the resulting
+            // on-disk boundary, so every shared-WAL user must stop immediately.
+            state.recovery_required = true;
+            if let Some(gate) = &state.durability_gate {
+                gate.require_recovery(
+                    DurabilityFailureKind::RecoveryRequired,
+                    format!(
+                        "shared A-WAL retention mutation failed at floor {}: {reason}",
+                        slowest_floor.as_u64()
+                    ),
+                );
+            }
+            Err(reason)
+        }
+    }
 }
 
 /// one logical persistence generation supplied by the future Ready loop
@@ -400,9 +419,11 @@ pub struct RaftWalStorage<W> {
     log_view: RaftReplicaLogView,
     conf_state: Option<ConfState>,
     hard_state: Option<HardState>,
+    hard_state_lsn: Option<Lsn>,
     durable_end_lsn: Option<Lsn>,
     recovery_required: bool,
     snapshot: Option<RaftSnapshotPointerRecord>,
+    snapshot_pointer_lsn: Option<Lsn>,
 }
 
 impl<W: RaftWal> RaftWalStorage<W> {
@@ -414,9 +435,11 @@ impl<W: RaftWal> RaftWalStorage<W> {
             log_view: RaftReplicaLogView::new(identity),
             conf_state: None,
             hard_state: None,
+            hard_state_lsn: None,
             durable_end_lsn: None,
             recovery_required: false,
             snapshot: None,
+            snapshot_pointer_lsn: None,
         }
     }
 
@@ -442,6 +465,22 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
     pub fn durable_end_lsn(&self) -> Option<Lsn> {
         self.durable_end_lsn
+    }
+
+    /// Return the oldest physical record required to reconstruct this replica.
+    ///
+    /// Snapshot files are not discoverable recovery authorities without their
+    /// WAL pointer. Retention must therefore preserve the pointer, stable state,
+    /// and retained suffix rather than using the end of durable storage.
+    pub fn minimum_recovery_lsn(&self) -> Option<Lsn> {
+        [
+            self.snapshot_pointer_lsn,
+            self.hard_state_lsn,
+            self.log_view.first_retained_lsn(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// retain the physical WAL prefix required by this replica while a
@@ -538,6 +577,10 @@ impl<W: RaftWal> RaftWalStorage<W> {
 
         let mut durable_view = self.log_view.clone();
         let mut extent_offset = 0;
+        let snapshot_pointer_lsn = snapshot.as_ref().map(|_| extents[0].start_lsn);
+        let hard_state_lsn = hard_state
+            .as_ref()
+            .and_then(|_| extents.last().map(|extent| extent.start_lsn));
 
         if let Some(snapshot) = &snapshot {
             durable_view
@@ -581,6 +624,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
                 },
             });
             self.snapshot = Some(snapshot);
+            self.snapshot_pointer_lsn = snapshot_pointer_lsn;
         }
 
         if let Some(hard_state) = hard_state {
@@ -591,6 +635,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
                     RaftPersistenceError::PostSyncInvariant(error.to_string())
                 })?;
             self.hard_state = Some(hard_state);
+            self.hard_state_lsn = hard_state_lsn;
         }
 
         self.durable_end_lsn = Some(end_lsn);
@@ -748,9 +793,11 @@ impl<W: RaftWal> RaftWalStorage<W> {
             log_view: recovered.log_view().clone(),
             conf_state: recovered.conf_state().cloned(),
             hard_state: recovered.hard_state().cloned(),
+            hard_state_lsn: recovered.hard_state_lsn(),
             durable_end_lsn: Some(durable_end_lsn),
             recovery_required: false,
             snapshot: recovered.snapshot().cloned(),
+            snapshot_pointer_lsn: recovered.snapshot_pointer_lsn(),
         })
     }
 }

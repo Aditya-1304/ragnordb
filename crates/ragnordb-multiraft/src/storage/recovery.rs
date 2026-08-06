@@ -45,8 +45,10 @@ pub struct RecoveredRaftReplica {
     log_view: RaftReplicaLogView,
     conf_state: Option<ConfState>,
     hard_state: Option<HardState>,
+    hard_state_lsn: Option<Lsn>,
     progress: RaftProgress,
     snapshot: Option<RaftSnapshotPointerRecord>,
+    snapshot_pointer_lsn: Option<Lsn>,
 }
 
 impl RecoveredRaftReplica {
@@ -55,8 +57,10 @@ impl RecoveredRaftReplica {
             log_view: RaftReplicaLogView::new(identity),
             conf_state: None,
             hard_state: None,
+            hard_state_lsn: None,
             progress: RaftProgress::default(),
             snapshot: None,
+            snapshot_pointer_lsn: None,
         }
     }
 
@@ -80,6 +84,11 @@ impl RecoveredRaftReplica {
         self.hard_state.as_ref()
     }
 
+    /// Return the physical WAL location of the latest decoded HardState.
+    pub fn hard_state_lsn(&self) -> Option<Lsn> {
+        self.hard_state_lsn
+    }
+
     /// return the latest recovered truncation and applied frontiers
     pub fn progress(&self) -> RaftProgress {
         self.progress
@@ -87,6 +96,11 @@ impl RecoveredRaftReplica {
 
     pub fn snapshot(&self) -> Option<&RaftSnapshotPointerRecord> {
         self.snapshot.as_ref()
+    }
+
+    /// Return the physical WAL location of the authoritative snapshot pointer.
+    pub fn snapshot_pointer_lsn(&self) -> Option<Lsn> {
+        self.snapshot_pointer_lsn
     }
 
     /// Normalize restart term state after the complete recoverable prefix is
@@ -234,6 +248,7 @@ impl RecoveredRaftStorage {
                         source,
                     })?;
                 replica.hard_state = Some(hard_state);
+                replica.hard_state_lsn = Some(record.lsn);
             }
             RaftWalRecordType::SnapshotPointer => {
                 let snapshot = RaftSnapshotPointerRecord::decode(&record.payload)?;
@@ -293,6 +308,7 @@ impl RecoveredRaftStorage {
 
                 replica.conf_state = Some(snapshot.conf_state.clone());
                 replica.snapshot = Some(snapshot);
+                replica.snapshot_pointer_lsn = Some(record.lsn);
             }
         }
         Ok(())
