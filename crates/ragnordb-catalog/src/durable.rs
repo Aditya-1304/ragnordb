@@ -110,6 +110,21 @@ where
         &self.catalog
     }
 
+    /// Replace the durability authority used by future catalog publications.
+    pub fn replace_durable_log(&mut self, durable_log: L) {
+        self.durable_log = durable_log;
+    }
+
+    /// Install a definition whose catalog command is already authoritative in
+    /// Raft. No second local catalog-log record is appended.
+    pub fn install_replicated_definition(
+        &mut self,
+        definition: ragnordb_common::catalog_codec::TableDefinition,
+    ) -> Result<Arc<TableSchema>> {
+        self.ensure_write_path_available()?;
+        self.catalog.install_definition(definition)
+    }
+
     pub fn requires_recovery(&self) -> bool {
         self.recovery_required_reason.is_some()
     }

@@ -85,6 +85,15 @@ impl LocalTransactionManager {
         Timestamp(self.last_timestamp)
     }
 
+    /// Raise local allocator floors after observing a replicated commit.
+    ///
+    /// This prevents a follower promoted to leader from allocating identifiers
+    /// or MVCC timestamps below state it learned through Raft.
+    pub fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
+        self.last_transaction_id = self.last_transaction_id.max(transaction_id.0);
+        self.last_timestamp = self.last_timestamp.max(timestamp.0);
+    }
+
     fn allocate_timestamp_after(&mut self, minimum_exclusive: Timestamp) -> Result<Timestamp> {
         let allocation_floor = self.last_timestamp.max(minimum_exclusive.0);
 

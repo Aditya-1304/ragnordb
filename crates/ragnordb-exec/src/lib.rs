@@ -35,7 +35,9 @@ use ragnordb_catalog::{
 use ragnordb_common::{
     Error, Result,
     catalog_codec::DataType,
-    codec::{Row, Value},
+    codec::{Row, Value, WriteKind},
+    command_codec::SingleShardCommitCommand,
+    encoding::encode_row,
     ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
     proto::snapshot as snapshot_proto,
 };
@@ -60,11 +62,16 @@ use ragnordb_txn::{
 pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
 pub use session::SqlSession;
 
-type SharedCommitLog = Arc<dyn DurableCommitLog + Send + Sync>;
+/// Process-wide semantic commit boundary used by every local tablet.
+///
+/// The trait object lets server startup replace the initial A-WAL sink with the
+/// replicated tablet proposal sink after Raft recovery is complete.
+pub type SharedCommitLog = Arc<dyn DurableCommitLog + Send + Sync>;
 
 type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
 
-type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
+/// Process-wide catalog publication boundary.
+pub type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
 
 type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
@@ -182,6 +189,103 @@ impl LocalExecutor {
             next_local_catalog_timestamp: 0,
             replay_from_end_lsn: 0,
         }
+    }
+
+    /// Route every future table commit through a new semantic durability sink.
+    ///
+    /// Existing coordinators must be updated together with the template stored
+    /// for later `CREATE TABLE` operations. Updating only one side would allow
+    /// tables created before startup wiring to bypass replication.
+    pub fn replace_commit_log(&mut self, commit_log: SharedCommitLog) {
+        for tablet in self.tablets.values_mut() {
+            tablet.replace_commit_log(commit_log.clone());
+        }
+        self.commit_log = commit_log;
+    }
+
+    /// Route future catalog publications through the replicated host.
+    pub fn replace_catalog_log(&mut self, catalog_log: SharedCatalogLog) {
+        self.catalog.replace_durable_log(catalog_log);
+    }
+
+    /// Install a Raft-authoritative catalog command and its local SQL tablet.
+    pub fn apply_replicated_catalog(
+        &mut self,
+        command: &ragnordb_common::command_codec::CatalogCommand,
+    ) -> Result<()> {
+        let ragnordb_common::command_codec::CatalogOperation::CreateTable(operation) =
+            &command.operation;
+        let schema = self
+            .catalog
+            .install_replicated_definition(operation.table_def.clone())?;
+        if !self.tablets.contains_key(&schema.id) {
+            let tablet = Tablet::new(TabletId(schema.id.0), schema.id)?;
+            let coordinator =
+                SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
+            self.tablets.insert(schema.id, coordinator);
+        }
+        Ok(())
+    }
+
+    /// Apply a Raft-authoritative single-tablet commit to the SQL read mirror.
+    ///
+    /// The replicated tablet state machine has already validated and applied
+    /// this command. This second materialization keeps follower SQL planning and
+    /// reads current without creating another durability record.
+    pub fn apply_replicated_commit(&mut self, command: &SingleShardCommitCommand) -> Result<usize> {
+        let first_key = command.writes.first().ok_or_else(|| {
+            Error::InvalidArgument("replicated commit contains no writes".to_string())
+        })?;
+        let table_id = decode_row_key(&first_key.key)?.table_id;
+        let mut transaction = Transaction::new(command.txn_id, command.start_timestamp)?;
+
+        for write in &command.writes {
+            let write_table_id = decode_row_key(&write.key)?.table_id;
+            if write_table_id != table_id {
+                return Err(Error::InvalidArgument(
+                    "replicated single-shard commit spans multiple tables".to_string(),
+                ));
+            }
+
+            match (write.op, write.row.as_ref()) {
+                (WriteKind::Put, Some(row)) => {
+                    transaction.buffer_put(write.key.clone(), encode_row(row)?)?;
+                }
+                (WriteKind::Delete, None) => {
+                    transaction.buffer_delete(write.key.clone())?;
+                }
+                _ => {
+                    return Err(Error::InvalidArgument(
+                        "replicated commit contains an invalid row mutation".to_string(),
+                    ));
+                }
+            }
+        }
+
+        self.tablets
+            .get_mut(&table_id)
+            .ok_or_else(|| Error::CorruptData(format!(
+                "replicated commit targets table {}, but the local catalog has no matching tablet",
+                table_id.0
+            )))?
+            .apply_replicated_commit(&transaction, command.commit_timestamp)
+    }
+
+    /// Replace the SQL mirror for the Milestone 4 tablet with Raft-recovered
+    /// state. Returns `false` when its catalog table has not been created yet.
+    pub fn install_replicated_storage(
+        &mut self,
+        table_id: TableId,
+        storage: InMemoryMvcc,
+    ) -> Result<bool> {
+        if self.catalog.catalog().table_by_id(table_id).is_none() {
+            return Ok(false);
+        }
+        let tablet = Tablet::with_storage(TabletId(table_id.0), table_id, storage)?;
+        let coordinator =
+            SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
+        self.tablets.insert(table_id, coordinator);
+        Ok(true)
     }
 
     /// constructs the live executor from completely recovered database state

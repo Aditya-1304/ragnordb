@@ -505,6 +505,14 @@ where
         self.wal.durable_lsn()
     }
 
+    /// Clone the synchronized A-WAL owner for another database subsystem.
+    ///
+    /// The returned handle shares the same engine; it does not open a second
+    /// writer or create an independent durability frontier.
+    pub fn wal_handle(&self) -> WalHandle<D, C> {
+        self.wal.clone()
+    }
+
     /// Return a point-in-time operational snapshot from the shared WAL owner.
     pub fn metrics(&self) -> WalMetrics {
         self.wal.metrics()

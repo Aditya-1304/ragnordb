@@ -86,6 +86,35 @@ fn executor_with_log(log: Arc<TestCommitLog>) -> LocalExecutor {
     LocalExecutor::with_commit_log(log)
 }
 
+/// Realistic bug caught:
+///
+/// A recovered server constructs table coordinators before the replicated
+/// tablet runtime is available. If replacing the executor's commit log leaves
+/// those existing coordinators connected to A-WAL, SQL reports success without
+/// ever proposing the write through Raft.
+#[test]
+fn replacing_commit_log_updates_existing_table_coordinators() {
+    let original = Arc::new(TestCommitLog::new());
+    let replicated = Arc::new(TestCommitLog::new());
+    let mut executor = executor_with_log(original.clone());
+    let mut manager = LocalTransactionManager::default();
+    let mut session = SqlSession::new();
+
+    create_users(&mut session, &mut executor, &mut manager);
+    executor.replace_commit_log(replicated.clone());
+
+    session
+        .execute_sql(
+            "INSERT INTO users (id, name) VALUES (1, 'replicated')",
+            &mut executor,
+            &mut manager,
+        )
+        .unwrap();
+
+    assert!(original.records().is_empty());
+    assert_eq!(replicated.records().len(), 1);
+}
+
 fn create_users(
     session: &mut SqlSession,
     executor: &mut LocalExecutor,

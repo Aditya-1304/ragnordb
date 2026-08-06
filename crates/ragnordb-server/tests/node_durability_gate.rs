@@ -199,6 +199,7 @@ async fn status_reports_recovery_required_reason() {
         max_connections: 8,
         durability_gate: gate,
         database: LocalDatabase::shared(),
+        replicated_tablet: None,
     });
     let server = tokio::spawn(async move {
         serve_admin(listener, state, server_shutdown).await.unwrap();

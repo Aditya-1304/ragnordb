@@ -298,9 +298,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             TabletCommand::Commit(command) => self.apply_commit(command),
             TabletCommand::Rollback(command) => self.apply_rollback(command),
             TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
-            command => Err(TabletCommandApplyError::UnsupportedCommand {
-                command: command_name(&command).to_string(),
-            }),
+            // Catalog publication is materialized by the server catalog owner.
+            // The tablet state machine still deduplicates and orders the command
+            // at this exact Raft position.
+            TabletCommand::Catalog(_) => Ok(TabletCommandApplyResult::Noop),
         };
 
         let result = match dispatched {
@@ -788,18 +789,6 @@ pub enum TabletCommandApplyError {
 
     #[error("invalid tablet command envelope: {0}")]
     InvalidEnvelope(#[from] TabletCommandEnvelopeError),
-}
-
-fn command_name(command: &TabletCommand) -> &'static str {
-    match command {
-        TabletCommand::Prewrite(_) => "prewrite",
-        TabletCommand::Commit(_) => "commit",
-        TabletCommand::Rollback(_) => "rollback",
-        TabletCommand::SingleShardCommit(_) => "single_shard_commit",
-        TabletCommand::ResolveIntent(_) => "resolve_intent",
-        TabletCommand::Catalog(_) => "catalog",
-        TabletCommand::Noop(_) => "noop",
-    }
 }
 
 #[cfg(test)]

@@ -199,6 +199,54 @@ where
         &self.participant
     }
 
+    /// Replace the semantic durability sink used by future commits.
+    ///
+    /// Startup uses this narrow hook to connect coordinators reconstructed from
+    /// database recovery to the replicated tablet host. The participant and its
+    /// recovery state remain unchanged; only commits admitted after this call
+    /// cross the new durability boundary.
+    pub fn replace_commit_log(&mut self, commit_log: W) {
+        self.commit_log = commit_log;
+    }
+
+    /// Materialize a commit that was already made authoritative by Raft.
+    ///
+    /// Followers use this path to keep the SQL execution mirror synchronized.
+    /// It deliberately performs no local log append: the matching committed
+    /// Raft entry in the shared A-WAL is the durable authority.
+    pub fn apply_replicated_commit(
+        &mut self,
+        transaction: &Transaction,
+        commit_timestamp: Timestamp,
+    ) -> Result<usize> {
+        self.validate_transaction_metadata(transaction)?;
+        self.ensure_write_path_available()?;
+        self.participant.validate_commit(transaction)?;
+        self.validate_allocated_commit_timestamp(transaction.start_ts(), commit_timestamp)?;
+
+        let expected_writes = transaction.len();
+        let applied_writes = self
+            .participant
+            .apply_commit(transaction, commit_timestamp)
+            .map_err(|source| {
+                self.stop_for_recovery(format!(
+                    "replicated commit for transaction {} at timestamp {} failed during MVCC application: {}",
+                    transaction.id().0,
+                    commit_timestamp.0,
+                    source
+                ))
+            })?;
+
+        if applied_writes != expected_writes {
+            return Err(self.stop_for_recovery(format!(
+                "replicated commit for transaction {} applied {} mutations, but its Raft command contains {}",
+                transaction.id().0, applied_writes, expected_writes
+            )));
+        }
+
+        Ok(applied_writes)
+    }
+
     pub fn requires_recovery(&self) -> bool {
         self.recovery_required_reason.is_some()
     }

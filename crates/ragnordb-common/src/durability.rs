@@ -152,6 +152,8 @@ impl DurabilityGate {
 
             Error::NotImplemented(_)
             | Error::InvalidArgument(_)
+            | Error::NotLeader { .. }
+            | Error::ProposalUnavailable { .. }
             | Error::WriteConflict(_)
             | Error::SqlParse(_)
             | Error::UnsupportedSql(_)

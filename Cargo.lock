@@ -1324,6 +1324,7 @@ dependencies = [
  "axum",
  "metrics",
  "metrics-exporter-prometheus",
+ "raft",
  "ragnordb-catalog",
  "ragnordb-common",
  "ragnordb-exec",

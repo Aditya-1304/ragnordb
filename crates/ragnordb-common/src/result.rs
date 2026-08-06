@@ -54,6 +54,14 @@ pub enum Error {
     #[error("statement admission timed out after {timeout_ms} ms")]
     StatementTimeout { timeout_ms: u64 },
 
+    /// The contacted replica is not the current tablet leader.
+    #[error("node is not the tablet leader; current leader is {leader_id:?}")]
+    NotLeader { leader_id: Option<u64> },
+
+    /// A proposal lost leadership or exceeded its deadline before apply.
+    #[error("replicated proposal did not reach a known apply result: {reason}")]
+    ProposalUnavailable { reason: String },
+
     /// A-WAL rejected the database record before assigning it a logical extent
     ///
     /// `recovery_required` distinguishes an ordinary admission rejection from a

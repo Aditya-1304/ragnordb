@@ -5,6 +5,7 @@ pub mod data_directory_lock;
 pub mod database;
 pub mod metrics;
 pub mod protocol;
+pub mod replicated_tablet;
 pub mod session;
 
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use config::{NodeConfig, StatementLogging};
 use database::{LocalDatabase, SharedLocalDatabase};
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{read_frame, write_frame};
+use replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime};
 use session::Session;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -82,6 +84,12 @@ impl Server {
         // no session can allocate identifiers or observe state while physical
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let (database, recovery_report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
+        let replicated_wal =
+            if self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty() {
+                Some(database.wal_handle()?)
+            } else {
+                None
+            };
 
         metrics::histogram_record(
             "ragnordb_recovery_duration_seconds",
@@ -97,12 +105,25 @@ impl Server {
         );
 
         let database = database.into_shared();
+        let replicated_runtime = match replicated_wal {
+            Some(wal) => {
+                let runtime = ReplicatedTabletRuntime::start(&self.config, wal, database.clone())?;
+                database.lock().await.replace_commit_log(runtime.handle());
+                database.lock().await.replace_catalog_log(runtime.handle());
+                Some(runtime)
+            }
+            None => None,
+        };
+        let replicated_handle = replicated_runtime
+            .as_ref()
+            .map(ReplicatedTabletRuntime::handle);
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),
             max_connections,
             durability_gate: database.lock().await.durability_gate(),
             database: database.clone(),
+            replicated_tablet: replicated_handle.clone(),
         });
 
         info!(
@@ -165,6 +186,7 @@ impl Server {
                                         connection_semaphore.clone();
 
                                     let connection_database = database.clone();
+                                    let connection_replicated = replicated_handle.clone();
 
                                     let connection_shutdown = server_shutdown.clone();
 
@@ -173,6 +195,7 @@ impl Server {
                                             handle_connection_with_policy(
                                                 stream,
                                                 connection_database,
+                                                connection_replicated,
                                                 connection_shutdown,
                                                 statement_timeout_ms,
                                                 statement_logging,
@@ -283,6 +306,12 @@ impl Server {
             }
         }
 
+        // Client work has drained, so the Ready owner can stop before A-WAL's
+        // clean-shutdown witness is published. No background tick may append a
+        // later Raft record beyond that witness.
+        drop(replicated_handle);
+        drop(replicated_runtime);
+
         let shutdown_database = database.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let mut database = shutdown_database;
@@ -309,6 +338,7 @@ pub async fn handle_connection(
     handle_connection_with_policy(
         stream,
         database,
+        None,
         CancellationToken::new(),
         30_000,
         StatementLogging::MetadataOnly,
@@ -319,6 +349,7 @@ pub async fn handle_connection(
 async fn handle_connection_with_policy(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
+    replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
     shutdown: CancellationToken,
     statement_timeout_ms: u64,
     statement_logging: StatementLogging,
@@ -342,56 +373,77 @@ async fn handle_connection_with_policy(
 
         log_statement(statement_logging, session.session_id.0, &trimmed);
 
+        // Latest reads are served only after an exact no-op has committed and
+        // applied on the current leader. This check happens before database
+        // admission so the Ready owner never waits on the SQL state mutex.
+        let read_barrier_error = if is_latest_read(&trimmed) {
+            if let Some(replicated) = replicated_tablet.clone() {
+                let timeout = Duration::from_millis(session.statement_timeout_ms);
+                tokio::task::spawn_blocking(move || replicated.read_barrier(timeout))
+                    .await?
+                    .err()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // The deadline covers admission to the serialized owner. Once admitted,
         // the operation runs to its authoritative durability outcome: timing out
         // an already staged commit would incorrectly turn uncertainty into an
         // ordinary cancellation. Synchronous SQL and fsync execute on the
         // blocking pool so Tokio workers remain available to network tasks.
-        let execution = match tokio::time::timeout(
-            Duration::from_millis(session.statement_timeout_ms),
-            database.clone().lock_owned(),
-        )
-        .await
-        {
-            Ok(database_guard) if !shutdown.is_cancelled() => {
-                let mut sql_session = std::mem::take(&mut session.sql);
-                let started = Instant::now();
-                let statement = trimmed.clone();
-                let (returned_session, result, status) = tokio::task::spawn_blocking(move || {
-                    let mut database = database_guard;
-                    let result = database.execute_sql(&mut sql_session, &statement);
-                    let status = database.status();
-                    (sql_session, result, status)
-                })
-                .await?;
-                session.sql = returned_session;
-                metrics::histogram_record(
-                    "ragnordb_statement_execution_seconds",
-                    started.elapsed().as_secs_f64(),
-                );
-                metrics::gauge_set("ragnordb_wal_durable_lsn", status.durable_lsn as f64);
-                metrics::gauge_set(
-                    "ragnordb_wal_retained_bytes",
-                    status.wal_retained_bytes as f64,
-                );
-                metrics::histogram_record(
-                    "ragnordb_wal_append_latency_seconds",
-                    status.wal_last_append_nanos as f64 / 1_000_000_000.0,
-                );
-                metrics::histogram_record(
-                    "ragnordb_wal_sync_latency_seconds",
-                    status.wal_last_sync_nanos as f64 / 1_000_000_000.0,
-                );
-                metrics::gauge_set(
-                    "ragnordb_wal_oldest_retention_pin",
-                    status.oldest_retention_pin_lsn.unwrap_or(0) as f64,
-                );
-                result
+        let execution = if let Some(error) = read_barrier_error {
+            Err(error)
+        } else {
+            match tokio::time::timeout(
+                Duration::from_millis(session.statement_timeout_ms),
+                database.clone().lock_owned(),
+            )
+            .await
+            {
+                Ok(database_guard) if !shutdown.is_cancelled() => {
+                    let mut sql_session = std::mem::take(&mut session.sql);
+                    let started = Instant::now();
+                    let statement = trimmed.clone();
+                    let (returned_session, result, status) =
+                        tokio::task::spawn_blocking(move || {
+                            let mut database = database_guard;
+                            let result = database.execute_sql(&mut sql_session, &statement);
+                            let status = database.status();
+                            (sql_session, result, status)
+                        })
+                        .await?;
+                    session.sql = returned_session;
+                    metrics::histogram_record(
+                        "ragnordb_statement_execution_seconds",
+                        started.elapsed().as_secs_f64(),
+                    );
+                    metrics::gauge_set("ragnordb_wal_durable_lsn", status.durable_lsn as f64);
+                    metrics::gauge_set(
+                        "ragnordb_wal_retained_bytes",
+                        status.wal_retained_bytes as f64,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_append_latency_seconds",
+                        status.wal_last_append_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_sync_latency_seconds",
+                        status.wal_last_sync_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::gauge_set(
+                        "ragnordb_wal_oldest_retention_pin",
+                        status.oldest_retention_pin_lsn.unwrap_or(0) as f64,
+                    );
+                    result
+                }
+                Ok(_) => break,
+                Err(_) => Err(ragnordb_common::Error::StatementTimeout {
+                    timeout_ms: session.statement_timeout_ms,
+                }),
             }
-            Ok(_) => break,
-            Err(_) => Err(ragnordb_common::Error::StatementTimeout {
-                timeout_ms: session.statement_timeout_ms,
-            }),
         };
 
         let response = match execution {
@@ -481,6 +533,13 @@ fn log_statement(policy: StatementLogging, session_id: u64, statement: &str) {
     }
 }
 
+fn is_latest_read(statement: &str) -> bool {
+    statement
+        .split_whitespace()
+        .next()
+        .is_some_and(|operation| operation.eq_ignore_ascii_case("SELECT"))
+}
+
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
@@ -528,6 +587,7 @@ mod operational_tests {
             handle_connection_with_policy(
                 stream,
                 handler_database,
+                None,
                 CancellationToken::new(),
                 20,
                 StatementLogging::Off,

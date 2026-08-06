@@ -16,9 +16,12 @@ use std::{
 
 use crate::data_directory_lock::DataDirectoryLock;
 use ragnordb_common::{
-    Error, Result, durability::DurabilityGate, ids::NodeId, proto::snapshot as snapshot_proto,
+    Error, Result, command_codec::SingleShardCommitCommand, durability::DurabilityGate,
+    ids::NodeId, proto::snapshot as snapshot_proto,
 };
-use ragnordb_exec::{ExecutionResult, LocalExecutor, SqlSession};
+use ragnordb_exec::{
+    ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SqlSession,
+};
 use ragnordb_storage::{
     checkpoint::{
         PublishedCheckpoint, cleanup_orphan_snapshot_files,
@@ -294,6 +297,82 @@ impl LocalDatabase {
     /// publish an already recovered runtime to connection tasks
     pub fn into_shared(self) -> SharedLocalDatabase {
         Arc::new(Mutex::new(self))
+    }
+
+    /// Connect future SQL commits to the server-owned replicated tablet host.
+    ///
+    /// Catalog durability and checkpoint metadata remain on the shared A-WAL;
+    /// only row-commit authority moves to Raft for the Milestone 4 replicated
+    /// runtime.
+    pub fn replace_commit_log(&mut self, commit_log: SharedCommitLog) {
+        self.executor.replace_commit_log(commit_log);
+    }
+
+    /// Connect future SQL catalog changes to the replicated tablet host.
+    pub fn replace_catalog_log(&mut self, catalog_log: SharedCatalogLog) {
+        self.executor.replace_catalog_log(catalog_log);
+    }
+
+    /// Clone the serialized A-WAL handle for the Raft persistence owner.
+    ///
+    /// `WalHandle` clones share one synchronized engine, so database records and
+    /// group-owned Raft records retain a single physical ordering and recovery
+    /// stream.
+    pub fn wal_handle(&self) -> Result<WalHandle<FsSegmentDirectory, ()>> {
+        self.checkpoint_adapter
+            .as_ref()
+            .map(|adapter| adapter.wal_handle())
+            .ok_or_else(|| {
+                Error::Configuration(
+                    "the in-memory database runtime does not own an A-WAL handle".to_string(),
+                )
+            })
+    }
+
+    /// Update the SQL-visible MVCC mirror from one committed Raft command.
+    pub(crate) fn apply_replicated_commit(
+        &mut self,
+        command: &SingleShardCommitCommand,
+    ) -> Result<usize> {
+        self.durability_gate.ensure_healthy()?;
+        let result = self.executor.apply_replicated_commit(command);
+        if result.is_ok() {
+            self.transaction_manager
+                .observe_replicated_high_water(command.txn_id, command.commit_timestamp);
+        }
+        if let Err(error) = &result {
+            self.durability_gate.observe_error(error);
+        }
+        result
+    }
+
+    /// Install the authoritative tablet image reconstructed by Raft startup.
+    pub(crate) fn install_replicated_storage(
+        &mut self,
+        table_id: ragnordb_common::ids::TableId,
+        storage: ragnordb_storage::mvcc::InMemoryMvcc,
+    ) -> Result<bool> {
+        let (transaction_id, timestamp) = storage.allocator_high_water_marks();
+        let installed = self
+            .executor
+            .install_replicated_storage(table_id, storage)?;
+        if installed {
+            self.transaction_manager
+                .observe_replicated_high_water(transaction_id, timestamp);
+        }
+        Ok(installed)
+    }
+
+    /// Materialize a Raft-authoritative catalog update on a follower.
+    pub(crate) fn apply_replicated_catalog(
+        &mut self,
+        command: &ragnordb_common::command_codec::CatalogCommand,
+        update_timestamp: ragnordb_common::ids::Timestamp,
+    ) -> Result<()> {
+        self.executor.apply_replicated_catalog(command)?;
+        self.transaction_manager
+            .observe_replicated_high_water(ragnordb_common::ids::TxnId(0), update_timestamp);
+        Ok(())
     }
 
     /// publish one complete checkpoint through the live database owner

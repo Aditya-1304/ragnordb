@@ -259,6 +259,38 @@ pub(crate) struct RestoredMvccState {
 }
 
 impl InMemoryMvcc {
+    /// Return allocator maxima represented by committed values and live locks.
+    ///
+    /// Replicated startup uses these values to seed a node-local SQL allocator
+    /// above the tablet state restored from Raft. They are observations, not a
+    /// replacement for the future metadata timestamp authority.
+    pub fn allocator_high_water_marks(&self) -> (TxnId, Timestamp) {
+        let mut max_transaction_id = TxnId(0);
+        let mut max_timestamp = Timestamp(0);
+
+        for versions in self.default.values() {
+            for start_timestamp in versions.keys() {
+                max_timestamp = Timestamp(max_timestamp.0.max(start_timestamp.0));
+            }
+        }
+        for lock in self.locks.values() {
+            max_transaction_id = TxnId(max_transaction_id.0.max(lock.txn_id.0));
+            max_timestamp = Timestamp(max_timestamp.0.max(lock.start_timestamp.0));
+        }
+        for versions in self.writes.values() {
+            for (commit_timestamp, record) in versions {
+                max_timestamp = Timestamp(
+                    max_timestamp
+                        .0
+                        .max(commit_timestamp.0)
+                        .max(record.start_timestamp.0),
+                );
+            }
+        }
+
+        (max_transaction_id, max_timestamp)
+    }
+
     /// Construct an empty in-memory MVCC engine.
     pub fn new() -> Self {
         Self::default()

@@ -191,6 +191,12 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
             error_response("STATEMENT_TIMEOUT", &error.to_string(), true)
         }
 
+        Error::NotLeader { .. } => error_response("NOT_LEADER", &error.to_string(), true),
+
+        Error::ProposalUnavailable { .. } => {
+            error_response("PROPOSAL_UNAVAILABLE", &error.to_string(), true)
+        }
+
         Error::NotImplemented(_) => error_response("UNSUPPORTED_SQL", &error.to_string(), false),
 
         Error::CorruptData(_)

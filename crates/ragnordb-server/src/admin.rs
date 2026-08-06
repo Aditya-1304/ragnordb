@@ -9,6 +9,7 @@ use tracing::info;
 use crate::build_info::BUILD_INFO;
 use crate::database::SharedLocalDatabase;
 use crate::metrics;
+use crate::replicated_tablet::ReplicatedTabletHandle;
 
 /// Thread-safe error type returned by administrative server tasks.
 ///
@@ -22,6 +23,7 @@ pub struct AdminState {
     pub max_connections: u32,
     pub durability_gate: DurabilityGate,
     pub database: SharedLocalDatabase,
+    pub replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
 }
 
 pub async fn start_admin_server(
@@ -73,9 +75,14 @@ async fn handle_status(
     axum::extract::State(state): axum::extract::State<Arc<AdminState>>,
 ) -> Json<serde_json::Value> {
     let active = state.max_connections as usize - state.connection_semaphore.available_permits();
-    let database = state.database.lock().await;
-    let storage = database.status();
-    drop(database);
+    // Health and leadership diagnostics must remain available while a SQL
+    // request owns the serialized database state. Storage details are omitted
+    // for that sample instead of blocking the complete status response.
+    let storage = state
+        .database
+        .try_lock()
+        .ok()
+        .map(|database| database.status());
 
     let durability = match state.durability_gate.state() {
         NodeDurabilityState::Healthy => {
@@ -95,6 +102,16 @@ async fn handle_status(
             })
         }
     };
+    let replication = state.replicated_tablet.as_ref().map(|runtime| {
+        let status = runtime.status();
+        serde_json::json!({
+            "leader_replica_id": status.leader_replica_id,
+            "term": status.term,
+            "applied_index": status.applied_index,
+            "is_leader": runtime.is_leader(),
+            "runtime_error": status.runtime_error,
+        })
+    });
 
     Json(serde_json::json!({
         "build": {
@@ -118,13 +135,14 @@ async fn handle_status(
             "active_connections": active,
         },
         "durability": durability,
-        "storage": {
+        "replication": replication,
+        "storage": storage.map(|storage| serde_json::json!({
             "durable_lsn": storage.durable_lsn,
             "replay_frontier": storage.replay_frontier,
             "latest_checkpoint_id": storage.latest_checkpoint_id,
             "wal_retained_bytes": storage.wal_retained_bytes,
             "retention_pins_active": storage.retention_pins_active,
             "oldest_retention_pin_lsn": storage.oldest_retention_pin_lsn,
-        },
+        })),
     }))
 }
