@@ -32,6 +32,12 @@ fn snapshot_image() -> TabletSnapshotImage {
     TabletSnapshotImage::new(metadata, payload).unwrap()
 }
 
+fn snapshot_image_with_id(snapshot_id: u64) -> TabletSnapshotImage {
+    let mut image = snapshot_image();
+    image.metadata.snapshot_id = snapshot_id;
+    TabletSnapshotImage::new(image.metadata, image.data).unwrap()
+}
+
 /// Catches durable metadata codecs silently dropping tablet identity,
 /// tablet epoch, configuration state, or the applied Raft boundary.
 #[test]
@@ -158,5 +164,29 @@ fn snapshot_id_reservation_is_monotonic_across_reopen() {
         3
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Realistic bug caught:
+///
+/// Long-running nodes can otherwise retain every complete tablet image and
+/// make benchmark results drift with disk usage and filesystem-cache pressure.
+/// Cleanup must remove only older images from the same replica lifetime.
+#[test]
+fn snapshot_pruning_keeps_current_newer_and_unrelated_files() {
+    let root =
+        std::env::temp_dir().join(format!("ragnordb-tablet-snapshot-prune-{}", process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let store = FileTabletSnapshotStore::new(root.clone(), 4096).unwrap();
+    let old = store.publish(&snapshot_image_with_id(8)).unwrap();
+    let current = store.publish(&snapshot_image_with_id(9)).unwrap();
+    let newer = store.publish(&snapshot_image_with_id(10)).unwrap();
+    fs::write(root.join("operator.snapshot"), b"keep").unwrap();
+
+    assert_eq!(store.prune_older_snapshots(&current).unwrap(), 1);
+    assert!(store.load_verified(&old).is_err());
+    assert!(store.load_verified(&current).is_ok());
+    assert!(store.load_verified(&newer).is_ok());
+    assert!(root.join("operator.snapshot").exists());
     let _ = fs::remove_dir_all(root);
 }

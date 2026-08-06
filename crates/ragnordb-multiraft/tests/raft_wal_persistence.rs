@@ -2,7 +2,10 @@ use raft::{
     entry::LogEntry,
     types::{ConfState, HardState, ReplicaId as CoreReplicaId},
 };
-use ragnordb_common::ids::{RaftGroupId, ReplicaId};
+use ragnordb_common::{
+    durability::{DurabilityGate, NodeDurabilityState},
+    ids::{RaftGroupId, ReplicaId},
+};
 use ragnordb_multiraft::storage::{
     codec::{
         RAFT_SNAPSHOT_POINTER_RECORD_VERSION, RaftHardStateRecord, RaftReplicaIdentity,
@@ -313,6 +316,31 @@ fn node_wide_retention_prunes_only_through_the_slowest_registered_group() {
     );
 }
 
+/// Realistic bug caught:
+///
+/// A database checkpoint may advance beyond the oldest Raft record still
+/// required for restart. Physical pruning must stop at the slower Raft floor
+/// even though the database snapshot can replay from a newer LSN.
+#[test]
+fn database_checkpoint_retention_cannot_pass_a_raft_replica_floor() {
+    let pruned_through = Arc::new(Mutex::new(Vec::new()));
+    let node_wal = NodeRaftWal::new(RetentionTrackingWal {
+        pruned_through: Arc::clone(&pruned_through),
+    });
+    let replica_identity = identity();
+    let replica_wal = node_wal.group_writer_for(replica_identity).unwrap();
+    node_wal.seal_retention_registry().unwrap();
+    let mut replica = RaftWalStorage::new(replica_wal, replica_identity);
+
+    node_wal
+        .advance_database_retention(Lsn::new(50_000))
+        .unwrap();
+    assert!(pruned_through.lock().unwrap().is_empty());
+
+    replica.release_retention(Lsn::new(20_000)).unwrap();
+    assert_eq!(*pruned_through.lock().unwrap(), vec![Lsn::new(20_000)]);
+}
+
 #[test]
 fn persistence_uses_one_ordered_batch_with_hard_state_last() {
     let mut storage = RaftWalStorage::new(FakeWal::healthy(), identity());
@@ -428,7 +456,8 @@ fn persistence_rejects_hard_state_below_resulting_log_term_before_wal_append() {
 /// per-replica writer.
 #[test]
 fn uncertain_batch_fences_every_group_writer_on_the_node() {
-    let node_wal = NodeRaftWal::new(FakeWal::failing_sync());
+    let gate = DurabilityGate::new();
+    let node_wal = NodeRaftWal::with_durability_gate(FakeWal::failing_sync(), gate.clone());
     let mut first = RaftWalStorage::new(node_wal.group_writer(), identity());
     let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
     let mut second = RaftWalStorage::new(node_wal.group_writer(), second_identity);
@@ -438,6 +467,11 @@ fn uncertain_batch_fences_every_group_writer_on_the_node() {
         RaftPersistenceError::OutcomeUnknown { .. }
     ));
     assert!(node_wal.recovery_required());
+    assert!(matches!(
+        gate.state(),
+        NodeDurabilityState::RecoveryRequired(_)
+    ));
+    assert!(gate.ensure_healthy().is_err());
 
     let error = second
         .persist(RaftPersistenceBatch {

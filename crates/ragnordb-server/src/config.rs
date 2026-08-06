@@ -17,6 +17,11 @@ use serde::Deserialize;
 const DEFAULT_MAX_CONNECTIONS: u32 = 100;
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS: u64 = 5_000;
+const DEFAULT_SNAPSHOT_INTERVAL_ENTRIES: u64 = 100_000;
+const DEFAULT_SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_MIN_ELAPSED_MS: u64 = 300_000;
+const DEFAULT_MAX_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_CHUNK_BYTES: u64 = 1024 * 1024;
 const ADMIN_PORT_OFFSET: u16 = 100;
 
 /// controls whether client SQL text may enter structured server logs
@@ -39,6 +44,22 @@ const fn default_shutdown_grace_period_ms() -> u64 {
 
 const fn default_statement_logging() -> StatementLogging {
     StatementLogging::MetadataOnly
+}
+
+const fn default_snapshot_interval_entries() -> u64 {
+    DEFAULT_SNAPSHOT_INTERVAL_ENTRIES
+}
+const fn default_snapshot_interval_bytes() -> u64 {
+    DEFAULT_SNAPSHOT_INTERVAL_BYTES
+}
+const fn default_snapshot_min_elapsed_ms() -> u64 {
+    DEFAULT_SNAPSHOT_MIN_ELAPSED_MS
+}
+const fn default_max_snapshot_file_bytes() -> u64 {
+    DEFAULT_MAX_SNAPSHOT_FILE_BYTES
+}
+const fn default_snapshot_chunk_bytes() -> u64 {
+    DEFAULT_SNAPSHOT_CHUNK_BYTES
 }
 
 /// Static address information for one cluster seed node.
@@ -92,6 +113,21 @@ pub struct NodeConfig {
 
     /// Static initial cluster membership.
     pub seed_nodes: Vec<SeedNodeConfig>,
+
+    /// Applied-entry distance that makes automatic snapshot generation due.
+    pub snapshot_interval_entries: u64,
+
+    /// Approximate applied command bytes that make snapshot generation due.
+    pub snapshot_interval_bytes: u64,
+
+    /// Minimum wall-clock delay between two locally generated snapshots.
+    pub snapshot_min_elapsed_ms: u64,
+
+    /// Maximum accepted encoded tablet snapshot size.
+    pub max_snapshot_file_bytes: u64,
+
+    /// Maximum payload carried by one out-of-band snapshot transport chunk.
+    pub snapshot_chunk_bytes: u64,
 }
 
 /// Deserialization-only representation of the TOML file
@@ -125,6 +161,17 @@ struct NodeConfigFile {
 
     #[serde(default)]
     seed_nodes: Vec<SeedNodeConfig>,
+
+    #[serde(default = "default_snapshot_interval_entries")]
+    snapshot_interval_entries: u64,
+    #[serde(default = "default_snapshot_interval_bytes")]
+    snapshot_interval_bytes: u64,
+    #[serde(default = "default_snapshot_min_elapsed_ms")]
+    snapshot_min_elapsed_ms: u64,
+    #[serde(default = "default_max_snapshot_file_bytes")]
+    max_snapshot_file_bytes: u64,
+    #[serde(default = "default_snapshot_chunk_bytes")]
+    snapshot_chunk_bytes: u64,
 }
 
 const fn default_max_connections() -> u32 {
@@ -151,6 +198,11 @@ impl NodeConfig {
             cluster_id: None,
             bootstrap: false,
             seed_nodes: Vec::new(),
+            snapshot_interval_entries: DEFAULT_SNAPSHOT_INTERVAL_ENTRIES,
+            snapshot_interval_bytes: DEFAULT_SNAPSHOT_INTERVAL_BYTES,
+            snapshot_min_elapsed_ms: DEFAULT_SNAPSHOT_MIN_ELAPSED_MS,
+            max_snapshot_file_bytes: DEFAULT_MAX_SNAPSHOT_FILE_BYTES,
+            snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
         };
 
         config.validate()?;
@@ -194,6 +246,11 @@ impl NodeConfig {
             cluster_id: file.cluster_id,
             bootstrap: file.bootstrap,
             seed_nodes: file.seed_nodes,
+            snapshot_interval_entries: file.snapshot_interval_entries,
+            snapshot_interval_bytes: file.snapshot_interval_bytes,
+            snapshot_min_elapsed_ms: file.snapshot_min_elapsed_ms,
+            max_snapshot_file_bytes: file.max_snapshot_file_bytes,
+            snapshot_chunk_bytes: file.snapshot_chunk_bytes,
         };
 
         config.validate()?;
@@ -249,6 +306,17 @@ impl NodeConfig {
         if self.shutdown_grace_period_ms == 0 {
             return Err(Error::Configuration(
                 "shutdown_grace_period_ms must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.snapshot_interval_entries == 0
+            || self.snapshot_interval_bytes == 0
+            || self.max_snapshot_file_bytes == 0
+            || self.snapshot_chunk_bytes == 0
+            || self.snapshot_chunk_bytes > self.max_snapshot_file_bytes
+        {
+            return Err(Error::Configuration(
+                "snapshot intervals and size limits must be non-zero, and chunk size must not exceed maximum file size".to_string(),
             ));
         }
 

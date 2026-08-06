@@ -84,13 +84,20 @@ impl Server {
         // recover the complete runtime before binding client facing listeners
         // no session can allocate identifiers or observe state while physical
         // WAL recovery, semantic replay, or allocator restoration is incomplete
-        let (database, recovery_report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
-        let replicated_wal =
-            if self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty() {
-                Some(database.wal_handle()?)
-            } else {
-                None
-            };
+        let replicated = self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty();
+        let (database, recovery_report, recovered_raft) = if replicated {
+            let configurations = ReplicatedTabletRuntime::recovery_configurations(&self.config)?;
+            let (database, report, recovered) = LocalDatabase::recover_shared_with_raft(
+                &data_dir,
+                self.config.node_id,
+                &configurations,
+            )?;
+            (database, report, Some(recovered))
+        } else {
+            let (database, report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
+            (database, report, None)
+        };
+        let replicated_wal = replicated.then(|| database.wal_handle()).transpose()?;
 
         metrics::histogram_record(
             "ragnordb_recovery_duration_seconds",
@@ -106,14 +113,20 @@ impl Server {
         );
 
         let database = database.into_shared();
-        let replicated_runtime = match replicated_wal {
-            Some(wal) => {
-                let runtime = ReplicatedTabletRuntime::start(&self.config, wal, database.clone())?;
+        let replicated_runtime = match (replicated_wal, recovered_raft) {
+            (Some(wal), Some(recovered)) => {
+                let runtime = ReplicatedTabletRuntime::start_from_shared_recovery(
+                    &self.config,
+                    wal,
+                    database.clone(),
+                    recovered,
+                )?;
                 database.lock().await.replace_commit_log(runtime.handle());
                 database.lock().await.replace_catalog_log(runtime.handle());
                 Some(runtime)
             }
-            None => None,
+            (None, None) => None,
+            _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
         let replicated_handle = replicated_runtime
             .as_ref()

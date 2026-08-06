@@ -28,7 +28,10 @@ use super::{
     recovery::RecoveredRaftReplica,
     view::{RaftLogViewError, RaftReplicaLogView},
 };
-use ragnordb_common::wal_registry::SharedWalRecordType;
+use ragnordb_common::{
+    durability::{DurabilityFailureKind, DurabilityGate},
+    wal_registry::SharedWalRecordType,
+};
 
 /// permanent user record identities reserved for Raft storage in shared A-WAL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +145,8 @@ pub struct NodeRaftWal<W> {
 struct NodeRaftWalState<W> {
     wal: W,
     recovery_required: bool,
+    durability_gate: Option<DurabilityGate>,
+    database_retention_floor: Option<Lsn>,
     retention_floors: BTreeMap<RaftReplicaIdentity, Option<Lsn>>,
     retention_registry_sealed: bool,
     last_pruned_floor: Lsn,
@@ -153,11 +158,51 @@ impl<W> NodeRaftWal<W> {
             state: Arc::new(Mutex::new(NodeRaftWalState {
                 wal,
                 recovery_required: false,
+                durability_gate: None,
+                database_retention_floor: None,
                 retention_floors: BTreeMap::new(),
                 retention_registry_sealed: false,
                 last_pruned_floor: Lsn::ZERO,
             })),
         }
+    }
+
+    /// Construct the shared WAL owner with the database durability gate that
+    /// must be fenced whenever a Raft append has an uncertain outcome.
+    pub fn with_durability_gate(wal: W, durability_gate: DurabilityGate) -> Self {
+        let owner = Self::new(wal);
+        owner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .durability_gate = Some(durability_gate);
+        owner
+    }
+
+    /// Publish the database checkpoint replay floor to the same node-wide
+    /// retention owner used by every Raft replica.
+    pub fn advance_database_retention(&self, floor: Lsn) -> Result<usize, String>
+    where
+        W: RaftWal,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        if state.recovery_required {
+            return Err("shared Raft WAL requires recovery before retention pruning".to_string());
+        }
+        if !state.retention_registry_sealed {
+            return Err("retention registry must be sealed before pruning".to_string());
+        }
+        if state
+            .database_retention_floor
+            .is_some_and(|previous| floor < previous)
+        {
+            return Err("database retention floor cannot move backwards".to_string());
+        }
+        state.database_retention_floor = Some(floor);
+        prune_to_slowest_floor(&mut state)
     }
 
     pub fn group_writer(&self) -> NodeRaftWalHandle<W> {
@@ -256,6 +301,12 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
                 .is_some_and(|error| error.wal_error().requires_recovery())
         {
             state.recovery_required = true;
+            if let Some(gate) = &state.durability_gate {
+                gate.require_recovery(
+                    DurabilityFailureKind::RecoveryRequired,
+                    "shared A-WAL Raft persistence outcome is uncertain",
+                );
+            }
         }
         result
     }
@@ -298,24 +349,31 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
         }
         *registered_floor = Some(floor);
 
-        let Some(slowest_floor) = state
-            .retention_floors
-            .values()
-            .copied()
-            .collect::<Option<Vec<_>>>()
-            .and_then(|floors| floors.into_iter().min())
-        else {
-            return Ok(0);
-        };
-
-        if slowest_floor <= state.last_pruned_floor {
-            return Ok(0);
-        }
-
-        let removed = state.wal.prune_before(slowest_floor)?;
-        state.last_pruned_floor = slowest_floor;
-        Ok(removed)
+        prune_to_slowest_floor(&mut state)
     }
+}
+
+fn prune_to_slowest_floor<W: RaftWal>(state: &mut NodeRaftWalState<W>) -> Result<usize, String> {
+    let Some(mut floors) = state
+        .retention_floors
+        .values()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(0);
+    };
+    if let Some(database_floor) = state.database_retention_floor {
+        floors.push(database_floor);
+    }
+    let Some(slowest_floor) = floors.into_iter().min() else {
+        return Ok(0);
+    };
+    if slowest_floor <= state.last_pruned_floor {
+        return Ok(0);
+    }
+    let removed = state.wal.prune_before(slowest_floor)?;
+    state.last_pruned_floor = slowest_floor;
+    Ok(removed)
 }
 
 /// one logical persistence generation supplied by the future Ready loop

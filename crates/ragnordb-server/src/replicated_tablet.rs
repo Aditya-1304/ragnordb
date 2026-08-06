@@ -9,7 +9,7 @@ use std::{
     io,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -31,6 +31,7 @@ use ragnordb_common::{
     command_codec::{
         NoopCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
     },
+    durability::DurabilityGate,
     encoding::decode_row,
     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     raft_bootstrap::RaftGroupBootstrap,
@@ -47,7 +48,11 @@ use ragnordb_multiraft::{
         install_incoming_tablet_snapshot, persist_tablet_snapshot_boundary_via_ready_loop,
         raft_pointer_for_tablet,
     },
-    storage::{persistence::RaftWal, recovery::recover_raft_storage_with_configurations},
+    storage::{
+        codec::RaftReplicaIdentity,
+        persistence::{NodeRaftWal, RaftWal},
+        recovery::{RecoveredRaftStorage, recover_raft_storage_with_configurations},
+    },
     tablet_apply::{CommittedTabletCommandDisposition, TabletCommandApplier},
 };
 use ragnordb_storage::wal::{
@@ -78,9 +83,6 @@ const HEARTBEAT_INTERVAL_TICKS: u64 = 3;
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const CHANNEL_CAPACITY: usize = 1_024;
 const INTERNAL_BARRIER_CLIENT_ID: u128 = 0x0052_4147_4e4f_5244_4242_4152_5249_4552;
-const MAX_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const SNAPSHOT_CHUNK_BYTES: u64 = 64 * 1024;
-const SNAPSHOT_INTERVAL_ENTRIES: u64 = 4;
 
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
 type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApplyError>;
@@ -150,11 +152,59 @@ struct PendingClient {
     reply: ClientReply,
 }
 
+/// Durable catalog-cache boundary owned by the Ready worker.
+///
+/// Catalog cache publication is part of applying a committed catalog entry,
+/// not a SQL-side follow-up. Any uncertain cache append therefore fences the
+/// same node-wide durability gate used by database and Raft WAL ownership.
+trait CatalogCacheWriter: Send + Sync {
+    fn append_catalog_update(&self, update: &CatalogLogRecord) -> Result<CatalogLogExtent>;
+}
+
+struct FencedCatalogCache {
+    adapter: RagnorDbWalAdapter<FsSegmentDirectory, ()>,
+    durability_gate: DurabilityGate,
+}
+
+impl CatalogCacheWriter for FencedCatalogCache {
+    fn append_catalog_update(&self, update: &CatalogLogRecord) -> Result<CatalogLogExtent> {
+        let result = self.adapter.append_catalog_update(update);
+        if let Err(error) = &result {
+            self.durability_gate.observe_error(error);
+        }
+        result
+    }
+}
+
+#[derive(Clone)]
+struct SnapshotPolicy {
+    interval_entries: u64,
+    interval_bytes: u64,
+    min_elapsed: Duration,
+    applied_bytes: Arc<AtomicU64>,
+}
+
+impl SnapshotPolicy {
+    fn note_applied(&self, bytes: usize) {
+        self.applied_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn is_due(&self, applied_index: u64, snapshot_index: u64, last_snapshot_at: Instant) -> bool {
+        last_snapshot_at.elapsed() >= self.min_elapsed
+            && (applied_index.saturating_sub(snapshot_index) >= self.interval_entries
+                || self.applied_bytes.load(Ordering::Relaxed) >= self.interval_bytes)
+    }
+
+    fn reset(&self) {
+        self.applied_bytes.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Cloneable SQL-side handle for one production tablet host.
 pub struct ReplicatedTabletHandle {
     requests: SyncSender<HostRequest>,
     status: Arc<RwLock<ReplicatedTabletStatus>>,
-    catalog_cache: Arc<RagnorDbWalAdapter<FsSegmentDirectory, ()>>,
 }
 
 impl ReplicatedTabletHandle {
@@ -224,16 +274,11 @@ impl DurableCatalogLog for ReplicatedTabletHandle {
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "replicated tablet runtime has stopped".to_string(),
             })?;
-        let raft_extent =
-            response
-                .recv_timeout(timeout)
-                .map_err(|_| Error::ProposalUnavailable {
-                    reason: "catalog deadline elapsed before tablet apply".to_string(),
-                })??;
-        // Raft is authoritative. This second record is a derived local cache
-        // that keeps SQL schema recovery available after Raft log compaction.
-        self.catalog_cache.append_catalog_update(update)?;
-        Ok(raft_extent)
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "catalog deadline elapsed before tablet apply".to_string(),
+            })?
     }
 }
 
@@ -245,12 +290,57 @@ pub struct ReplicatedTabletRuntime {
 }
 
 impl ReplicatedTabletRuntime {
+    /// Resolve the authoritative initial configuration before the node opens
+    /// the shared semantic recovery cursor.
+    pub fn recovery_configurations(
+        config: &NodeConfig,
+    ) -> Result<BTreeMap<RaftReplicaIdentity, raft::types::ConfState>> {
+        let requested = requested_bootstrap(config)?;
+        let store =
+            FileBootstrapStore::open(config.data_dir.join("raft-bootstrap")).map_err(|source| {
+                Error::RecoveryFailed {
+                    reason: source.to_string(),
+                }
+            })?;
+        let bootstrap = load_durable_group_bootstrap(&store, GROUP_ID)
+            .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?
+            .unwrap_or(requested);
+        let local_replica_id = ReplicaId(config.node_id.0);
+        let (identity, conf_state) = initial_recovery_configuration(&bootstrap, local_replica_id)
+            .map_err(|source| Error::RecoveryFailed {
+            reason: source.to_string(),
+        })?;
+        Ok(BTreeMap::from([(identity, conf_state)]))
+    }
+
     /// Recover or bootstrap the configured local replica, bind its Raft TCP
     /// endpoint, and start the sole owner of tick/message/Ready/apply ordering.
     pub fn start(
         config: &NodeConfig,
         wal: LocalWal,
         database: SharedLocalDatabase,
+    ) -> Result<Self> {
+        Self::start_inner(config, wal, database, None)
+    }
+
+    /// Start from Raft state produced by the server's one-cursor shared-WAL
+    /// recovery pass. No second semantic scan is performed.
+    pub fn start_from_shared_recovery(
+        config: &NodeConfig,
+        wal: LocalWal,
+        database: SharedLocalDatabase,
+        recovered: RecoveredRaftStorage,
+    ) -> Result<Self> {
+        Self::start_inner(config, wal, database, Some(recovered))
+    }
+
+    fn start_inner(
+        config: &NodeConfig,
+        wal: LocalWal,
+        database: SharedLocalDatabase,
+        mut shared_recovered: Option<RecoveredRaftStorage>,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
@@ -266,21 +356,7 @@ impl ReplicatedTabletRuntime {
             })?;
 
         let local_replica_id = ReplicaId(config.node_id.0);
-        let replica_to_node = config
-            .seed_nodes
-            .iter()
-            .map(|seed| (ReplicaId(seed.id.0), seed.id))
-            .collect::<BTreeMap<_, _>>();
-        let voters = replica_to_node.keys().copied().collect::<BTreeSet<_>>();
-        let requested = RaftGroupBootstrap::new(
-            cluster_id.clone(),
-            GROUP_ID,
-            1,
-            replica_to_node,
-            voters,
-            BTreeSet::new(),
-        )
-        .map_err(|source| Error::Configuration(source.to_string()))?;
+        let requested = requested_bootstrap(config)?;
 
         let target = TabletSnapshotInstallTarget {
             cluster_id: cluster_id.clone(),
@@ -296,7 +372,7 @@ impl ReplicatedTabletRuntime {
         let snapshot_store = Arc::new(
             FileTabletSnapshotStore::new(
                 config.data_dir.join("tablet-snapshots"),
-                MAX_SNAPSHOT_FILE_BYTES,
+                config.max_snapshot_file_bytes,
             )
             .map_err(|source| Error::RecoveryFailed {
                 reason: source.to_string(),
@@ -344,15 +420,19 @@ impl ReplicatedTabletRuntime {
             snapshot_peers,
             snapshot_store.clone(),
             snapshot_work.clone(),
-            SNAPSHOT_CHUNK_BYTES,
+            config.snapshot_chunk_bytes,
             shutdown.clone(),
         )
         .map_err(|source| Error::Configuration(format!("bind snapshot endpoint: {source}")))?;
-        let catalog_cache = Arc::new(RagnorDbWalAdapter::new(wal.clone()));
+        let snapshot_policy = SnapshotPolicy {
+            interval_entries: config.snapshot_interval_entries,
+            interval_bytes: config.snapshot_interval_bytes,
+            min_elapsed: Duration::from_millis(config.snapshot_min_elapsed_ms),
+            applied_bytes: Arc::new(AtomicU64::new(0)),
+        };
         let handle = Arc::new(ReplicatedTabletHandle {
             requests: request_tx,
             status: status.clone(),
-            catalog_cache: catalog_cache.clone(),
         });
 
         let durable_bootstrap =
@@ -363,6 +443,32 @@ impl ReplicatedTabletRuntime {
             })?;
         let worker_shutdown = shutdown.clone();
 
+        let identity = RaftReplicaIdentity::new(GROUP_ID, local_replica_id)
+            .map_err(|source| Error::Configuration(source.to_string()))?;
+        let durability_gate = database
+            .try_lock()
+            .map_err(|_| {
+                Error::Configuration("database is busy during WAL ownership setup".into())
+            })?
+            .durability_gate();
+        let catalog_cache: Arc<dyn CatalogCacheWriter> = Arc::new(FencedCatalogCache {
+            adapter: RagnorDbWalAdapter::new(wal.clone()),
+            durability_gate: durability_gate.clone(),
+        });
+        let node_wal = NodeRaftWal::with_durability_gate(wal.clone(), durability_gate);
+        let group_wal = node_wal
+            .group_writer_for(identity)
+            .map_err(Error::Configuration)?;
+        node_wal
+            .seal_retention_registry()
+            .map_err(Error::Configuration)?;
+        database
+            .try_lock()
+            .map_err(|_| {
+                Error::Configuration("database is busy during WAL ownership setup".into())
+            })?
+            .install_node_wal(node_wal)?;
+
         let worker = if let Some(bootstrap) = durable_bootstrap {
             // Durable bootstrap is authoritative after restart; changed static
             // membership cannot silently replace it.
@@ -372,17 +478,22 @@ impl ReplicatedTabletRuntime {
                         reason: source.to_string(),
                     }
                 })?;
-            let mut configurations = BTreeMap::new();
-            configurations.insert(identity, conf_state);
-            let mut source = wal
-                .iter_from(Lsn::ZERO)
-                .map_err(|source| Error::RecoveryFailed {
-                    reason: format!("open Raft recovery stream: {source}"),
-                })?;
-            let recovered = recover_raft_storage_with_configurations(&mut source, &configurations)
-                .map_err(|source| Error::RecoveryFailed {
-                    reason: source.to_string(),
-                })?;
+            let recovered = match shared_recovered.take() {
+                Some(recovered) => recovered,
+                None => {
+                    let configurations = BTreeMap::from([(identity, conf_state)]);
+                    let mut source =
+                        wal.iter_from(Lsn::ZERO)
+                            .map_err(|source| Error::RecoveryFailed {
+                                reason: format!("open Raft recovery stream: {source}"),
+                            })?;
+                    recover_raft_storage_with_configurations(&mut source, &configurations).map_err(
+                        |source| Error::RecoveryFailed {
+                            reason: source.to_string(),
+                        },
+                    )?
+                }
+            };
             let replica = recovered
                 .replica(identity)
                 .ok_or_else(|| Error::RecoveryFailed {
@@ -393,7 +504,7 @@ impl ReplicatedTabletRuntime {
             let recovered_replica = recover_tablet_replica(
                 bootstrap,
                 local_replica_id,
-                wal.clone(),
+                group_wal.clone(),
                 wal.durable_lsn(),
                 replica,
                 &snapshot_store,
@@ -422,6 +533,7 @@ impl ReplicatedTabletRuntime {
                 snapshot_endpoint,
                 cluster_id,
                 catalog_cache,
+                snapshot_policy,
             )
         } else {
             if !config.bootstrap {
@@ -433,7 +545,7 @@ impl ReplicatedTabletRuntime {
                 &mut bootstrap_store,
                 &requested,
                 local_replica_id,
-                wal,
+                group_wal,
                 &target,
                 ELECTION_TIMEOUT_TICKS,
                 HEARTBEAT_INTERVAL_TICKS,
@@ -459,6 +571,7 @@ impl ReplicatedTabletRuntime {
                 snapshot_endpoint,
                 cluster_id,
                 catalog_cache,
+                snapshot_policy,
             )
         };
 
@@ -473,6 +586,27 @@ impl ReplicatedTabletRuntime {
     pub fn handle(&self) -> Arc<ReplicatedTabletHandle> {
         self.handle.clone()
     }
+}
+
+fn requested_bootstrap(config: &NodeConfig) -> Result<RaftGroupBootstrap> {
+    let cluster_id = config.cluster_id.clone().ok_or_else(|| {
+        Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
+    })?;
+    let replica_to_node = config
+        .seed_nodes
+        .iter()
+        .map(|seed| (ReplicaId(seed.id.0), seed.id))
+        .collect::<BTreeMap<_, _>>();
+    let voters = replica_to_node.keys().copied().collect::<BTreeSet<_>>();
+    RaftGroupBootstrap::new(
+        cluster_id,
+        GROUP_ID,
+        1,
+        replica_to_node,
+        voters,
+        BTreeSet::new(),
+    )
+    .map_err(|source| Error::Configuration(source.to_string()))
 }
 
 fn install_recovered_sql_mirror(
@@ -549,7 +683,8 @@ fn spawn_ready_owner<W, LS, SS>(
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: SnapshotEndpoint,
     cluster_id: String,
-    catalog_cache: Arc<RagnorDbWalAdapter<FsSegmentDirectory, ()>>,
+    catalog_cache: Arc<dyn CatalogCacheWriter>,
+    snapshot_policy: SnapshotPolicy,
 ) -> thread::JoinHandle<()>
 where
     W: RaftWal + Send + 'static,
@@ -575,6 +710,7 @@ where
                 snapshot_endpoint,
                 cluster_id,
                 catalog_cache,
+                snapshot_policy,
             ) {
                 error!(error = %source, "replicated tablet runtime stopped");
                 failure_status
@@ -601,7 +737,8 @@ fn run_ready_owner<W, LS, SS>(
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: SnapshotEndpoint,
     cluster_id: String,
-    catalog_cache: Arc<RagnorDbWalAdapter<FsSegmentDirectory, ()>>,
+    catalog_cache: Arc<dyn CatalogCacheWriter>,
+    snapshot_policy: SnapshotPolicy,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -628,6 +765,7 @@ where
         .as_ref()
         .map(|image| image.metadata.last_included_index)
         .unwrap_or(0);
+    let mut last_snapshot_at = Instant::now();
     let mut snapshot_install_pending = false;
     let mut received_snapshot = None::<ReceivedTabletSnapshot>;
 
@@ -656,7 +794,8 @@ where
                 &transport,
                 &snapshot_endpoint,
                 &latest_snapshot,
-                &catalog_cache,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
             )?;
         }
 
@@ -676,7 +815,8 @@ where
                 &snapshot_work,
                 &cluster_id,
                 &mut latest_snapshot,
-                &catalog_cache,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
             )?;
             snapshot_install_pending = false;
             last_snapshot_index = latest_snapshot
@@ -693,7 +833,8 @@ where
             &transport,
             &snapshot_endpoint,
             &latest_snapshot,
-            &catalog_cache,
+            catalog_cache.as_ref(),
+            &snapshot_policy,
             &mut leader_activation,
         )?;
         let serving_leader = leader_activation.is_some_and(|activation| {
@@ -719,7 +860,8 @@ where
                 &transport,
                 &snapshot_endpoint,
                 &latest_snapshot,
-                &catalog_cache,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
             )?;
         }
 
@@ -735,7 +877,8 @@ where
                 &transport,
                 &snapshot_endpoint,
                 &latest_snapshot,
-                &catalog_cache,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
             )?;
         }
 
@@ -767,7 +910,9 @@ where
                 &cluster_id,
                 &mut latest_snapshot,
                 &mut last_snapshot_index,
-                &catalog_cache,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
+                &mut last_snapshot_at,
             )?;
         }
         publish_status(
@@ -927,7 +1072,8 @@ fn refresh_leader_activation<W, LS, SS>(
     transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
     snapshot_endpoint: &SnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
-    catalog_cache: &RagnorDbWalAdapter<FsSegmentDirectory, ()>,
+    catalog_cache: &dyn CatalogCacheWriter,
+    snapshot_policy: &SnapshotPolicy,
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
 ) -> std::result::Result<(), String>
 where
@@ -975,6 +1121,7 @@ where
         snapshot_endpoint,
         latest_snapshot,
         catalog_cache,
+        snapshot_policy,
     )
 }
 
@@ -991,7 +1138,9 @@ fn maybe_publish_snapshot<W, LS, SS>(
     cluster_id: &str,
     latest_snapshot: &mut Option<TabletSnapshotImage>,
     last_snapshot_index: &mut u64,
-    catalog_cache: &RagnorDbWalAdapter<FsSegmentDirectory, ()>,
+    catalog_cache: &dyn CatalogCacheWriter,
+    snapshot_policy: &SnapshotPolicy,
+    last_snapshot_at: &mut Instant,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -1001,7 +1150,7 @@ where
     let Some(frontier) = ready_loop.applied_frontier() else {
         return Ok(());
     };
-    if frontier.index.saturating_sub(*last_snapshot_index) < SNAPSHOT_INTERVAL_ENTRIES {
+    if !snapshot_policy.is_due(frontier.index, *last_snapshot_index, *last_snapshot_at) {
         return Ok(());
     }
 
@@ -1039,6 +1188,8 @@ where
         .map_err(|error| error.to_string())?;
 
     *last_snapshot_index = frontier.index;
+    *last_snapshot_at = Instant::now();
+    snapshot_policy.reset();
     *latest_snapshot = Some(image);
     drain_ready(
         ready_loop,
@@ -1049,7 +1200,13 @@ where
         snapshot_endpoint,
         latest_snapshot,
         catalog_cache,
-    )
+        snapshot_policy,
+    )?;
+    release_replica_retention(ready_loop)?;
+    store
+        .prune_older_snapshots(&pointer)
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,7 +1222,8 @@ fn install_received_snapshot<W, LS, SS>(
     work: &SnapshotWorkController,
     cluster_id: &str,
     latest_snapshot: &mut Option<TabletSnapshotImage>,
-    catalog_cache: &RagnorDbWalAdapter<FsSegmentDirectory, ()>,
+    catalog_cache: &dyn CatalogCacheWriter,
+    snapshot_policy: &SnapshotPolicy,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -1130,17 +1288,6 @@ where
         };
         let envelope = TabletCommandEnvelope::decode(bytes).map_err(|error| error.to_string())?;
         let locally_proposed = registry.is_pending(&envelope.request_id);
-        let mirrored_commit = match &envelope.command {
-            TabletCommand::SingleShardCommit(command) if !locally_proposed => Some(command.clone()),
-            _ => None,
-        };
-        let mirrored_catalog = match &envelope.command {
-            TabletCommand::Catalog(command) if !locally_proposed => Some((
-                command.clone(),
-                ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64),
-            )),
-            _ => None,
-        };
         let disposition = tablet
             .apply_committed(
                 ragnordb_multiraft::proposal::ProposalPosition {
@@ -1150,46 +1297,52 @@ where
                 bytes,
             )
             .map_err(|error| error.to_string())?;
-        if let Some(command) = mirrored_commit
-            && matches!(disposition, CommittedTabletCommandDisposition::Applied(_))
-        {
-            database
-                .blocking_lock()
-                .apply_replicated_commit(&command)
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some((command, update_timestamp)) = mirrored_catalog
-            && matches!(disposition, CommittedTabletCommandDisposition::Applied(_))
-        {
-            catalog_cache
-                .append_catalog_update(&CatalogLogRecord {
-                    table_id: TABLE_ID,
-                    update_timestamp,
-                    command: command.clone(),
-                })
-                .map_err(|error| error.to_string())?;
-            database
-                .blocking_lock()
-                .apply_replicated_catalog(&command, update_timestamp)
-                .map_err(|error| error.to_string())?;
-        }
-        if locally_proposed {
-            disposition
-                .resolve(registry)
-                .map_err(|error| error.to_string())?;
-        }
+        snapshot_policy.note_applied(bytes.len());
+        publish_committed_command(
+            &envelope,
+            locally_proposed,
+            disposition,
+            registry,
+            database,
+            catalog_cache,
+        )?;
     }
     ready_loop
         .advance_applied_frontier(frontier)
         .map_err(|error| error.to_string())?;
     *latest_snapshot = Some(image);
+    snapshot_policy.reset();
     send_messages(
         transport,
         snapshot_endpoint,
         latest_snapshot,
         ready.messages,
     );
+    release_replica_retention(ready_loop)?;
+    store
+        .prune_older_snapshots(&durable.installed.pointer)
+        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn release_replica_retention<W, LS, SS>(
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
+) -> std::result::Result<(), String>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let floor = ready_loop
+        .persistence()
+        .log_view()
+        .first_retained_lsn()
+        .or_else(|| ready_loop.persistence().durable_end_lsn())
+        .unwrap_or(Lsn::ZERO);
+    ready_loop
+        .release_retention(floor)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn tablet_snapshot_conf_state(
@@ -1277,6 +1430,61 @@ fn envelope_from_catalog(
     .map_err(|source| Error::InvalidArgument(source.to_string()))
 }
 
+/// Publish every durable side effect of an applied command before making its
+/// result or applied frontier visible to the rest of the process.
+///
+/// In particular, a locally proposed catalog update must reach the recoverable
+/// catalog cache before its proposal waiter can observe success. Returning an
+/// error leaves that waiter pending and prevents the caller from advancing the
+/// applied frontier or generating a snapshot past the missing cache record.
+fn publish_committed_command(
+    envelope: &TabletCommandEnvelope,
+    locally_proposed: bool,
+    disposition: CommittedTabletCommandDisposition,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    database: &SharedLocalDatabase,
+    catalog_cache: &dyn CatalogCacheWriter,
+) -> std::result::Result<(), String> {
+    if matches!(disposition, CommittedTabletCommandDisposition::Applied(_)) {
+        if let TabletCommand::SingleShardCommit(command) = &envelope.command
+            && !locally_proposed
+        {
+            database
+                .blocking_lock()
+                .apply_replicated_commit(command)
+                .map_err(|error| error.to_string())?;
+        }
+
+        if let TabletCommand::Catalog(command) = &envelope.command {
+            let update_timestamp =
+                ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64);
+            catalog_cache
+                .append_catalog_update(&CatalogLogRecord {
+                    table_id: TABLE_ID,
+                    update_timestamp,
+                    command: command.clone(),
+                })
+                .map_err(|error| error.to_string())?;
+
+            // Followers do not have a local SQL execution path that publishes
+            // the schema, so their in-memory catalog mirror is updated here.
+            if !locally_proposed {
+                database
+                    .blocking_lock()
+                    .apply_replicated_catalog(command, update_timestamp)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+
+    if locally_proposed {
+        disposition
+            .resolve(registry)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_ready<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
@@ -1286,7 +1494,8 @@ fn drain_ready<W, LS, SS>(
     transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
     snapshot_endpoint: &SnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
-    catalog_cache: &RagnorDbWalAdapter<FsSegmentDirectory, ()>,
+    catalog_cache: &dyn CatalogCacheWriter,
+    snapshot_policy: &SnapshotPolicy,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -1306,19 +1515,6 @@ where
             let envelope =
                 TabletCommandEnvelope::decode(bytes).map_err(|error| error.to_string())?;
             let locally_proposed = registry.is_pending(&envelope.request_id);
-            let mirrored_commit = match &envelope.command {
-                TabletCommand::SingleShardCommit(command) if !locally_proposed => {
-                    Some(command.clone())
-                }
-                _ => None,
-            };
-            let mirrored_catalog = match &envelope.command {
-                TabletCommand::Catalog(command) if !locally_proposed => Some((
-                    command.clone(),
-                    ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64),
-                )),
-                _ => None,
-            };
             let disposition = tablet
                 .apply_committed(
                     ragnordb_multiraft::proposal::ProposalPosition {
@@ -1328,35 +1524,15 @@ where
                     bytes,
                 )
                 .map_err(|error| error.to_string())?;
-
-            if let Some(command) = mirrored_commit
-                && matches!(disposition, CommittedTabletCommandDisposition::Applied(_))
-            {
-                database
-                    .blocking_lock()
-                    .apply_replicated_commit(&command)
-                    .map_err(|error| error.to_string())?;
-            }
-            if let Some((command, update_timestamp)) = mirrored_catalog
-                && matches!(disposition, CommittedTabletCommandDisposition::Applied(_))
-            {
-                catalog_cache
-                    .append_catalog_update(&CatalogLogRecord {
-                        table_id: TABLE_ID,
-                        update_timestamp,
-                        command: command.clone(),
-                    })
-                    .map_err(|error| error.to_string())?;
-                database
-                    .blocking_lock()
-                    .apply_replicated_catalog(&command, update_timestamp)
-                    .map_err(|error| error.to_string())?;
-            }
-            if locally_proposed {
-                disposition
-                    .resolve(registry)
-                    .map_err(|error| error.to_string())?;
-            }
+            snapshot_policy.note_applied(bytes.len());
+            publish_committed_command(
+                &envelope,
+                locally_proposed,
+                disposition,
+                registry,
+                database,
+                catalog_cache,
+            )?;
         }
         if let Some(frontier) = frontier {
             ready_loop
@@ -1503,4 +1679,83 @@ fn publish_status<W, LS, SS>(
         .applied_frontier()
         .map(|frontier| frontier.index)
         .unwrap_or(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ragnordb_common::{
+        catalog_codec::TableDefinition,
+        command_codec::{CatalogCommand, CatalogOperation, CreateTableOperation},
+        ids::Timestamp,
+    };
+    use ragnordb_multiraft::{proposal::ProposalPosition, tablet_apply::AppliedTabletCommand};
+    use ragnordb_tablet::command::TabletCommandApplyResult;
+
+    struct OutcomeUnknownCatalogCache;
+
+    impl CatalogCacheWriter for OutcomeUnknownCatalogCache {
+        fn append_catalog_update(&self, _update: &CatalogLogRecord) -> Result<CatalogLogExtent> {
+            Err(Error::CatalogOutcomeUnknown {
+                start_lsn: 40,
+                end_lsn: 50,
+                reason: "injected synchronization ambiguity".to_string(),
+            })
+        }
+    }
+
+    /// Realistic bug caught: a committed CREATE TABLE could previously resolve
+    /// its client waiter before the recoverable catalog cache existed, allowing
+    /// a snapshot and crash to permanently lose the acknowledged schema.
+    #[test]
+    fn catalog_cache_failure_keeps_the_client_proposal_unresolved() {
+        let record = CatalogLogRecord {
+            table_id: TABLE_ID,
+            update_timestamp: Timestamp(7),
+            command: CatalogCommand {
+                operation: CatalogOperation::CreateTable(CreateTableOperation {
+                    table_def: TableDefinition {
+                        table_id: TABLE_ID.0,
+                        name: "users".to_string(),
+                        columns: Vec::new(),
+                        primary_key_column_ids: Vec::new(),
+                        schema_version: 1,
+                        tablet_count: 1,
+                    },
+                }),
+            },
+        };
+        let envelope = envelope_from_catalog(1, &record).expect("catalog envelope must encode");
+        let position = ProposalPosition { term: 2, index: 9 };
+        let mut registry = ProposalRegistry::new();
+        let ticket = registry
+            .register(
+                envelope.request_id.clone(),
+                position,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("proposal registration must succeed");
+        let disposition = CommittedTabletCommandDisposition::Applied(AppliedTabletCommand {
+            request_id: envelope.request_id.clone(),
+            position,
+            outcome: TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: false,
+            },
+        });
+
+        let error = publish_committed_command(
+            &envelope,
+            true,
+            disposition,
+            &mut registry,
+            &crate::database::LocalDatabase::shared(),
+            &OutcomeUnknownCatalogCache,
+        )
+        .expect_err("uncertain catalog persistence must stop Ready publication");
+
+        assert!(error.contains("injected synchronization ambiguity"));
+        assert_eq!(registry.pending_count(), 1);
+        assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 }

@@ -9,12 +9,14 @@
 //! has succeeded
 
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
+use raft::types::ConfState;
 use ragnordb_catalog::Catalog;
 use ragnordb_common::{
     Error, Result, command_codec::SingleShardCommitCommand, durability::DurabilityGate,
@@ -22,6 +24,11 @@ use ragnordb_common::{
 };
 use ragnordb_exec::{
     ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SqlSession,
+};
+use ragnordb_multiraft::storage::persistence::NodeRaftWal;
+use ragnordb_multiraft::storage::{
+    codec::RaftReplicaIdentity, recovery::RecoveredRaftStorage,
+    shared_recovery::recover_shared_storage_from_state,
 };
 use ragnordb_storage::{
     checkpoint::{
@@ -102,6 +109,7 @@ pub struct LocalDatabase {
     durability_gate: DurabilityGate,
     latest_checkpoint_id: Option<u64>,
     checkpoint_replay_frontier: Lsn,
+    node_wal: Option<NodeRaftWal<WalHandle<FsSegmentDirectory, ()>>>,
 }
 
 impl fmt::Debug for LocalDatabase {
@@ -131,6 +139,7 @@ impl Default for LocalDatabase {
             durability_gate: DurabilityGate::new(),
             latest_checkpoint_id: None,
             checkpoint_replay_frontier: Lsn::ZERO,
+            node_wal: None,
         }
     }
 }
@@ -148,6 +157,32 @@ impl LocalDatabase {
     /// replays its exact WAL suffix into private state, and publishes the runtime
     /// only after every recovery boundary succeeds
     pub fn recover(data_dir: impl AsRef<Path>, node_id: NodeId) -> Result<(Self, RecoveryReport)> {
+        let (database, report, _) = Self::recover_internal(data_dir, node_id, None)?;
+        Ok((database, report))
+    }
+
+    /// Recover database and Raft semantic state from one retained A-WAL cursor.
+    /// Database records below a selected checkpoint are skipped while Raft
+    /// records remain visible to their independent recovery owner.
+    pub fn recover_shared_with_raft(
+        data_dir: impl AsRef<Path>,
+        node_id: NodeId,
+        configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
+    ) -> Result<(Self, RecoveryReport, RecoveredRaftStorage)> {
+        let (database, report, raft) =
+            Self::recover_internal(data_dir, node_id, Some(configurations))?;
+        Ok((
+            database,
+            report,
+            raft.expect("shared recovery always returns Raft state"),
+        ))
+    }
+
+    fn recover_internal(
+        data_dir: impl AsRef<Path>,
+        node_id: NodeId,
+        configurations: Option<&BTreeMap<RaftReplicaIdentity, ConfState>>,
+    ) -> Result<(Self, RecoveryReport, Option<RecoveredRaftStorage>)> {
         if node_id.0 == 0 {
             return Err(Error::Configuration(
                 "node ID 0 cannot identify a recovery WAL".to_string(),
@@ -235,8 +270,32 @@ impl LocalDatabase {
             None => (RecoveryState::new(), Lsn::ZERO),
         };
 
-        let replay_stream = scan_recovery_records(&wal, replay_from_lsn)?;
-        let recovered_state = replay_recovery_stream_from_state(replay_stream, recovered_state)?;
+        let (recovered_state, recovered_raft) = match configurations {
+            Some(configurations) => {
+                let mut replay_stream =
+                    wal.iter_from(first_retained_lsn)
+                        .map_err(|source| Error::RecoveryFailed {
+                            reason: format!("open shared database/Raft recovery stream: {source}"),
+                        })?;
+                let recovered = recover_shared_storage_from_state(
+                    &mut replay_stream,
+                    recovered_state,
+                    replay_from_lsn,
+                    configurations,
+                )
+                .map_err(|source| Error::RecoveryFailed {
+                    reason: source.to_string(),
+                })?;
+                (recovered.database, Some(recovered.raft))
+            }
+            None => {
+                let replay_stream = scan_recovery_records(&wal, replay_from_lsn)?;
+                (
+                    replay_recovery_stream_from_state(replay_stream, recovered_state)?,
+                    None,
+                )
+            }
+        };
 
         // Cleanup follows complete snapshot validation and WAL-suffix replay.
         // Until this point every final file may still be the only recoverable
@@ -285,8 +344,10 @@ impl LocalDatabase {
                 durability_gate: DurabilityGate::new(),
                 latest_checkpoint_id: selected_snapshot_id,
                 checkpoint_replay_frontier: replay_from_lsn,
+                node_wal: None,
             },
             recovery_report,
+            recovered_raft,
         ))
     }
 
@@ -328,6 +389,20 @@ impl LocalDatabase {
                     "the in-memory database runtime does not own an A-WAL handle".to_string(),
                 )
             })
+    }
+
+    /// Install the sole physical-retention owner for a shared database/Raft
+    /// WAL. Database checkpoints publish their logical floor through this
+    /// coordinator instead of truncating segments independently.
+    pub fn install_node_wal(
+        &mut self,
+        node_wal: NodeRaftWal<WalHandle<FsSegmentDirectory, ()>>,
+    ) -> Result<()> {
+        node_wal
+            .advance_database_retention(self.checkpoint_replay_frontier)
+            .map_err(|reason| Error::RecoveryRequired { reason })?;
+        self.node_wal = Some(node_wal);
+        Ok(())
     }
 
     /// Update the SQL-visible MVCC mirror from one committed Raft command.
@@ -422,7 +497,7 @@ impl LocalDatabase {
         let _publication_guard = publication_lock.lock_owned().await;
         durability_gate.ensure_healthy()?;
 
-        let (data_dir, snapshot, adapter, retention_pin) = {
+        let (data_dir, snapshot, adapter, retention_pin, node_wal) = {
             let mut runtime = database.lock().await;
             runtime.durability_gate.ensure_healthy()?;
 
@@ -443,7 +518,13 @@ impl LocalDatabase {
                 adapter.acquire_checkpoint_retention_pin()?;
             let snapshot = runtime.capture_checkpoint_image()?;
 
-            (data_dir, snapshot, adapter, retention_pin)
+            (
+                data_dir,
+                snapshot,
+                adapter,
+                retention_pin,
+                runtime.node_wal.clone(),
+            )
         };
 
         let worker_gate = durability_gate.clone();
@@ -468,8 +549,12 @@ impl LocalDatabase {
 
                 worker_gate.ensure_healthy()?;
 
-                let pruned_segments =
-                    adapter.advance_checkpoint_retention(checkpoint.replay_from_lsn)?;
+                let pruned_segments = match node_wal {
+                    Some(owner) => owner
+                        .advance_database_retention(checkpoint.replay_from_lsn)
+                        .map_err(|reason| Error::RecoveryRequired { reason })?,
+                    None => adapter.advance_checkpoint_retention(checkpoint.replay_from_lsn)?,
+                };
 
                 Ok(LiveCheckpointPublication {
                     checkpoint,

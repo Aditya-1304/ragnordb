@@ -885,6 +885,48 @@ impl FileTabletSnapshotStore {
         TabletSnapshotImage::new(metadata, stored.data).map_err(Into::into)
     }
 
+    /// Remove only older published images for the exact replica/tablet
+    /// identity retained by `current`. Newer images, allocator state,
+    /// temporary files, and unrelated operator files are never touched.
+    pub fn prune_older_snapshots(
+        &self,
+        current: &TabletSnapshotPointer,
+    ) -> Result<usize, TabletSnapshotStoreError> {
+        self.load_verified(current)?;
+        let prefix = format!(
+            "tablet-{}-{}-{}-",
+            current.metadata.raft_group_id.0,
+            current.metadata.replica_id.0,
+            current.metadata.tablet_id.0
+        );
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(snapshot_id) = file_name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".snapshot"))
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if snapshot_id < current.metadata.snapshot_id {
+                fs::remove_file(entry.path()).map_err(io_error)?;
+                removed += 1;
+            }
+        }
+        if removed != 0 {
+            File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)?;
+        }
+        Ok(removed)
+    }
+
     fn file_name(metadata: &TabletSnapshotMetadata) -> String {
         format!(
             "tablet-{}-{}-{}-{}.snapshot",

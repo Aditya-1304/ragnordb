@@ -160,7 +160,7 @@ fn sql_survives_process_leader_failure_and_restart_catchup() {
         let config_path = root.path().join(format!("node-{node_id}.toml"));
         let data_dir = root.path().join(format!("node-{node_id}"));
         let mut config = format!(
-            "node_id = {node_id}\ndata_dir = \"{}\"\nlisten_addr = \"{}\"\nadmin_addr = \"{}\"\ncluster_id = \"process-test\"\nbootstrap = true\nstatement_timeout_ms = 5000\nshutdown_grace_period_ms = 1000\n",
+            "node_id = {node_id}\ndata_dir = \"{}\"\nlisten_addr = \"{}\"\nadmin_addr = \"{}\"\ncluster_id = \"process-test\"\nbootstrap = true\nstatement_timeout_ms = 5000\nshutdown_grace_period_ms = 1000\nsnapshot_interval_entries = 4\nsnapshot_interval_bytes = 536870912\nsnapshot_min_elapsed_ms = 0\nmax_snapshot_file_bytes = 536870912\nsnapshot_chunk_bytes = 65536\n",
             data_dir.display(),
             addresses[index].2,
             addresses[index].3,

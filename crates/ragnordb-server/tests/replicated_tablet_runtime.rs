@@ -53,6 +53,11 @@ async fn sql_commit_crosses_three_node_tcp_raft_and_updates_followers() {
             cluster_id: Some("runtime-test".to_string()),
             bootstrap: true,
             seed_nodes: seeds.clone(),
+            snapshot_interval_entries: 100_000,
+            snapshot_interval_bytes: 256 * 1024 * 1024,
+            snapshot_min_elapsed_ms: 300_000,
+            max_snapshot_file_bytes: 512 * 1024 * 1024,
+            snapshot_chunk_bytes: 1024 * 1024,
         };
         let (database, _) = LocalDatabase::recover(&config.data_dir, config.node_id).unwrap();
         let wal = database.wal_handle().unwrap();
