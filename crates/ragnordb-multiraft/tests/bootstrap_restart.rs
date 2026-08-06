@@ -15,6 +15,7 @@ use ragnordb_common::{
 use ragnordb_multiraft::bootstrap::{
     BootstrapGroupError, BootstrapOutcome, BootstrapStore, BootstrapStoreError,
     BootstrapStoreInstall, FileBootstrapStore, bootstrap_group_exactly_once,
+    load_durable_group_bootstrap,
 };
 
 #[derive(Default)]
@@ -152,6 +153,39 @@ fn restart_rejects_changed_static_membership() {
         BootstrapGroupError::Envelope(RaftGroupBootstrapError::BootstrapConflict { .. })
     ));
     assert_eq!(restarted_process.successful_installs(), 1);
+}
+
+/// Realistic bug caught:
+///
+/// Process seed configuration may change while a group is offline. Restart
+/// must load the original durable bootstrap as its initial membership authority
+/// instead of silently replacing quorum with the new seed list.
+#[test]
+fn restart_loads_durable_membership_without_consulting_changed_seeds() {
+    let requested = bootstrap();
+    let mut first_process = MemoryBootstrapStore::new();
+    bootstrap_group_exactly_once(&mut first_process, &requested).unwrap();
+
+    let mut changed_seed = requested.clone();
+    changed_seed
+        .replica_to_node
+        .insert(ReplicaId(12), NodeId(99));
+
+    let restarted_process = first_process.reopen();
+    let durable = load_durable_group_bootstrap(&restarted_process, requested.raft_group_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(durable, requested);
+    assert_ne!(durable, changed_seed);
+    assert_eq!(
+        durable.to_core_conf_state().unwrap().voters,
+        BTreeSet::from([
+            ReplicaId(11).to_raft().unwrap(),
+            ReplicaId(12).to_raft().unwrap(),
+            ReplicaId(13).to_raft().unwrap(),
+        ])
+    );
 }
 
 #[test]

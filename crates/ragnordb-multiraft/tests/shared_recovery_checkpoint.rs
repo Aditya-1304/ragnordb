@@ -33,10 +33,13 @@ impl RaftWalRecoverySource for Source {
     }
 }
 
-/// Catches checkpoint state being silently replaced with an empty database
-/// state when the shared Raft/database WAL suffix is replayed after restart.
+/// Realistic bug caught:
+///
+/// A database checkpoint can have a later replay floor than the Raft records
+/// needed to reconstruct a local replica. Starting the shared cursor at the
+/// database floor would preserve SQL state while silently losing Raft state.
 #[test]
-fn checkpoint_state_is_preserved_while_the_shared_suffix_replays() {
+fn pre_checkpoint_raft_history_is_recovered_with_checkpointed_database_state() {
     let identity = RaftReplicaIdentity::new(RaftGroupId(501), ReplicaId(601)).unwrap();
 
     let checkpoint_catalog = CatalogUpdate {
@@ -118,8 +121,13 @@ fn checkpoint_state_is_preserved_while_the_shared_suffix_replays() {
         },
     )]);
 
-    let recovered =
-        recover_shared_storage_from_state(&mut source, checkpoint_state, &configurations).unwrap();
+    let recovered = recover_shared_storage_from_state(
+        &mut source,
+        checkpoint_state,
+        Lsn::new(40),
+        &configurations,
+    )
+    .unwrap();
 
     assert_eq!(
         recovered.database.high_water_marks().max_table_id,

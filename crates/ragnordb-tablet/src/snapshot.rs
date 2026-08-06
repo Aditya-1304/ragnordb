@@ -13,7 +13,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -691,6 +691,53 @@ impl FileTabletSnapshotStore {
         .map_err(Into::into)
     }
 
+    /// Load a snapshot referenced by durable Raft metadata when only the safe
+    /// identity-derived file name is available at startup.
+    ///
+    /// The embedded tablet metadata is treated as untrusted until the file name,
+    /// bounded file envelope, payload length, and checksum all validate.
+    pub fn load_verified_by_name(
+        &self,
+        file_name: &str,
+    ) -> Result<TabletSnapshotImage, TabletSnapshotStoreError> {
+        let mut components = Path::new(file_name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            return Err(TabletSnapshotStoreError::InvalidFileName);
+        }
+
+        let path = self.root.join(file_name);
+        let file = File::open(path).map_err(io_error)?;
+        let file_length = file.metadata().map_err(io_error)?.len();
+
+        if file_length > self.max_file_bytes {
+            return Err(TabletSnapshotStoreError::SnapshotFileTooLarge {
+                actual: file_length,
+                limit: self.max_file_bytes,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        file.take(self.max_file_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(io_error)?;
+
+        let stored = snapshot_proto::TabletSnapshotFile::decode(bytes.as_slice())
+            .map_err(|error| TabletSnapshotStoreError::FileDecode(error.to_string()))?;
+        let stored_metadata = stored
+            .metadata
+            .ok_or(TabletSnapshotStoreError::MissingFileMetadata)?;
+        let metadata = TabletSnapshotMetadata::decode(&stored_metadata.encode_to_vec())?;
+
+        if file_name != Self::file_name(&metadata) {
+            return Err(TabletSnapshotStoreError::InvalidFileName);
+        }
+
+        TabletSnapshotImage::new(metadata, stored.data).map_err(Into::into)
+    }
+
     fn file_name(metadata: &TabletSnapshotMetadata) -> String {
         format!(
             "tablet-{}-{}-{}-{}.snapshot",
@@ -967,27 +1014,24 @@ pub struct InstalledTabletSnapshot {
     pub frontier: AppliedTabletFrontier,
 }
 
-/// Receive, validate, publish, restore, and durably acknowledge a tablet
-/// snapshot.
+/// Tablet state reconstructed from a verified immutable snapshot image.
 ///
-/// The persistence callback must append the snapshot pointer, `ConfState`,
-/// boundary, and required Raft stable state through the exact A-WAL frontier.
-/// Installation is not reported as successful until that callback succeeds.
-pub fn install_incoming_snapshot<F, E>(
-    store: &FileTabletSnapshotStore,
-    receiver: IncomingTabletSnapshotReceiver,
-    target: &TabletSnapshotInstallTarget,
-    persist_boundary: F,
-) -> Result<InstalledTabletSnapshot, TabletSnapshotInstallError>
-where
-    F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
-    E: std::fmt::Display,
-{
-    validate_install_target(&receiver.metadata, target)?;
+/// This value is private startup state until the surrounding replica
+/// constructor has also validated the Raft pointer, rebuilt the Raft core, and
+/// replayed every committed entry after this frontier.
+#[derive(Debug)]
+pub struct RestoredTabletSnapshot {
+    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub frontier: AppliedTabletFrontier,
+}
 
-    let image = receiver
-        .finish()
-        .map_err(TabletSnapshotInstallError::Receive)?;
+/// Restore tablet MVCC and replicated deduplication state from a snapshot whose
+/// file envelope and payload checksum have already been verified by the store.
+pub fn restore_verified_snapshot(
+    image: &TabletSnapshotImage,
+    target: &TabletSnapshotInstallTarget,
+) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    validate_install_target(&image.metadata, target)?;
 
     let payload = snapshot_proto::TabletSnapshotPayload::decode(image.data.as_slice())
         .map_err(|error| TabletSnapshotInstallError::PayloadDecode(error.to_string()))?;
@@ -1022,13 +1066,6 @@ where
         return Err(TabletSnapshotInstallError::StateMachineIdentityMismatch);
     }
 
-    // Publish the verified immutable image before restoring live state. If
-    // restoration fails, the group remains quarantined and the durable image
-    // remains an unreferenced recovery artifact.
-    let pointer = store
-        .publish(&image)
-        .map_err(TabletSnapshotInstallError::Store)?;
-
     let storage = InMemoryMvcc::restore_from_snapshot_entries(
         target.table_id,
         payload.default_values,
@@ -1044,18 +1081,53 @@ where
         TabletStateMachine::restore_from_snapshot(tablet, &payload.tablet_state_machine)
             .map_err(|error| TabletSnapshotInstallError::StateMachineRestore(error.to_string()))?;
 
-    let frontier = AppliedTabletFrontier::new(
-        image.metadata.last_included_index,
-        image.metadata.last_included_term,
-    );
+    Ok(RestoredTabletSnapshot {
+        state_machine,
+        frontier: AppliedTabletFrontier::new(
+            image.metadata.last_included_index,
+            image.metadata.last_included_term,
+        ),
+    })
+}
 
-    persist_boundary(&pointer, frontier)
+/// Receive, validate, publish, restore, and durably acknowledge a tablet
+/// snapshot.
+///
+/// The persistence callback must append the snapshot pointer, `ConfState`,
+/// boundary, and required Raft stable state through the exact A-WAL frontier.
+/// Installation is not reported as successful until that callback succeeds.
+pub fn install_incoming_snapshot<F, E>(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+    persist_boundary: F,
+) -> Result<InstalledTabletSnapshot, TabletSnapshotInstallError>
+where
+    F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    validate_install_target(&receiver.metadata, target)?;
+
+    let image = receiver
+        .finish()
+        .map_err(TabletSnapshotInstallError::Receive)?;
+
+    // Publish the verified immutable image before restoring live state. If
+    // restoration fails, the group remains quarantined and the durable image
+    // remains an unreferenced recovery artifact.
+    let pointer = store
+        .publish(&image)
+        .map_err(TabletSnapshotInstallError::Store)?;
+
+    let restored = restore_verified_snapshot(&image, target)?;
+
+    persist_boundary(&pointer, restored.frontier)
         .map_err(|error| TabletSnapshotInstallError::BoundaryPersistence(error.to_string()))?;
 
     Ok(InstalledTabletSnapshot {
         pointer,
-        state_machine,
-        frontier,
+        state_machine: restored.state_machine,
+        frontier: restored.frontier,
     })
 }
 

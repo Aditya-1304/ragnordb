@@ -242,6 +242,21 @@ pub enum BootstrapOutcome {
     AlreadyInstalled,
 }
 
+/// load the durable bootstrap authority for an existing Raft group
+///
+/// restart callers intentionally provide only the group identity. Static seed
+/// membership is not reconciled here because it must never replace or redefine
+/// an already persisted quorum after process restart
+pub fn load_durable_group_bootstrap<S: BootstrapStore>(
+    store: &S,
+    raft_group_id: RaftGroupId,
+) -> Result<Option<RaftGroupBootstrap>, BootstrapGroupError> {
+    store
+        .load_bootstrap(raft_group_id)?
+        .map(|bytes| RaftGroupBootstrap::decode(&bytes).map_err(BootstrapGroupError::from))
+        .transpose()
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BootstrapGroupError {
     #[error(transparent)]
