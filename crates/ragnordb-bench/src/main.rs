@@ -440,11 +440,11 @@ struct RunReport {
 }
 
 fn write_histogram(path: &Path, histogram: &Histogram<u64>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create histogram directory {}", parent.display()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create histogram directory {}", parent.display()))?;
     }
 
     let mut file =
@@ -547,7 +547,7 @@ async fn load_table(
     Ok(())
 }
 
-async fn run_benchmark(
+struct BenchmarkConfig {
     addr: String,
     workload: Workload,
     clients: u32,
@@ -560,7 +560,24 @@ async fn run_benchmark(
     timeout_ms: u64,
     seed: u64,
     histogram_out: Option<PathBuf>,
-) -> Result<()> {
+}
+
+async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
+    let BenchmarkConfig {
+        addr,
+        workload,
+        clients,
+        seconds,
+        rows,
+        value_bytes,
+        read_percent,
+        warmup,
+        scan_rows,
+        timeout_ms,
+        seed,
+        histogram_out,
+    } = config;
+
     if clients == 0 {
         bail!("clients must be greater than zero");
     }
@@ -752,7 +769,7 @@ async fn main() -> Result<()> {
             seed,
             histogram_out,
         } => {
-            run_benchmark(
+            run_benchmark(BenchmarkConfig {
                 addr,
                 workload,
                 clients,
@@ -765,7 +782,7 @@ async fn main() -> Result<()> {
                 timeout_ms,
                 seed,
                 histogram_out,
-            )
+            })
             .await
         }
     }
