@@ -48,10 +48,11 @@ where
         .into());
     }
 
-    let len = u32::try_from(bytes.len())?;
+    let mut frame = Vec::with_capacity(LEN_SIZE + bytes.len());
+    frame.extend_from_slice(&u32::try_from(bytes.len())?.to_le_bytes());
+    frame.extend_from_slice(&bytes);
 
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(&bytes).await?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
 
     Ok(())
@@ -61,7 +62,41 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    #[derive(Default)]
+    struct WriteRecorder {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for WriteRecorder {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(bytes.to_vec());
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn request_frame_round_trip() {
@@ -108,6 +143,32 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(&decoded).unwrap();
 
         assert_eq!(decoded, expected);
+    }
+
+    /// A length prefix and a small JSON response written separately can trigger
+    /// TCP delayed-ACK/Nagle latency on request-response connections. One frame
+    /// must reach the socket writer as one contiguous write.
+    #[tokio::test]
+    async fn response_frame_is_emitted_in_one_write() {
+        let response = json!({ "ok": true, "result": "ready" });
+        let expected_body = serde_json::to_vec(&response).unwrap();
+        let mut writer = WriteRecorder::default();
+
+        write_frame(&mut writer, &response).await.unwrap();
+
+        assert_eq!(writer.writes.len(), 1);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(
+            writer.writes[0],
+            [
+                u32::try_from(expected_body.len())
+                    .unwrap()
+                    .to_le_bytes()
+                    .as_slice(),
+                expected_body.as_slice()
+            ]
+            .concat()
+        );
     }
 
     #[tokio::test]

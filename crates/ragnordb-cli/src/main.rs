@@ -1,7 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ragnordb_common::ids::NodeId;
 use ragnordb_common::protocol::read_frame;
-use ragnordb_server::config::NodeConfig;
+use ragnordb_server::config::{NodeConfig, StatementLogging};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -14,6 +14,29 @@ mod inspect;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// CLI spelling for the server's statement logging policy.
+///
+/// Kept in the CLI crate so the server configuration remains independent of
+/// argument parsing
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum StatementLoggingArgument {
+    Off,
+    MetadataOnly,
+    Redacted,
+    Full,
+}
+
+impl From<StatementLoggingArgument> for StatementLogging {
+    fn from(value: StatementLoggingArgument) -> Self {
+        match value {
+            StatementLoggingArgument::Off => Self::Off,
+            StatementLoggingArgument::MetadataOnly => Self::MetadataOnly,
+            StatementLoggingArgument::Redacted => Self::Redacted,
+            StatementLoggingArgument::Full => Self::Full,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -29,7 +52,8 @@ enum Commands {
             "data_dir",
             "listen",
             "admin_listen",
-            "max_connections"
+            "max_connections",
+            "statement_logging"
             ]
         )]
         config: Option<PathBuf>,
@@ -48,6 +72,10 @@ enum Commands {
 
         #[arg(long, default_value = "100")]
         max_connections: u32,
+
+        /// SQL statement logging policy for a node started from command-line flags.
+        #[arg(long, value_enum, default_value_t = StatementLoggingArgument::MetadataOnly)]
+        statement_logging: StatementLoggingArgument,
     },
 
     /// command to open interactive SQL shell
@@ -108,7 +136,19 @@ async fn main() {
             listen,
             admin_listen,
             max_connections,
-        } => run_node(config, id, &data_dir, listen, admin_listen, max_connections).await,
+            statement_logging,
+        } => {
+            run_node(
+                config,
+                id,
+                &data_dir,
+                listen,
+                admin_listen,
+                max_connections,
+                statement_logging.into(),
+            )
+            .await
+        }
         Commands::Sql { addr } => run_sql(addr).await,
         Commands::Status { addr, admin_addr } => run_status(addr, admin_addr).await,
         Commands::Inspect { command } => match command {
@@ -131,12 +171,14 @@ async fn run_node(
     listen: SocketAddr,
     admin_listen: Option<SocketAddr>,
     max_connections: u32,
+    statement_logging: StatementLogging,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = match config_path {
         Some(path) => NodeConfig::load_from_toml(path)?,
         None => {
             let mut config = NodeConfig::new(NodeId(id), PathBuf::from(data_dir), listen)?
-                .with_max_connections(max_connections)?;
+                .with_max_connections(max_connections)?
+                .with_statement_logging(statement_logging);
 
             if let Some(admin_addr) = admin_listen {
                 config = config.with_admin_addr(admin_addr)?;
@@ -286,4 +328,41 @@ async fn run_status(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// benchmark commands construct `NodeConfig` from
+    /// flags, so TOML-only logging configuration left those runs unexpectedly
+    /// emitting statement metadata.
+    #[test]
+    fn node_statement_logging_flag_selects_the_requested_policy() {
+        let cli = Cli::try_parse_from([
+            "ragnordb",
+            "node",
+            "--data-dir",
+            "/tmp/ragnordb-cli-test",
+            "--statement-logging",
+            "off",
+        ])
+        .expect("the benchmark logging flag must parse");
+
+        let Commands::Node {
+            statement_logging, ..
+        } = cli.command
+        else {
+            panic!("the command must parse as a node start");
+        };
+
+        let config = NodeConfig::new(
+            NodeId(1),
+            PathBuf::from("/tmp/ragnordb-cli-test"),
+            "127.0.0.1:7101".parse().unwrap(),
+        )
+        .unwrap()
+        .with_statement_logging(statement_logging.into());
+        assert_eq!(config.statement_logging, StatementLogging::Off);
+    }
 }

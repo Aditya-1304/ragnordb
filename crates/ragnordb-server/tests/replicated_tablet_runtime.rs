@@ -1,4 +1,8 @@
-use std::{net::TcpListener, time::Duration};
+use std::{
+    net::TcpListener,
+    sync::{Arc, Barrier},
+    time::Duration,
+};
 
 use ragnordb_common::{codec::Value, ids::NodeId};
 use ragnordb_exec::{ExecutionResult, SqlSession};
@@ -20,14 +24,15 @@ struct TestNode {
     _data: TempDir,
 }
 
-/// Realistic bug caught:
+/// Realistic bugs caught:
 ///
 /// The low-level Raft and deterministic cluster tests can all pass while the
 /// production TCP host remains disconnected from SQL. This test uses three
-/// independent durable runtimes and proves that a SQL commit returns through
-/// Raft apply and becomes visible in a follower's SQL MVCC mirror.
+/// independent durable runtimes. It also verifies that simultaneous latest
+/// reads do not reuse one internal request identity while their first barrier
+/// is still awaiting apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sql_commit_crosses_three_node_tcp_raft_and_updates_followers() {
+async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit() {
     let seeds = (1..=3)
         .map(|id| SeedNodeConfig {
             id: NodeId(id),
@@ -85,6 +90,33 @@ async fn sql_commit_crosses_three_node_tcp_raft_and_updates_followers() {
     })
     .await
     .expect("the production hosts must elect a leader");
+
+    // Both callers must receive independently tracked barriers. A shared
+    // request identity would reject one caller before Raft can commit either
+    // no-op, which makes healthy concurrent latest reads unavailable.
+    let start = Arc::new(Barrier::new(3));
+    let first = nodes[leader].runtime.handle();
+    let second = nodes[leader].runtime.handle();
+    let first_start = start.clone();
+    let first_barrier = tokio::task::spawn_blocking(move || {
+        first_start.wait();
+        first.read_barrier(Duration::from_secs(5))
+    });
+    let second_start = start.clone();
+    let second_barrier = tokio::task::spawn_blocking(move || {
+        second_start.wait();
+        second.read_barrier(Duration::from_secs(5))
+    });
+    start.wait();
+
+    first_barrier
+        .await
+        .unwrap()
+        .expect("the first concurrent latest-read barrier must apply");
+    second_barrier
+        .await
+        .unwrap()
+        .expect("the second concurrent latest-read barrier must apply");
 
     let leader_catalog = nodes[leader].database.clone();
     tokio::task::spawn_blocking(move || {

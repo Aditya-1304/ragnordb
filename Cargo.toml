@@ -13,6 +13,7 @@ members = [
     "crates/ragnordb-multiraft",
     "crates/ragnordb-server",
     "crates/ragnordb-cli",
+    "crates/ragnordb-bench",
 ]
 
 [workspace.package]
@@ -41,3 +42,9 @@ blake3 = "1"
 raft = { path = "../Papers/raft", version = "=0.1.0" }
 wal = { path = "../wal", version = "=0.1.0" }
 bloom-bloom = { path = "../bloom-bloom", version = "=0.1.0" }
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true

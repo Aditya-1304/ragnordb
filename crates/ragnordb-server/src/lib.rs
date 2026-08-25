@@ -368,6 +368,7 @@ async fn handle_connection_with_policy(
     statement_timeout_ms: u64,
     statement_logging: StatementLogging,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
     let mut session = Session::new();
     session.statement_timeout_ms = statement_timeout_ms;

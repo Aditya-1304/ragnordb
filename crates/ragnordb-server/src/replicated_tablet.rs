@@ -82,7 +82,7 @@ const ELECTION_TIMEOUT_TICKS: u64 = 10;
 const HEARTBEAT_INTERVAL_TICKS: u64 = 3;
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const CHANNEL_CAPACITY: usize = 1_024;
-const INTERNAL_BARRIER_CLIENT_ID: u128 = 0x0052_4147_4e4f_5244_4242_4152_5249_4552;
+const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
 type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApplyError>;
@@ -747,6 +747,7 @@ where
 {
     let mut registry = ProposalRegistry::new();
     let mut clients = Vec::<PendingClient>::new();
+    let mut internal_barrier_allocator = InternalBarrierAllocator::default();
     // Processes commonly start together under an orchestrator. A small stable
     // replica-specific offset prevents identical election tick cadences from
     // repeatedly producing split votes after leader failure.
@@ -818,6 +819,7 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
             )?;
+            internal_barrier_allocator.clear();
             snapshot_install_pending = false;
             last_snapshot_index = latest_snapshot
                 .as_ref()
@@ -836,6 +838,7 @@ where
             catalog_cache.as_ref(),
             &snapshot_policy,
             &mut leader_activation,
+            &mut internal_barrier_allocator,
         )?;
         let serving_leader = leader_activation.is_some_and(|activation| {
             ready_loop
@@ -851,6 +854,7 @@ where
                 &mut registry,
                 &mut clients,
                 serving_leader,
+                &mut internal_barrier_allocator,
             );
             drain_ready(
                 &mut ready_loop,
@@ -887,6 +891,7 @@ where
         if was_leader && !is_leader {
             registry.mark_leadership_lost(ready_loop.raft().hard_state().current_term);
             leader_activation = None;
+            internal_barrier_allocator.clear();
         }
         was_leader = is_leader;
         forward_completions(&mut clients);
@@ -930,6 +935,73 @@ where
     Ok(())
 }
 
+/// Allocates no-op identities for read barriers owned by this local Raft host.
+///
+/// Tablet command deduplication requires every client sequence to be strictly
+/// contiguous. The allocator therefore advances only after Raft has accepted a
+/// proposal into its log. Its client identity is scoped to a Raft term, so an
+/// uncommitted entry discarded during a leadership change cannot leave a gap
+/// for a future leader on this host.
+#[derive(Debug, Default)]
+struct InternalBarrierAllocator {
+    term: Option<u64>,
+    next_sequence: Option<u64>,
+}
+
+impl InternalBarrierAllocator {
+    fn candidate(
+        &mut self,
+        term: u64,
+        tablet: &TabletCommandApplier,
+    ) -> std::result::Result<RequestId, TabletCommandApplyError> {
+        if self.term != Some(term) {
+            let client_id = internal_barrier_client_id(term);
+            self.term = Some(term);
+            self.next_sequence = Some(tablet.state_machine().next_sequence_for_client(client_id)?);
+        }
+
+        self.candidate_for_active_term()
+    }
+
+    fn candidate_for_active_term(&self) -> std::result::Result<RequestId, TabletCommandApplyError> {
+        let term = self
+            .term
+            .expect("barrier allocator must select a term before a candidate");
+        let client_id = internal_barrier_client_id(term);
+        let sequence = self
+            .next_sequence
+            .ok_or(TabletCommandApplyError::RequestSequenceExhausted { client_id })?;
+        Ok(RequestId {
+            client_id,
+            sequence,
+            raft_group_id: GROUP_ID,
+        })
+    }
+
+    /// Record that the candidate was admitted into the Raft log. This must run
+    /// only after `RaftReadyLoop::propose` succeeds; rejected proposals have no
+    /// log entry and must retain their candidate sequence for a retry.
+    fn record_admission(&mut self, sequence: u64) {
+        debug_assert_eq!(self.next_sequence, Some(sequence));
+        self.next_sequence = sequence.checked_add(1);
+    }
+
+    fn clear(&mut self) {
+        self.term = None;
+        self.next_sequence = None;
+    }
+
+    #[cfg(test)]
+    fn activate_term_for_test(&mut self, term: u64, next_sequence: u64) {
+        self.term = Some(term);
+        self.next_sequence = Some(next_sequence);
+    }
+}
+
+const fn internal_barrier_client_id(term: u64) -> u128 {
+    (INTERNAL_BARRIER_CLIENT_NAMESPACE as u128) << 64 | term as u128
+}
+
 fn admit_request<W, LS, SS>(
     request: HostRequest,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
@@ -937,6 +1009,7 @@ fn admit_request<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
+    internal_barrier_allocator: &mut InternalBarrierAllocator,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -954,13 +1027,13 @@ fn admit_request<W, LS, SS>(
         return;
     }
 
-    let (envelope, deadline, reply) = match request {
+    let (envelope, deadline, reply, internal_barrier_sequence) = match request {
         HostRequest::Commit {
             commit,
             reply,
             deadline,
         } => match envelope_from_commit(local_id.get(), commit) {
-            Ok(envelope) => (envelope, deadline, ClientReply::Commit(reply)),
+            Ok(envelope) => (envelope, deadline, ClientReply::Commit(reply), None),
             Err(error) => {
                 let _ = reply.send(Err(error));
                 return;
@@ -971,18 +1044,17 @@ fn admit_request<W, LS, SS>(
             reply,
             deadline,
         } => match envelope_from_catalog(local_id.get(), &update) {
-            Ok(envelope) => (envelope, deadline, ClientReply::Catalog(reply)),
+            Ok(envelope) => (envelope, deadline, ClientReply::Catalog(reply), None),
             Err(error) => {
                 let _ = reply.send(Err(error));
                 return;
             }
         },
         HostRequest::Barrier { reply, deadline } => {
-            let sequence = match tablet
-                .state_machine()
-                .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)
+            let request_id = match internal_barrier_allocator
+                .candidate(ready_loop.raft().hard_state().current_term, tablet)
             {
-                Ok(sequence) => sequence,
+                Ok(request_id) => request_id,
                 Err(source) => {
                     let _ = reply.send(Err(Error::RecoveryRequired {
                         reason: source.to_string(),
@@ -991,18 +1063,19 @@ fn admit_request<W, LS, SS>(
                 }
             };
             let envelope = TabletCommandEnvelope::new(
-                RequestId {
-                    client_id: INTERNAL_BARRIER_CLIENT_ID,
-                    sequence,
-                    raft_group_id: GROUP_ID,
-                },
+                request_id.clone(),
                 TABLET_ID,
                 TABLET_EPOCH,
                 TabletCommand::Noop(NoopCommand),
             )
             .map_err(|source| Error::InvalidArgument(source.to_string()));
             match envelope {
-                Ok(envelope) => (envelope, deadline, ClientReply::Barrier(reply)),
+                Ok(envelope) => (
+                    envelope,
+                    deadline,
+                    ClientReply::Barrier(reply),
+                    Some(request_id.sequence),
+                ),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                     return;
@@ -1044,6 +1117,9 @@ fn admit_request<W, LS, SS>(
             return;
         }
     };
+    if let Some(sequence) = internal_barrier_sequence {
+        internal_barrier_allocator.record_admission(sequence);
+    }
     let position = ragnordb_multiraft::proposal::ProposalPosition {
         term: ready_loop.raft().hard_state().current_term,
         index,
@@ -1075,6 +1151,7 @@ fn refresh_leader_activation<W, LS, SS>(
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
+    internal_barrier_allocator: &mut InternalBarrierAllocator,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -1092,16 +1169,11 @@ where
         return Ok(());
     }
 
-    let sequence = tablet
-        .state_machine()
-        .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)
+    let request_id = internal_barrier_allocator
+        .candidate(term, tablet)
         .map_err(|error| error.to_string())?;
     let envelope = TabletCommandEnvelope::new(
-        RequestId {
-            client_id: INTERNAL_BARRIER_CLIENT_ID,
-            sequence,
-            raft_group_id: GROUP_ID,
-        },
+        request_id.clone(),
         TABLET_ID,
         TABLET_EPOCH,
         TabletCommand::Noop(NoopCommand),
@@ -1111,6 +1183,7 @@ where
     let index = ready_loop
         .propose(bytes.clone(), bytes.len())
         .map_err(|error| error.to_string())?;
+    internal_barrier_allocator.record_admission(request_id.sequence);
     *activation = Some(ragnordb_multiraft::proposal::ProposalPosition { term, index });
     drain_ready(
         ready_loop,
@@ -1755,5 +1828,61 @@ mod tests {
         assert!(error.contains("injected synchronization ambiguity"));
         assert_eq!(registry.pending_count(), 1);
         assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    /// Realistic bug caught: Raft can reject a barrier before appending it when
+    /// a proposal budget is exhausted. Retrying that read must reuse the same
+    /// client sequence because no command with the first sequence can apply.
+    #[test]
+    fn rejected_internal_barrier_proposal_reuses_its_candidate_sequence() {
+        let mut allocator = InternalBarrierAllocator::default();
+        allocator.activate_term_for_test(7, 6);
+
+        let rejected = allocator
+            .candidate_for_active_term()
+            .expect("the first barrier candidate must be available");
+        assert_eq!(rejected.sequence, 6);
+
+        // Model Raft rejecting the proposal before it appends a log entry.
+        let retry = allocator
+            .candidate_for_active_term()
+            .expect("a rejected proposal must leave the candidate reusable");
+        assert_eq!(retry.sequence, 6);
+
+        allocator.record_admission(retry.sequence);
+        assert_eq!(
+            allocator
+                .candidate_for_active_term()
+                .expect("the following admitted proposal must advance the sequence")
+                .sequence,
+            7
+        );
+    }
+
+    /// Realistic bug caught: an old leader can have admitted barriers that are
+    /// later discarded by a newer term. If it leads again, its new barriers
+    /// must not continue that discarded client sequence.
+    #[test]
+    fn leadership_term_change_uses_a_fresh_internal_barrier_client() {
+        let mut allocator = InternalBarrierAllocator::default();
+        allocator.activate_term_for_test(7, 4);
+
+        let old_term = allocator
+            .candidate_for_active_term()
+            .expect("the old leader must have a barrier candidate");
+        allocator.record_admission(old_term.sequence);
+        let another_old_term = allocator
+            .candidate_for_active_term()
+            .expect("the old leader can have another admitted pending barrier");
+        allocator.record_admission(another_old_term.sequence);
+
+        allocator.activate_term_for_test(8, 1);
+        let new_term = allocator
+            .candidate_for_active_term()
+            .expect("the new leader term must have a barrier candidate");
+
+        assert_ne!(new_term.client_id, old_term.client_id);
+        assert_eq!(new_term.client_id, internal_barrier_client_id(8));
+        assert_eq!(new_term.sequence, 1);
     }
 }
