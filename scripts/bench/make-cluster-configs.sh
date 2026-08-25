@@ -23,7 +23,7 @@ admin_addr = "127.0.0.1:$admin_port"
 max_connections = 128
 statement_timeout_ms = 30000
 shutdown_grace_period_ms = 5000
-statement_logging = "metadata-only"
+statement_logging = "off"
 
 cluster_id = "m4-benchmark"
 bootstrap = true
