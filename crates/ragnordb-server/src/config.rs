@@ -264,6 +264,16 @@ impl NodeConfig {
         Ok(self)
     }
 
+    /// Override the SQL statement logging policy for a flag-built node.
+    ///
+    /// This does not alter the safe `MetadataOnly` default used by normal
+    /// development and production starts; callers must explicitly select a
+    /// less verbose policy, such as benchmark runs selecting `Off`
+    pub fn with_statement_logging(mut self, statement_logging: StatementLogging) -> Self {
+        self.statement_logging = statement_logging;
+        self
+    }
+
     /// Override the administrative address while preserving validation.
     pub fn with_admin_addr(mut self, admin_addr: SocketAddr) -> Result<Self> {
         self.admin_addr = admin_addr;
