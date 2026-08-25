@@ -747,6 +747,12 @@ where
 {
     let mut registry = ProposalRegistry::new();
     let mut clients = Vec::<PendingClient>::new();
+    let mut next_internal_barrier_sequence = Some(
+        tablet
+            .state_machine()
+            .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)
+            .map_err(|error| error.to_string())?,
+    );
     // Processes commonly start together under an orchestrator. A small stable
     // replica-specific offset prevents identical election tick cadences from
     // repeatedly producing split votes after leader failure.
@@ -818,6 +824,8 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
             )?;
+            reconcile_internal_barrier_sequence(&tablet, &mut next_internal_barrier_sequence)
+                .map_err(|error| error.to_string())?;
             snapshot_install_pending = false;
             last_snapshot_index = latest_snapshot
                 .as_ref()
@@ -836,6 +844,7 @@ where
             catalog_cache.as_ref(),
             &snapshot_policy,
             &mut leader_activation,
+            &mut next_internal_barrier_sequence,
         )?;
         let serving_leader = leader_activation.is_some_and(|activation| {
             ready_loop
@@ -851,6 +860,7 @@ where
                 &mut registry,
                 &mut clients,
                 serving_leader,
+                &mut next_internal_barrier_sequence,
             );
             drain_ready(
                 &mut ready_loop,
@@ -930,6 +940,41 @@ where
     Ok(())
 }
 
+/// reserve a distinct request sequence for an internal no-op before it awaits
+/// Raft apply. applied deduplication state is the durable recovery baseline,
+/// but it cannot allocate concurrent in-flight requests because it advances
+/// only after apply succeeds
+fn reserve_internal_barrier_sequence(
+    next_sequence: &mut Option<u64>,
+) -> std::result::Result<u64, TabletCommandApplyError> {
+    let sequence =
+        next_sequence
+            .take()
+            .ok_or(TabletCommandApplyError::RequestSequenceExhausted {
+                client_id: INTERNAL_BARRIER_CLIENT_ID,
+            })?;
+    *next_sequence = sequence.checked_add(1);
+    Ok(sequence)
+}
+
+/// advance the volatile reservation watermark after recovery installs a newer
+/// tablet state. Reservations made before installation remain consumed so a
+/// stale snapshot can never cause this host to reuse an in flight identity
+fn reconcile_internal_barrier_sequence(
+    tablet: &TabletCommandApplier,
+    next_sequence: &mut Option<u64>,
+) -> std::result::Result<(), TabletCommandApplyError> {
+    let applied_next = tablet
+        .state_machine()
+        .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)?;
+
+    if let Some(next_sequence) = next_sequence {
+        *next_sequence = (*next_sequence).max(applied_next);
+    }
+
+    Ok(())
+}
+
 fn admit_request<W, LS, SS>(
     request: HostRequest,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
@@ -937,6 +982,7 @@ fn admit_request<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
+    next_internal_barrier_sequence: &mut Option<u64>,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -978,10 +1024,7 @@ fn admit_request<W, LS, SS>(
             }
         },
         HostRequest::Barrier { reply, deadline } => {
-            let sequence = match tablet
-                .state_machine()
-                .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)
-            {
+            let sequence = match reserve_internal_barrier_sequence(next_internal_barrier_sequence) {
                 Ok(sequence) => sequence,
                 Err(source) => {
                     let _ = reply.send(Err(Error::RecoveryRequired {
@@ -1075,6 +1118,7 @@ fn refresh_leader_activation<W, LS, SS>(
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
+    next_internal_barrier_sequence: &mut Option<u64>,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -1092,9 +1136,7 @@ where
         return Ok(());
     }
 
-    let sequence = tablet
-        .state_machine()
-        .next_sequence_for_client(INTERNAL_BARRIER_CLIENT_ID)
+    let sequence = reserve_internal_barrier_sequence(next_internal_barrier_sequence)
         .map_err(|error| error.to_string())?;
     let envelope = TabletCommandEnvelope::new(
         RequestId {
