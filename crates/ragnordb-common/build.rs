@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/ids.proto",
         "../../proto/row.proto",
         "../../proto/catalog.proto",
+        "../../proto/metadata.proto",
         "../../proto/mvcc.proto",
         "../../proto/command.proto",
         "../../proto/rpc.proto",

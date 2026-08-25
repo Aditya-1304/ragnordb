@@ -10,10 +10,12 @@
 //! replication without implementing those later phases here.
 
 mod durable;
+mod metadata;
 
 pub use durable::{
     CatalogCreateOutcome, CatalogLogExtent, CatalogLogRecord, DurableCatalog, DurableCatalogLog,
 };
+pub use metadata::{MetadataApplyOutcome, MetadataState};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

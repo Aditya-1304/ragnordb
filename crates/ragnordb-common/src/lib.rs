@@ -16,6 +16,7 @@ pub mod command_codec;
 pub mod durability;
 pub mod encoding;
 pub mod ids;
+pub mod metadata_codec;
 pub mod protocol;
 pub mod raft_bootstrap;
 pub mod result;
@@ -31,6 +32,9 @@ pub mod proto {
     }
     pub mod catalog {
         include!("proto/ragnordb.catalog.rs");
+    }
+    pub mod metadata {
+        include!("proto/ragnordb.metadata.rs");
     }
     pub mod mvcc {
         include!("proto/ragnordb.mvcc.rs");

@@ -1,0 +1,73 @@
+syntax = "proto3";
+package ragnordb.metadata;
+
+import "catalog.proto";
+import "ids.proto";
+
+// commands committed by the metadata Raft group. This schema intentionally
+// represents desired topology only; per-group committed membership belongs to
+// the Raft ConfState and current leadership is refreshed from live Raft state
+message MetadataCommand {
+    uint32 format_version = 1;
+
+    oneof command {
+        ClusterInitialized cluster_initialized = 2;
+        RegisterNode register_node = 3;
+        CreateTable create_table = 4;
+        CreateTablet create_tablet = 5;
+        SetDesiredReplicaPlacement set_desired_replica_placement = 6;
+        UpdateTableSchema update_table_schema = 7;
+    }
+}
+
+message ClusterInitialized {
+    string cluster_id = 1;
+}
+
+message NodeDescriptor {
+    ragnordb.ids.NodeId node_id = 1;
+    string endpoint = 2;
+}
+
+message RegisterNode {
+    NodeDescriptor node = 1;
+}
+
+message CreateTable {
+    ragnordb.catalog.TableDefinition table = 1;
+}
+
+message TabletDescriptor {
+    ragnordb.ids.TabletId tablet_id = 1;
+    ragnordb.ids.TableId table_id = 2;
+    ragnordb.ids.RaftGroupId raft_group_id = 3;
+    uint64 tablet_epoch = 4;
+    uint64 schema_version = 5;
+}
+
+message CreateTablet {
+    TabletDescriptor tablet = 1;
+}
+
+enum DesiredReplicaRole {
+    DESIRED_REPLICA_ROLE_UNSPECIFIED = 0;
+    DESIRED_REPLICA_ROLE_VOTER = 1;
+    DESIRED_REPLICA_ROLE_LEARNER = 2;
+}
+
+message DesiredReplica {
+    ragnordb.ids.ReplicaId replica_id = 1;
+    ragnordb.ids.NodeId node_id = 2;
+    DesiredReplicaRole role = 3;
+}
+
+message SetDesiredReplicaPlacement {
+    ragnordb.ids.TabletId tablet_id = 1;
+    uint64 configuration_epoch = 2;
+    repeated DesiredReplica replicas = 3;
+}
+
+message UpdateTableSchema {
+    uint64 expected_schema_version = 1;
+    ragnordb.catalog.TableDefinition table = 2;
+}
