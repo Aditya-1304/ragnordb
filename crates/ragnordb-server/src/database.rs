@@ -157,7 +157,7 @@ impl LocalDatabase {
     /// replays its exact WAL suffix into private state, and publishes the runtime
     /// only after every recovery boundary succeeds
     pub fn recover(data_dir: impl AsRef<Path>, node_id: NodeId) -> Result<(Self, RecoveryReport)> {
-        let (database, report, _) = Self::recover_internal(data_dir, node_id, None)?;
+        let (database, report, _) = Self::recover_internal(data_dir, node_id, None, None)?;
         Ok((database, report))
     }
 
@@ -170,7 +170,32 @@ impl LocalDatabase {
         configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
     ) -> Result<(Self, RecoveryReport, RecoveredRaftStorage)> {
         let (database, report, raft) =
-            Self::recover_internal(data_dir, node_id, Some(configurations))?;
+            Self::recover_internal(data_dir, node_id, Some(configurations), None)?;
+        Ok((
+            database,
+            report,
+            raft.expect("shared recovery always returns Raft state"),
+        ))
+    }
+
+    /// Recover a replicated runtime while consuming an exclusive directory
+    /// guard already acquired by the physical server startup path.
+    ///
+    /// This permits bootstrap discovery and WAL recovery to occur under one
+    /// continuous process-ownership lifetime.
+    pub fn recover_shared_with_raft_with_lock(
+        data_dir: impl AsRef<Path>,
+        node_id: NodeId,
+        configurations: &BTreeMap<RaftReplicaIdentity, ConfState>,
+        data_directory_lock: DataDirectoryLock,
+    ) -> Result<(Self, RecoveryReport, RecoveredRaftStorage)> {
+        let (database, report, raft) = Self::recover_internal(
+            data_dir,
+            node_id,
+            Some(configurations),
+            Some(data_directory_lock),
+        )?;
+
         Ok((
             database,
             report,
@@ -182,6 +207,7 @@ impl LocalDatabase {
         data_dir: impl AsRef<Path>,
         node_id: NodeId,
         configurations: Option<&BTreeMap<RaftReplicaIdentity, ConfState>>,
+        preacquired_lock: Option<DataDirectoryLock>,
     ) -> Result<(Self, RecoveryReport, Option<RecoveredRaftStorage>)> {
         if node_id.0 == 0 {
             return Err(Error::Configuration(
@@ -202,7 +228,22 @@ impl LocalDatabase {
             ),
         })?;
 
-        let data_directory_lock = DataDirectoryLock::acquire(&data_dir)?;
+        let data_directory_lock = match preacquired_lock {
+            Some(lock) => {
+                if lock.data_dir() != data_dir.as_path() {
+                    return Err(Error::Configuration(format!(
+                        "pre-acquired data-directory lock protects {}, \
+                         but recovery requested {}",
+                        lock.data_dir().display(),
+                        data_dir.display(),
+                    )));
+                }
+
+                lock
+            }
+
+            None => DataDirectoryLock::acquire(&data_dir)?,
+        };
         let wal_dir = data_dir.join("wal");
 
         fs::create_dir_all(&wal_dir).map_err(|source| Error::RecoveryFailed {

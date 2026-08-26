@@ -8,6 +8,7 @@ use ragnordb_common::{codec::Value, ids::NodeId};
 use ragnordb_exec::{ExecutionResult, SqlSession};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
+    data_directory_lock::DataDirectoryLock,
     database::{LocalDatabase, SharedLocalDatabase},
     multiraft_runtime::MultiRaftRuntime,
 };
@@ -64,11 +65,16 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
             max_snapshot_file_bytes: 512 * 1024 * 1024,
             snapshot_chunk_bytes: 1024 * 1024,
         };
-        let configurations = MultiRaftRuntime::recovery_configurations(&config).unwrap();
-        let (database, _, recovered) = LocalDatabase::recover_shared_with_raft(
+        let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
+
+        let configurations =
+            MultiRaftRuntime::recovery_configurations(&config, &data_directory_lock).unwrap();
+
+        let (database, _, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
             &config.data_dir,
             config.node_id,
             &configurations,
+            data_directory_lock,
         )
         .unwrap();
         let wal = database.wal_handle().unwrap();

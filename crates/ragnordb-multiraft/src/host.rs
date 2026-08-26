@@ -74,8 +74,20 @@ pub enum HostedGroupError {
     #[error("the shared Raft WAL requires recovery")]
     RecoveryRequired,
 
+    /// The group crossed a correctness boundary and must not execute again
+    /// until process restart/recovery.
     #[error("hosted Raft group failed: {0}")]
     Group(String),
+
+    /// The operation was valid to attempt but could not complete now. The
+    /// group remains healthy and may retry its pending Ready lifecycle later.
+    #[error("hosted Raft group operation is retryable: {0}")]
+    Retryable(String),
+
+    /// The operation was rejected without damaging the group's runtime state,
+    /// such as proposing to a follower.
+    #[error("hosted Raft group rejected the operation: {0}")]
+    Rejected(String),
 }
 
 /// Concrete adapter that drives the existing Ready runtime and its application
@@ -149,20 +161,30 @@ where
     }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        // A previous retryable persistence operation may have left a Ready
+        // generation pending. Finish it before mutating Raft again.
+        let mut outbound = self.drain_ready()?;
+
         self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
 
-        self.drain_ready()
+        outbound.extend(self.drain_ready()?);
+
+        Ok(outbound)
     }
 
     fn step_and_drain(
         &mut self,
         message: RaftMessageEnvelope,
     ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        let mut outbound = self.drain_ready()?;
+
         self.ready_loop
             .step(message)
             .map_err(classify_ready_error)?;
 
-        self.drain_ready()
+        outbound.extend(self.drain_ready()?);
+
+        Ok(outbound)
     }
 
     fn propose_and_drain(
@@ -170,33 +192,49 @@ where
         command: Vec<u8>,
         encoded_len: usize,
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        let mut outbound = self.drain_ready()?;
+
         let index = self
             .ready_loop
             .propose(command, encoded_len)
             .map_err(classify_ready_error)?;
 
-        let outbound = self.drain_ready()?;
+        outbound.extend(self.drain_ready()?);
 
         Ok((index, outbound))
     }
 }
 
 fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
-    if matches!(error, ReadyLoopError::RecoveryRequired) {
-        HostedGroupError::RecoveryRequired
-    } else {
-        HostedGroupError::Group(error.to_string())
+    match error {
+        ReadyLoopError::RecoveryRequired => HostedGroupError::RecoveryRequired,
+
+        // A pending Ready or explicitly retryable persistence result does not
+        // prove corruption. Keep the group live so the Ready can be retried.
+        ReadyLoopError::PendingReady | ReadyLoopError::RetryablePersistence(_) => {
+            HostedGroupError::Retryable(error.to_string())
+        }
+
+        // Network/input/proposal rejection does not justify destroying the
+        // local replica lifetime.
+        ReadyLoopError::Proposal(_) | ReadyLoopError::Step(_) => {
+            HostedGroupError::Rejected(error.to_string())
+        }
+
+        // Everything else here represents either an already quarantined
+        // runtime or a host/persistence/application invariant violation.
+        other => HostedGroupError::Group(other.to_string()),
     }
 }
 
 fn classify_apply_error(error: ReadyApplyError) -> HostedGroupError {
-    if matches!(
-        error,
-        ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired)
-    ) {
-        HostedGroupError::RecoveryRequired
-    } else {
-        HostedGroupError::Group(error.to_string())
+    match error {
+        ReadyApplyError::Ready(error) => classify_ready_error(error),
+
+        // Snapshot verification/restoration, application, or committed-entry
+        // ordering errors occur after a durable consensus boundary and isolate
+        // this replica until restart/recovery.
+        other => HostedGroupError::Group(other.to_string()),
     }
 }
 
@@ -467,6 +505,30 @@ where
                     reason,
                 });
             }
+
+            Err(HostedGroupError::Retryable(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRetryable {
+                    raft_group_id,
+                    reason,
+                });
+            }
+
+            Err(HostedGroupError::Rejected(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRejected {
+                    raft_group_id,
+                    reason,
+                });
+            }
         };
 
         self.ensure_shared_wal_healthy()?;
@@ -537,6 +599,21 @@ where
 
                     // Continue ticking unrelated groups.
                 }
+
+                Err(HostedGroupError::Retryable(_) | HostedGroupError::Rejected(_)) => {
+                    // Neither outcome proves local group corruption. Shared
+                    // WAL uncertainty still upgrades any group-local-looking
+                    // error to a node-wide recovery fence.
+                    if self.node_wal.recovery_required() {
+                        self.state = HostState::RecoveryRequired;
+
+                        return Err(MultiRaftHostError::RecoveryRequired);
+                    }
+
+                    // Continue servicing unrelated groups. This group remains
+                    // registered and will retry its pending lifecycle on a
+                    // later host turn.
+                }
             }
         }
 
@@ -586,6 +663,30 @@ where
                 self.quarantined.insert(raft_group_id, reason.clone());
 
                 return Err(MultiRaftHostError::Group {
+                    raft_group_id,
+                    reason,
+                });
+            }
+
+            Err(HostedGroupError::Retryable(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRetryable {
+                    raft_group_id,
+                    reason,
+                });
+            }
+
+            Err(HostedGroupError::Rejected(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRejected {
                     raft_group_id,
                     reason,
                 });
@@ -665,6 +766,17 @@ pub enum MultiRaftHostError {
     RetentionRegistry(String),
     #[error("hosted Raft group {raft_group_id:?} failed: {reason}")]
     Group {
+        raft_group_id: RaftGroupId,
+        reason: String,
+    },
+    #[error("Raft group {raft_group_id:?} temporarily could not complete operation: {reason}")]
+    GroupRetryable {
+        raft_group_id: RaftGroupId,
+        reason: String,
+    },
+
+    #[error("Raft group {raft_group_id:?} rejected operation without failing: {reason}")]
+    GroupRejected {
         raft_group_id: RaftGroupId,
         reason: String,
     },

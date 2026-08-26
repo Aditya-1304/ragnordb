@@ -9,7 +9,8 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -66,6 +67,27 @@ pub struct NodeRaftEndpoint {
     pub local_addr: SocketAddr,
 }
 
+struct NodeRaftListenerLifecycle {
+    shutdown: Arc<AtomicBool>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for NodeRaftListenerLifecycle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Cloneable physical-node transport.
 ///
 /// `routes` is group-qualified because the same ReplicaId may legitimately
@@ -79,6 +101,10 @@ pub struct NodeRaftTransport {
 
     // Used for a rare local destination without unnecessarily entering TCP.
     loopback: Sender<RoutedRaftMessage>,
+
+    /// Keeps the one physical listener alive while any node/group transport
+    /// handle still exists and joins it when the final handle disappears.
+    _lifecycle: Arc<NodeRaftListenerLifecycle>,
 }
 
 impl NodeRaftTransport {
@@ -95,20 +121,34 @@ impl NodeRaftTransport {
         }
 
         let listener = TcpListener::bind(bind_addr)?;
+        listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
 
         let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
         let (inbound_tx, inbound_rx) = mpsc::channel();
 
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let worker = spawn_listener(
+            listener,
+            inbound_tx.clone(),
+            codec.clone(),
+            Arc::clone(&shutdown),
+        )?;
+
+        let lifecycle = Arc::new(NodeRaftListenerLifecycle {
+            shutdown,
+            worker: Mutex::new(Some(worker)),
+        });
+
         let transport = Self {
             local_node_id,
             node_addresses: Arc::new(node_addresses),
             routes: Arc::new(RwLock::new(BTreeMap::new())),
-            codec: codec.clone(),
-            loopback: inbound_tx.clone(),
+            codec,
+            loopback: inbound_tx,
+            _lifecycle: lifecycle,
         };
-
-        spawn_listener(listener, inbound_tx, codec);
 
         Ok(NodeRaftEndpoint {
             transport,
@@ -367,26 +407,50 @@ fn spawn_listener(
     listener: TcpListener,
     inbound: Sender<RoutedRaftMessage>,
     codec: ByteEnvelopeCodec,
-) {
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("ragnordb-multiraft-listener".to_string())
         .spawn(move || {
-            for connection in listener.incoming() {
-                let Ok(stream) = connection else {
-                    continue;
-                };
+            while !shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let inbound = inbound.clone();
+                        let codec = codec.clone();
 
-                let inbound = inbound.clone();
-                let codec = codec.clone();
+                        if let Err(error) = thread::Builder::new()
+                            .name("ragnordb-multiraft-connection".to_string())
+                            .spawn(move || {
+                                if let Err(error) = handle_connection(stream, inbound, codec) {
+                                    tracing::debug!(
+                                        error = %error,
+                                        "MultiRaft connection closed with error",
+                                    );
+                                }
+                            })
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "MultiRaft connection worker could not be created",
+                            );
+                        }
+                    }
 
-                let _ = thread::Builder::new()
-                    .name("ragnordb-multiraft-connection".to_string())
-                    .spawn(move || {
-                        let _ = handle_connection(stream, inbound, codec);
-                    });
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "MultiRaft listener accept failed",
+                        );
+
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                }
             }
         })
-        .expect("MultiRaft listener thread creation must succeed");
 }
 
 fn handle_connection(
@@ -395,6 +459,7 @@ fn handle_connection(
     codec: ByteEnvelopeCodec,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     loop {
         let Some(payload) = read_frame(&mut stream)? else {

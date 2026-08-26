@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use admin::AdminState;
 use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
+use data_directory_lock::DataDirectoryLock;
 use database::{LocalDatabase, SharedLocalDatabase};
 use multiraft_runtime::MultiRaftRuntime;
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
@@ -88,12 +89,21 @@ impl Server {
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let replicated = self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty();
         let (database, recovery_report, recovered_raft) = if replicated {
-            let configurations = MultiRaftRuntime::recovery_configurations(&self.config)?;
-            let (database, report, recovered) = LocalDatabase::recover_shared_with_raft(
+            // Acquire process ownership before touching any bootstrap or WAL
+            // state. The same guard is transferred into LocalDatabase and held
+            // for the entire live database lifetime.
+            let data_directory_lock = DataDirectoryLock::acquire(&data_dir)?;
+
+            let configurations =
+                MultiRaftRuntime::recovery_configurations(&self.config, &data_directory_lock)?;
+
+            let (database, report, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
                 &data_dir,
                 self.config.node_id,
                 &configurations,
+                data_directory_lock,
             )?;
+
             (database, report, Some(recovered))
         } else {
             let (database, report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;

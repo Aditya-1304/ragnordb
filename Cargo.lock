@@ -1573,6 +1573,7 @@ dependencies = [
  "ragnordb-tablet",
  "ragnordb-txn",
  "thiserror",
+ "tracing",
  "wal",
 ]
 

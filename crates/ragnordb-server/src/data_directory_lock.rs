@@ -7,7 +7,7 @@
 
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use ragnordb_common::{Error, Result};
@@ -24,6 +24,7 @@ pub const DATA_DIRECTORY_LOCK_FILE: &str = ".ragnordb.lock";
 #[must_use = "dropping the guard releases exclusive data-directory ownership"]
 #[derive(Debug)]
 pub struct DataDirectoryLock {
+    data_dir: PathBuf,
     _file: File,
 }
 
@@ -55,7 +56,10 @@ impl DataDirectoryLock {
             })?;
 
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self {
+                data_dir: data_dir.to_path_buf(),
+                _file: file,
+            }),
 
             Err(TryLockError::WouldBlock) => Err(Error::Configuration(format!(
                 "data directory {} is already owned by another RagnorDB process; \
@@ -68,5 +72,10 @@ impl DataDirectoryLock {
                 lock_path.display()
             ))),
         }
+    }
+
+    /// Directory whose mutable storage lifetime is protected by this guard.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 }

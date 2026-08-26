@@ -1,3 +1,5 @@
+#![allow(clippy::unit_arg)]
+
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use ragnordb_common::{
     codec::{Row, Value, WriteKind},

@@ -71,7 +71,7 @@ use wal::{io::directory::FsSegmentDirectory, lsn::Lsn, wal::WalHandle};
 use crate::{
     config::NodeConfig,
     database::SharedLocalDatabase,
-    snapshot_transport::{ReceivedTabletSnapshot, SnapshotEndpoint},
+    snapshot_transport::{GroupSnapshotEndpoint, ReceivedTabletSnapshot},
 };
 
 pub(crate) const TABLET_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(1);
@@ -425,6 +425,9 @@ impl ReplicatedTabletRuntime {
         bootstrap: RaftGroupBootstrap,
         group_wal: NodeRaftWalHandle<LocalWal>,
         transport: GroupRaftTransport,
+        snapshot_store: Arc<FileTabletSnapshotStore>,
+        snapshot_work: SnapshotWorkController,
+        snapshot_endpoint: GroupSnapshotEndpoint,
         recovered: &RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -441,14 +444,6 @@ impl ReplicatedTabletRuntime {
                 ),
             });
         }
-
-        let local_seed = config
-            .seed_nodes
-            .iter()
-            .find(|seed| seed.id == config.node_id)
-            .ok_or_else(|| {
-                Error::Configuration("local node must appear in seed_nodes".to_string())
-            })?;
 
         let local_replica_id = bootstrap.replica_on_node(config.node_id).ok_or_else(|| {
             Error::Configuration(format!(
@@ -481,16 +476,6 @@ impl ReplicatedTabletRuntime {
                 },
             )?;
 
-        let snapshot_store = Arc::new(
-            FileTabletSnapshotStore::new(
-                config.data_dir.join("tablet-snapshots"),
-                config.max_snapshot_file_bytes,
-            )
-            .map_err(|source| Error::RecoveryFailed {
-                reason: source.to_string(),
-            })?,
-        );
-
         let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
 
         let (host_control_tx, host_control_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -498,25 +483,6 @@ impl ReplicatedTabletRuntime {
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
 
         let shutdown = Arc::new(AtomicBool::new(false));
-
-        let snapshot_peers = config
-            .seed_nodes
-            .iter()
-            .filter(|seed| seed.id != config.node_id)
-            .map(|seed| (seed.id.0, seed.snapshot_addr))
-            .collect();
-
-        let snapshot_work = SnapshotWorkController::default();
-
-        let snapshot_endpoint = SnapshotEndpoint::bind(
-            local_seed.snapshot_addr,
-            snapshot_peers,
-            snapshot_store.clone(),
-            snapshot_work.clone(),
-            config.snapshot_chunk_bytes,
-            shutdown.clone(),
-        )
-        .map_err(|source| Error::Configuration(format!("bind snapshot endpoint: {source}")))?;
 
         let snapshot_policy = SnapshotPolicy {
             interval_entries: config.snapshot_interval_entries,
@@ -746,7 +712,7 @@ fn spawn_ready_owner<W, LS, SS>(
     start_gate: Arc<AtomicBool>,
     snapshot_store: Arc<FileTabletSnapshotStore>,
     snapshot_work: SnapshotWorkController,
-    snapshot_endpoint: SnapshotEndpoint,
+    snapshot_endpoint: GroupSnapshotEndpoint,
     cluster_id: String,
     catalog_cache: Arc<dyn CatalogCacheWriter>,
     snapshot_policy: SnapshotPolicy,
@@ -802,7 +768,7 @@ fn run_ready_owner<W, LS, SS>(
     start_gate: Arc<AtomicBool>,
     snapshot_store: Arc<FileTabletSnapshotStore>,
     snapshot_work: SnapshotWorkController,
-    snapshot_endpoint: SnapshotEndpoint,
+    snapshot_endpoint: GroupSnapshotEndpoint,
     cluster_id: String,
     catalog_cache: Arc<dyn CatalogCacheWriter>,
     snapshot_policy: SnapshotPolicy,
@@ -857,7 +823,24 @@ where
                 RaftHostControl::Tick { ticks, reply } => {
                     let result = ready_loop
                         .tick(ticks)
-                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .map_err(|error| match error {
+                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
+                                HostedGroupError::RecoveryRequired
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_) => {
+                                HostedGroupError::Rejected(error.to_string())
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
+                                _,
+                            )
+                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
+                                HostedGroupError::Retryable(error.to_string())
+                            }
+
+                            other => HostedGroupError::Group(other.to_string()),
+                        })
                         .and_then(|_| {
                             drain_ready(
                                 &mut ready_loop,
@@ -891,7 +874,25 @@ where
 
                     let result = ready_loop
                         .step(message)
-                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .map_err(|error| match error {
+                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
+                                HostedGroupError::RecoveryRequired
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_)
+                            | ragnordb_multiraft::runtime::ReadyLoopError::Step(_) => {
+                                HostedGroupError::Rejected(error.to_string())
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
+                                _,
+                            )
+                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
+                                HostedGroupError::Retryable(error.to_string())
+                            }
+
+                            other => HostedGroupError::Group(other.to_string()),
+                        })
                         .and_then(|_| {
                             drain_ready(
                                 &mut ready_loop,
@@ -925,7 +926,24 @@ where
                 } => {
                     let result = ready_loop
                         .propose(command, encoded_len)
-                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .map_err(|error| match error {
+                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
+                                HostedGroupError::RecoveryRequired
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_) => {
+                                HostedGroupError::Rejected(error.to_string())
+                            }
+
+                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
+                                _,
+                            )
+                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
+                                HostedGroupError::Retryable(error.to_string())
+                            }
+
+                            other => HostedGroupError::Group(other.to_string()),
+                        })
                         .and_then(|index| {
                             drain_ready(
                                 &mut ready_loop,
@@ -1286,7 +1304,7 @@ fn refresh_leader_activation<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
-    snapshot_endpoint: &SnapshotEndpoint,
+    snapshot_endpoint: &GroupSnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
@@ -1345,7 +1363,7 @@ fn maybe_publish_snapshot<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
-    snapshot_endpoint: &SnapshotEndpoint,
+    snapshot_endpoint: &GroupSnapshotEndpoint,
     store: &FileTabletSnapshotStore,
     work: &SnapshotWorkController,
     cluster_id: &str,
@@ -1430,7 +1448,7 @@ fn install_received_snapshot<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
-    snapshot_endpoint: &SnapshotEndpoint,
+    snapshot_endpoint: &GroupSnapshotEndpoint,
     store: &FileTabletSnapshotStore,
     work: &SnapshotWorkController,
     cluster_id: &str,
@@ -1703,7 +1721,7 @@ fn drain_ready<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
-    snapshot_endpoint: &SnapshotEndpoint,
+    snapshot_endpoint: &GroupSnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
@@ -1762,7 +1780,7 @@ where
 
 fn send_messages(
     transport: &GroupRaftTransport,
-    snapshot_endpoint: &SnapshotEndpoint,
+    snapshot_endpoint: &GroupSnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
 ) {
@@ -1785,13 +1803,26 @@ fn send_messages(
 
         if carries_snapshot && let Some(image) = latest_snapshot.clone() {
             match target_node {
-                Ok(node_id) => snapshot_endpoint.send(node_id.0, image),
-                Err(source) => warn!(
-                    group_id = transport.raft_group_id().0,
-                    replica_id = target_replica.0,
-                    error = %source,
-                    "snapshot peer node could not be resolved",
-                ),
+                Ok(node_id) => {
+                    if let Err(source) = snapshot_endpoint.send(node_id, target_replica, image) {
+                        warn!(
+                            group_id = transport.raft_group_id().0,
+                            node_id = node_id.0,
+                            replica_id = target_replica.0,
+                            error = %source,
+                            "tablet snapshot could not be scheduled for transfer",
+                        );
+                    }
+                }
+
+                Err(source) => {
+                    warn!(
+                        group_id = transport.raft_group_id().0,
+                        replica_id = target_replica.0,
+                        error = %source,
+                        "snapshot peer node could not be resolved",
+                    );
+                }
             }
         }
     }
