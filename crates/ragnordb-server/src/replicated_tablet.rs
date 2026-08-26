@@ -138,6 +138,22 @@ enum RaftHostControl {
     },
 }
 
+/// Return a terminal runtime reason only for errors that cross a correctness
+/// boundary.
+///
+/// `Rejected` and `Retryable` are operation outcomes, not replica-lifetime
+/// failures. Killing the Ready owner for either one would turn an ordinary
+/// rejection into a permanent group quarantine on the next host interaction.
+fn fatal_host_control_reason<T>(
+    result: &std::result::Result<T, HostedGroupError>,
+) -> Option<String> {
+    match result {
+        Err(error @ HostedGroupError::RecoveryRequired) => Some(error.to_string()),
+        Err(error @ HostedGroupError::Group(_)) => Some(error.to_string()),
+        Ok(_) | Err(HostedGroupError::Retryable(_)) | Err(HostedGroupError::Rejected(_)) => None,
+    }
+}
+
 enum ClientReply {
     Commit(mpsc::Sender<Result<DurableWalExtent>>),
     Catalog(mpsc::Sender<Result<CatalogLogExtent>>),
@@ -856,14 +872,10 @@ where
                             .map_err(HostedGroupError::Group)
                         });
 
-                    let failed = result.is_err();
-                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
-
-                    if failed {
-                        return Err(
-                            reason.unwrap_or_else(|| "tablet group tick failed".to_string())
-                        );
+                    if let Some(reason) = fatal_reason {
+                        return Err(reason);
                     }
                 }
 
@@ -908,14 +920,10 @@ where
                             .map_err(HostedGroupError::Group)
                         });
 
-                    let failed = result.is_err();
-                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
-
-                    if failed {
-                        return Err(
-                            reason.unwrap_or_else(|| "tablet group step failed".to_string())
-                        );
+                    if let Some(reason) = fatal_reason {
+                        return Err(reason);
                     }
                 }
 
@@ -961,14 +969,10 @@ where
                             Ok(index)
                         });
 
-                    let failed = result.is_err();
-                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
-
-                    if failed {
-                        return Err(
-                            reason.unwrap_or_else(|| "tablet group proposal failed".to_string())
-                        );
+                    if let Some(reason) = fatal_reason {
+                        return Err(reason);
                     }
                 }
             }
@@ -2070,5 +2074,47 @@ mod tests {
         assert_ne!(new_term.client_id, old_term.client_id);
         assert_eq!(new_term.client_id, internal_barrier_client_id(8));
         assert_eq!(new_term.sequence, 1);
+    }
+
+    #[test]
+    fn rejected_and_retryable_host_operations_do_not_require_worker_shutdown() {
+        let rejected: std::result::Result<(), HostedGroupError> =
+            Err(HostedGroupError::Rejected("not leader".to_string()));
+
+        let retryable: std::result::Result<(), HostedGroupError> = Err(
+            HostedGroupError::Retryable("persistence temporarily unavailable".to_string()),
+        );
+
+        assert_eq!(
+            fatal_host_control_reason(&rejected),
+            None,
+            "ordinary rejection must not terminate the Ready owner",
+        );
+
+        assert_eq!(
+            fatal_host_control_reason(&retryable),
+            None,
+            "retryable failure must not terminate the Ready owner",
+        );
+    }
+
+    #[test]
+    fn correctness_failures_require_worker_shutdown() {
+        let group_failure: std::result::Result<(), HostedGroupError> = Err(
+            HostedGroupError::Group("state-machine apply failed".to_string()),
+        );
+
+        let recovery_required: std::result::Result<(), HostedGroupError> =
+            Err(HostedGroupError::RecoveryRequired);
+
+        assert!(
+            fatal_host_control_reason(&group_failure).is_some(),
+            "group-local correctness failure must terminate this Ready owner",
+        );
+
+        assert!(
+            fatal_host_control_reason(&recovery_required).is_some(),
+            "shared-WAL uncertainty must terminate this Ready owner",
+        );
     }
 }
