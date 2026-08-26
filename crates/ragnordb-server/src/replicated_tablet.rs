@@ -154,6 +154,25 @@ fn fatal_host_control_reason<T>(
     }
 }
 
+fn classify_ready_loop_error(
+    error: ragnordb_multiraft::runtime::ReadyLoopError,
+) -> HostedGroupError {
+    match error {
+        ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
+            HostedGroupError::RecoveryRequired
+        }
+        ragnordb_multiraft::runtime::ReadyLoopError::PendingReady
+        | ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(_) => {
+            HostedGroupError::Retryable(error.to_string())
+        }
+        ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_)
+        | ragnordb_multiraft::runtime::ReadyLoopError::Step(_) => {
+            HostedGroupError::Rejected(error.to_string())
+        }
+        other => HostedGroupError::Group(other.to_string()),
+    }
+}
+
 enum ClientReply {
     Commit(mpsc::Sender<Result<DurableWalExtent>>),
     Catalog(mpsc::Sender<Result<CatalogLogExtent>>),
@@ -837,40 +856,33 @@ where
         while let Ok(control) = host_control.try_recv() {
             match control {
                 RaftHostControl::Tick { ticks, reply } => {
-                    let result = ready_loop
-                        .tick(ticks)
-                        .map_err(|error| match error {
-                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
-                                HostedGroupError::RecoveryRequired
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_) => {
-                                HostedGroupError::Rejected(error.to_string())
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
-                                _,
-                            )
-                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
-                                HostedGroupError::Retryable(error.to_string())
-                            }
-
-                            other => HostedGroupError::Group(other.to_string()),
-                        })
-                        .and_then(|_| {
-                            drain_ready(
-                                &mut ready_loop,
-                                &mut tablet,
-                                &mut registry,
-                                &database,
-                                &transport,
-                                &snapshot_endpoint,
-                                &latest_snapshot,
-                                catalog_cache.as_ref(),
-                                &snapshot_policy,
-                            )
-                            .map_err(HostedGroupError::Group)
-                        });
+                    let result: std::result::Result<(), HostedGroupError> = (|| {
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        ready_loop.tick(ticks).map_err(classify_ready_loop_error)?;
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        Ok(())
+                    })(
+                    );
 
                     let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
@@ -884,41 +896,35 @@ where
                         snapshot_install_pending = true;
                     }
 
-                    let result = ready_loop
-                        .step(message)
-                        .map_err(|error| match error {
-                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
-                                HostedGroupError::RecoveryRequired
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_)
-                            | ragnordb_multiraft::runtime::ReadyLoopError::Step(_) => {
-                                HostedGroupError::Rejected(error.to_string())
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
-                                _,
-                            )
-                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
-                                HostedGroupError::Retryable(error.to_string())
-                            }
-
-                            other => HostedGroupError::Group(other.to_string()),
-                        })
-                        .and_then(|_| {
-                            drain_ready(
-                                &mut ready_loop,
-                                &mut tablet,
-                                &mut registry,
-                                &database,
-                                &transport,
-                                &snapshot_endpoint,
-                                &latest_snapshot,
-                                catalog_cache.as_ref(),
-                                &snapshot_policy,
-                            )
-                            .map_err(HostedGroupError::Group)
-                        });
+                    let result: std::result::Result<(), HostedGroupError> = (|| {
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        ready_loop
+                            .step(message)
+                            .map_err(classify_ready_loop_error)?;
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        Ok(())
+                    })(
+                    );
 
                     let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
@@ -932,42 +938,35 @@ where
                     encoded_len,
                     reply,
                 } => {
-                    let result = ready_loop
-                        .propose(command, encoded_len)
-                        .map_err(|error| match error {
-                            ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
-                                HostedGroupError::RecoveryRequired
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_) => {
-                                HostedGroupError::Rejected(error.to_string())
-                            }
-
-                            ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
-                                _,
-                            )
-                            | ragnordb_multiraft::runtime::ReadyLoopError::PendingReady => {
-                                HostedGroupError::Retryable(error.to_string())
-                            }
-
-                            other => HostedGroupError::Group(other.to_string()),
-                        })
-                        .and_then(|index| {
-                            drain_ready(
-                                &mut ready_loop,
-                                &mut tablet,
-                                &mut registry,
-                                &database,
-                                &transport,
-                                &snapshot_endpoint,
-                                &latest_snapshot,
-                                catalog_cache.as_ref(),
-                                &snapshot_policy,
-                            )
-                            .map_err(HostedGroupError::Group)?;
-
-                            Ok(index)
-                        });
+                    let result: std::result::Result<LogIndex, HostedGroupError> = (|| {
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        let index = ready_loop
+                            .propose(command, encoded_len)
+                            .map_err(classify_ready_loop_error)?;
+                        drain_ready(
+                            &mut ready_loop,
+                            &mut tablet,
+                            &mut registry,
+                            &database,
+                            &transport,
+                            &snapshot_endpoint,
+                            &latest_snapshot,
+                            catalog_cache.as_ref(),
+                            &snapshot_policy,
+                        )?;
+                        Ok(index)
+                    })(
+                    );
 
                     let fatal_reason = fatal_host_control_reason(&result);
                     let _ = reply.send(result);
@@ -1005,7 +1004,7 @@ where
                 .unwrap_or(last_snapshot_index);
         }
 
-        refresh_leader_activation(
+        match refresh_leader_activation(
             &mut ready_loop,
             &mut tablet,
             &mut registry,
@@ -1017,7 +1016,16 @@ where
             &snapshot_policy,
             &mut leader_activation,
             &mut internal_barrier_allocator,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(HostedGroupError::Retryable(error)) | Err(HostedGroupError::Rejected(error)) => {
+                tracing::debug!(
+                    error = %error,
+                    "leader activation refresh is retryable; will retry on next turn"
+                );
+            }
+            Err(error) => return Err(error.to_string()),
+        }
         let serving_leader = leader_activation.is_some_and(|activation| {
             ready_loop
                 .applied_frontier()
@@ -1034,7 +1042,7 @@ where
                 serving_leader,
                 &mut internal_barrier_allocator,
             );
-            drain_ready(
+            match drain_ready(
                 &mut ready_loop,
                 &mut tablet,
                 &mut registry,
@@ -1044,7 +1052,18 @@ where
                 &latest_snapshot,
                 catalog_cache.as_ref(),
                 &snapshot_policy,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(HostedGroupError::Retryable(error))
+                | Err(HostedGroupError::Rejected(error)) => {
+                    tracing::debug!(
+                        error = %error,
+                        "drain after client admit is retryable; will retry pending Ready"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
 
         let now = Instant::now();
@@ -1065,7 +1084,7 @@ where
                         .is_some_and(|frontier| frontier.index >= activation.index)
             });
         if serving_leader {
-            maybe_publish_snapshot(
+            match maybe_publish_snapshot(
                 &mut ready_loop,
                 &mut tablet,
                 &mut registry,
@@ -1080,7 +1099,17 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
                 &mut last_snapshot_at,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(HostedGroupError::Retryable(error))
+                | Err(HostedGroupError::Rejected(error)) => {
+                    tracing::debug!(
+                        error = %error,
+                        "snapshot publication drain is retryable; will retry"
+                    );
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
         publish_status(
             &ready_loop,
@@ -1314,7 +1343,7 @@ fn refresh_leader_activation<W, LS, SS>(
     snapshot_policy: &SnapshotPolicy,
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
     internal_barrier_allocator: &mut InternalBarrierAllocator,
-) -> std::result::Result<(), String>
+) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -1331,20 +1360,34 @@ where
         return Ok(());
     }
 
+    drain_ready(
+        ready_loop,
+        tablet,
+        registry,
+        database,
+        transport,
+        snapshot_endpoint,
+        latest_snapshot,
+        catalog_cache,
+        snapshot_policy,
+    )?;
+
     let request_id = internal_barrier_allocator
         .candidate(term, tablet)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let envelope = TabletCommandEnvelope::new(
         request_id.clone(),
         TABLET_ID,
         TABLET_EPOCH,
         TabletCommand::Noop(NoopCommand),
     )
-    .map_err(|error| error.to_string())?;
-    let bytes = envelope.encode().map_err(|error| error.to_string())?;
+    .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    let bytes = envelope
+        .encode()
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let index = ready_loop
         .propose(bytes.clone(), bytes.len())
-        .map_err(|error| error.to_string())?;
+        .map_err(classify_ready_loop_error)?;
     internal_barrier_allocator.record_admission(request_id.sequence);
     *activation = Some(ragnordb_multiraft::proposal::ProposalPosition { term, index });
     drain_ready(
@@ -1376,7 +1419,7 @@ fn maybe_publish_snapshot<W, LS, SS>(
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
     last_snapshot_at: &mut Instant,
-) -> std::result::Result<(), String>
+) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -1389,11 +1432,24 @@ where
         return Ok(());
     }
 
+    drain_ready(
+        ready_loop,
+        tablet,
+        registry,
+        database,
+        transport,
+        snapshot_endpoint,
+        latest_snapshot,
+        catalog_cache,
+        snapshot_policy,
+    )?;
+
     let local_replica_id = ReplicaId(ready_loop.raft().id().get());
-    let conf_state = tablet_snapshot_conf_state(ready_loop.raft().conf_state())?;
+    let conf_state = tablet_snapshot_conf_state(ready_loop.raft().conf_state())
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let snapshot_id = store
         .allocate_snapshot_id(TABLET_RAFT_GROUP_ID, local_replica_id, TABLET_ID)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let image = generate_tablet_snapshot_from_ready_loop(
         work,
         ready_loop,
@@ -1403,24 +1459,26 @@ where
         snapshot_id,
         conf_state,
     )
-    .map_err(|error| error.to_string())?;
-    let pointer = store.publish(&image).map_err(|error| error.to_string())?;
+    .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    let pointer = store
+        .publish(&image)
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let identity = ready_loop.persistence().log_view().identity();
-    let raft_pointer =
-        raft_pointer_for_tablet(identity, &pointer).map_err(|error| error.to_string())?;
+    let raft_pointer = raft_pointer_for_tablet(identity, &pointer)
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     persist_tablet_snapshot_boundary_via_ready_loop(
         ready_loop,
         &pointer,
         AppliedTabletFrontier::new(frontier.index, frontier.term),
         ready_loop.raft().hard_state(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let core_snapshot = TabletSnapshotTransfer::from_image(image.clone())
-        .map_err(|error| error.to_string())?
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?
         .into_core_snapshot();
     ready_loop
         .restore_persisted_snapshot(&raft_pointer, core_snapshot)
-        .map_err(|error| error.to_string())?;
+        .map_err(classify_ready_loop_error)?;
 
     *last_snapshot_index = frontier.index;
     *last_snapshot_at = Instant::now();
@@ -1437,10 +1495,11 @@ where
         catalog_cache,
         snapshot_policy,
     )?;
-    release_replica_retention(ready_loop)?;
+    release_replica_retention(ready_loop)
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     store
         .prune_older_snapshots(&pointer)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     Ok(())
 }
 
@@ -1729,7 +1788,7 @@ fn drain_ready<W, LS, SS>(
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
-) -> std::result::Result<(), String>
+) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -1737,7 +1796,7 @@ where
 {
     while let Some(ready) = ready_loop
         .persist_next_ready(None)
-        .map_err(|error| error.to_string())?
+        .map_err(classify_ready_loop_error)?
     {
         let mut frontier = None;
         for entry in &ready.committed_entries {
@@ -1745,8 +1804,8 @@ where
             let EntryPayload::Normal(bytes) = &entry.payload else {
                 continue;
             };
-            let envelope =
-                TabletCommandEnvelope::decode(bytes).map_err(|error| error.to_string())?;
+            let envelope = TabletCommandEnvelope::decode(bytes)
+                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
             let locally_proposed = registry.is_pending(&envelope.request_id);
             let disposition = tablet
                 .apply_committed(
@@ -1756,7 +1815,7 @@ where
                     },
                     bytes,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
             snapshot_policy.note_applied(bytes.len());
             publish_committed_command(
                 &envelope,
@@ -1765,12 +1824,13 @@ where
                 registry,
                 database,
                 catalog_cache,
-            )?;
+            )
+            .map_err(HostedGroupError::Group)?;
         }
         if let Some(frontier) = frontier {
             ready_loop
                 .advance_applied_frontier(frontier)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
         }
         send_messages(
             transport,
@@ -2115,6 +2175,35 @@ mod tests {
         assert!(
             fatal_host_control_reason(&recovery_required).is_some(),
             "shared-WAL uncertainty must terminate this Ready owner",
+        );
+    }
+
+    #[test]
+    fn retryable_persistence_is_classified_as_retryable() {
+        let error = ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(
+            ragnordb_multiraft::storage::persistence::RaftPersistenceError::NotStaged {
+                recovery_required: false,
+                reason: "injected retryable".to_string(),
+            },
+        );
+        assert!(
+            matches!(
+                classify_ready_loop_error(error),
+                HostedGroupError::Retryable(_)
+            ),
+            "RetryablePersistence with recovery_required=false must be Retryable",
+        );
+    }
+
+    #[test]
+    fn pending_ready_is_classified_as_retryable() {
+        let error = ragnordb_multiraft::runtime::ReadyLoopError::PendingReady;
+        assert!(
+            matches!(
+                classify_ready_loop_error(error),
+                HostedGroupError::Retryable(_)
+            ),
+            "PendingReady must be Retryable to allow pending Ready retry",
         );
     }
 }
