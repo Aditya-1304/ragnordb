@@ -270,3 +270,67 @@ fn filesystem_bootstrap_store_cleans_abandoned_temporary_files_on_open() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+/// Realistic bug caught: restart only recovers groups named by current static
+/// configuration and silently ignores another authoritative on-disk group.
+#[test]
+fn filesystem_store_discovers_every_durable_group() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "ragnordb-bootstrap-discovery-{}-{unique}",
+        process::id()
+    ));
+    let mut store = FileBootstrapStore::open(&directory).unwrap();
+
+    let mut group_10 = bootstrap();
+    group_10.raft_group_id = RaftGroupId(10);
+    let mut group_20 = bootstrap();
+    group_20.raft_group_id = RaftGroupId(20);
+
+    bootstrap_group_exactly_once(&mut store, &group_10).unwrap();
+    bootstrap_group_exactly_once(&mut store, &group_20).unwrap();
+    drop(store);
+
+    let reopened = FileBootstrapStore::open(&directory).unwrap();
+    let recovered = reopened.load_all_durable_bootstraps().unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert!(recovered.contains_key(&RaftGroupId(10)));
+    assert!(recovered.contains_key(&RaftGroupId(20)));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// Realistic bug caught: a renamed or misplaced authoritative bootstrap is
+/// accepted under the wrong transport namespace during restart.
+#[test]
+fn filesystem_discovery_rejects_filename_record_identity_mismatch() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "ragnordb-bootstrap-identity-{}-{unique}",
+        process::id()
+    ));
+    let store = FileBootstrapStore::open(&directory).unwrap();
+    let mut group_20 = bootstrap();
+    group_20.raft_group_id = RaftGroupId(20);
+    fs::write(
+        directory.join("raft-group-10.bootstrap"),
+        group_20.encode().unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.load_all_durable_bootstraps().unwrap_err(),
+        BootstrapGroupError::FileIdentityMismatch {
+            filename_group_id: RaftGroupId(10),
+            record_group_id: RaftGroupId(20),
+        }
+    ));
+
+    fs::remove_dir_all(directory).unwrap();
+}

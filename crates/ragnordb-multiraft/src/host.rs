@@ -19,7 +19,7 @@ use crate::{
     },
     storage::{
         codec::RaftReplicaIdentity,
-        persistence::{NodeRaftWal, RaftWal},
+        persistence::{NodeRaftWal, NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
 };
@@ -46,41 +46,26 @@ pub struct HostedProposal {
     pub outbound: Vec<RoutedRaftMessage>,
 }
 
-/// The node-wide A-WAL health boundary observed by every hosted group.
-///
-/// An uncertain shared-WAL operation has no group-local recovery proof. The
-/// host therefore checks this state before it routes, ticks, proposes, or
-/// drains any group, rather than allowing another group to continue serving.
-pub trait SharedWalHealth {
-    fn recovery_required(&self) -> bool;
-    fn seal_retention_registry(&self) -> Result<(), String>;
-}
-
-impl<W> SharedWalHealth for NodeRaftWal<W> {
-    fn recovery_required(&self) -> bool {
-        Self::recovery_required(self)
-    }
-
-    fn seal_retention_registry(&self) -> Result<(), String> {
-        Self::seal_retention_registry(self)
-    }
-}
-
 /// Type-erased lifecycle boundary for one hosted Raft replica.
 ///
-/// Erasure permits a single physical node to host groups backed by different
-/// state-machine and snapshot-store implementations without weakening the
-/// per-group Ready-loop ordering contract.
-pub trait HostedRaftGroup {
+/// A single call performs the triggering Raft operation and drains the
+/// resulting Ready lifecycle before returning. This prevents another caller
+/// from interleaving work between `step()` and persistence/apply.
+pub trait HostedRaftGroup: Send {
     fn identity(&self) -> RaftReplicaIdentity;
-    fn tick(&mut self, ticks: u64) -> Result<(), HostedGroupError>;
-    fn step(&mut self, message: RaftMessageEnvelope) -> Result<(), HostedGroupError>;
-    fn propose(
+
+    fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError>;
+
+    fn step_and_drain(
+        &mut self,
+        message: RaftMessageEnvelope,
+    ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError>;
+
+    fn propose_and_drain(
         &mut self,
         command: Vec<u8>,
         encoded_len: usize,
-    ) -> Result<LogIndex, HostedGroupError>;
-    fn persist_and_apply(&mut self) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError>;
+    ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError>;
 }
 
 /// Error reported by an individual hosted group.
@@ -131,43 +116,68 @@ where
     pub fn ready_loop(&self) -> &RaftReadyLoop<W, LS, SS> {
         &self.ready_loop
     }
+
+    fn drain_ready(&mut self) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        let mut outbound = Vec::new();
+
+        loop {
+            match self
+                .ready_loop
+                .persist_and_apply_next_ready(&mut self.snapshot_store, &mut self.state_machine)
+                .map_err(classify_apply_error)?
+            {
+                Some(ready) => {
+                    outbound.extend(ready.messages);
+                }
+
+                None => return Ok(outbound),
+            }
+        }
+    }
 }
 
 impl<W, LS, SS, SM, SF> HostedRaftGroup for ReadyLoopHostedGroup<W, LS, SS, SM, SF>
 where
-    W: RaftWal,
-    LS: LogStore<Vec<u8>>,
-    SS: StableStore,
-    SM: RaftReadyStateMachine,
-    SF: RaftSnapshotStore,
+    W: RaftWal + Send,
+    LS: LogStore<Vec<u8>> + Send,
+    SS: StableStore + Send,
+    SM: RaftReadyStateMachine + Send,
+    SF: RaftSnapshotStore + Send,
 {
     fn identity(&self) -> RaftReplicaIdentity {
         self.ready_loop.persistence().log_view().identity()
     }
 
-    fn tick(&mut self, ticks: u64) -> Result<(), HostedGroupError> {
-        self.ready_loop.tick(ticks).map_err(classify_ready_error)
+    fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
+
+        self.drain_ready()
     }
 
-    fn step(&mut self, message: RaftMessageEnvelope) -> Result<(), HostedGroupError> {
-        self.ready_loop.step(message).map_err(classify_ready_error)
+    fn step_and_drain(
+        &mut self,
+        message: RaftMessageEnvelope,
+    ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        self.ready_loop
+            .step(message)
+            .map_err(classify_ready_error)?;
+
+        self.drain_ready()
     }
 
-    fn propose(
+    fn propose_and_drain(
         &mut self,
         command: Vec<u8>,
         encoded_len: usize,
-    ) -> Result<LogIndex, HostedGroupError> {
-        self.ready_loop
+    ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        let index = self
+            .ready_loop
             .propose(command, encoded_len)
-            .map_err(classify_ready_error)
-    }
+            .map_err(classify_ready_error)?;
 
-    fn persist_and_apply(&mut self) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-        self.ready_loop
-            .persist_and_apply_next_ready(&mut self.snapshot_store, &mut self.state_machine)
-            .map_err(classify_apply_error)
-            .map(|ready| ready.map_or_else(Vec::new, |ready| ready.messages))
+        let outbound = self.drain_ready()?;
+
+        Ok((index, outbound))
     }
 }
 
@@ -203,44 +213,89 @@ enum HostState {
 /// caller must obtain each group's writer through `NodeRaftWal::group_writer_for`
 /// before activation; activation seals that registration so retention always
 /// considers every replica represented in the shared WAL.
-pub struct MultiRaftHost {
+pub struct MultiRaftHost<W>
+where
+    W: RaftWal,
+{
     node_id: NodeId,
-    wal_health: Box<dyn SharedWalHealth>,
+
+    /// The one physical Raft persistence authority for this node.
+    node_wal: NodeRaftWal<W>,
+
     state: HostState,
+
     groups: BTreeMap<RaftGroupId, Box<dyn HostedRaftGroup>>,
+
+    /// Durable identities discovered by the one shared-WAL scan which have
+    /// not yet been accounted for by startup reconstruction.
     pending_recovered: BTreeSet<RaftReplicaIdentity>,
+
+    /// Identities for which this host issued an identity-bound writer.
+    ///
+    /// A hosted group cannot be registered without first obtaining its WAL
+    /// handle from the same NodeRaftWal owned by this host.
+    issued_writers: BTreeSet<RaftReplicaIdentity>,
+
+    /// Permanently isolated groups for this process lifetime.
+    ///
+    /// Group-local corruption/apply/snapshot failures do not stop unrelated
+    /// Raft groups. Shared-WAL uncertainty still moves the entire host into
+    /// RecoveryRequired.
+    quarantined: BTreeMap<RaftGroupId, String>,
 }
 
-impl MultiRaftHost {
-    pub fn new(node_id: NodeId, wal_health: Box<dyn SharedWalHealth>) -> Self {
+impl<W> MultiRaftHost<W>
+where
+    W: RaftWal,
+{
+    pub fn new(node_id: NodeId, node_wal: NodeRaftWal<W>) -> Self {
         Self {
             node_id,
-            wal_health,
+            node_wal,
             state: HostState::Registering,
             groups: BTreeMap::new(),
             pending_recovered: BTreeSet::new(),
+            issued_writers: BTreeSet::new(),
+            quarantined: BTreeMap::new(),
         }
     }
 
-    /// Creates a host whose startup barrier covers every identity discovered by
-    /// the single shared-WAL recovery scan.
     pub fn from_recovered(
         node_id: NodeId,
-        wal_health: Box<dyn SharedWalHealth>,
+        node_wal: NodeRaftWal<W>,
         recovered: &RecoveredRaftStorage,
     ) -> Self {
-        Self::with_recovered_identities(
+        Self {
             node_id,
-            wal_health,
-            recovered.replicas().map(|(identity, _)| *identity),
-        )
+            node_wal,
+            state: HostState::Registering,
+            groups: BTreeMap::new(),
+            pending_recovered: recovered
+                .replicas()
+                .map(|(identity, _)| *identity)
+                .collect(),
+            issued_writers: BTreeSet::new(),
+            quarantined: BTreeMap::new(),
+        }
     }
 
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
+
+    /// Clone the node-wide WAL authority.
+    ///
+    /// Clones share the same physical persistence state and recovery fence.
+    pub fn node_wal(&self) -> NodeRaftWal<W> {
+        self.node_wal.clone()
+    }
+
     pub fn group_count(&self) -> usize {
         self.groups.len()
+    }
+
+    pub fn group_failure(&self, raft_group_id: RaftGroupId) -> Option<&str> {
+        self.quarantined.get(&raft_group_id).map(String::as_str)
     }
 
     pub fn register_new_group(
@@ -271,6 +326,9 @@ impl MultiRaftHost {
     ) -> Result<(), MultiRaftHostError> {
         self.ensure_registering()?;
         self.ensure_shared_wal_healthy()?;
+        if !self.issued_writers.contains(&identity) {
+            return Err(MultiRaftHostError::WalWriterNotIssued(identity));
+        }
         if self.pending_recovered.remove(&identity) {
             Ok(())
         } else {
@@ -286,6 +344,9 @@ impl MultiRaftHost {
         self.ensure_registering()?;
         self.ensure_shared_wal_healthy()?;
         let identity = group.identity();
+        if !self.issued_writers.contains(&identity) {
+            return Err(MultiRaftHostError::WalWriterNotIssued(identity));
+        }
         if self.groups.contains_key(&identity.raft_group_id) {
             return Err(MultiRaftHostError::DuplicateGroup(identity.raft_group_id));
         }
@@ -302,18 +363,24 @@ impl MultiRaftHost {
         Ok(())
     }
 
-    fn with_recovered_identities(
-        node_id: NodeId,
-        wal_health: Box<dyn SharedWalHealth>,
-        identities: impl IntoIterator<Item = RaftReplicaIdentity>,
-    ) -> Self {
-        Self {
-            node_id,
-            wal_health,
-            state: HostState::Registering,
-            groups: BTreeMap::new(),
-            pending_recovered: identities.into_iter().collect(),
+    /// Issue the only valid persistence handle for one replica lifetime.
+    ///
+    /// The caller must use this handle to construct the corresponding hosted
+    /// group. Registration without prior issuance is rejected.
+    pub fn issue_group_writer(
+        &mut self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<NodeRaftWalHandle<W>, MultiRaftHostError> {
+        self.ensure_registering()?;
+        self.ensure_shared_wal_healthy()?;
+
+        if !self.issued_writers.insert(identity) {
+            return Err(MultiRaftHostError::WalWriterAlreadyIssued(identity));
         }
+
+        self.node_wal
+            .group_writer_for(identity)
+            .map_err(MultiRaftHostError::WalRegistration)
     }
 
     /// Seals local replica discovery and permits Ready processing.
@@ -325,7 +392,7 @@ impl MultiRaftHost {
                 self.pending_recovered.iter().copied().collect(),
             ));
         }
-        self.wal_health
+        self.node_wal
             .seal_retention_registry()
             .map_err(MultiRaftHostError::RetentionRegistry)?;
         self.state = HostState::Active;
@@ -339,16 +406,27 @@ impl MultiRaftHost {
         message: RoutedRaftMessage,
     ) -> Result<Vec<RoutedRaftMessage>, MultiRaftHostError> {
         self.ensure_active()?;
+
         let raft_group_id = message.raft_group_id;
-        let group = self
+
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
+                raft_group_id,
+                reason: reason.clone(),
+            });
+        }
+
+        let identity = self
             .groups
-            .get_mut(&raft_group_id)
-            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?;
-        let identity = group.identity();
+            .get(&raft_group_id)
+            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?
+            .identity();
+
         let expected = identity
             .replica_id
             .to_raft()
-            .expect("stored replica identities are validated");
+            .expect("registered replica identity is validated");
+
         if message.envelope.to != expected {
             return Err(MultiRaftHostError::RecipientMismatch {
                 raft_group_id,
@@ -356,26 +434,112 @@ impl MultiRaftHost {
                 received: ReplicaId::from_raft(message.envelope.to),
             });
         }
-        group
-            .step(message.envelope)
-            .map_err(|error| self.group_error(raft_group_id, error))?;
-        self.drain_group(raft_group_id)
-    }
 
-    pub fn tick_all(&mut self, ticks: u64) -> Result<Vec<RoutedRaftMessage>, MultiRaftHostError> {
-        self.ensure_active()?;
-        let group_ids: Vec<_> = self.groups.keys().copied().collect();
-        let mut outbound = Vec::new();
-        for raft_group_id in group_ids {
+        let result = {
             let group = self
                 .groups
                 .get_mut(&raft_group_id)
-                .expect("group id collected from map");
-            group
-                .tick(ticks)
-                .map_err(|error| self.group_error(raft_group_id, error))?;
-            outbound.extend(self.drain_group(raft_group_id)?);
+                .expect("group was resolved above");
+
+            group.step_and_drain(message.envelope)
+        };
+
+        let messages = match result {
+            Ok(messages) => messages,
+
+            Err(HostedGroupError::RecoveryRequired) => {
+                self.state = HostState::RecoveryRequired;
+
+                return Err(MultiRaftHostError::RecoveryRequired);
+            }
+
+            Err(HostedGroupError::Group(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                self.quarantined.insert(raft_group_id, reason.clone());
+
+                return Err(MultiRaftHostError::Group {
+                    raft_group_id,
+                    reason,
+                });
+            }
+        };
+
+        self.ensure_shared_wal_healthy()?;
+
+        Ok(messages
+            .into_iter()
+            .map(|envelope| RoutedRaftMessage {
+                raft_group_id,
+                envelope,
+            })
+            .collect())
+    }
+
+    /// Tick every healthy local group once.
+    ///
+    /// A group-local failure quarantines only that group and iteration
+    /// continues. Shared-WAL uncertainty aborts the complete host immediately.
+    pub fn tick_all(&mut self, ticks: u64) -> Result<Vec<RoutedRaftMessage>, MultiRaftHostError> {
+        self.ensure_active()?;
+
+        let group_ids: Vec<_> = self.groups.keys().copied().collect();
+
+        let mut outbound = Vec::new();
+
+        for raft_group_id in group_ids {
+            if self.quarantined.contains_key(&raft_group_id) {
+                continue;
+            }
+
+            let result = {
+                let group = self
+                    .groups
+                    .get_mut(&raft_group_id)
+                    .expect("group ID came from group registry");
+
+                group.tick_and_drain(ticks)
+            };
+
+            match result {
+                Ok(messages) => {
+                    // Another group could have discovered shared-WAL
+                    // uncertainty while this group was running.
+                    self.ensure_shared_wal_healthy()?;
+
+                    outbound.extend(messages.into_iter().map(|envelope| RoutedRaftMessage {
+                        raft_group_id,
+                        envelope,
+                    }));
+                }
+
+                Err(HostedGroupError::RecoveryRequired) => {
+                    self.state = HostState::RecoveryRequired;
+
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                Err(HostedGroupError::Group(reason)) => {
+                    // If the underlying shared authority entered recovery,
+                    // this is node-wide even if the outer group adapter lost
+                    // the typed error.
+                    if self.node_wal.recovery_required() {
+                        self.state = HostState::RecoveryRequired;
+
+                        return Err(MultiRaftHostError::RecoveryRequired);
+                    }
+
+                    self.quarantined.insert(raft_group_id, reason);
+
+                    // Continue ticking unrelated groups.
+                }
+            }
         }
+
         Ok(outbound)
     }
 
@@ -386,37 +550,60 @@ impl MultiRaftHost {
         encoded_len: usize,
     ) -> Result<HostedProposal, MultiRaftHostError> {
         self.ensure_active()?;
-        let group = self
-            .groups
-            .get_mut(&raft_group_id)
-            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?;
-        let index = group
-            .propose(command, encoded_len)
-            .map_err(|error| self.group_error(raft_group_id, error))?;
-        let outbound = self.drain_group(raft_group_id)?;
-        Ok(HostedProposal { index, outbound })
-    }
 
-    fn drain_group(
-        &mut self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<Vec<RoutedRaftMessage>, MultiRaftHostError> {
-        self.ensure_shared_wal_healthy()?;
-        let group = self
-            .groups
-            .get_mut(&raft_group_id)
-            .expect("known hosted group");
-        let messages = group
-            .persist_and_apply()
-            .map_err(|error| self.group_error(raft_group_id, error))?;
-        self.ensure_shared_wal_healthy()?;
-        Ok(messages
-            .into_iter()
-            .map(|envelope| RoutedRaftMessage {
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
                 raft_group_id,
-                envelope,
-            })
-            .collect())
+                reason: reason.clone(),
+            });
+        }
+
+        let result = {
+            let group = self
+                .groups
+                .get_mut(&raft_group_id)
+                .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?;
+
+            group.propose_and_drain(command, encoded_len)
+        };
+
+        let (index, messages) = match result {
+            Ok(result) => result,
+
+            Err(HostedGroupError::RecoveryRequired) => {
+                self.state = HostState::RecoveryRequired;
+
+                return Err(MultiRaftHostError::RecoveryRequired);
+            }
+
+            Err(HostedGroupError::Group(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                self.quarantined.insert(raft_group_id, reason.clone());
+
+                return Err(MultiRaftHostError::Group {
+                    raft_group_id,
+                    reason,
+                });
+            }
+        };
+
+        self.ensure_shared_wal_healthy()?;
+
+        Ok(HostedProposal {
+            index,
+            outbound: messages
+                .into_iter()
+                .map(|envelope| RoutedRaftMessage {
+                    raft_group_id,
+                    envelope,
+                })
+                .collect(),
+        })
     }
 
     fn ensure_registering(&self) -> Result<(), MultiRaftHostError> {
@@ -428,7 +615,7 @@ impl MultiRaftHost {
     }
 
     fn ensure_active(&mut self) -> Result<(), MultiRaftHostError> {
-        if self.wal_health.recovery_required() {
+        if self.node_wal.recovery_required() {
             self.state = HostState::RecoveryRequired;
         }
         match self.state {
@@ -439,27 +626,11 @@ impl MultiRaftHost {
     }
 
     fn ensure_shared_wal_healthy(&mut self) -> Result<(), MultiRaftHostError> {
-        if self.wal_health.recovery_required() {
+        if self.node_wal.recovery_required() {
             self.state = HostState::RecoveryRequired;
             Err(MultiRaftHostError::RecoveryRequired)
         } else {
             Ok(())
-        }
-    }
-
-    fn group_error(
-        &mut self,
-        raft_group_id: RaftGroupId,
-        error: HostedGroupError,
-    ) -> MultiRaftHostError {
-        if matches!(error, HostedGroupError::RecoveryRequired) {
-            self.state = HostState::RecoveryRequired;
-            MultiRaftHostError::RecoveryRequired
-        } else {
-            MultiRaftHostError::Group {
-                raft_group_id,
-                reason: error.to_string(),
-            }
         }
     }
 }
@@ -497,6 +668,26 @@ pub enum MultiRaftHostError {
         raft_group_id: RaftGroupId,
         reason: String,
     },
+    #[error(
+        "Raft WAL writer for replica lifetime {0:?} \
+         was not issued by this MultiRaft host"
+    )]
+    WalWriterNotIssued(RaftReplicaIdentity),
+
+    #[error(
+        "Raft WAL writer for replica lifetime {0:?} \
+         was already issued"
+    )]
+    WalWriterAlreadyIssued(RaftReplicaIdentity),
+
+    #[error("could not register replica lifetime with shared Raft WAL: {0}")]
+    WalRegistration(String),
+
+    #[error("Raft group {raft_group_id:?} is quarantined: {reason}")]
+    GroupQuarantined {
+        raft_group_id: RaftGroupId,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -504,63 +695,97 @@ mod tests {
     use super::*;
     use raft::{message::Message, types::ReplicaId as RaftReplicaId};
     use ragnordb_common::ids::ReplicaId;
-    use std::{cell::Cell, rc::Rc};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
 
-    struct TestWalHealth {
-        recovery_required: Rc<Cell<bool>>,
-        sealed: Rc<Cell<bool>>,
+    struct TestWal;
+
+    impl RaftWal for TestWal {
+        fn append_batch_and_sync(
+            &mut self,
+            _: &[(RecordType, &[u8])],
+        ) -> Result<BatchAppendResult, BatchAppendFailure> {
+            unreachable!("host tests do not persist Ready generations")
+        }
     }
-    impl SharedWalHealth for TestWalHealth {
-        fn recovery_required(&self) -> bool {
-            self.recovery_required.get()
-        }
-        fn seal_retention_registry(&self) -> Result<(), String> {
-            self.sealed.set(true);
-            Ok(())
-        }
+
+    #[derive(Clone, Copy)]
+    enum TickBehavior {
+        Healthy,
+        GroupFailure,
+        RecoveryRequired,
     }
 
     struct TestGroup {
         identity: RaftReplicaIdentity,
-        stepped: usize,
+        tick_behavior: TickBehavior,
+        ticks: Arc<AtomicU64>,
+        stepped: Arc<AtomicU64>,
         outbound: Vec<RaftMessageEnvelope>,
     }
+
     impl HostedRaftGroup for TestGroup {
         fn identity(&self) -> RaftReplicaIdentity {
             self.identity
         }
-        fn tick(&mut self, _: u64) -> Result<(), HostedGroupError> {
-            Ok(())
-        }
-        fn step(&mut self, _: RaftMessageEnvelope) -> Result<(), HostedGroupError> {
-            self.stepped += 1;
-            Ok(())
-        }
-        fn propose(&mut self, _: Vec<u8>, _: usize) -> Result<LogIndex, HostedGroupError> {
-            Ok(0)
-        }
-        fn persist_and_apply(&mut self) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-            if self.stepped == 0 {
-                return Err(HostedGroupError::Group(
-                    "inbound message was not delivered".to_string(),
-                ));
+
+        fn tick_and_drain(&mut self, _: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+            match self.tick_behavior {
+                TickBehavior::Healthy => {
+                    self.ticks.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::new())
+                }
+                TickBehavior::GroupFailure => Err(HostedGroupError::Group(
+                    "injected group-local failure".to_string(),
+                )),
+                TickBehavior::RecoveryRequired => Err(HostedGroupError::RecoveryRequired),
             }
+        }
+
+        fn step_and_drain(
+            &mut self,
+            _: RaftMessageEnvelope,
+        ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+            self.stepped.fetch_add(1, Ordering::SeqCst);
             Ok(std::mem::take(&mut self.outbound))
         }
+
+        fn propose_and_drain(
+            &mut self,
+            _: Vec<u8>,
+            _: usize,
+        ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+            Ok((0, std::mem::take(&mut self.outbound)))
+        }
     }
+
     fn identity(group: u64, replica: u64) -> RaftReplicaIdentity {
         RaftReplicaIdentity::new(RaftGroupId(group), ReplicaId(replica)).unwrap()
     }
+
+    fn healthy_group(
+        identity: RaftReplicaIdentity,
+        outbound: Vec<RaftMessageEnvelope>,
+    ) -> TestGroup {
+        TestGroup {
+            identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound,
+        }
+    }
+
     #[test]
     fn route_demultiplexes_to_the_tagged_group_and_releases_only_its_messages() {
-        let recovery_required = Rc::new(Cell::new(false));
-        let mut host = MultiRaftHost::new(
-            NodeId(7),
-            Box::new(TestWalHealth {
-                recovery_required,
-                sealed: Rc::new(Cell::new(false)),
-            }),
-        );
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let first_identity = identity(10, 10);
+        let second_identity = identity(11, 11);
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
         let inbound = Envelope {
             from: RaftReplicaId::must(20),
             to: RaftReplicaId::must(11),
@@ -577,17 +802,12 @@ mod tests {
                 vote_granted: true,
             }),
         };
-        host.register_new_group(Box::new(TestGroup {
-            identity: identity(10, 10),
-            stepped: 0,
-            outbound: Vec::new(),
-        }))
-        .unwrap();
-        host.register_new_group(Box::new(TestGroup {
-            identity: identity(11, 11),
-            stepped: 0,
-            outbound: vec![outbound.clone()],
-        }))
+        host.register_new_group(Box::new(healthy_group(first_identity, Vec::new())))
+            .unwrap();
+        host.register_new_group(Box::new(healthy_group(
+            second_identity,
+            vec![outbound.clone()],
+        )))
         .unwrap();
         host.activate().unwrap();
         assert_eq!(
@@ -604,98 +824,66 @@ mod tests {
     }
 
     #[test]
-    fn recovered_identities_must_be_registered_before_retention_is_sealed() {
-        let recovery_required = Rc::new(Cell::new(false));
-        let sealed = Rc::new(Cell::new(false));
-        let recovered = identity(41, 9);
-        let mut host = MultiRaftHost::with_recovered_identities(
-            NodeId(7),
-            Box::new(TestWalHealth {
-                recovery_required,
-                sealed: Rc::clone(&sealed),
-            }),
-            [recovered],
-        );
+    fn quarantined_group_does_not_starve_other_groups() {
+        let healthy_ticks = Arc::new(AtomicU64::new(0));
+        let failing_identity = identity(10, 101);
+        let healthy_identity = identity(20, 202);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _failing_writer = host.issue_group_writer(failing_identity).unwrap();
+        let _healthy_writer = host.issue_group_writer(healthy_identity).unwrap();
 
-        let new_group = || {
-            Box::new(TestGroup {
-                identity: recovered,
-                stepped: 0,
-                outbound: Vec::new(),
-            }) as Box<dyn HostedRaftGroup>
-        };
-        assert_eq!(
-            host.register_new_group(new_group()).unwrap_err(),
-            MultiRaftHostError::RecoveredIdentityRequiresRecovery(recovered)
-        );
-        assert_eq!(
-            host.activate().unwrap_err(),
-            MultiRaftHostError::MissingRecovered(vec![recovered])
-        );
-        assert!(!sealed.get());
-
-        host.register_recovered_group(new_group()).unwrap();
-        host.activate().unwrap();
-        assert!(sealed.get());
-    }
-
-    #[test]
-    fn retired_recovered_replica_does_not_block_its_replacement_runtime() {
-        let recovery_required = Rc::new(Cell::new(false));
-        let sealed = Rc::new(Cell::new(false));
-        let retired = identity(51, 8);
-        let replacement = identity(51, 9);
-        let mut host = MultiRaftHost::with_recovered_identities(
-            NodeId(7),
-            Box::new(TestWalHealth {
-                recovery_required,
-                sealed: Rc::clone(&sealed),
-            }),
-            [retired, replacement],
-        );
-
-        host.register_inactive_recovered_identity(retired).unwrap();
-        host.register_recovered_group(Box::new(TestGroup {
-            identity: replacement,
-            stepped: 0,
-            outbound: Vec::new(),
-        }))
-        .unwrap();
-        host.activate().unwrap();
-        assert!(sealed.get());
-    }
-
-    #[test]
-    fn shared_wal_recovery_fences_every_hosted_group() {
-        let recovery_required = Rc::new(Cell::new(false));
-        let mut host = MultiRaftHost::new(
-            NodeId(7),
-            Box::new(TestWalHealth {
-                recovery_required: Rc::clone(&recovery_required),
-                sealed: Rc::new(Cell::new(false)),
-            }),
-        );
         host.register_new_group(Box::new(TestGroup {
-            identity: identity(31, 31),
-            stepped: 0,
+            identity: failing_identity,
+            tick_behavior: TickBehavior::GroupFailure,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::new(AtomicU64::new(0)),
             outbound: Vec::new(),
         }))
         .unwrap();
         host.register_new_group(Box::new(TestGroup {
-            identity: identity(32, 32),
-            stepped: 0,
+            identity: healthy_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&healthy_ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
             outbound: Vec::new(),
         }))
         .unwrap();
         host.activate().unwrap();
 
-        recovery_required.set(true);
+        host.tick_all(1).unwrap();
+        assert_eq!(healthy_ticks.load(Ordering::SeqCst), 1);
+        assert!(host.group_failure(RaftGroupId(10)).is_some());
+
+        host.tick_all(1).unwrap();
+        assert_eq!(healthy_ticks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn recovery_required_from_one_group_fences_whole_host() {
+        let failing_identity = identity(10, 101);
+        let healthy_identity = identity(20, 202);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _failing_writer = host.issue_group_writer(failing_identity).unwrap();
+        let _healthy_writer = host.issue_group_writer(healthy_identity).unwrap();
+
+        host.register_new_group(Box::new(TestGroup {
+            identity: failing_identity,
+            tick_behavior: TickBehavior::RecoveryRequired,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(healthy_group(healthy_identity, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+
         assert_eq!(
             host.tick_all(1).unwrap_err(),
             MultiRaftHostError::RecoveryRequired
         );
         assert_eq!(
-            host.propose(RaftGroupId(31), vec![1], 1).unwrap_err(),
+            host.propose(RaftGroupId(20), vec![1], 1).unwrap_err(),
             MultiRaftHostError::RecoveryRequired
         );
     }

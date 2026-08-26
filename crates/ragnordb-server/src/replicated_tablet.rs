@@ -6,7 +6,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,10 +19,10 @@ use raft::{
     core::ready::Ready,
     entry::EntryPayload,
     message::{Envelope, Message},
-    runtime::transport_tcp::{TcpEndpoint, TcpTransport},
-    storage::codec::{CommandCodec, SnapshotCodec},
     traits::{log_store::LogStore, stable_store::StableStore},
+    types::LogIndex,
 };
+
 use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog};
 use ragnordb_common::{
     Error, Result,
@@ -38,10 +37,9 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
+    host::{HostedGroupError, HostedRaftGroup, RaftMessageEnvelope},
     proposal::{ProposalCompletion, ProposalRegistry, ProposalTicket},
-    replica_startup::{
-        bootstrap_tablet_replica, initial_recovery_configuration, recover_tablet_replica,
-    },
+    replica_startup::{bootstrap_tablet_replica, recover_tablet_replica},
     runtime::{AppliedRaftFrontier, RaftReadyLoop},
     snapshot::{
         SnapshotWorkController, TabletSnapshotTransfer, generate_tablet_snapshot_from_ready_loop,
@@ -50,11 +48,13 @@ use ragnordb_multiraft::{
     },
     storage::{
         codec::RaftReplicaIdentity,
-        persistence::{NodeRaftWal, RaftWal},
-        recovery::{RecoveredRaftStorage, recover_raft_storage_with_configurations},
+        persistence::{NodeRaftWalHandle, RaftWal},
+        recovery::RecoveredRaftStorage,
     },
     tablet_apply::{CommittedTabletCommandDisposition, TabletCommandApplier},
+    transport::GroupRaftTransport,
 };
+
 use ragnordb_storage::wal::{
     DurableCommitLog, DurableWalExtent, RagnorDbWalAdapter, SingleNodeTxnCommit, WalMutation,
 };
@@ -65,7 +65,7 @@ use ragnordb_tablet::{
         TabletSnapshotImage, TabletSnapshotInstallTarget,
     },
 };
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use wal::{io::directory::FsSegmentDirectory, lsn::Lsn, wal::WalHandle};
 
 use crate::{
@@ -74,42 +74,17 @@ use crate::{
     snapshot_transport::{ReceivedTabletSnapshot, SnapshotEndpoint},
 };
 
-const GROUP_ID: RaftGroupId = RaftGroupId(1);
+pub(crate) const TABLET_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(1);
 const TABLET_ID: TabletId = TabletId(1);
 const TABLE_ID: TableId = TableId(1);
 const TABLET_EPOCH: u64 = 1;
 const ELECTION_TIMEOUT_TICKS: u64 = 10;
 const HEARTBEAT_INTERVAL_TICKS: u64 = 3;
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const CHANNEL_CAPACITY: usize = 1_024;
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
 type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApplyError>;
-
-/// Transport codec for already encoded command and snapshot payloads.
-#[derive(Debug, Clone, Copy, Default)]
-struct BytesCodec;
-
-impl CommandCodec<Vec<u8>> for BytesCodec {
-    fn encode(&self, command: &Vec<u8>) -> io::Result<Vec<u8>> {
-        Ok(command.clone())
-    }
-
-    fn decode(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(bytes.to_vec())
-    }
-}
-
-impl SnapshotCodec<Vec<u8>> for BytesCodec {
-    fn encode(&self, snapshot: &Vec<u8>) -> io::Result<Vec<u8>> {
-        Ok(snapshot.clone())
-    }
-
-    fn decode(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(bytes.to_vec())
-    }
-}
 
 /// Point-in-time routing state published without exposing the Ready owner.
 #[derive(Debug, Clone, Default)]
@@ -141,6 +116,28 @@ enum HostRequest {
     },
 }
 
+/// Node-level MultiRaft control messages.
+///
+/// Client SQL work continues to use `HostRequest`. Raft transport and ticking
+/// enter through this separate host-owned channel.
+enum RaftHostControl {
+    Tick {
+        ticks: u64,
+        reply: mpsc::Sender<std::result::Result<(), HostedGroupError>>,
+    },
+
+    Step {
+        message: RaftMessageEnvelope,
+        reply: mpsc::Sender<std::result::Result<(), HostedGroupError>>,
+    },
+
+    Propose {
+        command: Vec<u8>,
+        encoded_len: usize,
+        reply: mpsc::Sender<std::result::Result<LogIndex, HostedGroupError>>,
+    },
+}
+
 enum ClientReply {
     Commit(mpsc::Sender<Result<DurableWalExtent>>),
     Catalog(mpsc::Sender<Result<CatalogLogExtent>>),
@@ -150,6 +147,76 @@ enum ClientReply {
 struct PendingClient {
     ticket: ProposalTicket<TabletCommandApplyOutcome, TabletCommandApplyError>,
     reply: ClientReply,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReplicatedTabletGroupProxy {
+    identity: RaftReplicaIdentity,
+    control: SyncSender<RaftHostControl>,
+}
+
+impl ReplicatedTabletGroupProxy {
+    fn control_unavailable() -> HostedGroupError {
+        HostedGroupError::Group("replicated tablet worker has stopped".to_string())
+    }
+}
+
+impl HostedRaftGroup for ReplicatedTabletGroupProxy {
+    fn identity(&self) -> RaftReplicaIdentity {
+        self.identity
+    }
+
+    fn tick_and_drain(
+        &mut self,
+        ticks: u64,
+    ) -> std::result::Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        let (reply, response) = mpsc::channel();
+
+        self.control
+            .send(RaftHostControl::Tick { ticks, reply })
+            .map_err(|_| Self::control_unavailable())?;
+
+        response.recv().map_err(|_| Self::control_unavailable())??;
+
+        // The tablet worker sends its Ready messages through its
+        // group-scoped view of the one physical node transport.
+        Ok(Vec::new())
+    }
+
+    fn step_and_drain(
+        &mut self,
+        message: RaftMessageEnvelope,
+    ) -> std::result::Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        let (reply, response) = mpsc::channel();
+
+        self.control
+            .send(RaftHostControl::Step { message, reply })
+            .map_err(|_| Self::control_unavailable())?;
+
+        response.recv().map_err(|_| Self::control_unavailable())??;
+
+        Ok(Vec::new())
+    }
+
+    fn propose_and_drain(
+        &mut self,
+        command: Vec<u8>,
+        encoded_len: usize,
+    ) -> std::result::Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        let (reply, response) = mpsc::channel();
+
+        self.control
+            .send(RaftHostControl::Propose {
+                command,
+                encoded_len,
+                reply,
+            })
+            .map_err(|_| Self::control_unavailable())?;
+
+        let index = response.recv().map_err(|_| Self::control_unavailable())??;
+
+        Ok((index, Vec::new()))
+    }
 }
 
 /// Durable catalog-cache boundary owned by the Ready worker.
@@ -285,90 +352,135 @@ impl DurableCatalogLog for ReplicatedTabletHandle {
 /// Lifecycle guard for the background Ready owner and its cloneable SQL handle.
 pub struct ReplicatedTabletRuntime {
     handle: Arc<ReplicatedTabletHandle>,
+    identity: RaftReplicaIdentity,
+    host_control: SyncSender<RaftHostControl>,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl ReplicatedTabletRuntime {
-    /// Resolve the authoritative initial configuration before the node opens
-    /// the shared semantic recovery cursor.
-    pub fn recovery_configurations(
+    pub(crate) fn hosted_group(&self) -> ReplicatedTabletGroupProxy {
+        ReplicatedTabletGroupProxy {
+            identity: self.identity,
+            control: self.host_control.clone(),
+        }
+    }
+
+    /// Resolve the bootstrap authority used to construct the existing M4
+    /// tablet as the first group hosted by the M5 MultiRaft node.
+    ///
+    /// Static seed membership is used only for a genuinely new group. If WAL
+    /// state for this group already exists without its durable bootstrap,
+    /// startup fails closed rather than silently recreating membership.
+    pub(crate) fn resolve_tablet_bootstrap(
         config: &NodeConfig,
-    ) -> Result<BTreeMap<RaftReplicaIdentity, raft::types::ConfState>> {
-        let requested = requested_bootstrap(config)?;
+        recovered: &RecoveredRaftStorage,
+    ) -> Result<RaftGroupBootstrap> {
         let store =
             FileBootstrapStore::open(config.data_dir.join("raft-bootstrap")).map_err(|source| {
                 Error::RecoveryFailed {
                     reason: source.to_string(),
                 }
             })?;
-        let bootstrap = load_durable_group_bootstrap(&store, GROUP_ID)
+
+        if let Some(bootstrap) = load_durable_group_bootstrap(&store, TABLET_RAFT_GROUP_ID)
             .map_err(|source| Error::RecoveryFailed {
                 reason: source.to_string(),
             })?
-            .unwrap_or(requested);
-        let local_replica_id = ReplicaId(config.node_id.0);
-        let (identity, conf_state) = initial_recovery_configuration(&bootstrap, local_replica_id)
-            .map_err(|source| Error::RecoveryFailed {
-            reason: source.to_string(),
-        })?;
-        Ok(BTreeMap::from([(identity, conf_state)]))
+        {
+            return Ok(bootstrap);
+        }
+
+        let recovered_group_exists = recovered
+            .replicas()
+            .any(|(identity, _)| identity.raft_group_id == TABLET_RAFT_GROUP_ID);
+
+        if recovered_group_exists {
+            return Err(Error::RecoveryFailed {
+                reason: format!(
+                    "Raft WAL contains group {} state but its \
+                     durable bootstrap is missing; refusing \
+                     static membership reconstruction",
+                    TABLET_RAFT_GROUP_ID.0,
+                ),
+            });
+        }
+
+        if !config.bootstrap {
+            return Err(Error::Configuration(format!(
+                "Raft group {} has no durable bootstrap and \
+                 bootstrap=false",
+                TABLET_RAFT_GROUP_ID.0,
+            )));
+        }
+
+        requested_bootstrap(config)
     }
 
-    /// Recover or bootstrap the configured local replica, bind its Raft TCP
-    /// endpoint, and start the sole owner of tick/message/Ready/apply ordering.
-    pub fn start(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_hosted_from_shared_recovery(
         config: &NodeConfig,
         wal: LocalWal,
         database: SharedLocalDatabase,
-    ) -> Result<Self> {
-        Self::start_inner(config, wal, database, None)
-    }
-
-    /// Start from Raft state produced by the server's one-cursor shared-WAL
-    /// recovery pass. No second semantic scan is performed.
-    pub fn start_from_shared_recovery(
-        config: &NodeConfig,
-        wal: LocalWal,
-        database: SharedLocalDatabase,
-        recovered: RecoveredRaftStorage,
-    ) -> Result<Self> {
-        Self::start_inner(config, wal, database, Some(recovered))
-    }
-
-    fn start_inner(
-        config: &NodeConfig,
-        wal: LocalWal,
-        database: SharedLocalDatabase,
-        mut shared_recovered: Option<RecoveredRaftStorage>,
+        bootstrap: RaftGroupBootstrap,
+        group_wal: NodeRaftWalHandle<LocalWal>,
+        transport: GroupRaftTransport,
+        recovered: &RecoveredRaftStorage,
+        start_gate: Arc<AtomicBool>,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
         })?;
+
+        if bootstrap.cluster_id != cluster_id {
+            return Err(Error::RecoveryFailed {
+                reason: format!(
+                    "tablet bootstrap belongs to cluster {}, \
+                     configured cluster is {}",
+                    bootstrap.cluster_id, cluster_id,
+                ),
+            });
+        }
+
         let local_seed = config
             .seed_nodes
             .iter()
             .find(|seed| seed.id == config.node_id)
             .ok_or_else(|| {
-                Error::Configuration(
-                    "local node must appear in seed_nodes to bind its Raft endpoint".to_string(),
-                )
+                Error::Configuration("local node must appear in seed_nodes".to_string())
             })?;
 
-        let local_replica_id = ReplicaId(config.node_id.0);
-        let requested = requested_bootstrap(config)?;
+        let local_replica_id = bootstrap.replica_on_node(config.node_id).ok_or_else(|| {
+            Error::Configuration(format!(
+                "physical node {} is not assigned a replica \
+                     in Raft group {}",
+                config.node_id.0, bootstrap.raft_group_id.0,
+            ))
+        })?;
+
+        let identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
+            .map_err(|source| Error::Configuration(source.to_string()))?;
 
         let target = TabletSnapshotInstallTarget {
             cluster_id: cluster_id.clone(),
-            raft_group_id: GROUP_ID,
+            raft_group_id: TABLET_RAFT_GROUP_ID,
             tablet_id: TABLET_ID,
             table_id: TABLE_ID,
             tablet_epoch: TABLET_EPOCH,
         };
+
         let mut bootstrap_store = FileBootstrapStore::open(config.data_dir.join("raft-bootstrap"))
             .map_err(|source| Error::RecoveryFailed {
                 reason: source.to_string(),
             })?;
+
+        let durable_bootstrap =
+            load_durable_group_bootstrap(&bootstrap_store, TABLET_RAFT_GROUP_ID).map_err(
+                |source| Error::RecoveryFailed {
+                    reason: source.to_string(),
+                },
+            )?;
+
         let snapshot_store = Arc::new(
             FileTabletSnapshotStore::new(
                 config.data_dir.join("tablet-snapshots"),
@@ -379,42 +491,23 @@ impl ReplicatedTabletRuntime {
             })?,
         );
 
-        let peers = config
-            .seed_nodes
-            .iter()
-            .filter(|seed| seed.id != config.node_id)
-            .map(|seed| {
-                ReplicaId(seed.id.0)
-                    .to_raft()
-                    .map(|replica_id| (replica_id, seed.raft_addr))
-            })
-            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
-            .map_err(|reason| Error::Configuration(reason.to_string()))?;
-        let TcpEndpoint {
-            transport,
-            inbound,
-            local_addr,
-        } = TcpTransport::bind(
-            local_replica_id
-                .to_raft()
-                .map_err(|reason| Error::Configuration(reason.to_string()))?,
-            local_seed.raft_addr,
-            peers,
-            BytesCodec,
-            BytesCodec,
-        )
-        .map_err(|source| Error::Configuration(format!("bind Raft endpoint: {source}")))?;
-
         let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+
+        let (host_control_tx, host_control_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
+
         let shutdown = Arc::new(AtomicBool::new(false));
+
         let snapshot_peers = config
             .seed_nodes
             .iter()
             .filter(|seed| seed.id != config.node_id)
             .map(|seed| (seed.id.0, seed.snapshot_addr))
             .collect();
+
         let snapshot_work = SnapshotWorkController::default();
+
         let snapshot_endpoint = SnapshotEndpoint::bind(
             local_seed.snapshot_addr,
             snapshot_peers,
@@ -424,87 +517,60 @@ impl ReplicatedTabletRuntime {
             shutdown.clone(),
         )
         .map_err(|source| Error::Configuration(format!("bind snapshot endpoint: {source}")))?;
+
         let snapshot_policy = SnapshotPolicy {
             interval_entries: config.snapshot_interval_entries,
             interval_bytes: config.snapshot_interval_bytes,
             min_elapsed: Duration::from_millis(config.snapshot_min_elapsed_ms),
             applied_bytes: Arc::new(AtomicU64::new(0)),
         };
+
         let handle = Arc::new(ReplicatedTabletHandle {
             requests: request_tx,
             status: status.clone(),
         });
 
-        let durable_bootstrap =
-            load_durable_group_bootstrap(&bootstrap_store, GROUP_ID).map_err(|source| {
-                Error::RecoveryFailed {
-                    reason: source.to_string(),
-                }
-            })?;
-        let worker_shutdown = shutdown.clone();
-
-        let identity = RaftReplicaIdentity::new(GROUP_ID, local_replica_id)
-            .map_err(|source| Error::Configuration(source.to_string()))?;
         let durability_gate = database
             .try_lock()
             .map_err(|_| {
-                Error::Configuration("database is busy during WAL ownership setup".into())
+                Error::Configuration("database is busy during tablet startup".to_string())
             })?
             .durability_gate();
+
         let catalog_cache: Arc<dyn CatalogCacheWriter> = Arc::new(FencedCatalogCache {
             adapter: RagnorDbWalAdapter::new(wal.clone()),
-            durability_gate: durability_gate.clone(),
+            durability_gate,
         });
-        let node_wal = NodeRaftWal::with_durability_gate(wal.clone(), durability_gate);
-        let group_wal = node_wal
-            .group_writer_for(identity)
-            .map_err(Error::Configuration)?;
-        node_wal
-            .seal_retention_registry()
-            .map_err(Error::Configuration)?;
-        database
-            .try_lock()
-            .map_err(|_| {
-                Error::Configuration("database is busy during WAL ownership setup".into())
-            })?
-            .install_node_wal(node_wal)?;
 
-        let worker = if let Some(bootstrap) = durable_bootstrap {
-            // Durable bootstrap is authoritative after restart; changed static
-            // membership cannot silently replace it.
-            let (identity, conf_state) =
-                initial_recovery_configuration(&bootstrap, local_replica_id).map_err(|source| {
-                    Error::RecoveryFailed {
-                        reason: source.to_string(),
-                    }
-                })?;
-            let recovered = match shared_recovered.take() {
-                Some(recovered) => recovered,
-                None => {
-                    let configurations = BTreeMap::from([(identity, conf_state)]);
-                    let mut source =
-                        wal.iter_from(Lsn::ZERO)
-                            .map_err(|source| Error::RecoveryFailed {
-                                reason: format!("open Raft recovery stream: {source}"),
-                            })?;
-                    recover_raft_storage_with_configurations(&mut source, &configurations).map_err(
-                        |source| Error::RecoveryFailed {
-                            reason: source.to_string(),
-                        },
-                    )?
-                }
-            };
+        let worker_shutdown = shutdown.clone();
+
+        let worker = if let Some(durable_bootstrap) = durable_bootstrap {
+            if durable_bootstrap != bootstrap {
+                return Err(Error::RecoveryFailed {
+                    reason: format!(
+                        "resolved bootstrap for Raft group {} \
+                         changed during startup",
+                        TABLET_RAFT_GROUP_ID.0,
+                    ),
+                });
+            }
+
             let replica = recovered
                 .replica(identity)
                 .ok_or_else(|| Error::RecoveryFailed {
-                    reason: "durable bootstrap exists without a matching Raft WAL replica"
-                        .to_string(),
+                    reason: format!(
+                        "durable bootstrap exists for {:?} \
+                             without matching shared-WAL state",
+                        identity,
+                    ),
                 })?;
+
             install_recovered_catalog(&database, replica)?;
+
             let recovered_replica = recover_tablet_replica(
-                bootstrap,
+                durable_bootstrap,
                 local_replica_id,
-                group_wal.clone(),
+                group_wal,
                 wal.durable_lsn(),
                 replica,
                 &snapshot_store,
@@ -523,11 +589,12 @@ impl ReplicatedTabletRuntime {
                 recovered_replica.tablet,
                 None,
                 transport,
-                inbound,
+                host_control_rx,
                 request_rx,
                 database,
                 status,
                 worker_shutdown,
+                start_gate,
                 snapshot_store,
                 snapshot_work,
                 snapshot_endpoint,
@@ -536,14 +603,9 @@ impl ReplicatedTabletRuntime {
                 snapshot_policy,
             )
         } else {
-            if !config.bootstrap {
-                return Err(Error::Configuration(
-                    "no durable tablet bootstrap exists and bootstrap=false".to_string(),
-                ));
-            }
             let bootstrapped = bootstrap_tablet_replica(
                 &mut bootstrap_store,
-                &requested,
+                &bootstrap,
                 local_replica_id,
                 group_wal,
                 &target,
@@ -561,11 +623,12 @@ impl ReplicatedTabletRuntime {
                 bootstrapped.tablet,
                 Some(bootstrapped.initial_ready),
                 transport,
-                inbound,
+                host_control_rx,
                 request_rx,
                 database,
                 status,
                 worker_shutdown,
+                start_gate,
                 snapshot_store,
                 snapshot_work,
                 snapshot_endpoint,
@@ -575,9 +638,10 @@ impl ReplicatedTabletRuntime {
             )
         };
 
-        info!(raft = %local_addr, group_id = GROUP_ID.0, "replicated tablet runtime started");
         Ok(Self {
             handle,
+            identity,
+            host_control: host_control_tx,
             shutdown,
             worker: Some(worker),
         })
@@ -600,7 +664,7 @@ fn requested_bootstrap(config: &NodeConfig) -> Result<RaftGroupBootstrap> {
     let voters = replica_to_node.keys().copied().collect::<BTreeSet<_>>();
     RaftGroupBootstrap::new(
         cluster_id,
-        GROUP_ID,
+        TABLET_RAFT_GROUP_ID,
         1,
         replica_to_node,
         voters,
@@ -673,12 +737,13 @@ fn spawn_ready_owner<W, LS, SS>(
     ready_loop: RaftReadyLoop<W, LS, SS>,
     tablet: TabletCommandApplier,
     initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
-    transport: TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
-    inbound: Receiver<Envelope<Vec<u8>, Vec<u8>>>,
+    transport: GroupRaftTransport,
+    host_control: Receiver<RaftHostControl>,
     requests: Receiver<HostRequest>,
     database: SharedLocalDatabase,
     status: Arc<RwLock<ReplicatedTabletStatus>>,
     shutdown: Arc<AtomicBool>,
+    start_gate: Arc<AtomicBool>,
     snapshot_store: Arc<FileTabletSnapshotStore>,
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: SnapshotEndpoint,
@@ -700,11 +765,12 @@ where
                 tablet,
                 initial_ready,
                 transport,
-                inbound,
+                host_control,
                 requests,
                 database,
                 status,
                 shutdown,
+                start_gate,
                 snapshot_store,
                 snapshot_work,
                 snapshot_endpoint,
@@ -727,12 +793,13 @@ fn run_ready_owner<W, LS, SS>(
     mut ready_loop: RaftReadyLoop<W, LS, SS>,
     mut tablet: TabletCommandApplier,
     initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
-    transport: TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
-    inbound: Receiver<Envelope<Vec<u8>, Vec<u8>>>,
+    transport: GroupRaftTransport,
+    host_control: Receiver<RaftHostControl>,
     requests: Receiver<HostRequest>,
     database: SharedLocalDatabase,
     status: Arc<RwLock<ReplicatedTabletStatus>>,
     shutdown: Arc<AtomicBool>,
+    start_gate: Arc<AtomicBool>,
     snapshot_store: Arc<FileTabletSnapshotStore>,
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: SnapshotEndpoint,
@@ -748,12 +815,6 @@ where
     let mut registry = ProposalRegistry::new();
     let mut clients = Vec::<PendingClient>::new();
     let mut internal_barrier_allocator = InternalBarrierAllocator::default();
-    // Processes commonly start together under an orchestrator. A small stable
-    // replica-specific offset prevents identical election tick cadences from
-    // repeatedly producing split votes after leader failure.
-    let tick_interval = TICK_INTERVAL
-        + Duration::from_millis(ready_loop.raft().id().get().saturating_mul(7).min(50));
-    let mut next_tick = Instant::now() + tick_interval;
     let mut was_leader = false;
     let mut leader_activation = None::<ragnordb_multiraft::proposal::ProposalPosition>;
     let mut latest_snapshot = ready_loop
@@ -770,6 +831,17 @@ where
     let mut snapshot_install_pending = false;
     let mut received_snapshot = None::<ReceivedTabletSnapshot>;
 
+    // Group construction may persist its bootstrap Ready before the physical
+    // host has completed recovery registration and sealed retention. Messages
+    // must remain private until MultiRaftHost::activate succeeds.
+    while !start_gate.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(1));
+    }
+
     if let Some(ready) = initial_ready {
         send_messages(
             &transport,
@@ -780,24 +852,108 @@ where
     }
 
     while !shutdown.load(Ordering::Acquire) {
-        while let Ok(message) = inbound.try_recv() {
-            if matches!(message.msg, Message::InstallSnapshot(_)) {
-                snapshot_install_pending = true;
+        while let Ok(control) = host_control.try_recv() {
+            match control {
+                RaftHostControl::Tick { ticks, reply } => {
+                    let result = ready_loop
+                        .tick(ticks)
+                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .and_then(|_| {
+                            drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                            )
+                            .map_err(HostedGroupError::Group)
+                        });
+
+                    let failed = result.is_err();
+                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let _ = reply.send(result);
+
+                    if failed {
+                        return Err(
+                            reason.unwrap_or_else(|| "tablet group tick failed".to_string())
+                        );
+                    }
+                }
+
+                RaftHostControl::Step { message, reply } => {
+                    if matches!(message.msg, Message::InstallSnapshot(_)) {
+                        snapshot_install_pending = true;
+                    }
+
+                    let result = ready_loop
+                        .step(message)
+                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .and_then(|_| {
+                            drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                            )
+                            .map_err(HostedGroupError::Group)
+                        });
+
+                    let failed = result.is_err();
+                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let _ = reply.send(result);
+
+                    if failed {
+                        return Err(
+                            reason.unwrap_or_else(|| "tablet group step failed".to_string())
+                        );
+                    }
+                }
+
+                RaftHostControl::Propose {
+                    command,
+                    encoded_len,
+                    reply,
+                } => {
+                    let result = ready_loop
+                        .propose(command, encoded_len)
+                        .map_err(|error| HostedGroupError::Group(error.to_string()))
+                        .and_then(|index| {
+                            drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                            )
+                            .map_err(HostedGroupError::Group)?;
+
+                            Ok(index)
+                        });
+
+                    let failed = result.is_err();
+                    let reason = result.as_ref().err().map(ToString::to_string);
+                    let _ = reply.send(result);
+
+                    if failed {
+                        return Err(
+                            reason.unwrap_or_else(|| "tablet group proposal failed".to_string())
+                        );
+                    }
+                }
             }
-            ready_loop
-                .step(message)
-                .map_err(|error| error.to_string())?;
-            drain_ready(
-                &mut ready_loop,
-                &mut tablet,
-                &mut registry,
-                &database,
-                &transport,
-                &snapshot_endpoint,
-                &latest_snapshot,
-                catalog_cache.as_ref(),
-                &snapshot_policy,
-            )?;
         }
 
         while let Ok(received) = snapshot_endpoint.inbound.try_recv() {
@@ -870,22 +1026,6 @@ where
         }
 
         let now = Instant::now();
-        if now >= next_tick {
-            ready_loop.tick(1).map_err(|error| error.to_string())?;
-            next_tick = now + tick_interval;
-            drain_ready(
-                &mut ready_loop,
-                &mut tablet,
-                &mut registry,
-                &database,
-                &transport,
-                &snapshot_endpoint,
-                &latest_snapshot,
-                catalog_cache.as_ref(),
-                &snapshot_policy,
-            )?;
-        }
-
         registry.expire_deadlines(now);
         let is_leader = ready_loop.raft().leader_id() == Some(ready_loop.raft().id());
         if was_leader && !is_leader {
@@ -974,7 +1114,7 @@ impl InternalBarrierAllocator {
         Ok(RequestId {
             client_id,
             sequence,
-            raft_group_id: GROUP_ID,
+            raft_group_id: TABLET_RAFT_GROUP_ID,
         })
     }
 
@@ -1145,7 +1285,7 @@ fn refresh_leader_activation<W, LS, SS>(
     tablet: &mut TabletCommandApplier,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
-    transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
+    transport: &GroupRaftTransport,
     snapshot_endpoint: &SnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
@@ -1204,7 +1344,7 @@ fn maybe_publish_snapshot<W, LS, SS>(
     tablet: &mut TabletCommandApplier,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
-    transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
+    transport: &GroupRaftTransport,
     snapshot_endpoint: &SnapshotEndpoint,
     store: &FileTabletSnapshotStore,
     work: &SnapshotWorkController,
@@ -1230,7 +1370,7 @@ where
     let local_replica_id = ReplicaId(ready_loop.raft().id().get());
     let conf_state = tablet_snapshot_conf_state(ready_loop.raft().conf_state())?;
     let snapshot_id = store
-        .allocate_snapshot_id(GROUP_ID, local_replica_id, TABLET_ID)
+        .allocate_snapshot_id(TABLET_RAFT_GROUP_ID, local_replica_id, TABLET_ID)
         .map_err(|error| error.to_string())?;
     let image = generate_tablet_snapshot_from_ready_loop(
         work,
@@ -1289,7 +1429,7 @@ fn install_received_snapshot<W, LS, SS>(
     tablet: &mut TabletCommandApplier,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
-    transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
+    transport: &GroupRaftTransport,
     snapshot_endpoint: &SnapshotEndpoint,
     store: &FileTabletSnapshotStore,
     work: &SnapshotWorkController,
@@ -1311,7 +1451,7 @@ where
     }
     let target = TabletSnapshotInstallTarget {
         cluster_id: cluster_id.to_string(),
-        raft_group_id: GROUP_ID,
+        raft_group_id: TABLET_RAFT_GROUP_ID,
         tablet_id: TABLET_ID,
         table_id: TABLE_ID,
         tablet_epoch: TABLET_EPOCH,
@@ -1468,7 +1608,7 @@ fn envelope_from_commit(
         RequestId {
             client_id,
             sequence: 1,
-            raft_group_id: GROUP_ID,
+            raft_group_id: TABLET_RAFT_GROUP_ID,
         },
         TABLET_ID,
         TABLET_EPOCH,
@@ -1492,7 +1632,7 @@ fn envelope_from_catalog(
         RequestId {
             client_id,
             sequence: 1,
-            raft_group_id: GROUP_ID,
+            raft_group_id: TABLET_RAFT_GROUP_ID,
         },
         TABLET_ID,
         TABLET_EPOCH,
@@ -1562,7 +1702,7 @@ fn drain_ready<W, LS, SS>(
     tablet: &mut TabletCommandApplier,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
-    transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
+    transport: &GroupRaftTransport,
     snapshot_endpoint: &SnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
@@ -1621,23 +1761,38 @@ where
 }
 
 fn send_messages(
-    transport: &TcpTransport<Vec<u8>, Vec<u8>, BytesCodec, BytesCodec>,
+    transport: &GroupRaftTransport,
     snapshot_endpoint: &SnapshotEndpoint,
     latest_snapshot: &Option<TabletSnapshotImage>,
     messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
 ) {
     for message in messages {
-        let target = message.to;
+        let target_replica = ReplicaId::from_raft(message.to);
         let carries_snapshot = matches!(message.msg, Message::InstallSnapshot(_));
+        let target_node = transport.target_node_for_replica(target_replica);
+
         if let Err(source) = transport.try_send(message) {
             warn!(
-                from = transport.local_id().get(),
-                to = target.get(),
+                node_id = transport.local_node_id().0,
+                group_id = transport.raft_group_id().0,
+                replica_id = target_replica.0,
                 error = %source,
-                "Raft message could not be delivered; Raft will retry"
+                "Raft message could not be delivered; Raft will retry",
             );
-        } else if carries_snapshot && let Some(image) = latest_snapshot.clone() {
-            snapshot_endpoint.send(target.get(), image);
+
+            continue;
+        }
+
+        if carries_snapshot && let Some(image) = latest_snapshot.clone() {
+            match target_node {
+                Ok(node_id) => snapshot_endpoint.send(node_id.0, image),
+                Err(source) => warn!(
+                    group_id = transport.raft_group_id().0,
+                    replica_id = target_replica.0,
+                    error = %source,
+                    "snapshot peer node could not be resolved",
+                ),
+            }
         }
     }
 }

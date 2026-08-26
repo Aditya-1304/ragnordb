@@ -9,6 +9,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod tablet_apply;
 pub mod tablet_cluster;
+pub mod transport;
 
 /// Stable identity of one physical database node.
 ///

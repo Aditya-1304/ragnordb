@@ -4,6 +4,7 @@ pub mod config;
 pub mod data_directory_lock;
 pub mod database;
 pub mod metrics;
+pub mod multiraft_runtime;
 pub mod protocol;
 pub mod replicated_tablet;
 pub mod session;
@@ -16,9 +17,10 @@ use admin::AdminState;
 use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
 use database::{LocalDatabase, SharedLocalDatabase};
+use multiraft_runtime::MultiRaftRuntime;
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{read_frame, write_frame};
-use replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime};
+use replicated_tablet::ReplicatedTabletHandle;
 use session::Session;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -86,7 +88,7 @@ impl Server {
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let replicated = self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty();
         let (database, recovery_report, recovered_raft) = if replicated {
-            let configurations = ReplicatedTabletRuntime::recovery_configurations(&self.config)?;
+            let configurations = MultiRaftRuntime::recovery_configurations(&self.config)?;
             let (database, report, recovered) = LocalDatabase::recover_shared_with_raft(
                 &data_dir,
                 self.config.node_id,
@@ -115,7 +117,7 @@ impl Server {
         let database = database.into_shared();
         let replicated_runtime = match (replicated_wal, recovered_raft) {
             (Some(wal), Some(recovered)) => {
-                let runtime = ReplicatedTabletRuntime::start_from_shared_recovery(
+                let runtime = MultiRaftRuntime::start_from_shared_recovery(
                     &self.config,
                     wal,
                     database.clone(),
@@ -128,9 +130,7 @@ impl Server {
             (None, None) => None,
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
-        let replicated_handle = replicated_runtime
-            .as_ref()
-            .map(ReplicatedTabletRuntime::handle);
+        let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),

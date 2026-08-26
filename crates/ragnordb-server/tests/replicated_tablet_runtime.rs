@@ -9,7 +9,7 @@ use ragnordb_exec::{ExecutionResult, SqlSession};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
     database::{LocalDatabase, SharedLocalDatabase},
-    replicated_tablet::ReplicatedTabletRuntime,
+    multiraft_runtime::MultiRaftRuntime,
 };
 use tempfile::TempDir;
 
@@ -20,7 +20,7 @@ fn unused_address() -> std::net::SocketAddr {
 
 struct TestNode {
     database: SharedLocalDatabase,
-    runtime: ReplicatedTabletRuntime,
+    runtime: MultiRaftRuntime,
     _data: TempDir,
 }
 
@@ -64,10 +64,18 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
             max_snapshot_file_bytes: 512 * 1024 * 1024,
             snapshot_chunk_bytes: 1024 * 1024,
         };
-        let (database, _) = LocalDatabase::recover(&config.data_dir, config.node_id).unwrap();
+        let configurations = MultiRaftRuntime::recovery_configurations(&config).unwrap();
+        let (database, _, recovered) = LocalDatabase::recover_shared_with_raft(
+            &config.data_dir,
+            config.node_id,
+            &configurations,
+        )
+        .unwrap();
         let wal = database.wal_handle().unwrap();
         let database = database.into_shared();
-        let runtime = ReplicatedTabletRuntime::start(&config, wal, database.clone()).unwrap();
+        let runtime =
+            MultiRaftRuntime::start_from_shared_recovery(&config, wal, database.clone(), recovered)
+                .unwrap();
         database.lock().await.replace_commit_log(runtime.handle());
         database.lock().await.replace_catalog_log(runtime.handle());
         nodes.push(TestNode {
