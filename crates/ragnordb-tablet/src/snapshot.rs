@@ -1221,6 +1221,45 @@ pub struct InstalledTabletSnapshot {
     pub frontier: AppliedTabletFrontier,
 }
 
+/// Verified and restored incoming tablet image which has not yet crossed the
+/// Raft/A-WAL snapshot-boundary durability acknowledgement.
+///
+/// This value is deliberately not a successful installation. The caller must
+/// persist the matching Raft snapshot boundary before publishing this state as
+/// the live tablet image.
+#[derive(Debug)]
+pub struct PreparedTabletSnapshotInstall {
+    pub pointer: TabletSnapshotPointer,
+    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub frontier: AppliedTabletFrontier,
+}
+
+pub fn prepare_incoming_snapshot(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
+    validate_install_target(&receiver.metadata, target)?;
+
+    let image = receiver
+        .finish()
+        .map_err(TabletSnapshotInstallError::Receive)?;
+
+    // The immutable image must exist durably before Raft may reference it.
+    // Publication does not make it live database state.
+    let pointer = store
+        .publish(&image)
+        .map_err(TabletSnapshotInstallError::Store)?;
+
+    let restored = restore_verified_snapshot(&image, target)?;
+
+    Ok(PreparedTabletSnapshotInstall {
+        pointer,
+        state_machine: restored.state_machine,
+        frontier: restored.frontier,
+    })
+}
+
 /// Tablet state reconstructed from a verified immutable snapshot image.
 ///
 /// This value is private startup state until the surrounding replica
@@ -1313,28 +1352,15 @@ where
     F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
     E: std::fmt::Display,
 {
-    validate_install_target(&receiver.metadata, target)?;
+    let prepared = prepare_incoming_snapshot(store, receiver, target)?;
 
-    let image = receiver
-        .finish()
-        .map_err(TabletSnapshotInstallError::Receive)?;
-
-    // Publish the verified immutable image before restoring live state. If
-    // restoration fails, the group remains quarantined and the durable image
-    // remains an unreferenced recovery artifact.
-    let pointer = store
-        .publish(&image)
-        .map_err(TabletSnapshotInstallError::Store)?;
-
-    let restored = restore_verified_snapshot(&image, target)?;
-
-    persist_boundary(&pointer, restored.frontier)
+    persist_boundary(&prepared.pointer, prepared.frontier)
         .map_err(|error| TabletSnapshotInstallError::BoundaryPersistence(error.to_string()))?;
 
     Ok(InstalledTabletSnapshot {
-        pointer,
-        state_machine: restored.state_machine,
-        frontier: restored.frontier,
+        pointer: prepared.pointer,
+        state_machine: prepared.state_machine,
+        frontier: prepared.frontier,
     })
 }
 

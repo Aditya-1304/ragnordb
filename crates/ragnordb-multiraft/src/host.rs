@@ -7,6 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use raft::{
+    core::{
+        node::{ProposeError, RaftError, SnapshotInstallError, StepError},
+        ready::AdvanceError,
+    },
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
     types::LogIndex,
@@ -205,24 +209,30 @@ where
     }
 }
 
-fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
+/// Convert one Ready-loop failure into the physical host failure domain.
+///
+/// Recovery-required variants are matched recursively because the Raft core
+/// can report the same irreversible condition through tick, step, proposal,
+/// snapshot-install, or Ready acknowledgement APIs.
+pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
     match error {
-        ReadyLoopError::RecoveryRequired => HostedGroupError::RecoveryRequired,
+        ReadyLoopError::RecoveryRequired
+        | ReadyLoopError::Tick(RaftError::RecoveryRequired)
+        | ReadyLoopError::Step(StepError::RecoveryRequired)
+        | ReadyLoopError::Proposal(ProposeError::RecoveryRequired)
+        | ReadyLoopError::SnapshotInstall(SnapshotInstallError::RecoveryRequired)
+        | ReadyLoopError::Advance(AdvanceError::RecoveryRequired) => {
+            HostedGroupError::RecoveryRequired
+        }
 
-        // A pending Ready or explicitly retryable persistence result does not
-        // prove corruption. Keep the group live so the Ready can be retried.
         ReadyLoopError::PendingReady | ReadyLoopError::RetryablePersistence(_) => {
             HostedGroupError::Retryable(error.to_string())
         }
 
-        // Network/input/proposal rejection does not justify destroying the
-        // local replica lifetime.
         ReadyLoopError::Proposal(_) | ReadyLoopError::Step(_) => {
             HostedGroupError::Rejected(error.to_string())
         }
 
-        // Everything else here represents either an already quarantined
-        // runtime or a host/persistence/application invariant violation.
         other => HostedGroupError::Group(other.to_string()),
     }
 }
@@ -998,5 +1008,73 @@ mod tests {
             host.propose(RaftGroupId(20), vec![1], 1).unwrap_err(),
             MultiRaftHostError::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn external_shared_wal_fence_stops_host_via_durability_gate() {
+        use ragnordb_common::durability::{DurabilityFailureKind, DurabilityGate};
+        let gate = DurabilityGate::new();
+        let node_wal = NodeRaftWal::with_durability_gate(TestWal, gate.clone());
+        let mut host = MultiRaftHost::new(NodeId(7), node_wal);
+        let first_identity = identity(10, 10);
+        let second_identity = identity(20, 20);
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+        host.register_new_group(Box::new(healthy_group(first_identity, Vec::new())))
+            .unwrap();
+        host.register_new_group(Box::new(healthy_group(second_identity, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+        let _ = gate.require_recovery(
+            DurabilityFailureKind::CatalogOutcomeUnknown,
+            "injected catalog WAL uncertainty",
+        );
+        assert_eq!(
+            host.tick_all(1).unwrap_err(),
+            MultiRaftHostError::RecoveryRequired,
+        );
+    }
+
+    #[test]
+    fn nested_recovery_required_is_never_rejected_or_group() {
+        use crate::runtime::ReadyLoopError;
+        use raft::core::{
+            node::{ProposeError, RaftError, SnapshotInstallError, StepError},
+            ready::AdvanceError,
+        };
+
+        let cases = vec![
+            ReadyLoopError::RecoveryRequired,
+            ReadyLoopError::Tick(RaftError::RecoveryRequired),
+            ReadyLoopError::Step(StepError::RecoveryRequired),
+            ReadyLoopError::Proposal(ProposeError::RecoveryRequired),
+            ReadyLoopError::SnapshotInstall(SnapshotInstallError::RecoveryRequired),
+            ReadyLoopError::Advance(AdvanceError::RecoveryRequired),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_ready_error(error),
+                HostedGroupError::RecoveryRequired,
+                "nested RecoveryRequired must be classified as RecoveryRequired"
+            );
+        }
+
+        // Ensure ordinary rejections are not misclassified as recovery
+        let rejected = ReadyLoopError::Proposal(ProposeError::NotLeader);
+        assert!(matches!(
+            classify_ready_error(rejected),
+            HostedGroupError::Rejected(_)
+        ));
+
+        let retryable = ReadyLoopError::RetryablePersistence(
+            crate::storage::persistence::RaftPersistenceError::NotStaged {
+                recovery_required: false,
+                reason: "injected retryable".to_string(),
+            },
+        );
+        assert!(matches!(
+            classify_ready_error(retryable),
+            HostedGroupError::Retryable(_)
+        ));
     }
 }

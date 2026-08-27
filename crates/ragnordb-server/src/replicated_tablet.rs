@@ -20,7 +20,7 @@ use raft::{
     entry::EntryPayload,
     message::{Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::LogIndex,
+    types::{HardState, LogIndex, SnapshotMetadata},
 };
 
 use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog};
@@ -37,17 +37,19 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
-    host::{HostedGroupError, HostedRaftGroup, RaftMessageEnvelope},
+    host::{HostedGroupError, HostedRaftGroup, RaftMessageEnvelope, classify_ready_error},
     proposal::{ProposalCompletion, ProposalRegistry, ProposalTicket},
     replica_startup::{bootstrap_tablet_replica, recover_tablet_replica},
     runtime::{AppliedRaftFrontier, RaftReadyLoop},
     snapshot::{
-        SnapshotWorkController, TabletSnapshotTransfer, generate_tablet_snapshot_from_ready_loop,
-        install_incoming_tablet_snapshot, persist_tablet_snapshot_boundary_via_ready_loop,
-        raft_pointer_for_tablet,
+        PreparedIncomingTabletSnapshotInstall, SnapshotWorkController, SnapshotWorkError,
+        SnapshotWorkKind, TabletSnapshotIntegrationError, TabletSnapshotTransfer,
+        generate_tablet_snapshot_from_ready_loop, install_incoming_tablet_snapshot,
+        persist_tablet_snapshot_boundary_via_ready_loop, prepare_incoming_tablet_snapshot,
+        raft_metadata_for_tablet, raft_pointer_for_tablet,
     },
     storage::{
-        codec::RaftReplicaIdentity,
+        codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
         persistence::{NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
@@ -154,20 +156,11 @@ fn fatal_host_control_reason<T>(
     }
 }
 
-fn classify_ready_loop_error(
-    error: ragnordb_multiraft::runtime::ReadyLoopError,
-) -> HostedGroupError {
+fn classify_snapshot_integration_error(error: TabletSnapshotIntegrationError) -> HostedGroupError {
     match error {
-        ragnordb_multiraft::runtime::ReadyLoopError::RecoveryRequired => {
-            HostedGroupError::RecoveryRequired
-        }
-        ragnordb_multiraft::runtime::ReadyLoopError::PendingReady
-        | ragnordb_multiraft::runtime::ReadyLoopError::RetryablePersistence(_) => {
+        TabletSnapshotIntegrationError::ReadyLoop(error) => classify_ready_error(error),
+        error @ TabletSnapshotIntegrationError::Work(SnapshotWorkError::LimitReached { .. }) => {
             HostedGroupError::Retryable(error.to_string())
-        }
-        ragnordb_multiraft::runtime::ReadyLoopError::Proposal(_)
-        | ragnordb_multiraft::runtime::ReadyLoopError::Step(_) => {
-            HostedGroupError::Rejected(error.to_string())
         }
         other => HostedGroupError::Group(other.to_string()),
     }
@@ -182,6 +175,25 @@ enum ClientReply {
 struct PendingClient {
     ticket: ProposalTicket<TabletCommandApplyOutcome, TabletCommandApplyError>,
     reply: ClientReply,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum PendingIncomingSnapshotInstall {
+    Received {
+        expected: SnapshotMetadata,
+        received: ReceivedTabletSnapshot,
+    },
+    BoundaryPending {
+        expected: SnapshotMetadata,
+        prepared: PreparedIncomingTabletSnapshotInstall,
+        hard_state: HardState,
+    },
+    ReadyPending {
+        expected: SnapshotMetadata,
+        prepared: PreparedIncomingTabletSnapshotInstall,
+        image: TabletSnapshotImage,
+        raft_pointer: RaftSnapshotPointerRecord,
+    },
 }
 
 #[derive(Clone)]
@@ -829,8 +841,8 @@ where
         .map(|image| image.metadata.last_included_index)
         .unwrap_or(0);
     let mut last_snapshot_at = Instant::now();
-    let mut snapshot_install_pending = false;
-    let mut received_snapshot = None::<ReceivedTabletSnapshot>;
+    let mut expected_snapshot_install: Option<SnapshotMetadata> = None;
+    let mut pending_snapshot_install: Option<PendingIncomingSnapshotInstall> = None;
 
     // Group construction may persist its bootstrap Ready before the physical
     // host has completed recovery registration and sealed retention. Messages
@@ -857,7 +869,7 @@ where
             match control {
                 RaftHostControl::Tick { ticks, reply } => {
                     let result: std::result::Result<(), HostedGroupError> = (|| {
-                        drain_ready(
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -867,9 +879,12 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
-                        ready_loop.tick(ticks).map_err(classify_ready_loop_error)?;
-                        drain_ready(
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
+                        ready_loop.tick(ticks).map_err(classify_ready_error)?;
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -879,7 +894,10 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
                         Ok(())
                     })(
                     );
@@ -892,12 +910,8 @@ where
                 }
 
                 RaftHostControl::Step { message, reply } => {
-                    if matches!(message.msg, Message::InstallSnapshot(_)) {
-                        snapshot_install_pending = true;
-                    }
-
                     let result: std::result::Result<(), HostedGroupError> = (|| {
-                        drain_ready(
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -907,11 +921,12 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
-                        ready_loop
-                            .step(message)
-                            .map_err(classify_ready_loop_error)?;
-                        drain_ready(
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
+                        ready_loop.step(message).map_err(classify_ready_error)?;
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -921,7 +936,10 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
                         Ok(())
                     })(
                     );
@@ -939,7 +957,7 @@ where
                     reply,
                 } => {
                     let result: std::result::Result<LogIndex, HostedGroupError> = (|| {
-                        drain_ready(
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -949,11 +967,14 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
                         let index = ready_loop
                             .propose(command, encoded_len)
-                            .map_err(classify_ready_loop_error)?;
-                        drain_ready(
+                            .map_err(classify_ready_error)?;
+                        if let Some(metadata) = drain_ready(
                             &mut ready_loop,
                             &mut tablet,
                             &mut registry,
@@ -963,7 +984,10 @@ where
                             &latest_snapshot,
                             catalog_cache.as_ref(),
                             &snapshot_policy,
-                        )?;
+                        )? {
+                            expected_snapshot_install = Some(metadata);
+                            pending_snapshot_install = None;
+                        }
                         Ok(index)
                     })(
                     );
@@ -977,31 +1001,333 @@ where
             }
         }
 
-        while let Ok(received) = snapshot_endpoint.inbound.try_recv() {
-            received_snapshot = Some(received);
+        // Snapshot inbound correlation and state machine (retryable, exact metadata)
+        {
+            let mut inbound_valid: Option<ReceivedTabletSnapshot> = None;
+            while let Ok(received) = snapshot_endpoint.inbound.try_recv() {
+                let Some(expected) = expected_snapshot_install.as_ref() else {
+                    tracing::debug!(
+                        snapshot_id = received.metadata.snapshot_id,
+                        "discarding snapshot bytes without an accepted Raft install"
+                    );
+                    continue;
+                };
+                let actual = match raft_metadata_for_tablet(&received.metadata) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "discarding invalid incoming snapshot metadata"
+                        );
+                        continue;
+                    }
+                };
+                if &actual != expected {
+                    tracing::warn!(
+                        expected_snapshot_id = expected.snapshot_id,
+                        received_snapshot_id = actual.snapshot_id,
+                        "discarding snapshot bytes that do not match the accepted Raft install"
+                    );
+                    continue;
+                }
+                if pending_snapshot_install.is_some() || inbound_valid.is_some() {
+                    tracing::debug!(
+                        "discarding extra snapshot bytes while pending install in progress"
+                    );
+                    continue;
+                }
+                inbound_valid = Some(received);
+            }
+            if let Some(received) = inbound_valid {
+                let expected = expected_snapshot_install.clone().expect("validated");
+                pending_snapshot_install =
+                    Some(PendingIncomingSnapshotInstall::Received { expected, received });
+            }
         }
-        if snapshot_install_pending && let Some(received) = received_snapshot.take() {
-            install_received_snapshot(
-                received,
+
+        // Drive pending snapshot install: Received -> BoundaryPending -> ReadyPending -> publish
+        if let Some(PendingIncomingSnapshotInstall::Received { expected, received }) =
+            pending_snapshot_install.take()
+        {
+            let install_permit = match snapshot_work.acquire(SnapshotWorkKind::Install) {
+                Ok(p) => p,
+                Err(SnapshotWorkError::LimitReached { .. }) => {
+                    tracing::debug!("snapshot install backpressure: LimitReached, will retry");
+                    pending_snapshot_install =
+                        Some(PendingIncomingSnapshotInstall::Received { expected, received });
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let target = TabletSnapshotInstallTarget {
+                cluster_id: cluster_id.clone(),
+                raft_group_id: TABLET_RAFT_GROUP_ID,
+                tablet_id: TABLET_ID,
+                table_id: TABLE_ID,
+                tablet_epoch: TABLET_EPOCH,
+            };
+            match prepare_incoming_tablet_snapshot(
+                snapshot_store.as_ref(),
+                received.session,
+                &target,
+                install_permit,
+            ) {
+                Ok(prepared) => {
+                    let mut hard_state = ready_loop.raft().hard_state();
+                    hard_state.commit = hard_state.commit.max(expected.last_included_index);
+                    pending_snapshot_install =
+                        Some(PendingIncomingSnapshotInstall::BoundaryPending {
+                            expected,
+                            prepared,
+                            hard_state,
+                        });
+                }
+                Err(error) => {
+                    let is_remote = matches!(
+                        &error,
+                        TabletSnapshotIntegrationError::Install(install_err) if matches!(
+                            install_err,
+                            ragnordb_tablet::snapshot::TabletSnapshotInstallError::TargetClusterMismatch { .. }
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::TargetGroupMismatch { .. }
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::TargetTabletMismatch { .. }
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::TargetEpochMismatch { .. }
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::PayloadDecode(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::UnsupportedPayloadVersion(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::MissingPayloadTableId
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::TableMismatch { .. }
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::StateMachineIdentityMismatch
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::StateMachineDecode(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::MvccRestore(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::TabletRestore(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::StateMachineRestore(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::InvalidTarget(_)
+                                | ragnordb_tablet::snapshot::TabletSnapshotInstallError::Receive(_)
+                        )
+                    );
+                    if is_remote {
+                        tracing::warn!(error = %error, "rejecting malformed remote snapshot without quarantine");
+                    } else {
+                        let classified = classify_snapshot_integration_error(error);
+                        match classified {
+                            HostedGroupError::Retryable(reason) => {
+                                tracing::debug!(error = %reason, "snapshot prepare retryable, awaiting retransmission");
+                            }
+                            HostedGroupError::RecoveryRequired => {
+                                return Err(classified.to_string());
+                            }
+                            HostedGroupError::Group(reason) => return Err(reason),
+                            HostedGroupError::Rejected(reason) => {
+                                tracing::warn!(reason = %reason, "snapshot prepare rejected");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(PendingIncomingSnapshotInstall::BoundaryPending {
+            expected,
+            prepared,
+            hard_state,
+        }) = pending_snapshot_install.take()
+        {
+            match persist_tablet_snapshot_boundary_via_ready_loop(
                 &mut ready_loop,
-                &mut tablet,
-                &mut registry,
-                &database,
-                &transport,
-                &snapshot_endpoint,
-                &snapshot_store,
-                &snapshot_work,
-                &cluster_id,
-                &mut latest_snapshot,
-                catalog_cache.as_ref(),
-                &snapshot_policy,
-            )?;
-            internal_barrier_allocator.clear();
-            snapshot_install_pending = false;
-            last_snapshot_index = latest_snapshot
-                .as_ref()
-                .map(|image| image.metadata.last_included_index)
-                .unwrap_or(last_snapshot_index);
+                prepared.pointer(),
+                prepared.frontier(),
+                hard_state.clone(),
+            ) {
+                Ok(_) => {
+                    let image = match snapshot_store.load_verified(prepared.pointer()) {
+                        Ok(img) => img,
+                        Err(error) => {
+                            return Err(HostedGroupError::Group(error.to_string()).to_string());
+                        }
+                    };
+                    let core_snapshot = match TabletSnapshotTransfer::from_image(image.clone()) {
+                        Ok(t) => t.into_core_snapshot(),
+                        Err(error) => {
+                            return Err(HostedGroupError::Group(error.to_string()).to_string());
+                        }
+                    };
+                    match ready_loop.complete_snapshot_install(core_snapshot) {
+                        Ok(()) => {
+                            let identity = ready_loop.persistence().log_view().identity();
+                            let raft_pointer =
+                                match raft_pointer_for_tablet(identity, prepared.pointer()) {
+                                    Ok(p) => p,
+                                    Err(error) => {
+                                        return Err(
+                                            HostedGroupError::Group(error.to_string()).to_string()
+                                        );
+                                    }
+                                };
+                            pending_snapshot_install =
+                                Some(PendingIncomingSnapshotInstall::ReadyPending {
+                                    expected,
+                                    prepared,
+                                    image,
+                                    raft_pointer,
+                                });
+                        }
+                        Err(error) => {
+                            let classified = classify_ready_error(error);
+                            match classified {
+                                HostedGroupError::RecoveryRequired => {
+                                    return Err(classified.to_string());
+                                }
+                                HostedGroupError::Retryable(reason) => {
+                                    tracing::debug!(error = %reason, "complete_snapshot_install retryable");
+                                    pending_snapshot_install =
+                                        Some(PendingIncomingSnapshotInstall::BoundaryPending {
+                                            expected,
+                                            prepared,
+                                            hard_state,
+                                        });
+                                    thread::sleep(Duration::from_millis(2));
+                                    continue;
+                                }
+                                HostedGroupError::Group(reason) => return Err(reason),
+                                HostedGroupError::Rejected(reason) => {
+                                    tracing::warn!(reason = %reason, "complete_snapshot_install rejected");
+                                    return Err(reason);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let classified = classify_snapshot_integration_error(error);
+                    match classified {
+                        HostedGroupError::RecoveryRequired => return Err(classified.to_string()),
+                        HostedGroupError::Retryable(reason) => {
+                            tracing::debug!(error = %reason, "snapshot boundary persist retryable");
+                            pending_snapshot_install =
+                                Some(PendingIncomingSnapshotInstall::BoundaryPending {
+                                    expected,
+                                    prepared,
+                                    hard_state,
+                                });
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        HostedGroupError::Group(reason) => return Err(reason),
+                        HostedGroupError::Rejected(reason) => {
+                            tracing::warn!(reason = %reason, "snapshot boundary rejected, discarding pending");
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(PendingIncomingSnapshotInstall::ReadyPending {
+            expected,
+            prepared,
+            image,
+            raft_pointer,
+        }) = pending_snapshot_install.take()
+        {
+            match ready_loop.persist_ready_after_snapshot_boundary(&raft_pointer) {
+                Ok(Some(ready)) => {
+                    let installed = prepared.into_installed();
+                    // Finalize: install tablet, apply suffix, advance frontier, publish
+                    tablet = TabletCommandApplier::new(installed.state_machine);
+                    database
+                        .blocking_lock()
+                        .install_replicated_storage(
+                            TABLE_ID,
+                            tablet.state_machine().tablet().storage().clone(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let mut frontier = AppliedRaftFrontier::new(
+                        image.metadata.last_included_index,
+                        image.metadata.last_included_term,
+                    );
+                    for entry in &ready.committed_entries {
+                        frontier = AppliedRaftFrontier::new(entry.index, entry.term);
+                        let EntryPayload::Normal(bytes) = &entry.payload else {
+                            continue;
+                        };
+                        let envelope =
+                            TabletCommandEnvelope::decode(bytes).map_err(|e| e.to_string())?;
+                        let locally_proposed = registry.is_pending(&envelope.request_id);
+                        let disposition = tablet
+                            .apply_committed(
+                                ragnordb_multiraft::proposal::ProposalPosition {
+                                    term: entry.term,
+                                    index: entry.index,
+                                },
+                                bytes,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        snapshot_policy.note_applied(bytes.len());
+                        publish_committed_command(
+                            &envelope,
+                            locally_proposed,
+                            disposition,
+                            &mut registry,
+                            &database,
+                            catalog_cache.as_ref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    ready_loop
+                        .advance_applied_frontier(frontier)
+                        .map_err(|e| e.to_string())?;
+                    latest_snapshot = Some(image.clone());
+                    snapshot_policy.reset();
+                    send_messages(
+                        &transport,
+                        &snapshot_endpoint,
+                        &latest_snapshot,
+                        ready.messages,
+                    );
+                    release_replica_retention(&mut ready_loop).map_err(|e| e.to_string())?;
+                    snapshot_store
+                        .prune_older_snapshots(&installed.pointer)
+                        .map_err(|e| e.to_string())?;
+                    expected_snapshot_install = None;
+                    internal_barrier_allocator.clear();
+                    last_snapshot_index = latest_snapshot
+                        .as_ref()
+                        .map(|img| img.metadata.last_included_index)
+                        .unwrap_or(last_snapshot_index);
+                }
+                Ok(None) => {
+                    return Err(
+                        "completed snapshot install produced no Ready generation".to_string()
+                    );
+                }
+                Err(error) => {
+                    let classified = classify_ready_error(error);
+                    match classified {
+                        HostedGroupError::RecoveryRequired => return Err(classified.to_string()),
+                        HostedGroupError::Retryable(reason) => {
+                            tracing::debug!(error = %reason, "post-snapshot Ready persist retryable");
+                            pending_snapshot_install =
+                                Some(PendingIncomingSnapshotInstall::ReadyPending {
+                                    expected,
+                                    prepared,
+                                    image,
+                                    raft_pointer,
+                                });
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        other => return Err(other.to_string()),
+                    }
+                }
+            }
+        }
+
+        // If a ReadyPending is still pending (retryable), service it before generic drains
+        if pending_snapshot_install
+            .as_ref()
+            .is_some_and(|p| matches!(p, PendingIncomingSnapshotInstall::ReadyPending { .. }))
+        {
+            thread::sleep(Duration::from_millis(2));
+            continue;
         }
 
         match refresh_leader_activation(
@@ -1032,6 +1358,36 @@ where
                 .is_some_and(|frontier| frontier.index >= activation.index)
         });
 
+        // P1: drain pending Ready before next SQL admission
+        match drain_ready(
+            &mut ready_loop,
+            &mut tablet,
+            &mut registry,
+            &database,
+            &transport,
+            &snapshot_endpoint,
+            &latest_snapshot,
+            catalog_cache.as_ref(),
+            &snapshot_policy,
+        ) {
+            Ok(Some(metadata)) => {
+                expected_snapshot_install = Some(metadata);
+                pending_snapshot_install = None;
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            Ok(None) => {}
+            Err(HostedGroupError::Retryable(error)) | Err(HostedGroupError::Rejected(error)) => {
+                tracing::debug!(
+                    error = %error,
+                    "pending Ready remains blocked before client admission"
+                );
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+
         while let Ok(request) = requests.try_recv() {
             admit_request(
                 request,
@@ -1053,7 +1409,7 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
             ) {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(HostedGroupError::Retryable(error))
                 | Err(HostedGroupError::Rejected(error)) => {
                     tracing::debug!(
@@ -1360,7 +1716,7 @@ where
         return Ok(());
     }
 
-    drain_ready(
+    let _ = drain_ready(
         ready_loop,
         tablet,
         registry,
@@ -1387,10 +1743,10 @@ where
         .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let index = ready_loop
         .propose(bytes.clone(), bytes.len())
-        .map_err(classify_ready_loop_error)?;
+        .map_err(classify_ready_error)?;
     internal_barrier_allocator.record_admission(request_id.sequence);
     *activation = Some(ragnordb_multiraft::proposal::ProposalPosition { term, index });
-    drain_ready(
+    let _ = drain_ready(
         ready_loop,
         tablet,
         registry,
@@ -1400,7 +1756,8 @@ where
         latest_snapshot,
         catalog_cache,
         snapshot_policy,
-    )
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1459,7 +1816,7 @@ where
         snapshot_id,
         conf_state,
     )
-    .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    .map_err(classify_snapshot_integration_error)?;
     let pointer = store
         .publish(&image)
         .map_err(|error| HostedGroupError::Group(error.to_string()))?;
@@ -1472,13 +1829,13 @@ where
         AppliedTabletFrontier::new(frontier.index, frontier.term),
         ready_loop.raft().hard_state(),
     )
-    .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    .map_err(classify_snapshot_integration_error)?;
     let core_snapshot = TabletSnapshotTransfer::from_image(image.clone())
         .map_err(|error| HostedGroupError::Group(error.to_string()))?
         .into_core_snapshot();
     ready_loop
         .restore_persisted_snapshot(&raft_pointer, core_snapshot)
-        .map_err(classify_ready_loop_error)?;
+        .map_err(classify_ready_error)?;
 
     *last_snapshot_index = frontier.index;
     *last_snapshot_at = Instant::now();
@@ -1504,6 +1861,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn install_received_snapshot<W, LS, SS>(
     received: ReceivedTabletSnapshot,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
@@ -1788,15 +2146,16 @@ fn drain_ready<W, LS, SS>(
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
-) -> std::result::Result<(), HostedGroupError>
+) -> std::result::Result<Option<SnapshotMetadata>, HostedGroupError>
 where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
     SS: StableStore,
 {
+    let mut snapshot_install = None;
     while let Some(ready) = ready_loop
         .persist_next_ready(None)
-        .map_err(classify_ready_loop_error)?
+        .map_err(classify_ready_error)?
     {
         let mut frontier = None;
         for entry in &ready.committed_entries {
@@ -1832,6 +2191,9 @@ where
                 .advance_applied_frontier(frontier)
                 .map_err(|error| HostedGroupError::Group(error.to_string()))?;
         }
+        if let Some(metadata) = ready.snapshot_install.clone() {
+            snapshot_install = Some(metadata);
+        }
         send_messages(
             transport,
             snapshot_endpoint,
@@ -1839,7 +2201,7 @@ where
             ready.messages,
         );
     }
-    Ok(())
+    Ok(snapshot_install)
 }
 
 fn send_messages(
@@ -2187,10 +2549,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(
-                classify_ready_loop_error(error),
-                HostedGroupError::Retryable(_)
-            ),
+            matches!(classify_ready_error(error), HostedGroupError::Retryable(_)),
             "RetryablePersistence with recovery_required=false must be Retryable",
         );
     }
@@ -2199,10 +2558,7 @@ mod tests {
     fn pending_ready_is_classified_as_retryable() {
         let error = ragnordb_multiraft::runtime::ReadyLoopError::PendingReady;
         assert!(
-            matches!(
-                classify_ready_loop_error(error),
-                HostedGroupError::Retryable(_)
-            ),
+            matches!(classify_ready_error(error), HostedGroupError::Retryable(_)),
             "PendingReady must be Retryable to allow pending Ready retry",
         );
     }

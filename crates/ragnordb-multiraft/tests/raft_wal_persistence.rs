@@ -3,7 +3,7 @@ use raft::{
     types::{ConfState, HardState, ReplicaId as CoreReplicaId},
 };
 use ragnordb_common::{
-    durability::{DurabilityGate, NodeDurabilityState},
+    durability::{DurabilityFailureKind, DurabilityGate, NodeDurabilityState},
     ids::{RaftGroupId, ReplicaId},
 };
 use ragnordb_multiraft::storage::{
@@ -290,7 +290,7 @@ fn node_wide_wal_forwards_snapshot_retention_pins() {
     let node_wal = NodeRaftWal::new(PinTrackingWal {
         active_pins: Arc::clone(&active_pins),
     });
-    let handle = node_wal.group_writer();
+    let handle = node_wal.group_writer_for(identity()).unwrap();
 
     let pin = handle
         .acquire_retention_pin("tablet-snapshot", Lsn::new(100))
@@ -608,9 +608,12 @@ fn persistence_rejects_hard_state_below_resulting_log_term_before_wal_append() {
 fn uncertain_batch_fences_every_group_writer_on_the_node() {
     let gate = DurabilityGate::new();
     let node_wal = NodeRaftWal::with_durability_gate(FakeWal::failing_sync(), gate.clone());
-    let mut first = RaftWalStorage::new(node_wal.group_writer(), identity());
+    let mut first = RaftWalStorage::new(node_wal.group_writer_for(identity()).unwrap(), identity());
     let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
-    let mut second = RaftWalStorage::new(node_wal.group_writer(), second_identity);
+    let mut second = RaftWalStorage::new(
+        node_wal.group_writer_for(second_identity).unwrap(),
+        second_identity,
+    );
 
     assert!(matches!(
         first.persist(batch()).unwrap_err(),
@@ -691,4 +694,48 @@ fn every_ready_record_prefix_recovers_without_dangling_dependencies() {
 
         assert!(replica.progress().applied_index <= recovered_last_index);
     }
+}
+
+#[test]
+fn external_shared_wal_fence_stops_every_raft_writer() {
+    let gate = DurabilityGate::new();
+
+    let node_wal = NodeRaftWal::with_durability_gate(FakeWal::healthy(), gate.clone());
+
+    let first_identity = identity();
+
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+
+    let mut first = node_wal.group_writer_for(first_identity).unwrap();
+
+    let mut second = node_wal.group_writer_for(second_identity).unwrap();
+
+    node_wal.seal_retention_registry().unwrap();
+
+    let _ = gate.require_recovery(
+        DurabilityFailureKind::CatalogOutcomeUnknown,
+        "injected catalog WAL uncertainty",
+    );
+
+    assert!(
+        node_wal.recovery_required(),
+        "NodeRaftWal must observe recovery required by another shared-WAL owner",
+    );
+
+    let records = [(
+        RaftWalRecordType::LogEntry.as_wal_record_type(),
+        &b"must-not-write"[..],
+    )];
+
+    assert!(matches!(
+        first.append_batch_and_sync(&records),
+        Err(BatchAppendFailure::NotStaged(source))
+            if source.requires_recovery()
+    ));
+
+    assert!(matches!(
+        second.append_batch_and_sync(&records),
+        Err(BatchAppendFailure::NotStaged(source))
+            if source.requires_recovery()
+    ));
 }

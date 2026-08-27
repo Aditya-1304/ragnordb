@@ -10,10 +10,11 @@ use ragnordb_tablet::{
     command::TabletStateMachine,
     snapshot::{
         AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
-        InstalledTabletSnapshot, TabletSnapshotConfState, TabletSnapshotGenerationError,
-        TabletSnapshotImage, TabletSnapshotInstallError, TabletSnapshotInstallTarget,
-        TabletSnapshotMetadata, TabletSnapshotPointer, TabletSnapshotReceiveError,
-        generate_local_snapshot, install_incoming_snapshot,
+        InstalledTabletSnapshot, PreparedTabletSnapshotInstall, TabletSnapshotConfState,
+        TabletSnapshotGenerationError, TabletSnapshotImage, TabletSnapshotInstallError,
+        TabletSnapshotInstallTarget, TabletSnapshotMetadata, TabletSnapshotPointer,
+        TabletSnapshotReceiveError, generate_local_snapshot, install_incoming_snapshot,
+        prepare_incoming_snapshot,
     },
 };
 
@@ -676,10 +677,7 @@ where
 
         Ok::<(), TabletSnapshotIntegrationError>(())
     })
-    .map_err(|error| {
-        ready_loop.quarantine();
-        TabletSnapshotIntegrationError::Install(error)
-    })?;
+    .map_err(TabletSnapshotIntegrationError::Install)?;
 
     let persisted = persisted.ok_or(TabletSnapshotIntegrationError::PersistenceShape)?;
     install_permit.note_bytes(installed.pointer.metadata.total_length);
@@ -694,6 +692,56 @@ where
 pub struct DurableTabletSnapshotInstall {
     pub installed: InstalledTabletSnapshot,
     pub persisted: RaftPersistedBatch,
+}
+
+/// Fully verified/restored incoming snapshot whose live publication is waiting
+/// for the matching Raft durability boundary.
+///
+/// Both admission permits remain owned here across retryable WAL rejection.
+/// Dropping this value cleanly abandons the candidate without modifying the
+/// currently live tablet state.
+#[derive(Debug)]
+pub struct PreparedIncomingTabletSnapshotInstall {
+    installed: PreparedTabletSnapshotInstall,
+    _receive_permit: SnapshotWorkPermit,
+    install_permit: SnapshotWorkPermit,
+}
+
+impl PreparedIncomingTabletSnapshotInstall {
+    pub fn pointer(&self) -> &TabletSnapshotPointer {
+        &self.installed.pointer
+    }
+
+    pub fn frontier(&self) -> AppliedTabletFrontier {
+        self.installed.frontier
+    }
+
+    pub fn into_installed(self) -> PreparedTabletSnapshotInstall {
+        self.install_permit
+            .note_bytes(self.installed.pointer.metadata.total_length);
+
+        self.installed
+    }
+}
+
+pub fn prepare_incoming_tablet_snapshot(
+    store: &FileTabletSnapshotStore,
+    receiver: TabletSnapshotReceiveSession,
+    target: &TabletSnapshotInstallTarget,
+    install_permit: SnapshotWorkPermit,
+) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    let (receiver, receive_permit) = receiver.into_parts();
+
+    let installed = prepare_incoming_snapshot(store, receiver, target)
+        .map_err(TabletSnapshotIntegrationError::Install)?;
+
+    install_permit.set_total_bytes(installed.pointer.metadata.total_length);
+
+    Ok(PreparedIncomingTabletSnapshotInstall {
+        installed,
+        _receive_permit: receive_permit,
+        install_permit,
+    })
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

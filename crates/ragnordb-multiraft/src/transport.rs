@@ -253,6 +253,7 @@ impl NodeRaftTransport {
 
         let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
         stream.set_nodelay(true)?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
         write_frame(&mut stream, &payload)?;
         stream.flush()?;

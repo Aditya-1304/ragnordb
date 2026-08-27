@@ -152,6 +152,29 @@ struct NodeRaftWalState<W> {
     last_pruned_floor: Lsn,
 }
 
+/// Refresh the node-wide recovery fence from every authority that can observe
+/// uncertainty in the physically shared A-WAL.
+///
+/// Raft is not the only writer of A-WAL. Database commits, catalog-cache
+/// publication, checkpoints, and retention operations share the same durable
+/// prefix. Once the common DurabilityGate is fenced, every Raft writer must
+/// stop even if the uncertainty was first observed outside NodeRaftWal.
+fn refresh_recovery_fence<W>(state: &mut NodeRaftWalState<W>) -> bool {
+    if state.recovery_required {
+        return true;
+    }
+
+    if state
+        .durability_gate
+        .as_ref()
+        .is_some_and(|gate| !gate.is_healthy())
+    {
+        state.recovery_required = true;
+    }
+
+    state.recovery_required
+}
+
 impl<W> NodeRaftWal<W> {
     pub fn new(wal: W) -> Self {
         Self {
@@ -189,8 +212,8 @@ impl<W> NodeRaftWal<W> {
             .state
             .lock()
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
-        if state.recovery_required {
-            return Err("shared Raft WAL requires recovery before retention pruning".to_string());
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
         }
         if !state.retention_registry_sealed {
             return Err("retention registry must be sealed before pruning".to_string());
@@ -203,13 +226,6 @@ impl<W> NodeRaftWal<W> {
         }
         state.database_retention_floor = Some(floor);
         prune_to_slowest_floor(&mut state)
-    }
-
-    pub fn group_writer(&self) -> NodeRaftWalHandle<W> {
-        NodeRaftWalHandle {
-            state: Arc::clone(&self.state),
-            owner: None,
-        }
     }
 
     /// register one replica lifetime before a shared-WAL retention pass.
@@ -226,6 +242,9 @@ impl<W> NodeRaftWal<W> {
             .state
             .lock()
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
+        }
         if state.retention_registry_sealed {
             return Err(
                 "cannot register a Raft group after retention registry sealing".to_string(),
@@ -245,6 +264,9 @@ impl<W> NodeRaftWal<W> {
             .state
             .lock()
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
+        }
         state.retention_registry_sealed = true;
         Ok(())
     }
@@ -252,7 +274,7 @@ impl<W> NodeRaftWal<W> {
     pub fn recovery_required(&self) -> bool {
         self.state
             .lock()
-            .map(|state| state.recovery_required)
+            .map(|mut state| refresh_recovery_fence(&mut state))
             .unwrap_or(true)
     }
 }
@@ -288,7 +310,7 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
             .state
             .lock()
             .map_err(|_| BatchAppendFailure::NotStaged(WalError::BrokenDurabilityContract))?;
-        if state.recovery_required {
+        if refresh_recovery_fence(&mut state) {
             return Err(BatchAppendFailure::NotStaged(
                 WalError::BrokenDurabilityContract,
             ));
@@ -333,8 +355,8 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
             .lock()
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
 
-        if state.recovery_required {
-            return Err("shared Raft WAL requires recovery before retention pruning".to_string());
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
         }
         if !state.retention_registry_sealed {
             return Err("retention registry must be sealed before pruning".to_string());
