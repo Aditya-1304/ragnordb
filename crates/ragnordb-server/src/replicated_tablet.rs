@@ -156,6 +156,36 @@ fn fatal_host_control_reason<T>(
     }
 }
 
+/// Reject one host operation without mutating Raft while an exact snapshot
+/// durability lifecycle owns the group's outstanding state.
+///
+/// The physical MultiRaft host is synchronous in Phase 5.0. Leaving the
+/// request queued would block `tick_all()` on this replica and prevent
+/// unrelated groups from running. Returning `Retryable` preserves both the
+/// snapshot ordering invariant and cross-group failure isolation.
+fn reply_snapshot_blocked_host_control(control: RaftHostControl, reason: &str) {
+    match control {
+        RaftHostControl::Tick { reply, .. } | RaftHostControl::Step { reply, .. } => {
+            let _ = reply.send(Err(HostedGroupError::Retryable(reason.to_string())));
+        }
+
+        RaftHostControl::Propose { reply, .. } => {
+            let _ = reply.send(Err(HostedGroupError::Retryable(reason.to_string())));
+        }
+    }
+}
+
+/// Drain host requests which cannot legally mutate this Raft group while a
+/// snapshot persistence retry owns its exact Ready/frontier.
+///
+/// Requests are answered instead of merely left queued so the synchronous
+/// node-level host remains free to service unrelated Raft groups.
+fn reject_snapshot_blocked_host_controls(host_control: &Receiver<RaftHostControl>, reason: &str) {
+    while let Ok(control) = host_control.try_recv() {
+        reply_snapshot_blocked_host_control(control, reason);
+    }
+}
+
 fn classify_snapshot_integration_error(error: TabletSnapshotIntegrationError) -> HostedGroupError {
     match error {
         TabletSnapshotIntegrationError::ReadyLoop(error) => classify_ready_error(error),
@@ -918,6 +948,14 @@ where
     }
 
     while !shutdown.load(Ordering::Acquire) {
+        // This snapshot candidate owns a fixed state-machine frontier. Host
+        // operations must not mutate the group until its boundary is resolved,
+        // but they must receive a Retryable response so this replica cannot stall
+        // the physical MultiRaft host.
+        reject_snapshot_blocked_host_controls(
+            &host_control,
+            "local snapshot durability boundary is awaiting retry",
+        );
         // A locally generated snapshot whose immutable image has already been
         // published owns a stable state-machine frontier until its A-WAL boundary is
         // resolved.
@@ -975,7 +1013,12 @@ where
                 .map(PendingIncomingSnapshotInstall::phase),
         );
 
-        if !post_snapshot_ready_pending {
+        if post_snapshot_ready_pending {
+            reject_snapshot_blocked_host_controls(
+                &host_control,
+                "post-snapshot Ready persistence is awaiting retry",
+            );
+        } else {
             while let Ok(control) = host_control.try_recv() {
                 match control {
                     RaftHostControl::Tick { ticks, reply } => {
@@ -2867,6 +2910,69 @@ mod tests {
         assert!(!snapshot_state_blocks_normal_work(
             Some(IncomingSnapshotPhase::BoundaryPending),
             false,
+        ));
+    }
+
+    #[test]
+    fn snapshot_retry_returns_retryable_to_host_control() {
+        let (control_tx, control_rx) = mpsc::sync_channel(3);
+
+        let (tick_reply_tx, tick_reply_rx) = mpsc::channel();
+
+        let (step_reply_tx, step_reply_rx) = mpsc::channel();
+
+        let (propose_reply_tx, propose_reply_rx) = mpsc::channel();
+
+        control_tx
+            .send(RaftHostControl::Tick {
+                ticks: 1,
+                reply: tick_reply_tx,
+            })
+            .unwrap();
+
+        let message = RaftMessageEnvelope {
+            from: raft::types::ReplicaId::must(2),
+            to: raft::types::ReplicaId::must(1),
+            msg: Message::AppendEntries(raft::message::AppendEntriesRequest {
+                term: 1,
+                leader_id: raft::types::ReplicaId::must(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        };
+
+        control_tx
+            .send(RaftHostControl::Step {
+                message,
+                reply: step_reply_tx,
+            })
+            .unwrap();
+
+        control_tx
+            .send(RaftHostControl::Propose {
+                command: vec![1, 2, 3],
+                encoded_len: 3,
+                reply: propose_reply_tx,
+            })
+            .unwrap();
+
+        reject_snapshot_blocked_host_controls(&control_rx, "snapshot persistence pending");
+
+        assert!(matches!(
+            tick_reply_rx.recv().unwrap(),
+            Err(HostedGroupError::Retryable(_)),
+        ));
+
+        assert!(matches!(
+            step_reply_rx.recv().unwrap(),
+            Err(HostedGroupError::Retryable(_)),
+        ));
+
+        assert!(matches!(
+            propose_reply_rx.recv().unwrap(),
+            Err(HostedGroupError::Retryable(_)),
         ));
     }
 }
