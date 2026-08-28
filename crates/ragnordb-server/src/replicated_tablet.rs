@@ -918,6 +918,53 @@ where
     }
 
     while !shutdown.load(Ordering::Acquire) {
+        // A locally generated snapshot whose immutable image has already been
+        // published owns a stable state-machine frontier until its A-WAL boundary is
+        // resolved.
+        //
+        // Do not admit Raft messages, ticks, proposals, or SQL work while this
+        // candidate is waiting on a retryable persistence result. Advancing applied
+        // state before retry would make the retained snapshot stale and could turn
+        // benign WAL backpressure into an applied-index regression.
+        if pending_local_snapshot.is_some() {
+            match maybe_publish_snapshot(
+                &mut ready_loop,
+                &mut tablet,
+                &mut registry,
+                &database,
+                &transport,
+                &snapshot_endpoint,
+                &snapshot_store,
+                &snapshot_work,
+                &cluster_id,
+                &mut latest_snapshot,
+                &mut pending_local_snapshot,
+                &mut last_snapshot_index,
+                catalog_cache.as_ref(),
+                &snapshot_policy,
+                &mut last_snapshot_at,
+            ) {
+                Ok(()) => {
+                    debug_assert!(
+                        pending_local_snapshot.is_none(),
+                        "successful local snapshot publication must consume the retained candidate",
+                    );
+                }
+
+                Err(HostedGroupError::Retryable(error))
+                | Err(HostedGroupError::Rejected(error)) => {
+                    tracing::debug!(
+                        error = %error,
+                        "retained local snapshot boundary remains retryable",
+                    );
+
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         // A completed external snapshot owns the outstanding Ready generation.
         // That generation can only be retried with its already-durable snapshot
         // pointer. No tick, step, or proposal may enter generic drain_ready() until
@@ -1139,8 +1186,6 @@ where
                 install_permit,
             ) {
                 Ok(prepared) => {
-                    let mut hard_state = ready_loop.raft().hard_state();
-                    hard_state.commit = hard_state.commit.max(expected.last_included_index);
                     pending_snapshot_install =
                         Some(PendingIncomingSnapshotInstall::BoundaryPending {
                             expected,
@@ -2481,6 +2526,13 @@ mod tests {
     use ragnordb_multiraft::{proposal::ProposalPosition, tablet_apply::AppliedTabletCommand};
     use ragnordb_tablet::command::TabletCommandApplyResult;
 
+    fn snapshot_state_blocks_normal_work(
+        incoming_phase: Option<IncomingSnapshotPhase>,
+        local_snapshot_pending: bool,
+    ) -> bool {
+        local_snapshot_pending || incoming_phase == Some(IncomingSnapshotPhase::ReadyPending)
+    }
+
     /// Realistic bug caught: a queued tick could enter the generic Ready path
     /// while the post-snapshot Ready generation was still awaiting durable
     /// persistence, violating the single-outstanding-Ready ownership rule.
@@ -2801,5 +2853,20 @@ mod tests {
             matches!(classify_ready_error(error), HostedGroupError::Retryable(_)),
             "PendingReady must be Retryable to allow pending Ready retry",
         );
+    }
+
+    #[test]
+    fn pending_local_snapshot_blocks_raft_and_sql_progress() {
+        assert!(snapshot_state_blocks_normal_work(None, true,));
+
+        assert!(snapshot_state_blocks_normal_work(
+            Some(IncomingSnapshotPhase::ReadyPending),
+            false,
+        ));
+
+        assert!(!snapshot_state_blocks_normal_work(
+            Some(IncomingSnapshotPhase::BoundaryPending),
+            false,
+        ));
     }
 }
