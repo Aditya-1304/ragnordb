@@ -3,7 +3,8 @@ use ragnordb_common::{
     ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
     metadata_codec::{
         DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand,
-        MetadataCommandCodecError, NodeDescriptor, TabletDescriptor,
+        MetadataCommandCodecError, MetadataSnapshot, NodeDescriptor, PartitionSpec,
+        RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
@@ -11,54 +12,82 @@ fn table() -> TableDefinition {
     TableDefinition {
         table_id: 7,
         name: "accounts".to_string(),
+
         columns: vec![ColumnDefinition {
             column_id: ColumnId(1),
             name: "id".to_string(),
             ty: DataType::Int,
             nullable: false,
         }],
+
         primary_key_column_ids: vec![ColumnId(1)],
+
         schema_version: 1,
-        tablet_count: 1,
+        tablet_count: 2,
     }
 }
 
-/// Realistic bug caught:
-///
-/// If the bytes proposed to the metadata Raft group do not retain placement
-/// role, epoch, and tablet identity exactly, a restart can reconcile a
-/// different topology than the one that was committed.
+fn node(node_id: u64, base_port: u16) -> NodeDescriptor {
+    NodeDescriptor {
+        node_id: NodeId(node_id),
+
+        raft_addr: format!("127.0.0.1:{base_port}"),
+
+        snapshot_addr: format!("127.0.0.1:{}", base_port + 50),
+
+        sql_addr: format!("127.0.0.1:{}", base_port + 100),
+
+        admin_addr: format!("127.0.0.1:{}", base_port + 200),
+    }
+}
+
+fn tablet() -> TabletDescriptor {
+    TabletDescriptor {
+        tablet_id: TabletId(17),
+        table_id: TableId(7),
+        raft_group_id: RaftGroupId(23),
+        tablet_epoch: 1,
+
+        partition: PartitionSpec::Hash {
+            bucket: 0,
+            bucket_count: 2,
+        },
+    }
+}
+
+fn placement() -> DesiredReplicaPlacement {
+    DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 1,
+
+        replicas: vec![
+            DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(11),
+                role: DesiredReplicaRole::Voter,
+            },
+            DesiredReplica {
+                replica_id: ReplicaId(32),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Learner,
+            },
+        ],
+    }
+}
+
 #[test]
-fn metadata_commands_roundtrip_all_committed_topology_fields() {
+fn metadata_v2_commands_roundtrip_every_authoritative_field() {
     let commands = vec![
         MetadataCommand::ClusterInitialized {
             cluster_id: "cluster-a".to_string(),
         },
-        MetadataCommand::RegisterNode(NodeDescriptor {
-            node_id: NodeId(11),
-            endpoint: "127.0.0.1:7101".to_string(),
-        }),
+        MetadataCommand::RegisterNode(node(11, 7001)),
         MetadataCommand::CreateTable { table: table() },
-        MetadataCommand::CreateTablet {
-            tablet: TabletDescriptor {
-                tablet_id: TabletId(17),
-                table_id: TableId(7),
-                raft_group_id: RaftGroupId(23),
-                tablet_epoch: 1,
-                schema_version: 1,
-            },
-        },
-        MetadataCommand::SetDesiredReplicaPlacement(DesiredReplicaPlacement {
-            tablet_id: TabletId(17),
-            configuration_epoch: 2,
-            replicas: vec![DesiredReplica {
-                replica_id: ReplicaId(31),
-                node_id: NodeId(11),
-                role: DesiredReplicaRole::Voter,
-            }],
-        }),
+        MetadataCommand::CreateTablet { tablet: tablet() },
+        MetadataCommand::SetDesiredReplicaPlacement(placement()),
         MetadataCommand::UpdateTableSchema {
             expected_schema_version: 1,
+
             table: TableDefinition {
                 schema_version: 2,
                 ..table()
@@ -68,20 +97,34 @@ fn metadata_commands_roundtrip_all_committed_topology_fields() {
 
     for command in commands {
         let encoded = command.encode().unwrap();
+
         assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
     }
 }
 
-/// Realistic bug caught:
-///
-/// Protobuf preserves repeated-field order. Accepting a non-canonical replica
-/// list would allow the same desired placement to acquire multiple durable
-/// byte representations and could make replay or hashing disagree by node.
 #[test]
-fn noncanonical_replica_order_is_rejected_before_proposal() {
-    let command = MetadataCommand::SetDesiredReplicaPlacement(DesiredReplicaPlacement {
+fn old_experimental_metadata_command_version_is_rejected() {
+    let command = MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    };
+
+    let mut proto = command.to_proto();
+
+    proto.format_version = 1;
+
+    assert_eq!(
+        MetadataCommand::from_proto(proto).unwrap_err(),
+        MetadataCommandCodecError::UnsupportedVersion(1)
+    );
+}
+
+#[test]
+fn desired_placement_requires_canonical_replica_order_and_a_voter() {
+    let noncanonical = MetadataCommand::SetDesiredReplicaPlacement(DesiredReplicaPlacement {
         tablet_id: TabletId(17),
+
         configuration_epoch: 1,
+
         replicas: vec![
             DesiredReplica {
                 replica_id: ReplicaId(32),
@@ -97,26 +140,89 @@ fn noncanonical_replica_order_is_rejected_before_proposal() {
     });
 
     assert_eq!(
-        command.encode().unwrap_err(),
+        noncanonical.encode().unwrap_err(),
         MetadataCommandCodecError::ReplicaPlacementNotCanonical
+    );
+
+    let no_voter = MetadataCommand::SetDesiredReplicaPlacement(DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+
+        configuration_epoch: 1,
+
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(31),
+            node_id: NodeId(11),
+            role: DesiredReplicaRole::Learner,
+        }],
+    });
+
+    assert_eq!(
+        no_voter.encode().unwrap_err(),
+        MetadataCommandCodecError::PlacementHasNoVoter
     );
 }
 
-/// Realistic bug caught:
-///
-/// A node upgraded with new metadata-command semantics could otherwise replay
-/// an unsupported committed record as though it were the current format,
-/// producing an incompatible metadata projection after recovery.
 #[test]
-fn unsupported_metadata_command_version_is_rejected() {
-    let command = MetadataCommand::ClusterInitialized {
-        cluster_id: "cluster-a".to_string(),
+fn invalid_hash_partition_is_rejected_before_proposal() {
+    let command = MetadataCommand::CreateTablet {
+        tablet: TabletDescriptor {
+            partition: PartitionSpec::Hash {
+                bucket: 2,
+                bucket_count: 2,
+            },
+
+            ..tablet()
+        },
     };
-    let mut proto = command.to_proto();
-    proto.format_version = 2;
 
     assert_eq!(
-        MetadataCommand::from_proto(proto).unwrap_err(),
-        MetadataCommandCodecError::UnsupportedVersion(2)
+        command.encode().unwrap_err(),
+        MetadataCommandCodecError::InvalidHashBucket {
+            bucket: 2,
+            bucket_count: 2,
+        }
+    );
+}
+
+#[test]
+fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
+    let snapshot = MetadataSnapshot {
+        cluster_id: Some("cluster-a".to_string()),
+
+        nodes: vec![node(11, 7001), node(12, 7002)],
+
+        tables: vec![table()],
+
+        tablets: vec![tablet()],
+
+        desired_placements: vec![placement()],
+
+        retired_replicas: vec![RetiredReplicaLifetime {
+            raft_group_id: RaftGroupId(23),
+            replica_id: ReplicaId(30),
+        }],
+    };
+
+    let encoded = snapshot.encode().unwrap();
+
+    assert_eq!(MetadataSnapshot::decode(&encoded).unwrap(), snapshot);
+}
+
+#[test]
+fn metadata_snapshot_rejects_noncanonical_node_order() {
+    let snapshot = MetadataSnapshot {
+        cluster_id: Some("cluster-a".to_string()),
+
+        nodes: vec![node(12, 7002), node(11, 7001)],
+
+        tables: Vec::new(),
+        tablets: Vec::new(),
+        desired_placements: Vec::new(),
+        retired_replicas: Vec::new(),
+    };
+
+    assert_eq!(
+        snapshot.encode().unwrap_err(),
+        MetadataCommandCodecError::NonCanonicalSnapshot("nodes")
     );
 }

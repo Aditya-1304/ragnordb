@@ -1,12 +1,16 @@
 syntax = "proto3";
+
 package ragnordb.metadata;
 
 import "catalog.proto";
 import "ids.proto";
 
-// commands committed by the metadata Raft group. This schema intentionally
-// represents desired topology only; per-group committed membership belongs to
-// the Raft ConfState and current leadership is refreshed from live Raft state
+// Commands committed through the metadata Raft group.
+//
+// Metadata owns desired cluster topology and SQL/catalog state. It deliberately
+// does not own:
+//   - the current Raft leader, which is transient observation/cache state;
+//   - committed voters/learners, which belong to each group's Raft ConfState.
 message MetadataCommand {
     uint32 format_version = 1;
 
@@ -24,9 +28,19 @@ message ClusterInitialized {
     string cluster_id = 1;
 }
 
+// Durable physical-node directory record.
+//
+// Field 2 was used by the pre-Phase-5 experimental format for one generic
+// endpoint. It must never be reinterpreted as one of the production addresses.
 message NodeDescriptor {
     ragnordb.ids.NodeId node_id = 1;
-    string endpoint = 2;
+
+    reserved 2;
+
+    string raft_addr = 3;
+    string snapshot_addr = 4;
+    string sql_addr = 5;
+    string admin_addr = 6;
 }
 
 message RegisterNode {
@@ -37,12 +51,34 @@ message CreateTable {
     ragnordb.catalog.TableDefinition table = 1;
 }
 
+message HashPartition {
+    // Zero-based bucket number.
+    uint32 bucket = 1;
+
+    // Total number of hash buckets for this table.
+    uint32 bucket_count = 2;
+}
+
+message PartitionSpec {
+    oneof kind {
+        HashPartition hash = 1;
+    }
+}
+
+// Stable mapping from one logical tablet to one Raft group.
+//
+// Field 5 was schema_version in the experimental metadata format. Schema
+// version belongs to the table definition and would become stale on every
+// schema update, so that field is permanently retired.
 message TabletDescriptor {
     ragnordb.ids.TabletId tablet_id = 1;
     ragnordb.ids.TableId table_id = 2;
     ragnordb.ids.RaftGroupId raft_group_id = 3;
     uint64 tablet_epoch = 4;
-    uint64 schema_version = 5;
+
+    reserved 5;
+
+    PartitionSpec partition = 6;
 }
 
 message CreateTablet {
@@ -61,6 +97,11 @@ message DesiredReplica {
     DesiredReplicaRole role = 3;
 }
 
+// Desired membership for one tablet.
+//
+// configuration_epoch is metadata authority only. It must not be interpreted
+// as the Raft ConfState version. Reconciliation compares this desired state to
+// the independently committed ConfState of the tablet Raft group.
 message SetDesiredReplicaPlacement {
     ragnordb.ids.TabletId tablet_id = 1;
     uint64 configuration_epoch = 2;
@@ -70,4 +111,32 @@ message SetDesiredReplicaPlacement {
 message UpdateTableSchema {
     uint64 expected_schema_version = 1;
     ragnordb.catalog.TableDefinition table = 2;
+}
+
+// Permanent record that one consensus identity has ended.
+//
+// Replica IDs are scoped to one Raft group, so the tombstone key is the full
+// (raft_group_id, replica_id) pair.
+message RetiredReplicaLifetime {
+    ragnordb.ids.RaftGroupId raft_group_id = 1;
+    ragnordb.ids.ReplicaId replica_id = 2;
+}
+
+// Deterministic snapshot of the metadata Raft state machine.
+//
+// All repeated fields are serialized in ascending stable-ID order. This gives
+// one canonical representation for the same logical metadata projection.
+message MetadataSnapshot {
+    uint32 format_version = 1;
+
+    // The metadata group may technically snapshot before ClusterInitialized.
+    // Keep that state representable instead of manufacturing a cluster ID.
+    bool initialized = 2;
+    string cluster_id = 3;
+
+    repeated NodeDescriptor nodes = 4;
+    repeated ragnordb.catalog.TableDefinition tables = 5;
+    repeated TabletDescriptor tablets = 6;
+    repeated SetDesiredReplicaPlacement desired_placements = 7;
+    repeated RetiredReplicaLifetime retired_replicas = 8;
 }

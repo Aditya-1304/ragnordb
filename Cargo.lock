@@ -1513,6 +1513,7 @@ version = "0.1.0"
 dependencies = [
  "ragnordb-common",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1568,6 +1569,7 @@ dependencies = [
  "blake3",
  "prost",
  "raft",
+ "ragnordb-catalog",
  "ragnordb-common",
  "ragnordb-storage",
  "ragnordb-tablet",

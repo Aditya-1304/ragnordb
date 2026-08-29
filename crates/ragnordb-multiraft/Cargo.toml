@@ -7,9 +7,10 @@ repository.workspace = true
 
 [dependencies]
 ragnordb-common = { path = "../ragnordb-common" }
+ragnordb-catalog = { path = "../ragnordb-catalog" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
 ragnordb-storage = { path = "../ragnordb-storage" }
-ragnordb-txn = { path = "../ragnordb-txn"}
+ragnordb-txn = { path = "../ragnordb-txn" }
 raft.workspace = true
 wal.workspace = true
 thiserror.workspace = true

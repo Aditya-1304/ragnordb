@@ -2,6 +2,7 @@ use ragnordb_common::ids::NodeId;
 
 pub mod bootstrap;
 pub mod host;
+pub mod meta;
 pub mod proposal;
 pub mod replica_startup;
 pub mod runtime;

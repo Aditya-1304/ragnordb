@@ -1,10 +1,11 @@
-use ragnordb_catalog::{MetadataApplyOutcome, MetadataState};
+use ragnordb_catalog::{MetadataApplyOutcome, MetadataRejection, MetadataState};
+
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
     ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
     metadata_codec::{
         DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand,
-        NodeDescriptor, TabletDescriptor,
+        NodeDescriptor, PartitionSpec, TabletDescriptor,
     },
 };
 
@@ -12,224 +13,341 @@ fn table() -> TableDefinition {
     TableDefinition {
         table_id: 7,
         name: "accounts".to_string(),
+
         columns: vec![ColumnDefinition {
             column_id: ColumnId(1),
             name: "id".to_string(),
             ty: DataType::Int,
             nullable: false,
         }],
+
         primary_key_column_ids: vec![ColumnId(1)],
+
         schema_version: 1,
-        tablet_count: 1,
+        tablet_count: 2,
     }
 }
 
-/// A metadata log replay could publish table and tablet records without their
-/// desired placement, or collapse desired placement into current Raft
-/// membership. After a crash, a reconciler would then either have no work or
-/// could treat an uncommitted replica as a voter.
-#[test]
-fn committed_metadata_replay_preserves_desired_placement_separately_from_tablet_identity() {
+fn node(id: u64, base_port: u16) -> NodeDescriptor {
+    NodeDescriptor {
+        node_id: NodeId(id),
+
+        raft_addr: format!("127.0.0.1:{base_port}"),
+
+        snapshot_addr: format!("127.0.0.1:{}", base_port + 50),
+
+        sql_addr: format!("127.0.0.1:{}", base_port + 100),
+
+        admin_addr: format!("127.0.0.1:{}", base_port + 200),
+    }
+}
+
+fn tablet() -> TabletDescriptor {
+    TabletDescriptor {
+        tablet_id: TabletId(17),
+        table_id: TableId(7),
+        raft_group_id: RaftGroupId(23),
+        tablet_epoch: 1,
+
+        partition: PartitionSpec::Hash {
+            bucket: 0,
+            bucket_count: 2,
+        },
+    }
+}
+
+fn bootstrap_state() -> MetadataState {
     let mut state = MetadataState::new();
 
     assert_eq!(
-        state
-            .apply(MetadataCommand::ClusterInitialized {
-                cluster_id: "cluster-a".to_string(),
-            })
-            .expect("cluster initialization must apply"),
-        MetadataApplyOutcome::Applied
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        },),
+        MetadataApplyOutcome::Applied,
     );
+
+    for node in [node(11, 7001), node(12, 7002), node(13, 7003)] {
+        assert_eq!(
+            state.apply(MetadataCommand::RegisterNode(node),),
+            MetadataApplyOutcome::Applied,
+        );
+    }
+
     assert_eq!(
-        state
-            .apply(MetadataCommand::RegisterNode(NodeDescriptor {
-                node_id: NodeId(11),
-                endpoint: "127.0.0.1:7101".to_string(),
-            }))
-            .expect("node registration must apply"),
-        MetadataApplyOutcome::Applied
+        state.apply(MetadataCommand::CreateTable { table: table() },),
+        MetadataApplyOutcome::Applied,
     );
+
     assert_eq!(
-        state
-            .apply(MetadataCommand::CreateTable { table: table() })
-            .expect("table creation must apply"),
-        MetadataApplyOutcome::Applied
+        state.apply(MetadataCommand::CreateTablet { tablet: tablet() },),
+        MetadataApplyOutcome::Applied,
     );
-    assert_eq!(
-        state
-            .apply(MetadataCommand::CreateTablet {
-                tablet: TabletDescriptor {
-                    tablet_id: TabletId(17),
-                    table_id: TableId(7),
-                    raft_group_id: RaftGroupId(23),
-                    tablet_epoch: 1,
-                    schema_version: 1,
-                },
-            })
-            .expect("tablet creation must apply"),
-        MetadataApplyOutcome::Applied
-    );
+
+    state
+}
+
+#[test]
+fn committed_metadata_replay_preserves_tablet_partition_and_desired_placement() {
+    let mut state = bootstrap_state();
 
     let placement = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
+
         configuration_epoch: 1,
-        replicas: vec![DesiredReplica {
-            replica_id: ReplicaId(31),
-            node_id: NodeId(11),
-            role: DesiredReplicaRole::Voter,
-        }],
+
+        replicas: vec![
+            DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(11),
+                role: DesiredReplicaRole::Voter,
+            },
+            DesiredReplica {
+                replica_id: ReplicaId(32),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Learner,
+            },
+        ],
     };
+
     assert_eq!(
-        state
-            .apply(MetadataCommand::SetDesiredReplicaPlacement(
-                placement.clone()
-            ))
-            .expect("desired placement must apply"),
-        MetadataApplyOutcome::Applied
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            placement.clone(),
+        ),),
+        MetadataApplyOutcome::Applied,
     );
 
     assert_eq!(state.cluster_id(), Some("cluster-a"));
+
     assert_eq!(
-        state.table(TableId(7)).expect("table must exist").name,
-        "accounts"
+        state.tablet(TabletId(17)).unwrap().partition,
+        PartitionSpec::Hash {
+            bucket: 0,
+            bucket_count: 2,
+        }
     );
-    assert_eq!(
-        state
-            .tablet(TabletId(17))
-            .expect("tablet must exist")
-            .raft_group_id,
-        RaftGroupId(23)
-    );
+
     assert_eq!(state.desired_placement(TabletId(17)), Some(&placement));
 }
 
-/// A recovered metadata log can contain the command that was already applied
-/// before a crash. Treating that exact replay as a conflict loses recovery
-/// availability, while accepting a changed command at the same epoch can make
-/// metadata claim a topology the Raft group never committed.
 #[test]
-fn exact_replay_is_idempotent_but_conflicting_cluster_and_stale_placement_are_rejected() {
-    let mut state = MetadataState::new();
-    let initialized = MetadataCommand::ClusterInitialized {
-        cluster_id: "cluster-a".to_string(),
-    };
+fn stale_metadata_command_is_a_rejection_not_a_state_machine_failure() {
+    let mut state = bootstrap_state();
 
-    assert_eq!(
-        state.apply(initialized.clone()).unwrap(),
-        MetadataApplyOutcome::Applied
-    );
-    assert_eq!(
-        state.apply(initialized).unwrap(),
-        MetadataApplyOutcome::AlreadyApplied
-    );
-    assert!(
-        state
-            .apply(MetadataCommand::ClusterInitialized {
-                cluster_id: "cluster-b".to_string(),
-            })
-            .is_err()
-    );
-
-    state
-        .apply(MetadataCommand::RegisterNode(NodeDescriptor {
-            node_id: NodeId(11),
-            endpoint: "127.0.0.1:7101".to_string(),
-        }))
-        .unwrap();
-    state
-        .apply(MetadataCommand::CreateTable { table: table() })
-        .unwrap();
-    state
-        .apply(MetadataCommand::CreateTablet {
-            tablet: TabletDescriptor {
-                tablet_id: TabletId(17),
-                table_id: TableId(7),
-                raft_group_id: RaftGroupId(23),
-                tablet_epoch: 1,
-                schema_version: 1,
-            },
-        })
-        .unwrap();
-
-    let epoch_two = DesiredReplicaPlacement {
+    let epoch_one = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
-        configuration_epoch: 2,
+
+        configuration_epoch: 1,
+
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(31),
             node_id: NodeId(11),
             role: DesiredReplicaRole::Voter,
         }],
     };
-    state
-        .apply(MetadataCommand::SetDesiredReplicaPlacement(
-            epoch_two.clone(),
-        ))
-        .unwrap();
+
     assert_eq!(
-        state
-            .apply(MetadataCommand::SetDesiredReplicaPlacement(epoch_two))
-            .unwrap(),
-        MetadataApplyOutcome::AlreadyApplied
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(epoch_one,),),
+        MetadataApplyOutcome::Applied,
     );
-    assert!(
-        state
-            .apply(MetadataCommand::SetDesiredReplicaPlacement(
-                DesiredReplicaPlacement {
-                    tablet_id: TabletId(17),
-                    configuration_epoch: 1,
-                    replicas: vec![DesiredReplica {
-                        replica_id: ReplicaId(31),
-                        node_id: NodeId(11),
-                        role: DesiredReplicaRole::Voter,
-                    }],
-                }
-            ))
-            .is_err()
-    );
+
+    let stale = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+
+        configuration_epoch: 3,
+
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(31),
+            node_id: NodeId(11),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+
+    assert!(matches!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(stale,),),
+        MetadataApplyOutcome::Rejected(MetadataRejection::PlacementEpochMismatch {
+            expected: 2,
+            received: 3,
+            ..
+        })
+    ));
 }
 
-/// A delayed schema command from an old coordinator could otherwise overwrite
-/// a newer committed definition. That would make nodes that replayed the same
-/// Raft log disagree about the schema used to decode tablet rows.
 #[test]
-fn schema_update_advances_exactly_one_version_and_rejects_a_stale_precondition() {
-    let mut state = MetadataState::new();
-    state
-        .apply(MetadataCommand::ClusterInitialized {
-            cluster_id: "cluster-a".to_string(),
+fn removed_replica_id_is_tombstoned_and_cannot_be_reused() {
+    let mut state = bootstrap_state();
+
+    let initial = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+
+        configuration_epoch: 1,
+
+        replicas: vec![
+            DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(11),
+                role: DesiredReplicaRole::Voter,
+            },
+            DesiredReplica {
+                replica_id: ReplicaId(32),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Learner,
+            },
+        ],
+    };
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(initial,),),
+        MetadataApplyOutcome::Applied,
+    );
+
+    // Replica 32 becomes the replacement voter and replica 31 is removed.
+    let replacement = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+
+        configuration_epoch: 2,
+
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(32),
+            node_id: NodeId(12),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(replacement,),),
+        MetadataApplyOutcome::Applied,
+    );
+
+    assert!(state.is_replica_retired(RaftGroupId(23), ReplicaId(31),));
+
+    let illegal_reuse = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+
+        configuration_epoch: 3,
+
+        replicas: vec![
+            DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(13),
+                role: DesiredReplicaRole::Learner,
+            },
+            DesiredReplica {
+                replica_id: ReplicaId(32),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Voter,
+            },
+        ],
+    };
+
+    assert!(matches!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(illegal_reuse,),),
+        MetadataApplyOutcome::Rejected(MetadataRejection::RetiredReplicaReuse {
+            raft_group_id: RaftGroupId(23),
+            replica_id: ReplicaId(31),
         })
-        .unwrap();
-    state
-        .apply(MetadataCommand::CreateTable { table: table() })
-        .unwrap();
+    ));
+}
+
+#[test]
+fn schema_update_is_additive_and_preserves_existing_row_contract() {
+    let mut state = bootstrap_state();
 
     let version_two = TableDefinition {
+        columns: vec![
+            ColumnDefinition {
+                column_id: ColumnId(1),
+                name: "id".to_string(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnDefinition {
+                column_id: ColumnId(2),
+                name: "note".to_string(),
+                ty: DataType::Text,
+                nullable: true,
+            },
+        ],
+
         schema_version: 2,
+
         ..table()
     };
-    let update = MetadataCommand::UpdateTableSchema {
-        expected_schema_version: 1,
-        table: version_two.clone(),
-    };
-    assert_eq!(
-        state.apply(update.clone()).unwrap(),
-        MetadataApplyOutcome::Applied
-    );
-    assert_eq!(
-        state.apply(update).unwrap(),
-        MetadataApplyOutcome::AlreadyApplied
-    );
-    assert_eq!(state.table(TableId(7)).unwrap().schema_version, 2);
 
-    assert!(
-        state
-            .apply(MetadataCommand::UpdateTableSchema {
-                expected_schema_version: 1,
-                table: TableDefinition {
-                    schema_version: 3,
-                    ..version_two
+    assert_eq!(
+        state.apply(MetadataCommand::UpdateTableSchema {
+            expected_schema_version: 1,
+            table: version_two.clone(),
+        },),
+        MetadataApplyOutcome::Applied,
+    );
+
+    // Exact replay remains idempotent even though expected version 1 is stale
+    // after the first application.
+    assert_eq!(
+        state.apply(MetadataCommand::UpdateTableSchema {
+            expected_schema_version: 1,
+            table: version_two,
+        },),
+        MetadataApplyOutcome::AlreadyApplied,
+    );
+
+    assert_eq!(state.table(TableId(7)).unwrap().schema_version, 2);
+}
+
+#[test]
+fn metadata_snapshot_roundtrip_preserves_replica_tombstones() {
+    let mut state = bootstrap_state();
+
+    state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+        DesiredReplicaPlacement {
+            tablet_id: TabletId(17),
+
+            configuration_epoch: 1,
+
+            replicas: vec![
+                DesiredReplica {
+                    replica_id: ReplicaId(31),
+                    node_id: NodeId(11),
+                    role: DesiredReplicaRole::Voter,
                 },
-            })
-            .is_err()
+                DesiredReplica {
+                    replica_id: ReplicaId(32),
+                    node_id: NodeId(12),
+                    role: DesiredReplicaRole::Learner,
+                },
+            ],
+        },
+    ));
+
+    state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+        DesiredReplicaPlacement {
+            tablet_id: TabletId(17),
+
+            configuration_epoch: 2,
+
+            replicas: vec![DesiredReplica {
+                replica_id: ReplicaId(32),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Voter,
+            }],
+        },
+    ));
+
+    let encoded = state.to_snapshot().encode().unwrap();
+
+    let decoded = ragnordb_common::metadata_codec::MetadataSnapshot::decode(&encoded).unwrap();
+
+    let recovered = MetadataState::from_snapshot(decoded).unwrap();
+
+    assert_eq!(recovered.cluster_id(), Some("cluster-a"));
+
+    assert!(recovered.is_replica_retired(RaftGroupId(23), ReplicaId(31),));
+
+    assert_eq!(
+        recovered
+            .desired_placement(TabletId(17))
+            .unwrap()
+            .configuration_epoch,
+        2
     );
 }

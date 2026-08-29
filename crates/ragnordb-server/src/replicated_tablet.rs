@@ -948,14 +948,16 @@ where
     }
 
     while !shutdown.load(Ordering::Acquire) {
-        // This snapshot candidate owns a fixed state-machine frontier. Host
-        // operations must not mutate the group until its boundary is resolved,
-        // but they must receive a Retryable response so this replica cannot stall
-        // the physical MultiRaft host.
-        reject_snapshot_blocked_host_controls(
-            &host_control,
-            "local snapshot durability boundary is awaiting retry",
-        );
+        if pending_local_snapshot.is_some() {
+            // This snapshot candidate owns a fixed state-machine frontier. Host
+            // operations must not mutate the group until its boundary is resolved,
+            // but they must receive a Retryable response so this replica cannot stall
+            // the physical MultiRaft host.
+            reject_snapshot_blocked_host_controls(
+                &host_control,
+                "local snapshot durability boundary is awaiting retry",
+            );
+        }
         // A locally generated snapshot whose immutable image has already been
         // published owns a stable state-machine frontier until its A-WAL boundary is
         // resolved.
