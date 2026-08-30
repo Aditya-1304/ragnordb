@@ -43,8 +43,18 @@ fn metadata_domain_rejection_does_not_fail_the_raft_state_machine() {
         )
         .unwrap();
 
+    let results = state_machine.take_applied_results();
+
+    assert_eq!(results.len(), 2);
+
+    assert_eq!(results[0].index, 1);
+
+    assert_eq!(results[0].outcome, MetadataApplyOutcome::Applied,);
+
+    assert_eq!(results[1].index, 2);
+
     assert!(matches!(
-        &state_machine.last_applied().unwrap().outcome,
+        &results[1].outcome,
         MetadataApplyOutcome::Rejected(MetadataRejection::ClusterConflict { .. })
     ));
 
@@ -203,4 +213,63 @@ fn reconciliation_adds_promotes_then_removes_in_safe_order() {
     .unwrap();
 
     assert_eq!(next_reconcile_action(&desired, &observed,).unwrap(), None);
+}
+
+#[test]
+fn multiple_committed_metadata_results_are_preserved_in_log_order() {
+    let mut state_machine = MetadataRaftStateMachine::new();
+
+    state_machine
+        .apply(
+            10,
+            &MetadataCommand::ClusterInitialized {
+                cluster_id: "cluster-a".to_string(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+
+    state_machine
+        .apply(
+            11,
+            &MetadataCommand::ClusterInitialized {
+                cluster_id: "cluster-b".to_string(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+
+    state_machine
+        .apply(
+            12,
+            &MetadataCommand::ClusterInitialized {
+                cluster_id: "cluster-a".to_string(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+
+    let results = state_machine.take_applied_results();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.index)
+            .collect::<Vec<_>>(),
+        vec![10, 11, 12],
+    );
+
+    assert_eq!(results[0].outcome, MetadataApplyOutcome::Applied,);
+
+    assert!(matches!(
+        results[1].outcome,
+        MetadataApplyOutcome::Rejected(MetadataRejection::ClusterConflict { .. }),
+    ));
+
+    assert_eq!(results[2].outcome, MetadataApplyOutcome::AlreadyApplied,);
+
+    assert_eq!(state_machine.pending_apply_results(), 0,);
 }

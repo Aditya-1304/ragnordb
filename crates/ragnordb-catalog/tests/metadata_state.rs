@@ -173,14 +173,54 @@ fn stale_metadata_command_is_a_rejection_not_a_state_machine_failure() {
 }
 
 #[test]
-fn removed_replica_id_is_tombstoned_and_cannot_be_reused() {
+fn desired_placement_can_revert_before_replica_removal_is_committed() {
     let mut state = bootstrap_state();
 
     let initial = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
-
         configuration_epoch: 1,
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(31),
+            node_id: NodeId(11),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
 
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(initial)),
+        MetadataApplyOutcome::Applied,
+    );
+
+    // Metadata expresses the intention to replace replica 31 with 32.
+    //
+    // This does not prove that group 23 has committed RemoveReplica(31).
+    let replacement = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 2,
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(32),
+            node_id: NodeId(12),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(replacement)),
+        MetadataApplyOutcome::Applied,
+    );
+
+    assert!(
+        !state.is_replica_retired(RaftGroupId(23), ReplicaId(31),),
+        "desired placement changes must not retire a replica before \
+         committed Raft membership removal"
+    );
+
+    // Reconciliation may fail before any ConfChange commits. Metadata must
+    // therefore be able to change its desired topology again while replica 31
+    // remains a legitimate committed member.
+    let reverted = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 3,
         replicas: vec![
             DesiredReplica {
                 replica_id: ReplicaId(31),
@@ -190,62 +230,15 @@ fn removed_replica_id_is_tombstoned_and_cannot_be_reused() {
             DesiredReplica {
                 replica_id: ReplicaId(32),
                 node_id: NodeId(12),
-                role: DesiredReplicaRole::Learner,
-            },
-        ],
-    };
-
-    assert_eq!(
-        state.apply(MetadataCommand::SetDesiredReplicaPlacement(initial,),),
-        MetadataApplyOutcome::Applied,
-    );
-
-    // Replica 32 becomes the replacement voter and replica 31 is removed.
-    let replacement = DesiredReplicaPlacement {
-        tablet_id: TabletId(17),
-
-        configuration_epoch: 2,
-
-        replicas: vec![DesiredReplica {
-            replica_id: ReplicaId(32),
-            node_id: NodeId(12),
-            role: DesiredReplicaRole::Voter,
-        }],
-    };
-
-    assert_eq!(
-        state.apply(MetadataCommand::SetDesiredReplicaPlacement(replacement,),),
-        MetadataApplyOutcome::Applied,
-    );
-
-    assert!(state.is_replica_retired(RaftGroupId(23), ReplicaId(31),));
-
-    let illegal_reuse = DesiredReplicaPlacement {
-        tablet_id: TabletId(17),
-
-        configuration_epoch: 3,
-
-        replicas: vec![
-            DesiredReplica {
-                replica_id: ReplicaId(31),
-                node_id: NodeId(13),
-                role: DesiredReplicaRole::Learner,
-            },
-            DesiredReplica {
-                replica_id: ReplicaId(32),
-                node_id: NodeId(12),
                 role: DesiredReplicaRole::Voter,
             },
         ],
     };
 
-    assert!(matches!(
-        state.apply(MetadataCommand::SetDesiredReplicaPlacement(illegal_reuse,),),
-        MetadataApplyOutcome::Rejected(MetadataRejection::RetiredReplicaReuse {
-            raft_group_id: RaftGroupId(23),
-            replica_id: ReplicaId(31),
-        })
-    ));
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(reverted)),
+        MetadataApplyOutcome::Applied,
+    );
 }
 
 #[test]
@@ -341,7 +334,10 @@ fn metadata_snapshot_roundtrip_preserves_replica_tombstones() {
 
     assert_eq!(recovered.cluster_id(), Some("cluster-a"));
 
-    assert!(recovered.is_replica_retired(RaftGroupId(23), ReplicaId(31),));
+    assert!(
+        !recovered.is_replica_retired(RaftGroupId(23), ReplicaId(31),),
+        "Phase 5.1 must not tombstone on desired placement alone"
+    );
 
     assert_eq!(
         recovered

@@ -7,7 +7,7 @@
 //! metadata group. Phase 5.1a will construct a RaftReadyLoop using this state
 //! machine through the already-frozen Phase 5.0 MultiRaft host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use raft::types::{ConfState, Snapshot};
 
@@ -41,7 +41,18 @@ pub struct AppliedMetadataCommand {
 #[derive(Debug, Default)]
 pub struct MetadataRaftStateMachine {
     state: MetadataState,
-    last_applied: Option<AppliedMetadataCommand>,
+
+    /// Ordered results produced by committed metadata entries.
+    ///
+    /// A single Ready generation can contain several committed commands.
+    /// Keeping only the latest result would lose proposal outcomes and make it
+    /// impossible for Phase 5.2 to correlate every committed proposal with its
+    /// deterministic state-machine result.
+    ///
+    /// The owning metadata runtime must drain this queue after each Ready
+    /// generation. Recovery may drain and discard outcomes because proposal
+    /// waiters are process-local and do not survive restart.
+    applied_results: VecDeque<AppliedMetadataCommand>,
 }
 
 impl MetadataRaftStateMachine {
@@ -53,8 +64,18 @@ impl MetadataRaftStateMachine {
         &self.state
     }
 
-    pub fn last_applied(&self) -> Option<&AppliedMetadataCommand> {
-        self.last_applied.as_ref()
+    pub fn pending_apply_results(&self) -> usize {
+        self.applied_results.len()
+    }
+
+    /// Remove every result produced since the previous drain, preserving Raft log
+    /// order.
+    ///
+    /// The metadata runtime will use the log index to complete the matching
+    /// proposal waiter. This keeps state-machine semantics deterministic while
+    /// proposal ownership remains outside the replicated metadata projection.
+    pub fn take_applied_results(&mut self) -> Vec<AppliedMetadataCommand> {
+        self.applied_results.drain(..).collect()
     }
 
     /// Encode the complete metadata projection for a Raft snapshot.
@@ -82,7 +103,7 @@ impl RaftReadyStateMachine for MetadataRaftStateMachine {
         // Proposal completion state is volatile. Snapshot restoration rebuilds
         // authoritative metadata but must not invent a response for a proposal
         // waiter that did not survive restart.
-        self.last_applied = None;
+        self.applied_results.clear();
 
         Ok(())
     }
@@ -93,7 +114,8 @@ impl RaftReadyStateMachine for MetadataRaftStateMachine {
 
         let outcome = self.state.apply(command);
 
-        self.last_applied = Some(AppliedMetadataCommand { index, outcome });
+        self.applied_results
+            .push_back(AppliedMetadataCommand { index, outcome });
 
         // A MetadataApplyOutcome::Rejected is a deterministic command result,
         // not corruption. Returning Err here would quarantine the entire

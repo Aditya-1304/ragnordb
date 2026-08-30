@@ -268,10 +268,14 @@ pub struct MetadataState {
 
     desired_placements: BTreeMap<TabletId, DesiredReplicaPlacement>,
 
-    /// Consensus identities that have ended permanently.
+    /// Consensus identities whose removal has been authoritatively completed.
     ///
-    /// This set must be included in snapshots. Losing it during log compaction
-    /// would make a removed replica ID reusable after restart.
+    /// Phase 5.1 does not populate this set merely because a replica disappears
+    /// from desired placement. Desired topology is intent; a replica lifetime ends
+    /// only after the affected Raft group has committed its removal.
+    ///
+    /// Phase 5.10 will connect committed membership removal to this durable
+    /// retirement history so removed ReplicaIds can never be reused.
     retired_replicas: BTreeSet<(RaftGroupId, ReplicaId)>,
 }
 
@@ -621,11 +625,11 @@ impl MetadataState {
             }
         };
 
-        let (bucket, bucket_count) = match tablet.partition {
+        let (bucket, bucket_count) = match &tablet.partition {
             PartitionSpec::Hash {
                 bucket,
                 bucket_count,
-            } => (bucket, bucket_count),
+            } => (*bucket, *bucket_count),
         };
 
         if bucket_count != table.tablet_count {
@@ -778,24 +782,6 @@ impl MetadataState {
                             MetadataRejection::UnsupportedVoterDemotion(new_replica.replica_id),
                         );
                     }
-                }
-            }
-        }
-
-        // Do not mutate the retirement set until every validation above has
-        // succeeded. A rejected desired-placement command must be a complete
-        // no-op.
-        if let Some(existing) = &existing {
-            let new_ids: BTreeSet<ReplicaId> = placement
-                .replicas
-                .iter()
-                .map(|replica| replica.replica_id)
-                .collect();
-
-            for old_replica in &existing.replicas {
-                if !new_ids.contains(&old_replica.replica_id) {
-                    self.retired_replicas
-                        .insert((tablet.raft_group_id, old_replica.replica_id));
                 }
             }
         }

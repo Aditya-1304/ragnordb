@@ -576,6 +576,18 @@ impl DesiredReplicaPlacement {
 }
 
 impl RetiredReplicaLifetime {
+    fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.raft_group_id.0 == 0 {
+            return Err(MetadataCommandCodecError::ZeroRaftGroupId);
+        }
+
+        if self.replica_id.0 == 0 {
+            return Err(MetadataCommandCodecError::ZeroReplicaId);
+        }
+
+        Ok(())
+    }
+
     fn to_proto(self) -> metadata::RetiredReplicaLifetime {
         metadata::RetiredReplicaLifetime {
             raft_group_id: Some(self.raft_group_id.to_proto()),
@@ -596,13 +608,7 @@ impl RetiredReplicaLifetime {
             )?),
         };
 
-        if value.raft_group_id.0 == 0 {
-            return Err(MetadataCommandCodecError::ZeroRaftGroupId);
-        }
-
-        if value.replica_id.0 == 0 {
-            return Err(MetadataCommandCodecError::ZeroReplicaId);
-        }
+        value.validate()?;
 
         Ok(value)
     }
@@ -653,6 +659,10 @@ impl MetadataSnapshot {
 
         for placement in &self.desired_placements {
             placement.validate()?;
+        }
+
+        for retired in &self.retired_replicas {
+            retired.validate()?;
         }
 
         if !strictly_ascending(&self.nodes, |node| node.node_id) {
