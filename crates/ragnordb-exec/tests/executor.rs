@@ -1,9 +1,17 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use ragnordb_catalog::Catalog;
 use ragnordb_common::{
     Error, Result,
+    catalog_codec::TableDefinition,
     codec::{Row, Value},
-    ids::{Timestamp, TxnId},
+    ids::{RaftGroupId, RequestId, TableId, Timestamp, TxnId},
+    metadata_codec::CreateTableRequest,
 };
-use ragnordb_exec::{DmlOperation, ExecutionResult, LocalExecutor, ResultSet};
+use ragnordb_exec::{
+    DmlOperation, ExecutionResult, LocalExecutor, MetadataTableCreator, ResultSet,
+};
 use ragnordb_sql::{BoundExprKind, Plan, analyze, parse_one, plan};
 use ragnordb_txn::Transaction;
 
@@ -40,6 +48,65 @@ fn result_set(result: ExecutionResult) -> ResultSet {
     };
 
     result
+}
+
+struct TestMetadataTableCreator;
+
+impl MetadataTableCreator for TestMetadataTableCreator {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        _request_id: RequestId,
+        _timeout: Duration,
+    ) -> Result<TableDefinition> {
+        assert_eq!(request.table_name, "authoritative");
+
+        Ok(TableDefinition {
+            table_id: 42,
+            name: request.table_name,
+            columns: request.columns,
+            primary_key_column_ids: request.primary_key_column_ids,
+            schema_version: 1,
+            tablet_count: 1,
+        })
+    }
+
+    fn list_tables(&self) -> Vec<TableDefinition> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn metadata_create_installs_the_identity_returned_by_metadata() {
+    let mut executor = LocalExecutor::new();
+    executor.replace_metadata_table_creator(Arc::new(TestMetadataTableCreator));
+
+    let Plan::CreateTable(plan) =
+        build(&executor, "CREATE TABLE authoritative (id INT PRIMARY KEY)").unwrap()
+    else {
+        panic!("expected CREATE TABLE plan");
+    };
+
+    let result = executor
+        .execute_create_table_with_metadata(
+            plan,
+            RequestId {
+                client_id: 7,
+                sequence: 1,
+                raft_group_id: RaftGroupId(2),
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result,
+        ExecutionResult::CreatedTable {
+            table_id: TableId(42)
+        }
+    );
+    assert!(executor.catalog().table_by_id(TableId(42)).is_some());
+    assert!(executor.catalog().table_by_id(TableId(1)).is_none());
 }
 
 #[test]

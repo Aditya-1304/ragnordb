@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use ragnordb_common::{codec::Value, ids::NodeId};
+use ragnordb_common::{Error, codec::Value, ids::NodeId};
 use ragnordb_exec::{ExecutionResult, SqlSession};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
@@ -189,15 +189,28 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
                 .database
                 .lock()
                 .await
-                .execute_sql(&mut SqlSession::new(), "SELECT id, name FROM users")
-                .unwrap();
-            if let ExecutionResult::Query(rows) = result
-                && rows.rows
-                    == vec![ragnordb_common::codec::Row {
-                        values: vec![Value::Int(1), Value::Text("replicated".to_string())],
-                    }]
-            {
-                break;
+                .execute_sql(&mut SqlSession::new(), "SELECT id, name FROM users");
+
+            match result {
+                Ok(ExecutionResult::Query(rows))
+                    if rows.rows
+                        == vec![ragnordb_common::codec::Row {
+                            values: vec![Value::Int(1), Value::Text("replicated".to_string())],
+                        }] =>
+                {
+                    break;
+                }
+
+                // The catalog mirror is published by the follower's Ready
+                // owner. It may apply the durable CREATE entry after the
+                // leader has acknowledged it, so an initial unknown-table
+                // response is a valid propagation state rather than a test
+                // failure. Any other SQL error remains fatal.
+                Err(Error::SchemaMismatch(message)) if message == "unknown table: users" => {}
+
+                Ok(_) => {}
+
+                Err(error) => panic!("follower SQL mirror returned an unexpected error: {error}"),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

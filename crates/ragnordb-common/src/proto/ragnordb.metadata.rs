@@ -9,6 +9,15 @@
 pub struct MetadataCommand {
     #[prost(uint32, tag = "1")]
     pub format_version: u32,
+    /// Present for client-originated proposals. Startup compatibility commands
+    /// may omit it because they predate metadata request deduplication.
+    #[prost(message, optional, tag = "9")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    /// Present with request_id. This version is separate from the command
+    /// format_version because the same command payload is also used by legacy
+    /// startup entries without an envelope.
+    #[prost(uint32, tag = "10")]
+    pub envelope_version: u32,
     #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8")]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
@@ -204,6 +213,30 @@ pub struct MetadataSnapshot {
     pub retired_replicas: ::prost::alloc::vec::Vec<RetiredReplicaLifetime>,
     #[prost(message, optional, tag = "9")]
     pub allocator_state: ::core::option::Option<MetadataAllocatorState>,
+    /// Request results are part of replicated metadata state. Without this
+    /// history, a retry after leadership change or snapshot restore could
+    /// allocate a second table identity.
+    #[prost(message, repeated, tag = "10")]
+    pub request_deduplication: ::prost::alloc::vec::Vec<MetadataRequestDeduplication>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataRequestDeduplication {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(enumeration = "MetadataCachedOutcomeKind", tag = "2")]
+    pub outcome_kind: i32,
+    /// Populated only for METADATA_CACHED_OUTCOME_TABLE_CREATED.
+    #[prost(uint64, tag = "3")]
+    pub table_id: u64,
+    #[prost(uint64, tag = "4")]
+    pub tablet_id: u64,
+    #[prost(uint64, tag = "5")]
+    pub raft_group_id: u64,
+    /// Populated only for METADATA_CACHED_OUTCOME_REJECTED. The original
+    /// rejection text is retained so a replay has the same client-visible
+    /// deterministic result without re-evaluating current metadata state.
+    #[prost(string, tag = "6")]
+    pub rejection: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -230,6 +263,55 @@ impl DesiredReplicaRole {
             "DESIRED_REPLICA_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
             "DESIRED_REPLICA_ROLE_VOTER" => Some(Self::Voter),
             "DESIRED_REPLICA_ROLE_LEARNER" => Some(Self::Learner),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MetadataCachedOutcomeKind {
+    MetadataCachedOutcomeUnspecified = 0,
+    MetadataCachedOutcomeApplied = 1,
+    MetadataCachedOutcomeAlreadyApplied = 2,
+    MetadataCachedOutcomeTableCreated = 3,
+    MetadataCachedOutcomeRejected = 4,
+}
+impl MetadataCachedOutcomeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::MetadataCachedOutcomeUnspecified => {
+                "METADATA_CACHED_OUTCOME_UNSPECIFIED"
+            }
+            Self::MetadataCachedOutcomeApplied => "METADATA_CACHED_OUTCOME_APPLIED",
+            Self::MetadataCachedOutcomeAlreadyApplied => {
+                "METADATA_CACHED_OUTCOME_ALREADY_APPLIED"
+            }
+            Self::MetadataCachedOutcomeTableCreated => {
+                "METADATA_CACHED_OUTCOME_TABLE_CREATED"
+            }
+            Self::MetadataCachedOutcomeRejected => "METADATA_CACHED_OUTCOME_REJECTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "METADATA_CACHED_OUTCOME_UNSPECIFIED" => {
+                Some(Self::MetadataCachedOutcomeUnspecified)
+            }
+            "METADATA_CACHED_OUTCOME_APPLIED" => Some(Self::MetadataCachedOutcomeApplied),
+            "METADATA_CACHED_OUTCOME_ALREADY_APPLIED" => {
+                Some(Self::MetadataCachedOutcomeAlreadyApplied)
+            }
+            "METADATA_CACHED_OUTCOME_TABLE_CREATED" => {
+                Some(Self::MetadataCachedOutcomeTableCreated)
+            }
+            "METADATA_CACHED_OUTCOME_REJECTED" => {
+                Some(Self::MetadataCachedOutcomeRejected)
+            }
             _ => None,
         }
     }

@@ -1,12 +1,12 @@
 use prost::Message;
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         LEGACY_METADATA_SNAPSHOT_VERSION, METADATA_SNAPSHOT_VERSION, MetadataAllocatorState,
-        MetadataCommand, MetadataCommandCodecError, MetadataSnapshot, NodeDescriptor,
-        PartitionSpec, RetiredReplicaLifetime, TabletDescriptor,
+        MetadataCommand, MetadataCommandCodecError, MetadataCommandEnvelope, MetadataSnapshot,
+        NodeDescriptor, PartitionSpec, RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
@@ -212,6 +212,32 @@ fn tablet_cannot_claim_metadata_raft_group() {
 }
 
 #[test]
+fn metadata_command_envelope_roundtrips_request_identity() {
+    let envelope = MetadataCommandEnvelope::new(
+        RequestId {
+            client_id: 0x42,
+            sequence: 7,
+            raft_group_id: RaftGroupId(2),
+        },
+        MetadataCommand::CreateTableTopology(CreateTableRequest {
+            table_name: "accounts".to_string(),
+            columns: vec![ColumnDefinition {
+                column_id: ColumnId(1),
+                name: "id".to_string(),
+                ty: DataType::Int,
+                nullable: false,
+            }],
+            primary_key_column_ids: vec![ColumnId(1)],
+        }),
+    )
+    .unwrap();
+
+    let decoded = MetadataCommandEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded, envelope);
+}
+
+#[test]
 fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
     let snapshot = MetadataSnapshot {
         cluster_id: Some("cluster-a".to_string()),
@@ -234,6 +260,8 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
             max_tablet_id: 17,
             max_raft_group_id: 23,
         },
+
+        request_deduplication: Vec::new(),
     };
 
     let encoded = snapshot.encode().unwrap();
@@ -254,6 +282,8 @@ fn metadata_snapshot_rejects_noncanonical_node_order() {
         retired_replicas: Vec::new(),
 
         allocator: MetadataAllocatorState::initial(),
+
+        request_deduplication: Vec::new(),
     };
 
     assert_eq!(
@@ -281,6 +311,8 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
             max_tablet_id: 200,
             max_raft_group_id: 300,
         },
+
+        request_deduplication: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
@@ -312,6 +344,8 @@ fn current_metadata_snapshot_requires_allocator_state() {
         desired_placements: Vec::new(),
         retired_replicas: Vec::new(),
         allocator: MetadataAllocatorState::initial(),
+
+        request_deduplication: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
@@ -342,6 +376,8 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
             max_tablet_id: 20,
             max_raft_group_id: 30,
         },
+
+        request_deduplication: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(

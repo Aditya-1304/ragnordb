@@ -4,7 +4,7 @@ use ragnordb_catalog::{
 
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         MetadataCommand, NodeDescriptor, PartitionSpec, TabletDescriptor,
@@ -294,6 +294,74 @@ fn rejected_duplicate_table_name_does_not_advance_allocators() {
         before,
         "rejected CREATE TABLE must consume no cluster-global identity",
     );
+}
+
+#[test]
+fn metadata_request_replay_returns_the_original_create_without_reallocation() {
+    let mut state = initialized_state_with_nodes();
+    let request_id = RequestId {
+        client_id: 0x42,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    let request = create_request("accounts");
+
+    let first = state.apply_with_request_id(
+        request_id.clone(),
+        MetadataCommand::CreateTableTopology(request.clone()),
+    );
+    let before_replay = state.allocator_state();
+    let replay = state.apply_with_request_id(
+        request_id,
+        MetadataCommand::CreateTableTopology(request.clone()),
+    );
+
+    assert_eq!(replay, first);
+    assert_eq!(state.allocator_state(), before_replay);
+
+    // A separate CREATE TABLE request with the same schema is independent and
+    // must not be mistaken for a retry of the first request.
+    let independent = state.apply_with_request_id(
+        RequestId {
+            client_id: 0x43,
+            sequence: 1,
+            raft_group_id: RaftGroupId(2),
+        },
+        MetadataCommand::CreateTableTopology(request),
+    );
+
+    assert_eq!(
+        independent,
+        MetadataApplyOutcome::Rejected(MetadataRejection::TableNameConflict(
+            "accounts".to_string(),
+        )),
+    );
+    assert_eq!(state.allocator_state(), before_replay);
+}
+
+#[test]
+fn metadata_request_deduplication_survives_snapshot_restore() {
+    let mut state = initialized_state_with_nodes();
+    let request_id = RequestId {
+        client_id: 0x52,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    let request = create_request("accounts");
+
+    let first = state.apply_with_request_id(
+        request_id.clone(),
+        MetadataCommand::CreateTableTopology(request.clone()),
+    );
+    let allocator = state.allocator_state();
+
+    let restored = MetadataState::from_snapshot(state.to_snapshot()).unwrap();
+    let replay = restored
+        .clone()
+        .apply_with_request_id(request_id, MetadataCommand::CreateTableTopology(request));
+
+    assert_eq!(replay, first);
+    assert_eq!(restored.allocator_state(), allocator);
 }
 
 #[test]

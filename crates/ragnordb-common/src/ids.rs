@@ -221,7 +221,7 @@ impl RowKey {
 ///
 /// client_id: 128-bit unique client identifier (e.g., UUID v4).
 /// sequence:  monotonically increasing per-client counter.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId {
     pub client_id: u128,
     pub sequence: u64,

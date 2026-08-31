@@ -17,10 +17,11 @@ use std::{
 use ragnordb_common::{
     Error, Result,
     catalog_codec::TableDefinition,
-    ids::{NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
+    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
-        MetadataAllocatorState, MetadataCommand, MetadataSnapshot, NodeDescriptor, PartitionSpec,
+        MetadataAllocatorState, MetadataCachedOutcome, MetadataCommand,
+        MetadataRequestDeduplication, MetadataSnapshot, NodeDescriptor, PartitionSpec,
         RetiredReplicaLifetime, TabletDescriptor,
     },
 };
@@ -305,6 +306,13 @@ pub struct MetadataState {
     /// Phase 5.10 will connect committed membership removal to this durable
     /// retirement history so removed ReplicaIds can never be reused.
     retired_replicas: BTreeSet<(RaftGroupId, ReplicaId)>,
+
+    /// Durable result cache for request identities accepted by metadata Raft.
+    ///
+    /// A replay must return the original result without re-running allocation
+    /// against the current table-name map. This is what makes a retry after a
+    /// leadership change different from an independent CREATE TABLE request.
+    request_deduplication: BTreeMap<RequestId, MetadataCachedOutcome>,
 }
 
 impl Default for MetadataState {
@@ -320,6 +328,7 @@ impl Default for MetadataState {
             tablet_ids_by_partition: BTreeMap::new(),
             desired_placements: BTreeMap::new(),
             retired_replicas: BTreeSet::new(),
+            request_deduplication: BTreeMap::new(),
         }
     }
 }
@@ -373,6 +382,33 @@ impl MetadataState {
     /// do not escape as `Result::Err`, because an ordinary stale request must
     /// not quarantine the metadata Raft group.
     pub fn apply(&mut self, command: MetadataCommand) -> MetadataApplyOutcome {
+        self.apply_command(command)
+    }
+
+    /// Apply one request-bearing metadata command with durable retry
+    /// deduplication.
+    ///
+    /// The request identity is checked before allocation. An exact replay
+    /// returns the cached original outcome, while a different request identity
+    /// still evaluates normal uniqueness and allocation rules independently.
+    pub fn apply_with_request_id(
+        &mut self,
+        request_id: RequestId,
+        command: MetadataCommand,
+    ) -> MetadataApplyOutcome {
+        if let Some(outcome) = self.request_deduplication.get(&request_id) {
+            return metadata_outcome_from_cached(outcome);
+        }
+
+        let outcome = self.apply_command(command);
+
+        self.request_deduplication
+            .insert(request_id, metadata_outcome_to_cached(&outcome));
+
+        outcome
+    }
+
+    fn apply_command(&mut self, command: MetadataCommand) -> MetadataApplyOutcome {
         if let Err(error) = command.validate() {
             return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(
                 error.to_string(),
@@ -432,6 +468,15 @@ impl MetadataState {
                 .collect(),
 
             allocator: self.allocator,
+
+            request_deduplication: self
+                .request_deduplication
+                .iter()
+                .map(|(request_id, outcome)| MetadataRequestDeduplication {
+                    request_id: request_id.clone(),
+                    outcome: outcome.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -453,6 +498,7 @@ impl MetadataState {
             desired_placements,
             retired_replicas,
             allocator,
+            request_deduplication,
         } = snapshot;
 
         if cluster_id.is_none() {
@@ -559,6 +605,49 @@ impl MetadataState {
         // visible identities. Install them only after the semantic projection
         // has been reconstructed successfully.
         state.allocator = allocator;
+
+        for request in request_deduplication {
+            if let MetadataCachedOutcome::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } = request.outcome
+            {
+                let Some(table) = state.tables.get(&table_id) else {
+                    return Err(Error::CorruptData(format!(
+                        "metadata snapshot request cache references unknown table {}",
+                        table_id.0,
+                    )));
+                };
+
+                let Some(tablet) = state.tablets.get(&tablet_id) else {
+                    return Err(Error::CorruptData(format!(
+                        "metadata snapshot request cache references unknown tablet {}",
+                        tablet_id.0,
+                    )));
+                };
+
+                if tablet.table_id != table_id || tablet.raft_group_id != raft_group_id {
+                    return Err(Error::CorruptData(format!(
+                        "metadata snapshot request cache has inconsistent CREATE TABLE identities for table {}",
+                        table.id.0,
+                    )));
+                }
+
+                state.request_deduplication.insert(
+                    request.request_id,
+                    MetadataCachedOutcome::TableCreated {
+                        table_id,
+                        tablet_id,
+                        raft_group_id,
+                    },
+                );
+            } else {
+                state
+                    .request_deduplication
+                    .insert(request.request_id, request.outcome);
+            }
+        }
 
         Ok(state)
     }
@@ -1153,6 +1242,40 @@ impl Catalog for MetadataState {
 
     fn list_tables(&self) -> Vec<Arc<TableSchema>> {
         self.tables.values().cloned().collect()
+    }
+}
+
+fn metadata_outcome_to_cached(outcome: &MetadataApplyOutcome) -> MetadataCachedOutcome {
+    match outcome {
+        MetadataApplyOutcome::Applied => MetadataCachedOutcome::Applied,
+        MetadataApplyOutcome::AlreadyApplied => MetadataCachedOutcome::AlreadyApplied,
+        MetadataApplyOutcome::TableCreated(created) => MetadataCachedOutcome::TableCreated {
+            table_id: created.table_id,
+            tablet_id: created.tablet_id,
+            raft_group_id: created.raft_group_id,
+        },
+        MetadataApplyOutcome::Rejected(rejection) => {
+            MetadataCachedOutcome::Rejected(rejection.to_string())
+        }
+    }
+}
+
+fn metadata_outcome_from_cached(outcome: &MetadataCachedOutcome) -> MetadataApplyOutcome {
+    match outcome {
+        MetadataCachedOutcome::Applied => MetadataApplyOutcome::Applied,
+        MetadataCachedOutcome::AlreadyApplied => MetadataApplyOutcome::AlreadyApplied,
+        MetadataCachedOutcome::TableCreated {
+            table_id,
+            tablet_id,
+            raft_group_id,
+        } => MetadataApplyOutcome::TableCreated(MetadataTableCreated {
+            table_id: *table_id,
+            tablet_id: *tablet_id,
+            raft_group_id: *raft_group_id,
+        }),
+        MetadataCachedOutcome::Rejected(reason) => {
+            MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(reason.clone()))
+        }
     }
 }
 

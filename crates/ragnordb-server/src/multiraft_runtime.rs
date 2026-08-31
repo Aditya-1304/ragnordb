@@ -9,7 +9,7 @@
 //! committed Raft ConfState, never from the current seed voter list.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,10 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ragnordb_catalog::{Catalog, MetadataApplyOutcome};
 use ragnordb_common::{
     Error, Result,
-    ids::NodeId,
-    metadata_codec::{MetadataCommand, NodeDescriptor},
+    ids::{NodeId, RequestId},
+    metadata_codec::{
+        CreateTableRequest, MetadataCommand, MetadataCommandEnvelope, NodeDescriptor,
+    },
 };
 
 use ragnordb_multiraft::{
@@ -38,6 +41,7 @@ use ragnordb_multiraft::{
     transport::{NodeRaftEndpoint, NodeRaftTransport},
 };
 
+use ragnordb_exec::{MetadataTableCreator, SharedMetadataTableCreator};
 use ragnordb_tablet::snapshot::FileTabletSnapshotStore;
 
 use wal::{io::directory::FsSegmentDirectory, wal::WalHandle};
@@ -63,10 +67,154 @@ const METADATA_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 const METADATA_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+const METADATA_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+
+enum MetadataHostRequest {
+    CreateTable {
+        envelope: MetadataCommandEnvelope,
+        reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
+        deadline: Instant,
+    },
+}
+
+struct PendingMetadataProposal {
+    request_id: RequestId,
+    reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
+    deadline: Instant,
+}
+
+/// Client-side proposal boundary for metadata-owned SQL schema operations.
+///
+/// The SQL executor never allocates a table identity and never writes through
+/// the legacy catalog WAL when this client is installed. A request is accepted
+/// only after the metadata host has correlated the committed Raft apply result.
+pub struct MetadataProposalClient {
+    requests: mpsc::SyncSender<MetadataHostRequest>,
+    metadata: MetadataRuntimeHandle,
+}
+
+impl MetadataProposalClient {
+    fn new(
+        requests: mpsc::SyncSender<MetadataHostRequest>,
+        metadata: MetadataRuntimeHandle,
+    ) -> Self {
+        Self { requests, metadata }
+    }
+
+    fn table_definition_for_outcome(
+        &self,
+        outcome: MetadataApplyOutcome,
+    ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
+        let MetadataApplyOutcome::TableCreated(created) = outcome else {
+            return match outcome {
+                MetadataApplyOutcome::Rejected(rejection) => {
+                    Err(Error::ConstraintViolation(rejection.to_string()))
+                }
+
+                MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => {
+                    Err(Error::CorruptData(
+                        "metadata CREATE TABLE apply did not return allocated topology".to_string(),
+                    ))
+                }
+
+                MetadataApplyOutcome::TableCreated(_) => unreachable!(),
+            };
+        };
+
+        let state = self.metadata.state_snapshot();
+        let table = state.table(created.table_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "metadata CREATE TABLE returned table {} without a table definition",
+                created.table_id.0,
+            ))
+        })?;
+
+        let tablet = state.tablet(created.tablet_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "metadata CREATE TABLE returned tablet {} without a tablet descriptor",
+                created.tablet_id.0,
+            ))
+        })?;
+
+        if tablet.table_id != created.table_id || tablet.raft_group_id != created.raft_group_id {
+            return Err(Error::CorruptData(format!(
+                "metadata CREATE TABLE returned topology inconsistent with tablet {}",
+                created.tablet_id.0,
+            )));
+        }
+
+        if state.desired_placement(created.tablet_id).is_none() {
+            return Err(Error::CorruptData(format!(
+                "metadata CREATE TABLE returned tablet {} without desired placement",
+                created.tablet_id.0,
+            )));
+        }
+
+        Ok(table.to_definition())
+    }
+}
+
+impl MetadataTableCreator for MetadataProposalClient {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        request_id: RequestId,
+        timeout: Duration,
+    ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
+        let command = MetadataCommand::CreateTableTopology(request);
+        let envelope = MetadataCommandEnvelope::new(request_id.clone(), command)
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("metadata request deadline overflowed".into()))?;
+        let (reply, response) = mpsc::channel();
+
+        self.requests
+            .try_send(MetadataHostRequest::CreateTable {
+                envelope,
+                reply,
+                deadline,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Error::ProposalUnavailable {
+                    reason: "metadata proposal queue is full".to_string(),
+                },
+                mpsc::TrySendError::Disconnected(_) => Error::ProposalUnavailable {
+                    reason: "metadata Raft host is not running".to_string(),
+                },
+            })?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let outcome = response
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Error::ProposalUnavailable {
+                    reason: "metadata CREATE TABLE deadline elapsed before apply".to_string(),
+                },
+                mpsc::RecvTimeoutError::Disconnected => Error::ProposalUnavailable {
+                    reason: "metadata Raft host stopped before CREATE TABLE applied".to_string(),
+                },
+            })??;
+
+        self.table_definition_for_outcome(outcome)
+    }
+
+    fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition> {
+        self.metadata
+            .state_snapshot()
+            .list_tables()
+            .into_iter()
+            .map(|table| table.to_definition())
+            .collect()
+    }
+}
+
 pub struct MultiRaftRuntime {
     tablet_runtime: Option<ReplicatedTabletRuntime>,
 
     metadata: MetadataRuntimeHandle,
+
+    metadata_creator: SharedMetadataTableCreator,
 
     /// Explicitly retain ownership of the one physical snapshot transport for
     /// the complete node runtime lifetime.
@@ -368,6 +516,13 @@ impl MultiRaftRuntime {
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        let (metadata_request_tx, metadata_request_rx) =
+            mpsc::sync_channel(METADATA_REQUEST_CHANNEL_CAPACITY);
+        let metadata_creator: SharedMetadataTableCreator = Arc::new(MetadataProposalClient::new(
+            metadata_request_tx,
+            metadata_handle.clone(),
+        ));
+
         let worker_shutdown = Arc::clone(&shutdown);
 
         let worker_metadata = metadata_handle.clone();
@@ -381,6 +536,7 @@ impl MultiRaftRuntime {
                     host,
                     transport,
                     inbound,
+                    metadata_request_rx,
                     worker_shutdown,
                     worker_metadata,
                     cluster_id,
@@ -445,6 +601,8 @@ impl MultiRaftRuntime {
 
             metadata: metadata_handle,
 
+            metadata_creator,
+
             _snapshot_transport: snapshot_transport,
 
             shutdown,
@@ -462,10 +620,16 @@ impl MultiRaftRuntime {
 
     /// Read-only committed metadata publication.
     ///
-    /// Phase 5.2 will use this handle for table-creation proposal completion and
-    /// metadata-backed routing state.
+    /// SQL schema analysis uses the publication to refresh its local cache;
+    /// proposal completion remains correlated through the metadata host's
+    /// request channel.
     pub fn metadata_handle(&self) -> MetadataRuntimeHandle {
         self.metadata.clone()
+    }
+
+    /// Return the metadata-owned CREATE TABLE boundary for the SQL executor.
+    pub fn metadata_table_creator(&self) -> SharedMetadataTableCreator {
+        self.metadata_creator.clone()
     }
 }
 
@@ -474,6 +638,7 @@ fn run_host<W>(
     mut host: MultiRaftHost<W>,
     transport: NodeRaftTransport,
     inbound: std::sync::mpsc::Receiver<RoutedRaftMessage>,
+    metadata_requests: mpsc::Receiver<MetadataHostRequest>,
     shutdown: Arc<AtomicBool>,
     metadata: MetadataRuntimeHandle,
     cluster_id: String,
@@ -484,11 +649,31 @@ fn run_host<W>(
 {
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
+    let mut pending_metadata = BTreeMap::<u64, PendingMetadataProposal>::new();
+    let mut pending_metadata_by_request = HashMap::<RequestId, u64>::new();
+
     let mut next_metadata_attempt = Instant::now();
 
     let mut startup_sender = Some(metadata_ready);
 
     while !shutdown.load(Ordering::Acquire) {
+        if !service_metadata_requests(
+            &mut host,
+            &transport,
+            &metadata_requests,
+            &mut pending_metadata,
+            &mut pending_metadata_by_request,
+        ) {
+            fail_pending_metadata(
+                &mut pending_metadata,
+                &mut pending_metadata_by_request,
+                Error::RecoveryRequired {
+                    reason: "metadata host entered recovery-required state".to_string(),
+                },
+            );
+            return;
+        }
+
         while let Ok(message) = inbound.try_recv() {
             match host.route(message) {
                 Ok(outbound) => {
@@ -502,6 +687,14 @@ fn run_host<W>(
                     );
 
                     tracing::error!("shared Raft WAL requires node recovery");
+
+                    fail_pending_metadata(
+                        &mut pending_metadata,
+                        &mut pending_metadata_by_request,
+                        Error::RecoveryRequired {
+                            reason: "shared Raft WAL requires node recovery".to_string(),
+                        },
+                    );
 
                     return;
                 }
@@ -531,6 +724,14 @@ fn run_host<W>(
 
                     tracing::error!("shared Raft WAL requires node recovery");
 
+                    fail_pending_metadata(
+                        &mut pending_metadata,
+                        &mut pending_metadata_by_request,
+                        Error::RecoveryRequired {
+                            reason: "shared Raft WAL requires node recovery".to_string(),
+                        },
+                    );
+
                     return;
                 }
 
@@ -544,6 +745,13 @@ fn run_host<W>(
 
             next_tick = now + TICK_INTERVAL;
         }
+
+        drain_metadata_results(
+            &metadata,
+            &mut pending_metadata,
+            &mut pending_metadata_by_request,
+        );
+        expire_metadata_proposals(&mut pending_metadata, &mut pending_metadata_by_request, now);
 
         if startup_sender.is_some() && now >= next_metadata_attempt {
             match next_metadata_bootstrap_command(&metadata, &cluster_id, &metadata_nodes) {
@@ -616,6 +824,168 @@ fn run_host<W>(
         }
 
         thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn service_metadata_requests<W>(
+    host: &mut MultiRaftHost<W>,
+    transport: &NodeRaftTransport,
+    requests: &mpsc::Receiver<MetadataHostRequest>,
+    pending: &mut BTreeMap<u64, PendingMetadataProposal>,
+    pending_by_request: &mut HashMap<RequestId, u64>,
+) -> bool
+where
+    W: RaftWal,
+{
+    while let Ok(request) = requests.try_recv() {
+        match request {
+            MetadataHostRequest::CreateTable {
+                envelope,
+                reply,
+                deadline,
+            } => {
+                let request_id = envelope.request_id.clone();
+
+                if pending_by_request.contains_key(&request_id) {
+                    let _ = reply.send(Err(Error::ProposalUnavailable {
+                        reason: "metadata request is already pending".to_string(),
+                    }));
+                    continue;
+                }
+
+                if deadline <= Instant::now() {
+                    let _ = reply.send(Err(Error::ProposalUnavailable {
+                        reason: "metadata CREATE TABLE deadline elapsed before proposal"
+                            .to_string(),
+                    }));
+                    continue;
+                }
+
+                let encoded = match envelope.encode() {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::InvalidArgument(error.to_string())));
+                        continue;
+                    }
+                };
+                let encoded_len = encoded.len();
+
+                match host.propose(METADATA_RAFT_GROUP_ID, encoded, encoded_len) {
+                    Ok(proposal) => {
+                        let index = proposal.index;
+                        pending.insert(
+                            index,
+                            PendingMetadataProposal {
+                                request_id: request_id.clone(),
+                                reply,
+                                deadline,
+                            },
+                        );
+                        pending_by_request.insert(request_id, index);
+                        send_outbound(transport, proposal.outbound);
+                    }
+
+                    Err(MultiRaftHostError::GroupRejected { raft_group_id, .. })
+                        if raft_group_id == METADATA_RAFT_GROUP_ID =>
+                    {
+                        let _ = reply.send(Err(Error::NotLeader { leader_id: None }));
+                    }
+
+                    Err(MultiRaftHostError::GroupRetryable { reason, .. }) => {
+                        let _ = reply.send(Err(Error::ProposalUnavailable { reason }));
+                    }
+
+                    Err(MultiRaftHostError::RecoveryRequired) => {
+                        let _ = reply.send(Err(Error::RecoveryRequired {
+                            reason: "shared Raft WAL requires node recovery".to_string(),
+                        }));
+                        return false;
+                    }
+
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::ProposalUnavailable {
+                            reason: error.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn drain_metadata_results(
+    metadata: &MetadataRuntimeHandle,
+    pending: &mut BTreeMap<u64, PendingMetadataProposal>,
+    pending_by_request: &mut HashMap<RequestId, u64>,
+) {
+    for applied in metadata.take_applied_results() {
+        let Some(proposal) = pending.remove(&applied.index) else {
+            // Startup entries, timed-out requests, and proposals admitted by a
+            // prior process lifetime are intentionally not client responses.
+            continue;
+        };
+
+        pending_by_request.remove(&proposal.request_id);
+
+        let result = if applied.request_id.as_ref() != Some(&proposal.request_id) {
+            Err(Error::CorruptData(format!(
+                "metadata apply result at index {} carried the wrong request identity",
+                applied.index,
+            )))
+        } else {
+            match applied.outcome {
+                MetadataApplyOutcome::Rejected(rejection) => {
+                    Err(Error::ConstraintViolation(rejection.to_string()))
+                }
+                outcome => Ok(outcome),
+            }
+        };
+
+        let _ = proposal.reply.send(result);
+    }
+}
+
+fn expire_metadata_proposals(
+    pending: &mut BTreeMap<u64, PendingMetadataProposal>,
+    pending_by_request: &mut HashMap<RequestId, u64>,
+    now: Instant,
+) {
+    let expired = pending
+        .iter()
+        .filter_map(|(index, proposal)| (proposal.deadline <= now).then_some(*index))
+        .collect::<Vec<_>>();
+
+    for index in expired {
+        let Some(proposal) = pending.remove(&index) else {
+            continue;
+        };
+
+        pending_by_request.remove(&proposal.request_id);
+        let _ = proposal.reply.send(Err(Error::ProposalUnavailable {
+            reason: "metadata CREATE TABLE deadline elapsed before apply".to_string(),
+        }));
+    }
+}
+
+fn fail_pending_metadata(
+    pending: &mut BTreeMap<u64, PendingMetadataProposal>,
+    pending_by_request: &mut HashMap<RequestId, u64>,
+    error: Error,
+) {
+    let proposals = std::mem::take(pending);
+    pending_by_request.clear();
+
+    for proposal in proposals.into_values() {
+        let _ = proposal.reply.send(Err(match &error {
+            Error::RecoveryRequired { reason } => Error::RecoveryRequired {
+                reason: reason.clone(),
+            },
+            _ => Error::ProposalUnavailable {
+                reason: error.to_string(),
+            },
+        }));
     }
 }
 

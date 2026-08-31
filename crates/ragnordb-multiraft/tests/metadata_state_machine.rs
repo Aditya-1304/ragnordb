@@ -3,9 +3,11 @@ use raft::types::{ConfState, Snapshot};
 use ragnordb_catalog::{MetadataApplyOutcome, MetadataRejection};
 
 use ragnordb_common::{
-    ids::{NodeId, ReplicaId, TabletId},
+    catalog_codec::{ColumnDefinition, DataType},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TabletId},
     metadata_codec::{
-        DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand,
+        CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
+        MetadataCommand, MetadataCommandEnvelope, NodeDescriptor,
     },
 };
 
@@ -312,4 +314,63 @@ fn metadata_snapshot_restore_clears_process_local_apply_results() {
         0,
         "snapshot recovery must not invent process-local proposal completions",
     );
+}
+
+#[test]
+fn metadata_state_machine_replays_the_same_request_result() {
+    let mut state_machine = MetadataRaftStateMachine::new();
+    let request_id = RequestId {
+        client_id: 0x63,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+
+    let node = NodeDescriptor {
+        node_id: NodeId(1),
+        raft_addr: "127.0.0.1:7101".to_string(),
+        snapshot_addr: "127.0.0.1:7151".to_string(),
+        sql_addr: "127.0.0.1:7201".to_string(),
+        admin_addr: "127.0.0.1:7301".to_string(),
+    };
+    let create = MetadataCommand::CreateTableTopology(CreateTableRequest {
+        table_name: "accounts".to_string(),
+        columns: vec![ColumnDefinition {
+            column_id: ColumnId(1),
+            name: "id".to_string(),
+            ty: DataType::Int,
+            nullable: false,
+        }],
+        primary_key_column_ids: vec![ColumnId(1)],
+    });
+
+    for (index, command) in [
+        MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        },
+        MetadataCommand::RegisterNode(node),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state_machine
+            .apply((index + 1) as u64, &command.encode().unwrap())
+            .unwrap();
+    }
+
+    let envelope = MetadataCommandEnvelope::new(request_id.clone(), create.clone()).unwrap();
+    let encoded = envelope.encode().unwrap();
+
+    state_machine.apply(3, &encoded).unwrap();
+    state_machine.apply(4, &encoded).unwrap();
+
+    let results = state_machine.take_applied_results();
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[2].request_id, Some(request_id.clone()));
+    assert!(matches!(
+        results[2].outcome,
+        MetadataApplyOutcome::TableCreated(_)
+    ));
+    assert_eq!(results[3].request_id, Some(request_id));
+    assert_eq!(results[3].outcome, results[2].outcome);
 }

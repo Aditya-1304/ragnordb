@@ -8,7 +8,9 @@
 //! an implicit transaction. BEGIN attaches an explicit transaction that remains
 //! active until COMMIT or ROLLBACK.
 
-use ragnordb_common::{Error, Result, ids::TxnId};
+use std::time::Duration;
+
+use ragnordb_common::{Error, Result, ids::RequestId, ids::TxnId};
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_txn::{Transaction, TransactionManager};
 
@@ -63,11 +65,36 @@ impl SqlSession {
         executor: &mut LocalExecutor,
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
+        self.execute_sql_with_metadata_request(
+            sql,
+            executor,
+            transaction_manager,
+            None,
+            Duration::ZERO,
+        )
+    }
+
+    /// Parse, analyze, and execute one SQL statement with an optional
+    /// metadata-Raft request identity for CREATE TABLE.
+    pub fn execute_sql_with_metadata_request<M: TransactionManager>(
+        &mut self,
+        sql: &str,
+        executor: &mut LocalExecutor,
+        transaction_manager: &mut M,
+        metadata_request_id: Option<RequestId>,
+        metadata_timeout: Duration,
+    ) -> Result<ExecutionResult> {
         let parsed = parse_one(sql)?;
         let bound = analyze(&parsed, executor.catalog())?;
         let plan = plan(bound);
 
-        self.execute_plan(plan, executor, transaction_manager)
+        self.execute_plan_with_metadata_request(
+            plan,
+            executor,
+            transaction_manager,
+            metadata_request_id,
+            metadata_timeout,
+        )
     }
 
     /// Execute one parser-independent logical plan.
@@ -76,6 +103,25 @@ impl SqlSession {
         plan: Plan,
         executor: &mut LocalExecutor,
         transaction_manager: &mut M,
+    ) -> Result<ExecutionResult> {
+        self.execute_plan_with_metadata_request(
+            plan,
+            executor,
+            transaction_manager,
+            None,
+            Duration::ZERO,
+        )
+    }
+
+    /// Execute one plan while preserving the optional metadata request
+    /// identity across the SQL-session boundary.
+    pub fn execute_plan_with_metadata_request<M: TransactionManager>(
+        &mut self,
+        plan: Plan,
+        executor: &mut LocalExecutor,
+        transaction_manager: &mut M,
+        metadata_request_id: Option<RequestId>,
+        metadata_timeout: Duration,
     ) -> Result<ExecutionResult> {
         match plan {
             Plan::Begin => self.begin(transaction_manager),
@@ -93,7 +139,19 @@ impl SqlSession {
                         .execute(Plan::CreateTable(plan), self.current_transaction.as_mut());
                 }
 
-                executor.execute_create_table_durable(plan, transaction_manager)
+                match metadata_request_id {
+                    Some(request_id) => executor.execute_create_table_with_metadata(
+                        plan,
+                        request_id,
+                        metadata_timeout,
+                    ),
+                    None if executor.metadata_table_creator_installed() => {
+                        Err(Error::InvalidArgument(
+                            "metadata-backed CREATE TABLE requires a request identity".to_string(),
+                        ))
+                    }
+                    None => executor.execute_create_table_durable(plan, transaction_manager),
+                }
             }
 
             // SHOW TABLES reads catalog metadata and does not require an MVCC

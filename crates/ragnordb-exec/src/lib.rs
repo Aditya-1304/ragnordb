@@ -25,6 +25,7 @@ mod session;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use expression::evaluate;
@@ -39,6 +40,7 @@ use ragnordb_common::{
     command_codec::SingleShardCommitCommand,
     encoding::encode_row,
     ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
+    metadata_codec::{CreateTableRequest, MetadataCommandCodecError},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_sql::{
@@ -72,6 +74,27 @@ type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
 
 /// Process-wide catalog publication boundary.
 pub type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
+
+/// Metadata-owned CREATE TABLE authority used by replicated SQL execution.
+///
+/// The executor supplies only schema semantics and a request identity. The
+/// implementation must submit those semantics to metadata Raft and return the
+/// fully assigned definition only after the corresponding entry has applied.
+pub trait MetadataTableCreator: Send + Sync {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        request_id: ragnordb_common::ids::RequestId,
+        timeout: Duration,
+    ) -> Result<ragnordb_common::catalog_codec::TableDefinition>;
+
+    /// Return the latest committed metadata definitions for local catalog
+    /// cache refresh. Definitions are authoritative but remain read-only here.
+    fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition>;
+}
+
+/// Shared metadata CREATE TABLE client installed by the server runtime.
+pub type SharedMetadataTableCreator = Arc<dyn MetadataTableCreator>;
 
 type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
@@ -140,6 +163,8 @@ impl DurableCommitLog for InMemoryCommitLog {
 pub struct LocalExecutor {
     catalog: LocalCatalog,
     tablets: BTreeMap<TableId, LocalTablet>,
+    metadata_table_creator: Option<SharedMetadataTableCreator>,
+    metadata_table_ids: BTreeSet<TableId>,
     commit_log: SharedCommitLog,
     next_local_catalog_timestamp: u64,
     replay_from_end_lsn: u64,
@@ -185,6 +210,8 @@ impl LocalExecutor {
         Self {
             catalog: DurableCatalog::new(catalog_log),
             tablets: BTreeMap::new(),
+            metadata_table_creator: None,
+            metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: 0,
             replay_from_end_lsn: 0,
@@ -208,6 +235,50 @@ impl LocalExecutor {
         self.catalog.replace_durable_log(catalog_log);
     }
 
+    /// Install the metadata Raft client used for replicated CREATE TABLE.
+    pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
+        self.metadata_table_creator = Some(creator);
+    }
+
+    pub(crate) fn metadata_table_creator_installed(&self) -> bool {
+        self.metadata_table_creator.is_some()
+    }
+
+    /// Refresh the local SQL catalog cache from committed metadata state.
+    ///
+    /// Metadata-owned tables do not receive a local MVCC tablet until the
+    /// later tablet-lifecycle phase. They are therefore visible to SQL schema
+    /// analysis and `SHOW TABLES`, while DML correctly remains unavailable until
+    /// a routed tablet is installed.
+    pub fn refresh_metadata_catalog(&mut self) -> Result<()> {
+        let Some(creator) = &self.metadata_table_creator else {
+            return Ok(());
+        };
+
+        for definition in creator.list_tables() {
+            let schema = self
+                .catalog
+                .catalog()
+                .table_by_id(TableId(definition.table_id));
+
+            if let Some(existing) = schema {
+                if existing.to_definition() != definition {
+                    return Err(Error::CorruptData(format!(
+                        "metadata catalog definition for table {} conflicts with the local SQL cache",
+                        definition.table_id,
+                    )));
+                }
+            } else {
+                self.catalog
+                    .install_replicated_definition(definition.clone())?;
+            }
+
+            self.metadata_table_ids.insert(TableId(definition.table_id));
+        }
+
+        Ok(())
+    }
+
     /// Install a Raft-authoritative catalog command and its local SQL tablet.
     pub fn apply_replicated_catalog(
         &mut self,
@@ -225,6 +296,81 @@ impl LocalExecutor {
             self.tablets.insert(schema.id, coordinator);
         }
         Ok(())
+    }
+
+    /// Execute a metadata-owned CREATE TABLE.
+    ///
+    /// No local table-ID allocator, timestamp allocator, or
+    /// `DurableCatalogLog` is consulted. The returned definition is already
+    /// authoritative in metadata Raft and is installed only as a local SQL
+    /// cache entry.
+    pub fn execute_create_table_with_metadata(
+        &mut self,
+        plan: CreateTablePlan,
+        request_id: ragnordb_common::ids::RequestId,
+        timeout: Duration,
+    ) -> Result<ExecutionResult> {
+        let creator = self
+            .metadata_table_creator
+            .clone()
+            .ok_or(Error::NotImplemented(
+                "metadata-backed CREATE TABLE is unavailable",
+            ))?;
+
+        let CreateTablePlan {
+            table_name,
+            columns,
+            primary_key_column_ids,
+        } = plan;
+
+        let request = CreateTableRequest {
+            table_name,
+            columns: columns
+                .into_iter()
+                .map(|column| ragnordb_common::catalog_codec::ColumnDefinition {
+                    column_id: column.id,
+                    name: column.name,
+                    ty: column.ty,
+                    nullable: column.nullable,
+                })
+                .collect(),
+            primary_key_column_ids,
+        };
+
+        request
+            .validate()
+            .map_err(|error: MetadataCommandCodecError| {
+                Error::ConstraintViolation(error.to_string())
+            })?;
+
+        let expected_request = request.clone();
+        let definition = creator.create_table(request, request_id, timeout)?;
+
+        if definition.table_id <= 1 {
+            return Err(Error::CorruptData(format!(
+                "metadata CREATE TABLE returned reserved table ID {}",
+                definition.table_id,
+            )));
+        }
+
+        if definition.name != expected_request.table_name
+            || definition.columns != expected_request.columns
+            || definition.primary_key_column_ids != expected_request.primary_key_column_ids
+            || definition.schema_version != 1
+            || definition.tablet_count != 1
+        {
+            return Err(Error::CorruptData(
+                "metadata CREATE TABLE returned a definition different from the requested schema"
+                    .to_string(),
+            ));
+        }
+
+        let table_id = TableId(definition.table_id);
+
+        self.catalog.install_replicated_definition(definition)?;
+        self.metadata_table_ids.insert(table_id);
+
+        Ok(ExecutionResult::CreatedTable { table_id })
     }
 
     /// Apply a Raft-authoritative single-tablet commit to the SQL read mirror.
@@ -357,6 +503,8 @@ impl LocalExecutor {
         Ok(Self {
             catalog: DurableCatalog::from_recovered(catalog, catalog_log),
             tablets,
+            metadata_table_creator: None,
+            metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: catalog_timestamp_high_water.0,
             replay_from_end_lsn,
@@ -381,6 +529,13 @@ impl LocalExecutor {
             .catalog()
             .list_tables()
             .into_iter()
+            .filter_map(|schema| {
+                if self.metadata_table_ids.contains(&schema.id) {
+                    return None;
+                }
+
+                Some(schema)
+            })
             .map(|schema| {
                 let coordinator = self.tablets.get(&schema.id).ok_or_else(|| {
                     Error::CorruptData(format!(

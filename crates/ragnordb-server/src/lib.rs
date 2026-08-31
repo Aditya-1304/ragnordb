@@ -136,6 +136,10 @@ impl Server {
                 )?;
                 database.lock().await.replace_commit_log(runtime.handle());
                 database.lock().await.replace_catalog_log(runtime.handle());
+                database
+                    .lock()
+                    .await
+                    .replace_metadata_table_creator(runtime.metadata_table_creator());
                 Some(runtime)
             }
             (None, None) => None,
@@ -395,6 +399,16 @@ async fn handle_connection_with_policy(
 
         let trimmed = sql.trim().to_string();
 
+        // Allocate the identity before parsing so leading SQL comments or
+        // equivalent parser syntax cannot accidentally fall back to the local
+        // catalog path. Non-CREATE statements simply carry and ignore this
+        // optional identity at the executor boundary.
+        let metadata_request_id = if replicated_tablet.is_some() {
+            Some(session.next_metadata_request_id()?)
+        } else {
+            None
+        };
+
         metrics::counter_inc("RagnorDB_requests_received_total");
 
         log_statement(statement_logging, session.session_id.0, &trimmed);
@@ -436,7 +450,12 @@ async fn handle_connection_with_policy(
                     let (returned_session, result, status) =
                         tokio::task::spawn_blocking(move || {
                             let mut database = database_guard;
-                            let result = database.execute_sql(&mut sql_session, &statement);
+                            let result = database.execute_sql_with_metadata_request(
+                                &mut sql_session,
+                                &statement,
+                                metadata_request_id,
+                                Duration::from_millis(statement_timeout_ms),
+                            );
                             let status = database.status();
                             (sql_session, result, status)
                         })

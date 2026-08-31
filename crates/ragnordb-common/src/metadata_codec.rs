@@ -10,7 +10,7 @@ use prost::Message;
 
 use crate::{
     catalog_codec::{ColumnDefinition, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TabletId},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     proto::metadata,
 };
 
@@ -19,6 +19,9 @@ use crate::{
 /// Version 1 existed only as premature pre-Phase-5 experimental code and is
 /// intentionally rejected rather than silently reinterpreted.
 pub const METADATA_COMMAND_VERSION: u32 = 2;
+
+/// Version of the request-bearing metadata proposal envelope.
+pub const METADATA_COMMAND_ENVELOPE_VERSION: u32 = 1;
 
 /// Snapshot format before metadata-owned allocation history was persisted.
 pub const LEGACY_METADATA_SNAPSHOT_VERSION: u32 = 1;
@@ -36,6 +39,8 @@ pub const INITIAL_METADATA_TABLET_HIGH_WATER: u64 = 1;
 
 /// Durable identity occupied by the metadata Raft group. Tablet metadata must
 /// never assign this group to a SQL tablet.
+pub const RESERVED_LEGACY_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(1);
+
 pub const RESERVED_METADATA_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(2);
 
 pub const INITIAL_METADATA_RAFT_GROUP_HIGH_WATER: u64 = RESERVED_METADATA_RAFT_GROUP_ID.0;
@@ -77,6 +82,119 @@ pub struct CreateTableRequest {
     pub table_name: String,
     pub columns: Vec<ColumnDefinition>,
     pub primary_key_column_ids: Vec<ColumnId>,
+}
+
+/// Durable metadata proposal envelope carrying the identity used for retry
+/// deduplication.
+///
+/// The command payload remains unallocated. The metadata state machine assigns
+/// table, tablet, and Raft identities only when this envelope is applied in
+/// the committed log order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataCommandEnvelope {
+    pub format_version: u32,
+    pub request_id: RequestId,
+    pub command: MetadataCommand,
+}
+
+impl MetadataCommandEnvelope {
+    pub fn new(
+        request_id: RequestId,
+        command: MetadataCommand,
+    ) -> Result<Self, MetadataCommandCodecError> {
+        let envelope = Self {
+            format_version: METADATA_COMMAND_ENVELOPE_VERSION,
+            request_id,
+            command,
+        };
+
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    pub fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.format_version != METADATA_COMMAND_ENVELOPE_VERSION {
+            return Err(MetadataCommandCodecError::UnsupportedEnvelopeVersion(
+                self.format_version,
+            ));
+        }
+
+        if self.request_id.client_id == 0 {
+            return Err(MetadataCommandCodecError::InvalidRequestId(
+                "client ID must be non-zero",
+            ));
+        }
+
+        if self.request_id.sequence == 0 {
+            return Err(MetadataCommandCodecError::InvalidRequestId(
+                "request sequence must be non-zero",
+            ));
+        }
+
+        if self.request_id.raft_group_id != RESERVED_METADATA_RAFT_GROUP_ID {
+            return Err(MetadataCommandCodecError::RequestGroupMismatch {
+                expected: RESERVED_METADATA_RAFT_GROUP_ID,
+                received: self.request_id.raft_group_id,
+            });
+        }
+
+        self.command.validate()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, MetadataCommandCodecError> {
+        self.validate()?;
+        Ok(self.to_proto().encode_to_vec())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MetadataCommandCodecError> {
+        let proto = metadata::MetadataCommand::decode(bytes)
+            .map_err(|error| MetadataCommandCodecError::Decode(error.to_string()))?;
+
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> metadata::MetadataCommand {
+        let mut proto = self.command.to_proto();
+        proto.request_id = Some(self.request_id.to_proto());
+        proto.envelope_version = self.format_version;
+        proto
+    }
+
+    fn from_proto(proto: metadata::MetadataCommand) -> Result<Self, MetadataCommandCodecError> {
+        if proto.envelope_version != METADATA_COMMAND_ENVELOPE_VERSION {
+            return Err(MetadataCommandCodecError::UnsupportedEnvelopeVersion(
+                proto.envelope_version,
+            ));
+        }
+
+        let request_id = RequestId::from_proto(proto.request_id.clone().ok_or(
+            MetadataCommandCodecError::MissingField("metadata_command.request_id"),
+        )?)
+        .map_err(MetadataCommandCodecError::InvalidRequestId)?;
+
+        let command = MetadataCommand::from_proto(proto)?;
+        Self::new(request_id, command)
+    }
+}
+
+/// Result retained for one request identity in the replicated metadata state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataCachedOutcome {
+    Applied,
+    AlreadyApplied,
+    TableCreated {
+        table_id: TableId,
+        tablet_id: TabletId,
+        raft_group_id: RaftGroupId,
+    },
+    Rejected(String),
+}
+
+/// One request identity and its deterministic result retained in snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataRequestDeduplication {
+    pub request_id: RequestId,
+    pub outcome: MetadataCachedOutcome,
 }
 
 /// Monotonic identity high-water marks owned by metadata.
@@ -188,6 +306,8 @@ pub struct MetadataSnapshot {
     pub desired_placements: Vec<DesiredReplicaPlacement>,
     pub retired_replicas: Vec<RetiredReplicaLifetime>,
     pub allocator: MetadataAllocatorState,
+
+    pub request_deduplication: Vec<MetadataRequestDeduplication>,
 }
 
 impl MetadataCommand {
@@ -199,10 +319,51 @@ impl MetadataCommand {
 
     /// Decode and validate one command read from the Raft log.
     pub fn decode(bytes: &[u8]) -> Result<Self, MetadataCommandCodecError> {
+        let (_, command) = Self::decode_with_optional_request_id(bytes)?;
+
+        Ok(command)
+    }
+
+    /// Decode a metadata command while preserving an optional request identity.
+    ///
+    /// The optional form is required for replaying pre-Slice-2 bootstrap
+    /// entries, which intentionally have no client request identity.
+    pub fn decode_with_optional_request_id(
+        bytes: &[u8],
+    ) -> Result<(Option<RequestId>, Self), MetadataCommandCodecError> {
         let proto = metadata::MetadataCommand::decode(bytes)
             .map_err(|error| MetadataCommandCodecError::Decode(error.to_string()))?;
 
-        Self::from_proto(proto)
+        let request_id = proto
+            .request_id
+            .clone()
+            .map(RequestId::from_proto)
+            .transpose()
+            .map_err(MetadataCommandCodecError::InvalidRequestId)?;
+
+        let envelope_version = proto.envelope_version;
+        let command = Self::from_proto(proto)?;
+
+        if let Some(request_id) = &request_id {
+            if envelope_version != METADATA_COMMAND_ENVELOPE_VERSION {
+                return Err(MetadataCommandCodecError::UnsupportedEnvelopeVersion(
+                    envelope_version,
+                ));
+            }
+
+            // State-machine replay uses this optional decoder directly rather
+            // than constructing an envelope first. Reapply the envelope
+            // identity checks here so malformed committed request IDs cannot
+            // enter the durable deduplication map.
+            MetadataCommandEnvelope {
+                format_version: METADATA_COMMAND_ENVELOPE_VERSION,
+                request_id: request_id.clone(),
+                command: command.clone(),
+            }
+            .validate()?;
+        }
+
+        Ok((request_id, command))
     }
 
     pub fn validate(&self) -> Result<(), MetadataCommandCodecError> {
@@ -271,6 +432,8 @@ impl MetadataCommand {
 
         metadata::MetadataCommand {
             format_version: METADATA_COMMAND_VERSION,
+            request_id: None,
+            envelope_version: 0,
             command: Some(command),
         }
     }
@@ -591,7 +754,8 @@ impl TabletDescriptor {
 
         // Group 2 is the metadata state machine's own Raft group. Allowing a
         // tablet to claim it would alias two independent authorities onto one
-        // log and persistence namespace.
+        // log and persistence namespace. Group 1 remains readable for the
+        // legacy M4 descriptor format; the new atomic allocator starts at 3.
         if self.raft_group_id == RESERVED_METADATA_RAFT_GROUP_ID {
             return Err(
                 MetadataCommandCodecError::MetadataRaftGroupAssignedToTablet(self.raft_group_id),
@@ -882,6 +1046,7 @@ impl MetadataSnapshot {
                     || !self.tablets.is_empty()
                     || !self.desired_placements.is_empty()
                     || !self.retired_replicas.is_empty()
+                    || !self.request_deduplication.is_empty()
                 {
                     return Err(MetadataCommandCodecError::UninitializedSnapshotHasState);
                 }
@@ -906,6 +1071,10 @@ impl MetadataSnapshot {
 
         for retired in &self.retired_replicas {
             retired.validate()?;
+        }
+
+        for request in &self.request_deduplication {
+            request.validate()?;
         }
 
         self.allocator.validate()?;
@@ -986,6 +1155,14 @@ impl MetadataSnapshot {
             ));
         }
 
+        if !strictly_ascending(&self.request_deduplication, |request| {
+            request.request_id.clone()
+        }) {
+            return Err(MetadataCommandCodecError::NonCanonicalSnapshot(
+                "request_deduplication",
+            ));
+        }
+
         Ok(())
     }
 
@@ -1021,6 +1198,12 @@ impl MetadataSnapshot {
                 .collect(),
 
             allocator_state: Some(self.allocator.to_proto()),
+
+            request_deduplication: self
+                .request_deduplication
+                .iter()
+                .map(MetadataRequestDeduplication::to_proto)
+                .collect(),
         }
     }
 
@@ -1044,6 +1227,7 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator_state,
+            request_deduplication,
             ..
         } = proto;
 
@@ -1082,6 +1266,11 @@ impl MetadataSnapshot {
         let retired_replicas = retired_replicas
             .into_iter()
             .map(RetiredReplicaLifetime::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let request_deduplication = request_deduplication
+            .into_iter()
+            .map(MetadataRequestDeduplication::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
 
         let allocator = match (snapshot_version, allocator_state) {
@@ -1135,11 +1324,170 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator,
+            request_deduplication,
         };
 
         snapshot.validate()?;
 
         Ok(snapshot)
+    }
+}
+
+impl MetadataRequestDeduplication {
+    fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.request_id.client_id == 0 {
+            return Err(MetadataCommandCodecError::InvalidRequestId(
+                "client ID must be non-zero",
+            ));
+        }
+
+        if self.request_id.sequence == 0 {
+            return Err(MetadataCommandCodecError::InvalidRequestId(
+                "request sequence must be non-zero",
+            ));
+        }
+
+        if self.request_id.raft_group_id != RESERVED_METADATA_RAFT_GROUP_ID {
+            return Err(MetadataCommandCodecError::RequestGroupMismatch {
+                expected: RESERVED_METADATA_RAFT_GROUP_ID,
+                received: self.request_id.raft_group_id,
+            });
+        }
+
+        match &self.outcome {
+            MetadataCachedOutcome::Applied | MetadataCachedOutcome::AlreadyApplied => {}
+
+            MetadataCachedOutcome::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => {
+                if table_id.0 <= INITIAL_METADATA_TABLE_HIGH_WATER {
+                    return Err(MetadataCommandCodecError::InvalidCachedOutcome(
+                        "cached CREATE TABLE result uses a reserved table ID",
+                    ));
+                }
+
+                if tablet_id.0 <= INITIAL_METADATA_TABLET_HIGH_WATER {
+                    return Err(MetadataCommandCodecError::InvalidCachedOutcome(
+                        "cached CREATE TABLE result uses a reserved tablet ID",
+                    ));
+                }
+
+                if raft_group_id.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroRaftGroupId);
+                }
+
+                if *raft_group_id == RESERVED_LEGACY_RAFT_GROUP_ID
+                    || *raft_group_id == RESERVED_METADATA_RAFT_GROUP_ID
+                {
+                    return Err(
+                        MetadataCommandCodecError::MetadataRaftGroupAssignedToTablet(
+                            *raft_group_id,
+                        ),
+                    );
+                }
+            }
+
+            MetadataCachedOutcome::Rejected(reason) if reason.trim().is_empty() => {
+                return Err(MetadataCommandCodecError::InvalidCachedOutcome(
+                    "rejection reason cannot be empty",
+                ));
+            }
+
+            MetadataCachedOutcome::Rejected(_) => {}
+        }
+
+        Ok(())
+    }
+
+    fn to_proto(&self) -> metadata::MetadataRequestDeduplication {
+        let (outcome_kind, table_id, tablet_id, raft_group_id, rejection) = match &self.outcome {
+            MetadataCachedOutcome::Applied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
+                0,
+                0,
+                0,
+                String::new(),
+            ),
+            MetadataCachedOutcome::AlreadyApplied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
+                0,
+                0,
+                0,
+                String::new(),
+            ),
+            MetadataCachedOutcome::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
+                table_id.0,
+                tablet_id.0,
+                raft_group_id.0,
+                String::new(),
+            ),
+            MetadataCachedOutcome::Rejected(reason) => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
+                0,
+                0,
+                0,
+                reason.clone(),
+            ),
+        };
+
+        metadata::MetadataRequestDeduplication {
+            request_id: Some(self.request_id.to_proto()),
+            outcome_kind: outcome_kind as i32,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+        }
+    }
+
+    fn from_proto(
+        proto: metadata::MetadataRequestDeduplication,
+    ) -> Result<Self, MetadataCommandCodecError> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or(
+            MetadataCommandCodecError::MissingField("request_deduplication.request_id"),
+        )?)
+        .map_err(MetadataCommandCodecError::InvalidRequestId)?;
+
+        let outcome_kind = metadata::MetadataCachedOutcomeKind::try_from(proto.outcome_kind)
+            .map_err(|_| MetadataCommandCodecError::InvalidCachedOutcome("unknown outcome kind"))?;
+
+        let outcome = match outcome_kind {
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied => {
+                MetadataCachedOutcome::Applied
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied => {
+                MetadataCachedOutcome::AlreadyApplied
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated => {
+                MetadataCachedOutcome::TableCreated {
+                    table_id: TableId(proto.table_id),
+                    tablet_id: TabletId(proto.tablet_id),
+                    raft_group_id: RaftGroupId(proto.raft_group_id),
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected => {
+                MetadataCachedOutcome::Rejected(proto.rejection)
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeUnspecified => {
+                return Err(MetadataCommandCodecError::InvalidCachedOutcome(
+                    "outcome kind is unspecified",
+                ));
+            }
+        };
+
+        let request = Self {
+            request_id,
+            outcome,
+        };
+        request.validate()?;
+        Ok(request)
     }
 }
 
@@ -1199,6 +1547,9 @@ pub enum MetadataCommandCodecError {
     #[error("unsupported metadata command format version {0}")]
     UnsupportedVersion(u32),
 
+    #[error("unsupported metadata command envelope format version {0}")]
+    UnsupportedEnvelopeVersion(u32),
+
     #[error("unsupported metadata snapshot format version {0}")]
     UnsupportedSnapshotVersion(u32),
 
@@ -1210,6 +1561,19 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata value is missing {0}")]
     MissingField(&'static str),
+
+    #[error("invalid metadata request ID: {0}")]
+    InvalidRequestId(&'static str),
+
+    #[error(
+        "metadata request belongs to Raft group {}, expected metadata group {}",
+        received.0,
+        expected.0
+    )]
+    RequestGroupMismatch {
+        expected: RaftGroupId,
+        received: RaftGroupId,
+    },
 
     #[error("metadata cluster ID cannot be empty")]
     EmptyClusterId,
@@ -1310,4 +1674,7 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata snapshot field {0} is not in canonical ascending order")]
     NonCanonicalSnapshot(&'static str),
+
+    #[error("metadata cached outcome is invalid: {0}")]
+    InvalidCachedOutcome(&'static str),
 }

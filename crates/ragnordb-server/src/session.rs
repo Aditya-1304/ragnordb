@@ -4,12 +4,35 @@
 //! SQL transaction state is delegated exclusively to `SqlSession`, preventing
 //! the server and executor layers from maintaining competing transaction state.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use ragnordb_common::ids::TxnId;
+use ragnordb_common::{
+    Error, Result,
+    ids::{RequestId, TxnId},
+    metadata_codec::RESERVED_METADATA_RAFT_GROUP_ID,
+};
 use ragnordb_exec::SqlSession;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_CLIENT_ID: OnceLock<u128> = OnceLock::new();
+
+fn process_client_id() -> u128 {
+    *PROCESS_CLIENT_ID.get_or_init(|| {
+        let clock_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let process_id = u128::from(std::process::id());
+
+        clock_nanos ^ (process_id << 64)
+    })
+}
 
 /// Process-local diagnostic identity for one client connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +48,13 @@ pub struct Session {
     pub session_id: SessionId,
     pub sql: SqlSession,
     pub statement_timeout_ms: u64,
+
+    /// Monotonic request sequence scoped to this connection identity.
+    ///
+    /// The sequence is allocated for potential metadata-Raft requests. Other
+    /// SQL statements may consume a sequence without creating a metadata entry;
+    /// this keeps request allocation independent from SQL comment syntax.
+    next_metadata_sequence: u64,
 }
 
 impl Session {
@@ -41,7 +71,27 @@ impl Session {
             session_id: SessionId(session_id),
             sql: SqlSession::new(),
             statement_timeout_ms: 30_000,
+            next_metadata_sequence: 1,
         }
+    }
+
+    /// Allocate the next request identity for the metadata Raft group.
+    pub fn next_metadata_request_id(&mut self) -> Result<RequestId> {
+        let sequence = self.next_metadata_sequence;
+        self.next_metadata_sequence = sequence.checked_add(1).ok_or_else(|| {
+            Error::Configuration("metadata request sequence space is exhausted".to_string())
+        })?;
+
+        Ok(RequestId {
+            // The process-incarnation component prevents a restarted server
+            // from accidentally reusing a durable request identity. The
+            // connection component keeps sessions independent within one
+            // process; an explicit retry must reuse its original ID rather
+            // than allocate a fresh sequence.
+            client_id: process_client_id() ^ u128::from(self.session_id.0),
+            sequence,
+            raft_group_id: RESERVED_METADATA_RAFT_GROUP_ID,
+        })
     }
 
     /// Return whether standalone data statements use implicit transactions.

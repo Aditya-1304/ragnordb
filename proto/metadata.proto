@@ -14,6 +14,15 @@ import "ids.proto";
 message MetadataCommand {
     uint32 format_version = 1;
 
+    // Present for client-originated proposals. Startup compatibility commands
+    // may omit it because they predate metadata request deduplication.
+    ragnordb.ids.RequestId request_id = 9;
+
+    // Present with request_id. This version is separate from the command
+    // format_version because the same command payload is also used by legacy
+    // startup entries without an envelope.
+    uint32 envelope_version = 10;
+
     oneof command {
         ClusterInitialized cluster_initialized = 2;
         RegisterNode register_node = 3;
@@ -165,4 +174,32 @@ message MetadataSnapshot {
     repeated RetiredReplicaLifetime retired_replicas = 8;
 
     MetadataAllocatorState allocator_state = 9;
+
+    // Request results are part of replicated metadata state. Without this
+    // history, a retry after leadership change or snapshot restore could
+    // allocate a second table identity.
+    repeated MetadataRequestDeduplication request_deduplication = 10;
+}
+
+enum MetadataCachedOutcomeKind {
+    METADATA_CACHED_OUTCOME_UNSPECIFIED = 0;
+    METADATA_CACHED_OUTCOME_APPLIED = 1;
+    METADATA_CACHED_OUTCOME_ALREADY_APPLIED = 2;
+    METADATA_CACHED_OUTCOME_TABLE_CREATED = 3;
+    METADATA_CACHED_OUTCOME_REJECTED = 4;
+}
+
+message MetadataRequestDeduplication {
+    ragnordb.ids.RequestId request_id = 1;
+    MetadataCachedOutcomeKind outcome_kind = 2;
+
+    // Populated only for METADATA_CACHED_OUTCOME_TABLE_CREATED.
+    uint64 table_id = 3;
+    uint64 tablet_id = 4;
+    uint64 raft_group_id = 5;
+
+    // Populated only for METADATA_CACHED_OUTCOME_REJECTED. The original
+    // rejection text is retained so a replay has the same client-visible
+    // deterministic result without re-evaluating current metadata state.
+    string rejection = 6;
 }

@@ -19,11 +19,15 @@ use crate::data_directory_lock::DataDirectoryLock;
 use raft::types::ConfState;
 use ragnordb_catalog::Catalog;
 use ragnordb_common::{
-    Error, Result, command_codec::SingleShardCommitCommand, durability::DurabilityGate,
-    ids::NodeId, proto::snapshot as snapshot_proto,
+    Error, Result,
+    command_codec::SingleShardCommitCommand,
+    durability::DurabilityGate,
+    ids::{NodeId, RequestId},
+    proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
-    ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SqlSession,
+    ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SharedMetadataTableCreator,
+    SqlSession,
 };
 use ragnordb_multiraft::storage::persistence::NodeRaftWal;
 use ragnordb_multiraft::storage::{
@@ -416,6 +420,15 @@ impl LocalDatabase {
         self.executor.replace_catalog_log(catalog_log);
     }
 
+    /// Install the metadata-Raft authority used by replicated SQL CREATE TABLE.
+    ///
+    /// The legacy catalog log remains available for the M4 compatibility table,
+    /// but metadata-owned schema creation is routed through this boundary and
+    /// therefore receives its identity only from the metadata state machine.
+    pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
+        self.executor.replace_metadata_table_creator(creator);
+    }
+
     /// Clone the serialized A-WAL handle for the Raft persistence owner.
     ///
     /// `WalHandle` clones share one synchronized engine, so database records and
@@ -643,7 +656,20 @@ impl LocalDatabase {
     /// after authoritative durable state becomes uncertain. The error that
     /// first crosses this boundary fences every later connection
     pub fn execute_sql(&mut self, session: &mut SqlSession, sql: &str) -> Result<ExecutionResult> {
+        self.execute_sql_with_metadata_request(session, sql, None, std::time::Duration::ZERO)
+    }
+
+    /// Execute one SQL statement after refreshing committed metadata state and
+    /// optionally carrying a request identity to metadata Raft.
+    pub fn execute_sql_with_metadata_request(
+        &mut self,
+        session: &mut SqlSession,
+        sql: &str,
+        metadata_request_id: Option<RequestId>,
+        metadata_timeout: std::time::Duration,
+    ) -> Result<ExecutionResult> {
         self.durability_gate.ensure_healthy()?;
+        self.executor.refresh_metadata_catalog()?;
 
         let result = {
             let Self {
@@ -652,7 +678,13 @@ impl LocalDatabase {
                 ..
             } = self;
 
-            session.execute_sql(sql, executor, transaction_manager)
+            session.execute_sql_with_metadata_request(
+                sql,
+                executor,
+                transaction_manager,
+                metadata_request_id,
+                metadata_timeout,
+            )
         };
 
         if let Err(error) = &result {

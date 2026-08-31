@@ -53,6 +53,10 @@ use crate::{
 /// state-machine failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedMetadataCommand {
+    /// Request identity, when the committed entry came from a client-bearing
+    /// metadata envelope. Legacy startup entries may not carry one.
+    pub request_id: Option<ragnordb_common::ids::RequestId>,
+
     pub index: u64,
     pub outcome: MetadataApplyOutcome,
 }
@@ -192,13 +196,21 @@ impl RaftReadyStateMachine for MetadataRaftStateMachine {
     }
 
     fn apply(&mut self, index: u64, command: &[u8]) -> Result<(), Self::Error> {
-        let command =
-            MetadataCommand::decode(command).map_err(MetadataStateMachineError::CommandDecode)?;
+        let (request_id, command) = MetadataCommand::decode_with_optional_request_id(command)
+            .map_err(MetadataStateMachineError::CommandDecode)?;
 
-        let outcome = self.state.apply(command);
+        let outcome = match &request_id {
+            Some(request_id) => self
+                .state
+                .apply_with_request_id(request_id.clone(), command),
+            None => self.state.apply(command),
+        };
 
-        self.applied_results
-            .push_back(AppliedMetadataCommand { index, outcome });
+        self.applied_results.push_back(AppliedMetadataCommand {
+            request_id,
+            index,
+            outcome,
+        });
 
         // A MetadataApplyOutcome::Rejected is a deterministic command result,
         // not corruption. Returning Err here would quarantine the entire
