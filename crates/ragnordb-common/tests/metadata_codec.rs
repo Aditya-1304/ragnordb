@@ -1,10 +1,11 @@
+use prost::Message;
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
     ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
     metadata_codec::{
-        DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand,
-        MetadataCommandCodecError, MetadataSnapshot, NodeDescriptor, PartitionSpec,
-        RetiredReplicaLifetime, TabletDescriptor,
+        CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
+        MetadataAllocatorState, MetadataCommand, MetadataCommandCodecError, MetadataSnapshot,
+        NodeDescriptor, PartitionSpec, RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
@@ -84,6 +85,16 @@ fn metadata_v2_commands_roundtrip_every_authoritative_field() {
         MetadataCommand::RegisterNode(node(11, 7001)),
         MetadataCommand::CreateTable { table: table() },
         MetadataCommand::CreateTablet { tablet: tablet() },
+        MetadataCommand::CreateTableTopology(CreateTableRequest {
+            table_name: "new_table".to_string(),
+            columns: vec![ColumnDefinition {
+                column_id: ColumnId(1),
+                name: "id".to_string(),
+                ty: DataType::Int,
+                nullable: false,
+            }],
+            primary_key_column_ids: vec![ColumnId(1)],
+        }),
         MetadataCommand::SetDesiredReplicaPlacement(placement()),
         MetadataCommand::UpdateTableSchema {
             expected_schema_version: 1,
@@ -201,6 +212,12 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
             raft_group_id: RaftGroupId(23),
             replica_id: ReplicaId(30),
         }],
+
+        allocator: MetadataAllocatorState {
+            max_table_id: 7,
+            max_tablet_id: 17,
+            max_raft_group_id: 23,
+        },
     };
 
     let encoded = snapshot.encode().unwrap();
@@ -219,10 +236,51 @@ fn metadata_snapshot_rejects_noncanonical_node_order() {
         tablets: Vec::new(),
         desired_placements: Vec::new(),
         retired_replicas: Vec::new(),
+
+        allocator: MetadataAllocatorState::initial(),
     };
 
     assert_eq!(
         snapshot.encode().unwrap_err(),
         MetadataCommandCodecError::NonCanonicalSnapshot("nodes")
+    );
+}
+
+#[test]
+fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
+    let legacy_tablet = TabletDescriptor {
+        raft_group_id: RaftGroupId(1),
+        ..tablet()
+    };
+
+    let snapshot = MetadataSnapshot {
+        cluster_id: Some("cluster-a".to_string()),
+        nodes: vec![node(11, 7001), node(12, 7002)],
+        tables: vec![table()],
+        tablets: vec![legacy_tablet],
+        desired_placements: vec![placement()],
+        retired_replicas: Vec::new(),
+        allocator: MetadataAllocatorState {
+            max_table_id: 100,
+            max_tablet_id: 200,
+            max_raft_group_id: 300,
+        },
+    };
+
+    let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
+        snapshot.encode().unwrap().as_slice(),
+    )
+    .unwrap();
+    proto.allocator_state = None;
+
+    let decoded = MetadataSnapshot::decode(&proto.encode_to_vec()).unwrap();
+
+    assert_eq!(
+        decoded.allocator,
+        MetadataAllocatorState {
+            max_table_id: 7,
+            max_tablet_id: 17,
+            max_raft_group_id: 2,
+        },
     );
 }

@@ -16,14 +16,33 @@ use std::{
 
 use ragnordb_common::{
     Error, Result,
+    catalog_codec::TableDefinition,
     ids::{NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
     metadata_codec::{
-        DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand, MetadataSnapshot,
-        NodeDescriptor, PartitionSpec, RetiredReplicaLifetime, TabletDescriptor,
+        CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
+        MetadataAllocatorState, MetadataCommand, MetadataSnapshot, NodeDescriptor, PartitionSpec,
+        RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
 use crate::{Catalog, TableSchema};
+
+/// Phase 5.2 creates one initial hash bucket per table. Actual key-to-tablet
+/// routing begins in Phase 5.3.
+const INITIAL_TABLET_COUNT: u32 = 1;
+
+/// Initial desired replication factor. Small development clusters use every
+/// available node up to this limit; larger clusters do not join every node to
+/// every newly created tablet group.
+const INITIAL_REPLICATION_FACTOR: usize = 3;
+
+/// Cluster-global identities assigned by one successful atomic CREATE TABLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataTableCreated {
+    pub table_id: TableId,
+    pub tablet_id: TabletId,
+    pub raft_group_id: RaftGroupId,
+}
 
 /// Result of applying one already-committed metadata command.
 ///
@@ -34,12 +53,13 @@ use crate::{Catalog, TableSchema};
 pub enum MetadataApplyOutcome {
     Applied,
     AlreadyApplied,
+    TableCreated(MetadataTableCreated),
     Rejected(MetadataRejection),
 }
 
 impl MetadataApplyOutcome {
     pub const fn changed_state(&self) -> bool {
-        matches!(self, Self::Applied)
+        matches!(self, Self::Applied | Self::TableCreated(_))
     }
 }
 
@@ -83,6 +103,12 @@ pub enum MetadataRejection {
 
     #[error("table name {0} is already assigned")]
     TableNameConflict(String),
+
+    #[error("CREATE TABLE requires at least one registered physical node")]
+    NoRegisteredNodes,
+
+    #[error("metadata {0} identity space is exhausted")]
+    IdentitySpaceExhausted(&'static str),
 
     #[error(
         "metadata references unknown table {}",
@@ -250,9 +276,11 @@ pub enum MetadataRejection {
 }
 
 /// Complete deterministic projection of committed metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MetadataState {
     cluster_id: Option<String>,
+
+    allocator: MetadataAllocatorState,
 
     nodes: BTreeMap<NodeId, NodeDescriptor>,
 
@@ -279,6 +307,23 @@ pub struct MetadataState {
     retired_replicas: BTreeSet<(RaftGroupId, ReplicaId)>,
 }
 
+impl Default for MetadataState {
+    fn default() -> Self {
+        Self {
+            cluster_id: None,
+            allocator: MetadataAllocatorState::initial(),
+            nodes: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            table_ids_by_name: BTreeMap::new(),
+            tablets: BTreeMap::new(),
+            tablet_ids_by_raft_group: BTreeMap::new(),
+            tablet_ids_by_partition: BTreeMap::new(),
+            desired_placements: BTreeMap::new(),
+            retired_replicas: BTreeSet::new(),
+        }
+    }
+}
+
 impl MetadataState {
     pub fn new() -> Self {
         Self::default()
@@ -286,6 +331,10 @@ impl MetadataState {
 
     pub fn cluster_id(&self) -> Option<&str> {
         self.cluster_id.as_deref()
+    }
+
+    pub const fn allocator_state(&self) -> MetadataAllocatorState {
+        self.allocator
     }
 
     pub fn node(&self, node_id: NodeId) -> Option<&NodeDescriptor> {
@@ -341,6 +390,10 @@ impl MetadataState {
 
             MetadataCommand::CreateTablet { tablet } => self.apply_create_tablet(tablet),
 
+            MetadataCommand::CreateTableTopology(request) => {
+                self.apply_create_table_topology(request)
+            }
+
             MetadataCommand::SetDesiredReplicaPlacement(placement) => {
                 self.apply_desired_placement(placement)
             }
@@ -377,6 +430,8 @@ impl MetadataState {
                     replica_id: *replica_id,
                 })
                 .collect(),
+
+            allocator: self.allocator,
         }
     }
 
@@ -397,10 +452,13 @@ impl MetadataState {
             tablets,
             desired_placements,
             retired_replicas,
+            allocator,
         } = snapshot;
 
         if cluster_id.is_none() {
-            return Ok(Self::new());
+            let mut state = Self::new();
+            state.allocator = allocator;
+            return Ok(state);
         }
 
         let mut state = Self::new();
@@ -497,6 +555,11 @@ impl MetadataState {
                 .insert((retired.raft_group_id, retired.replica_id));
         }
 
+        // Snapshot validation proved that these high-water marks dominate all
+        // visible identities. Install them only after the semantic projection
+        // has been reconstructed successfully.
+        state.allocator = allocator;
+
         Ok(state)
     }
 
@@ -549,10 +612,152 @@ impl MetadataState {
         MetadataApplyOutcome::Applied
     }
 
-    fn apply_create_table(
-        &mut self,
-        table: ragnordb_common::catalog_codec::TableDefinition,
-    ) -> MetadataApplyOutcome {
+    fn apply_create_table_topology(&mut self, request: CreateTableRequest) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        // Duplicate-name rejection is intentionally before allocation. A
+        // rejected CREATE TABLE must not consume cluster-global identities.
+        if self.table_ids_by_name.contains_key(&request.table_name) {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::TableNameConflict(
+                request.table_name,
+            ));
+        }
+
+        let selected_nodes = self
+            .nodes
+            .keys()
+            .copied()
+            .take(INITIAL_REPLICATION_FACTOR)
+            .collect::<Vec<_>>();
+
+        if selected_nodes.is_empty() {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::NoRegisteredNodes);
+        }
+
+        // Calculate every identity before mutating state. Checked arithmetic
+        // turns an exhausted identity space into a deterministic rejection.
+        let table_id = match self.allocator.max_table_id.checked_add(1) {
+            Some(id) => TableId(id),
+            None => {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::IdentitySpaceExhausted(
+                    "table",
+                ));
+            }
+        };
+
+        let tablet_id = match self.allocator.max_tablet_id.checked_add(1) {
+            Some(id) => TabletId(id),
+            None => {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::IdentitySpaceExhausted(
+                    "tablet",
+                ));
+            }
+        };
+
+        let raft_group_id = match self.allocator.max_raft_group_id.checked_add(1) {
+            Some(id) => RaftGroupId(id),
+            None => {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::IdentitySpaceExhausted(
+                    "Raft group",
+                ));
+            }
+        };
+
+        let table_definition = TableDefinition {
+            table_id: table_id.0,
+            name: request.table_name,
+            columns: request.columns,
+            primary_key_column_ids: request.primary_key_column_ids,
+            schema_version: 1,
+            tablet_count: INITIAL_TABLET_COUNT,
+        };
+
+        let schema = match TableSchema::from_definition(table_definition) {
+            Ok(schema) => schema,
+            Err(error) => {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidTable(
+                    error.to_string(),
+                ));
+            }
+        };
+
+        let tablet = TabletDescriptor {
+            tablet_id,
+            table_id,
+            raft_group_id,
+            tablet_epoch: 1,
+            partition: PartitionSpec::Hash {
+                bucket: 0,
+                bucket_count: INITIAL_TABLET_COUNT,
+            },
+        };
+
+        if let Err(error) = tablet.validate() {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(
+                error.to_string(),
+            ));
+        }
+
+        let placement = DesiredReplicaPlacement {
+            tablet_id,
+            configuration_epoch: 1,
+            replicas: selected_nodes
+                .into_iter()
+                .enumerate()
+                .map(|(index, node_id)| DesiredReplica {
+                    replica_id: ReplicaId((index as u64) + 1),
+                    node_id,
+                    role: DesiredReplicaRole::Voter,
+                })
+                .collect(),
+        };
+
+        if let Err(error) = placement.validate() {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(
+                error.to_string(),
+            ));
+        }
+
+        // An occupied identity would indicate state corruption because all
+        // successful legacy and topology creations advance these high-water
+        // marks. Do not partially publish if that invariant is violated.
+        if self.tables.contains_key(&table_id)
+            || self.tablets.contains_key(&tablet_id)
+            || self.tablet_ids_by_raft_group.contains_key(&raft_group_id)
+        {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(
+                "metadata allocator produced an occupied identity".to_string(),
+            ));
+        }
+
+        // Atomic publication boundary: every operation below is an infallible
+        // ordered-map insertion, so observers cannot see a table without its
+        // tablet and desired placement.
+        let table_name = schema.name.clone();
+
+        self.tables.insert(table_id, Arc::new(schema));
+        self.table_ids_by_name.insert(table_name, table_id);
+        self.tablet_ids_by_raft_group
+            .insert(raft_group_id, tablet_id);
+        self.tablet_ids_by_partition
+            .insert((table_id, 0), tablet_id);
+        self.tablets.insert(tablet_id, tablet);
+        self.desired_placements.insert(tablet_id, placement);
+
+        self.allocator.max_table_id = table_id.0;
+        self.allocator.max_tablet_id = tablet_id.0;
+        self.allocator.max_raft_group_id = raft_group_id.0;
+
+        MetadataApplyOutcome::TableCreated(MetadataTableCreated {
+            table_id,
+            tablet_id,
+            raft_group_id,
+        })
+    }
+
+    fn apply_create_table(&mut self, table: TableDefinition) -> MetadataApplyOutcome {
         if let Err(rejection) = self.require_initialized() {
             return MetadataApplyOutcome::Rejected(rejection);
         }
@@ -587,6 +792,8 @@ impl MetadataState {
         self.tables.insert(table_id, Arc::new(schema));
 
         self.table_ids_by_name.insert(table_name, table_id);
+
+        self.allocator.max_table_id = self.allocator.max_table_id.max(table_id.0);
 
         MetadataApplyOutcome::Applied
     }
@@ -665,13 +872,20 @@ impl MetadataState {
             });
         }
 
+        let tablet_id = tablet.tablet_id;
+        let raft_group_id = tablet.raft_group_id;
+        let table_id = tablet.table_id;
+
         self.tablet_ids_by_raft_group
-            .insert(tablet.raft_group_id, tablet.tablet_id);
+            .insert(raft_group_id, tablet_id);
 
         self.tablet_ids_by_partition
-            .insert((tablet.table_id, bucket), tablet.tablet_id);
+            .insert((table_id, bucket), tablet_id);
 
-        self.tablets.insert(tablet.tablet_id, tablet);
+        self.tablets.insert(tablet_id, tablet);
+
+        self.allocator.max_tablet_id = self.allocator.max_tablet_id.max(tablet_id.0);
+        self.allocator.max_raft_group_id = self.allocator.max_raft_group_id.max(raft_group_id.0);
 
         MetadataApplyOutcome::Applied
     }
@@ -953,7 +1167,9 @@ fn node_endpoints(node: &NodeDescriptor) -> [&str; 4] {
 
 fn apply_snapshot_command(state: &mut MetadataState, command: MetadataCommand) -> Result<()> {
     match state.apply(command) {
-        MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => Ok(()),
+        MetadataApplyOutcome::Applied
+        | MetadataApplyOutcome::AlreadyApplied
+        | MetadataApplyOutcome::TableCreated(_) => Ok(()),
 
         MetadataApplyOutcome::Rejected(rejection) => Err(Error::CorruptData(format!(
             "metadata snapshot violates state-machine invariant: {rejection}"

@@ -9,7 +9,7 @@
 pub struct MetadataCommand {
     #[prost(uint32, tag = "1")]
     pub format_version: u32,
-    #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8")]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
 /// Nested message and enum types in `MetadataCommand`.
@@ -28,6 +28,10 @@ pub mod metadata_command {
         SetDesiredReplicaPlacement(super::SetDesiredReplicaPlacement),
         #[prost(message, tag = "7")]
         UpdateTableSchema(super::UpdateTableSchema),
+        /// Phase 5.2 authoritative CREATE TABLE transition. The metadata state
+        /// machine assigns all cluster-global identities when this entry applies.
+        #[prost(message, tag = "8")]
+        CreateTableTopology(super::CreateTableTopology),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -61,6 +65,19 @@ pub struct RegisterNode {
 pub struct CreateTable {
     #[prost(message, optional, tag = "1")]
     pub table: ::core::option::Option<super::catalog::TableDefinition>,
+}
+/// Unallocated SQL schema submitted to metadata Raft.
+///
+/// The proposer supplies schema semantics only. Table/tablet/Raft identities,
+/// schema version, tablet count and desired placement are metadata decisions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTableTopology {
+    #[prost(string, tag = "1")]
+    pub table_name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub columns: ::prost::alloc::vec::Vec<super::catalog::ColumnDefinition>,
+    #[prost(uint64, repeated, tag = "3")]
+    pub primary_key_column_ids: ::prost::alloc::vec::Vec<u64>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HashPartition {
@@ -148,6 +165,19 @@ pub struct RetiredReplicaLifetime {
     #[prost(message, optional, tag = "2")]
     pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
 }
+/// Monotonic identity high-water marks owned by metadata.
+///
+/// These values survive removal of visible metadata objects. A future DROP TABLE
+/// must never make an old identity allocatable again.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MetadataAllocatorState {
+    #[prost(uint64, tag = "1")]
+    pub max_table_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub max_tablet_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub max_raft_group_id: u64,
+}
 /// Deterministic snapshot of the metadata Raft state machine.
 ///
 /// All repeated fields are serialized in ascending stable-ID order. This gives
@@ -172,6 +202,8 @@ pub struct MetadataSnapshot {
     pub desired_placements: ::prost::alloc::vec::Vec<SetDesiredReplicaPlacement>,
     #[prost(message, repeated, tag = "8")]
     pub retired_replicas: ::prost::alloc::vec::Vec<RetiredReplicaLifetime>,
+    #[prost(message, optional, tag = "9")]
+    pub allocator_state: ::core::option::Option<MetadataAllocatorState>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

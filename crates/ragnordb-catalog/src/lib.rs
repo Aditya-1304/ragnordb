@@ -15,7 +15,7 @@ mod metadata;
 pub use durable::{
     CatalogCreateOutcome, CatalogLogExtent, CatalogLogRecord, DurableCatalog, DurableCatalogLog,
 };
-pub use metadata::{MetadataApplyOutcome, MetadataRejection, MetadataState};
+pub use metadata::{MetadataApplyOutcome, MetadataRejection, MetadataState, MetadataTableCreated};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

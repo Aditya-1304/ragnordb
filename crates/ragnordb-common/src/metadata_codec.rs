@@ -9,8 +9,8 @@ use std::{collections::BTreeSet, net::SocketAddr};
 use prost::Message;
 
 use crate::{
-    catalog_codec::TableDefinition,
-    ids::{NodeId, RaftGroupId, ReplicaId, TabletId},
+    catalog_codec::{ColumnDefinition, TableDefinition},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, TabletId},
     proto::metadata,
 };
 
@@ -22,6 +22,12 @@ pub const METADATA_COMMAND_VERSION: u32 = 2;
 
 /// First metadata state-machine snapshot format.
 pub const METADATA_SNAPSHOT_VERSION: u32 = 1;
+
+/// Compatibility high-water marks reserved by the M4 runtime and metadata
+/// Raft group. New metadata allocations begin strictly above these values.
+pub const INITIAL_METADATA_TABLE_HIGH_WATER: u64 = 1;
+pub const INITIAL_METADATA_TABLET_HIGH_WATER: u64 = 1;
+pub const INITIAL_METADATA_RAFT_GROUP_HIGH_WATER: u64 = 2;
 
 /// Deterministic transition proposed to the metadata Raft group.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,12 +46,53 @@ pub enum MetadataCommand {
         tablet: TabletDescriptor,
     },
 
+    /// Atomically allocate and publish one table with its initial topology.
+    CreateTableTopology(CreateTableRequest),
+
     SetDesiredReplicaPlacement(DesiredReplicaPlacement),
 
     UpdateTableSchema {
         expected_schema_version: u64,
         table: TableDefinition,
     },
+}
+
+/// Unallocated schema semantics submitted to the metadata state machine.
+///
+/// Cluster-global identities and initial topology are deliberately absent:
+/// only the committed metadata transition may assign them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableRequest {
+    pub table_name: String,
+    pub columns: Vec<ColumnDefinition>,
+    pub primary_key_column_ids: Vec<ColumnId>,
+}
+
+/// Monotonic identity high-water marks owned by metadata.
+///
+/// These are high-water marks rather than next values, so removing a visible
+/// object cannot make its durable identity available for reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataAllocatorState {
+    pub max_table_id: u64,
+    pub max_tablet_id: u64,
+    pub max_raft_group_id: u64,
+}
+
+impl MetadataAllocatorState {
+    pub const fn initial() -> Self {
+        Self {
+            max_table_id: INITIAL_METADATA_TABLE_HIGH_WATER,
+            max_tablet_id: INITIAL_METADATA_TABLET_HIGH_WATER,
+            max_raft_group_id: INITIAL_METADATA_RAFT_GROUP_HIGH_WATER,
+        }
+    }
+}
+
+impl Default for MetadataAllocatorState {
+    fn default() -> Self {
+        Self::initial()
+    }
 }
 
 /// Durable physical-node directory entry.
@@ -129,6 +176,7 @@ pub struct MetadataSnapshot {
     pub tablets: Vec<TabletDescriptor>,
     pub desired_placements: Vec<DesiredReplicaPlacement>,
     pub retired_replicas: Vec<RetiredReplicaLifetime>,
+    pub allocator: MetadataAllocatorState,
 }
 
 impl MetadataCommand {
@@ -155,6 +203,8 @@ impl MetadataCommand {
             Self::CreateTable { table } => validate_table(table),
 
             Self::CreateTablet { tablet } => tablet.validate(),
+
+            Self::CreateTableTopology(request) => request.validate(),
 
             Self::SetDesiredReplicaPlacement(placement) => placement.validate(),
 
@@ -192,6 +242,8 @@ impl MetadataCommand {
             Self::CreateTablet { tablet } => Command::CreateTablet(metadata::CreateTablet {
                 tablet: Some(tablet.to_proto()),
             }),
+
+            Self::CreateTableTopology(request) => Command::CreateTableTopology(request.to_proto()),
 
             Self::SetDesiredReplicaPlacement(placement) => {
                 Command::SetDesiredReplicaPlacement(placement.to_proto())
@@ -245,6 +297,10 @@ impl MetadataCommand {
                 )?)?,
             },
 
+            Some(Command::CreateTableTopology(command)) => {
+                Self::CreateTableTopology(CreateTableRequest::from_proto(command)?)
+            }
+
             Some(Command::SetDesiredReplicaPlacement(command)) => {
                 Self::SetDesiredReplicaPlacement(DesiredReplicaPlacement::from_proto(command)?)
             }
@@ -266,6 +322,127 @@ impl MetadataCommand {
         command.validate()?;
 
         Ok(command)
+    }
+}
+
+impl CreateTableRequest {
+    /// Validate the schema semantics that can be checked without metadata
+    /// state. The state machine repeats full table validation after assigning
+    /// the identities it owns.
+    pub fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.table_name.trim().is_empty() {
+            return Err(MetadataCommandCodecError::EmptyTableName);
+        }
+
+        if self.columns.is_empty() {
+            return Err(MetadataCommandCodecError::EmptyTableColumns);
+        }
+
+        let mut column_ids = BTreeSet::new();
+        let mut column_names = BTreeSet::new();
+
+        for column in &self.columns {
+            if column.column_id.0 == 0 {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "column ID must be non-zero",
+                ));
+            }
+
+            if column.name.trim().is_empty() {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "column name cannot be empty",
+                ));
+            }
+
+            if !column_ids.insert(column.column_id) {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "column IDs must be unique",
+                ));
+            }
+
+            if !column_names.insert(column.name.as_str()) {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "column names must be unique",
+                ));
+            }
+        }
+
+        if self.primary_key_column_ids.is_empty() {
+            return Err(MetadataCommandCodecError::InvalidTable(
+                "primary key must contain at least one column",
+            ));
+        }
+
+        let mut primary_key_ids = BTreeSet::new();
+
+        for column_id in &self.primary_key_column_ids {
+            if column_id.0 == 0 {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "primary-key column ID must be non-zero",
+                ));
+            }
+
+            if !primary_key_ids.insert(*column_id) {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "primary-key column IDs must be unique",
+                ));
+            }
+
+            let column = self
+                .columns
+                .iter()
+                .find(|column| column.column_id == *column_id)
+                .ok_or(MetadataCommandCodecError::InvalidTable(
+                    "primary-key column ID must reference a declared column",
+                ))?;
+
+            if column.nullable {
+                return Err(MetadataCommandCodecError::InvalidTable(
+                    "primary-key columns cannot be nullable",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn to_proto(&self) -> metadata::CreateTableTopology {
+        metadata::CreateTableTopology {
+            table_name: self.table_name.clone(),
+            columns: self
+                .columns
+                .iter()
+                .map(ColumnDefinition::to_proto)
+                .collect(),
+            primary_key_column_ids: self
+                .primary_key_column_ids
+                .iter()
+                .map(|column_id| column_id.0)
+                .collect(),
+        }
+    }
+
+    fn from_proto(proto: metadata::CreateTableTopology) -> Result<Self, MetadataCommandCodecError> {
+        let request = Self {
+            table_name: proto.table_name,
+            columns: proto
+                .columns
+                .into_iter()
+                .map(|column| {
+                    ColumnDefinition::from_proto(column)
+                        .map_err(MetadataCommandCodecError::InvalidTable)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            primary_key_column_ids: proto
+                .primary_key_column_ids
+                .into_iter()
+                .map(ColumnId)
+                .collect(),
+        };
+
+        request.validate()?;
+
+        Ok(request)
     }
 }
 
@@ -614,6 +791,52 @@ impl RetiredReplicaLifetime {
     }
 }
 
+impl MetadataAllocatorState {
+    fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.max_table_id < INITIAL_METADATA_TABLE_HIGH_WATER {
+            return Err(MetadataCommandCodecError::AllocatorBelowReservedFloor(
+                "table",
+            ));
+        }
+
+        if self.max_tablet_id < INITIAL_METADATA_TABLET_HIGH_WATER {
+            return Err(MetadataCommandCodecError::AllocatorBelowReservedFloor(
+                "tablet",
+            ));
+        }
+
+        if self.max_raft_group_id < INITIAL_METADATA_RAFT_GROUP_HIGH_WATER {
+            return Err(MetadataCommandCodecError::AllocatorBelowReservedFloor(
+                "raft_group",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn to_proto(self) -> metadata::MetadataAllocatorState {
+        metadata::MetadataAllocatorState {
+            max_table_id: self.max_table_id,
+            max_tablet_id: self.max_tablet_id,
+            max_raft_group_id: self.max_raft_group_id,
+        }
+    }
+
+    fn from_proto(
+        proto: metadata::MetadataAllocatorState,
+    ) -> Result<Self, MetadataCommandCodecError> {
+        let allocator = Self {
+            max_table_id: proto.max_table_id,
+            max_tablet_id: proto.max_tablet_id,
+            max_raft_group_id: proto.max_raft_group_id,
+        };
+
+        allocator.validate()?;
+
+        Ok(allocator)
+    }
+}
+
 impl MetadataSnapshot {
     pub fn encode(&self) -> Result<Vec<u8>, MetadataCommandCodecError> {
         self.validate()?;
@@ -663,6 +886,58 @@ impl MetadataSnapshot {
 
         for retired in &self.retired_replicas {
             retired.validate()?;
+        }
+
+        self.allocator.validate()?;
+
+        let visible_max_table_id = self
+            .tables
+            .iter()
+            .map(|table| table.table_id)
+            .max()
+            .unwrap_or(INITIAL_METADATA_TABLE_HIGH_WATER);
+
+        if self.allocator.max_table_id < visible_max_table_id {
+            return Err(MetadataCommandCodecError::AllocatorBelowVisibleState {
+                kind: "table",
+                high_water: self.allocator.max_table_id,
+                visible: visible_max_table_id,
+            });
+        }
+
+        let visible_max_tablet_id = self
+            .tablets
+            .iter()
+            .map(|tablet| tablet.tablet_id.0)
+            .max()
+            .unwrap_or(INITIAL_METADATA_TABLET_HIGH_WATER);
+
+        if self.allocator.max_tablet_id < visible_max_tablet_id {
+            return Err(MetadataCommandCodecError::AllocatorBelowVisibleState {
+                kind: "tablet",
+                high_water: self.allocator.max_tablet_id,
+                visible: visible_max_tablet_id,
+            });
+        }
+
+        let visible_max_raft_group_id = self
+            .tablets
+            .iter()
+            .map(|tablet| tablet.raft_group_id.0)
+            .chain(
+                self.retired_replicas
+                    .iter()
+                    .map(|retired| retired.raft_group_id.0),
+            )
+            .max()
+            .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER);
+
+        if self.allocator.max_raft_group_id < visible_max_raft_group_id {
+            return Err(MetadataCommandCodecError::AllocatorBelowVisibleState {
+                kind: "raft_group",
+                high_water: self.allocator.max_raft_group_id,
+                visible: visible_max_raft_group_id,
+            });
         }
 
         if !strictly_ascending(&self.nodes, |node| node.node_id) {
@@ -724,6 +999,8 @@ impl MetadataSnapshot {
                 .copied()
                 .map(RetiredReplicaLifetime::to_proto)
                 .collect(),
+
+            allocator_state: Some(self.allocator.to_proto()),
         }
     }
 
@@ -734,51 +1011,95 @@ impl MetadataSnapshot {
             ));
         }
 
-        let cluster_id = if proto.initialized {
-            Some(proto.cluster_id)
+        let metadata::MetadataSnapshot {
+            initialized,
+            cluster_id,
+            nodes,
+            tables,
+            tablets,
+            desired_placements,
+            retired_replicas,
+            allocator_state,
+            ..
+        } = proto;
+
+        let cluster_id = if initialized {
+            Some(cluster_id)
         } else {
-            if !proto.cluster_id.is_empty() {
+            if !cluster_id.is_empty() {
                 return Err(MetadataCommandCodecError::UninitializedSnapshotHasClusterId);
             }
 
             None
         };
 
+        let nodes = nodes
+            .into_iter()
+            .map(NodeDescriptor::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tables = tables
+            .into_iter()
+            .map(|table| {
+                TableDefinition::from_proto(table).map_err(MetadataCommandCodecError::InvalidTable)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tablets = tablets
+            .into_iter()
+            .map(TabletDescriptor::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let desired_placements = desired_placements
+            .into_iter()
+            .map(DesiredReplicaPlacement::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let retired_replicas = retired_replicas
+            .into_iter()
+            .map(RetiredReplicaLifetime::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let allocator = match allocator_state {
+            Some(allocator) => MetadataAllocatorState::from_proto(allocator)?,
+
+            None => MetadataAllocatorState {
+                max_table_id: tables
+                    .iter()
+                    .map(|table| table.table_id)
+                    .max()
+                    .unwrap_or(INITIAL_METADATA_TABLE_HIGH_WATER)
+                    .max(INITIAL_METADATA_TABLE_HIGH_WATER),
+
+                max_tablet_id: tablets
+                    .iter()
+                    .map(|tablet| tablet.tablet_id.0)
+                    .max()
+                    .unwrap_or(INITIAL_METADATA_TABLET_HIGH_WATER)
+                    .max(INITIAL_METADATA_TABLET_HIGH_WATER),
+
+                max_raft_group_id: tablets
+                    .iter()
+                    .map(|tablet| tablet.raft_group_id.0)
+                    .chain(
+                        retired_replicas
+                            .iter()
+                            .map(|retired| retired.raft_group_id.0),
+                    )
+                    .max()
+                    .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER)
+                    .max(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER),
+            },
+        };
+
         let snapshot = Self {
             cluster_id,
-
-            nodes: proto
-                .nodes
-                .into_iter()
-                .map(NodeDescriptor::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-
-            tables: proto
-                .tables
-                .into_iter()
-                .map(|table| {
-                    TableDefinition::from_proto(table)
-                        .map_err(MetadataCommandCodecError::InvalidTable)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-
-            tablets: proto
-                .tablets
-                .into_iter()
-                .map(TabletDescriptor::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-
-            desired_placements: proto
-                .desired_placements
-                .into_iter()
-                .map(DesiredReplicaPlacement::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-
-            retired_replicas: proto
-                .retired_replicas
-                .into_iter()
-                .map(RetiredReplicaLifetime::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
+            nodes,
+            tables,
+            tablets,
+            desired_placements,
+            retired_replicas,
+            allocator,
         };
 
         snapshot.validate()?;
@@ -876,6 +1197,9 @@ pub enum MetadataCommandCodecError {
     #[error("metadata table name cannot be empty")]
     EmptyTableName,
 
+    #[error("metadata CREATE TABLE requires at least one column")]
+    EmptyTableColumns,
+
     #[error("metadata schema version must be non-zero")]
     ZeroSchemaVersion,
 
@@ -926,6 +1250,16 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata replica role is invalid or unspecified")]
     InvalidReplicaRole,
+
+    #[error("metadata {0} allocator is below its reserved identity floor")]
+    AllocatorBelowReservedFloor(&'static str),
+
+    #[error("metadata {kind} allocator high-water {high_water} is below visible ID {visible}")]
+    AllocatorBelowVisibleState {
+        kind: &'static str,
+        high_water: u64,
+        visible: u64,
+    },
 
     #[error("uninitialized metadata snapshot contains replicated state")]
     UninitializedSnapshotHasState,

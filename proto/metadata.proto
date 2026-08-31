@@ -21,6 +21,10 @@ message MetadataCommand {
         CreateTablet create_tablet = 5;
         SetDesiredReplicaPlacement set_desired_replica_placement = 6;
         UpdateTableSchema update_table_schema = 7;
+
+        // Phase 5.2 authoritative CREATE TABLE transition. The metadata state
+        // machine assigns all cluster-global identities when this entry applies.
+        CreateTableTopology create_table_topology = 8;
     }
 }
 
@@ -49,6 +53,16 @@ message RegisterNode {
 
 message CreateTable {
     ragnordb.catalog.TableDefinition table = 1;
+}
+
+// Unallocated SQL schema submitted to metadata Raft.
+//
+// The proposer supplies schema semantics only. Table/tablet/Raft identities,
+// schema version, tablet count and desired placement are metadata decisions.
+message CreateTableTopology {
+    string table_name = 1;
+    repeated ragnordb.catalog.ColumnDefinition columns = 2;
+    repeated uint64 primary_key_column_ids = 3;
 }
 
 message HashPartition {
@@ -122,6 +136,16 @@ message RetiredReplicaLifetime {
     ragnordb.ids.ReplicaId replica_id = 2;
 }
 
+// Monotonic identity high-water marks owned by metadata.
+//
+// These values survive removal of visible metadata objects. A future DROP TABLE
+// must never make an old identity allocatable again.
+message MetadataAllocatorState {
+    uint64 max_table_id = 1;
+    uint64 max_tablet_id = 2;
+    uint64 max_raft_group_id = 3;
+}
+
 // Deterministic snapshot of the metadata Raft state machine.
 //
 // All repeated fields are serialized in ascending stable-ID order. This gives
@@ -139,4 +163,6 @@ message MetadataSnapshot {
     repeated TabletDescriptor tablets = 6;
     repeated SetDesiredReplicaPlacement desired_placements = 7;
     repeated RetiredReplicaLifetime retired_replicas = 8;
+
+    MetadataAllocatorState allocator_state = 9;
 }
