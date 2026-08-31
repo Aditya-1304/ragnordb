@@ -273,3 +273,43 @@ fn multiple_committed_metadata_results_are_preserved_in_log_order() {
 
     assert_eq!(state_machine.pending_apply_results(), 0,);
 }
+
+#[test]
+fn metadata_snapshot_restore_clears_process_local_apply_results() {
+    let mut source = MetadataRaftStateMachine::new();
+
+    source
+        .apply(
+            1,
+            &MetadataCommand::ClusterInitialized {
+                cluster_id: "cluster-a".to_string(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+
+    let bytes = source.encode_snapshot().unwrap();
+
+    let conf_state = ConfState::new(1, [raft::types::ReplicaId::must(1)], []).unwrap();
+
+    let snapshot = Snapshot {
+        snapshot_id: 10,
+        last_included_index: 1,
+        last_included_term: 1,
+        conf_state,
+        size_bytes: bytes.len() as u64,
+        checksum: *blake3::hash(&bytes).as_bytes(),
+        data: bytes,
+    };
+
+    let mut recovered = MetadataRaftStateMachine::new();
+
+    recovered.restore_snapshot(&snapshot).unwrap();
+
+    assert_eq!(
+        recovered.pending_apply_results(),
+        0,
+        "snapshot recovery must not invent process-local proposal completions",
+    );
+}

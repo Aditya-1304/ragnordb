@@ -7,9 +7,19 @@
 //! metadata group. Phase 5.1a will construct a RaftReadyLoop using this state
 //! machine through the already-frozen Phase 5.0 MultiRaft host.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+};
 
-use raft::types::{ConfState, Snapshot};
+use raft::{
+    core::node::RaftNode,
+    storage::mem::MemStorage,
+    types::{ConfState, Snapshot},
+};
+
+use wal::lsn::Lsn;
 
 use ragnordb_catalog::{MetadataApplyOutcome, MetadataState};
 
@@ -17,11 +27,24 @@ use ragnordb_common::{
     ids::{NodeId, ReplicaId},
     metadata_codec::{
         DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole, MetadataCommand,
-        MetadataCommandCodecError, MetadataSnapshot,
+        MetadataCommandCodecError, MetadataSnapshot, NodeDescriptor,
     },
+    raft_bootstrap::{RaftGroupBootstrap, RaftGroupBootstrapError},
 };
 
-use crate::runtime::RaftReadyStateMachine;
+use crate::{
+    host::{HostedRaftGroup, ReadyLoopHostedGroup},
+    runtime::{
+        AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
+        RaftSnapshotStore, ReadyLoopError,
+    },
+    storage::{
+        adapter::{RaftLogStoreAdapter, RaftStableStoreAdapter, RaftStorageAdapters},
+        codec::{DurableRaftEntryPayload, RaftReplicaIdentity},
+        persistence::{RaftPersistenceError, RaftWal, RaftWalStorage},
+        recovery::RecoveredRaftReplica,
+    },
+};
 
 /// Result produced by the most recently applied metadata log entry.
 ///
@@ -32,6 +55,66 @@ use crate::runtime::RaftReadyStateMachine;
 pub struct AppliedMetadataCommand {
     pub index: u64,
     pub outcome: MetadataApplyOutcome,
+}
+
+/// Read-only publication boundary between the metadata Ready owner and the
+/// rest of the node.
+///
+/// `MetadataRaftStateMachine` remains the sole mutation authority. This handle
+/// only receives clones after committed apply/snapshot restore, so routing and
+/// startup code cannot bypass Raft by mutating metadata directly.
+#[derive(Clone, Default)]
+pub struct MetadataRuntimeHandle {
+    state: Arc<RwLock<MetadataState>>,
+
+    applied_results: Arc<Mutex<VecDeque<AppliedMetadataCommand>>>,
+}
+
+impl MetadataRuntimeHandle {
+    pub fn state_snapshot(&self) -> MetadataState {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn cluster_id(&self) -> Option<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cluster_id()
+            .map(str::to_string)
+    }
+
+    pub fn node(&self, node_id: NodeId) -> Option<NodeDescriptor> {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(node_id)
+            .cloned()
+    }
+
+    pub fn take_applied_results(&self) -> Vec<AppliedMetadataCommand> {
+        self.applied_results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn publish_state(&self, state: &MetadataState) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.clone();
+    }
+
+    fn publish_results(&self, results: impl IntoIterator<Item = AppliedMetadataCommand>) {
+        self.applied_results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(results);
+    }
 }
 
 /// Raft-owned wrapper around the deterministic metadata projection.
@@ -137,6 +220,305 @@ pub enum MetadataStateMachineError {
 
     #[error("metadata snapshot state is invalid: {0}")]
     SnapshotState(String),
+}
+
+/// State-machine wrapper used by the physical MultiRaft host.
+///
+/// The inner state machine remains deterministic and unaware of threads,
+/// networking, or proposal ownership. This wrapper only publishes committed
+/// observations after the inner mutation has completed successfully.
+struct HostedMetadataStateMachine {
+    inner: MetadataRaftStateMachine,
+    runtime: MetadataRuntimeHandle,
+}
+
+impl HostedMetadataStateMachine {
+    fn new(inner: MetadataRaftStateMachine, runtime: MetadataRuntimeHandle) -> Self {
+        runtime.publish_state(inner.state());
+
+        Self { inner, runtime }
+    }
+
+    fn publish_after_apply(&mut self) {
+        self.runtime.publish_state(self.inner.state());
+
+        self.runtime
+            .publish_results(self.inner.take_applied_results());
+    }
+}
+
+impl RaftReadyStateMachine for HostedMetadataStateMachine {
+    type Error = MetadataStateMachineError;
+
+    fn restore_snapshot(&mut self, snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+        self.inner.restore_snapshot(snapshot)?;
+
+        self.runtime.publish_state(self.inner.state());
+
+        // Proposal waiters do not survive snapshot/restart recovery.
+        // The inner restore already clears its volatile result queue.
+        Ok(())
+    }
+
+    fn apply(&mut self, index: u64, command: &[u8]) -> Result<(), Self::Error> {
+        self.inner.apply(index, command)?;
+
+        self.publish_after_apply();
+
+        Ok(())
+    }
+}
+
+type BootstrappedMetadataReadyLoop<W> =
+    RaftReadyLoop<W, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+type RecoveredMetadataReadyLoop<W> = RaftReadyLoop<W, RaftLogStoreAdapter, RaftStableStoreAdapter>;
+
+/// Construct a genuinely new metadata replica from an already durable
+/// RaftGroupBootstrap.
+///
+/// The caller MUST install/fsync the bootstrap before calling this function.
+/// We intentionally do not accept the static seed list here; membership has
+/// already crossed its durable authority boundary.
+pub fn bootstrap_metadata_group<W>(
+    bootstrap: &RaftGroupBootstrap,
+    local_replica_id: ReplicaId,
+    wal: W,
+    snapshot_root: PathBuf,
+    election_timeout: u64,
+    heartbeat_interval: u64,
+) -> Result<(Box<dyn HostedRaftGroup>, MetadataRuntimeHandle), MetadataReplicaStartupError>
+where
+    W: RaftWal + Send + 'static,
+{
+    bootstrap.validate()?;
+
+    if !bootstrap.replica_to_node.contains_key(&local_replica_id) {
+        return Err(MetadataReplicaStartupError::ReplicaMissingFromBootstrap(
+            local_replica_id,
+        ));
+    }
+
+    let identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
+        .map_err(|source| MetadataReplicaStartupError::Identity(source.to_string()))?;
+
+    let conf_state = bootstrap.to_core_conf_state()?;
+
+    let raft = RaftNode::bootstrap(
+        local_replica_id
+            .to_raft()
+            .map_err(|reason| MetadataReplicaStartupError::Identity(reason.to_string()))?,
+        conf_state,
+        MemStorage::<Vec<u8>, Vec<u8>>::new(),
+        MemStorage::<Vec<u8>, Vec<u8>>::new(),
+        election_timeout,
+        heartbeat_interval,
+    )
+    .map_err(|error| MetadataReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
+
+    let ready_loop = RaftReadyLoop::new(raft, RaftWalStorage::new(wal, identity));
+
+    let snapshot_store = FileRaftSnapshotStore::new(snapshot_root)
+        .map_err(|source| MetadataReplicaStartupError::SnapshotStore(source.to_string()))?;
+
+    let runtime = MetadataRuntimeHandle::default();
+
+    let state_machine =
+        HostedMetadataStateMachine::new(MetadataRaftStateMachine::new(), runtime.clone());
+
+    // Do not manually drain the bootstrap Ready here.
+    //
+    // The Phase-5.0 HostedRaftGroup pre-drains Ready before its first tick,
+    // step, or proposal. Because the group is not driven until after
+    // MultiRaftHost::activate(), initial Ready durability remains ordered behind
+    // complete local replica registration.
+    let group = ReadyLoopHostedGroup::new(ready_loop, state_machine, snapshot_store);
+
+    Ok((Box::new(group), runtime))
+}
+
+/// Reconstruct the metadata projection from its durable snapshot plus committed
+/// A-WAL suffix, then restart the same Raft replica.
+///
+/// Static seed membership is intentionally absent from this function. The
+/// supplied bootstrap and the recovered committed ConfState are the only
+/// membership authorities.
+pub fn recover_metadata_group<W>(
+    bootstrap: &RaftGroupBootstrap,
+    local_replica_id: ReplicaId,
+    wal: W,
+    durable_end_lsn: Lsn,
+    recovered: &RecoveredRaftReplica,
+    snapshot_root: PathBuf,
+    election_timeout: u64,
+    heartbeat_interval: u64,
+) -> Result<(Box<dyn HostedRaftGroup>, MetadataRuntimeHandle), MetadataReplicaStartupError>
+where
+    W: RaftWal + Send + 'static,
+{
+    bootstrap.validate()?;
+
+    if !bootstrap.replica_to_node.contains_key(&local_replica_id) {
+        return Err(MetadataReplicaStartupError::ReplicaMissingFromBootstrap(
+            local_replica_id,
+        ));
+    }
+
+    let identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
+        .map_err(|source| MetadataReplicaStartupError::Identity(source.to_string()))?;
+
+    if recovered.identity() != identity {
+        return Err(MetadataReplicaStartupError::RecoveredIdentityMismatch);
+    }
+
+    let mut snapshot_store = FileRaftSnapshotStore::new(snapshot_root)
+        .map_err(|source| MetadataReplicaStartupError::SnapshotStore(source.to_string()))?;
+
+    let mut state_machine = MetadataRaftStateMachine::new();
+
+    let mut applied_frontier = None;
+
+    let mut applied_index = 0_u64;
+
+    if let Some(pointer) = recovered.snapshot() {
+        let snapshot = snapshot_store
+            .load_verified(pointer)
+            .map_err(|source| MetadataReplicaStartupError::SnapshotStore(source.to_string()))?;
+
+        state_machine.restore_snapshot(&snapshot)?;
+
+        applied_index = snapshot.last_included_index;
+
+        applied_frontier = Some(AppliedRaftFrontier::new(
+            snapshot.last_included_index,
+            snapshot.last_included_term,
+        ));
+    } else if recovered.progress().truncated_through_index != 0 {
+        return Err(
+            MetadataReplicaStartupError::MissingSnapshotForCompactedLog {
+                truncated_through: recovered.progress().truncated_through_index,
+            },
+        );
+    }
+
+    let commit = recovered
+        .hard_state()
+        .map(|state| state.commit)
+        .unwrap_or(0);
+
+    for entry in recovered.log_view().entries() {
+        if entry.record.index <= applied_index {
+            continue;
+        }
+
+        if entry.record.index > commit {
+            break;
+        }
+
+        let expected = applied_index.saturating_add(1);
+
+        if entry.record.index != expected {
+            return Err(MetadataReplicaStartupError::CommittedSuffixGap {
+                expected,
+                received: entry.record.index,
+            });
+        }
+
+        if let DurableRaftEntryPayload::Normal(command) = &entry.record.payload {
+            state_machine.apply(entry.record.index, command)?;
+        }
+
+        applied_index = entry.record.index;
+
+        applied_frontier = Some(AppliedRaftFrontier::new(
+            entry.record.index,
+            entry.record.term,
+        ));
+    }
+
+    if applied_index != commit {
+        return Err(MetadataReplicaStartupError::CommitNotReconstructed {
+            commit,
+            applied: applied_index,
+        });
+    }
+
+    // Recovery reconstructs state, not process-local proposal completions.
+    let _ = state_machine.take_applied_results();
+
+    let adapters = RaftStorageAdapters::from_recovered(recovered)
+        .map_err(|source| MetadataReplicaStartupError::RaftAdapter(source.to_string()))?;
+
+    let raft = RaftNode::restart(
+        local_replica_id
+            .to_raft()
+            .map_err(|reason| MetadataReplicaStartupError::Identity(reason.to_string()))?,
+        adapters.log,
+        adapters.stable,
+        election_timeout,
+        heartbeat_interval,
+    )
+    .map_err(|error| MetadataReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
+
+    let persistence = RaftWalStorage::from_recovered(wal, recovered, durable_end_lsn)?;
+
+    let mut ready_loop = RaftReadyLoop::new(raft, persistence);
+
+    if let Some(frontier) = applied_frontier {
+        ready_loop.advance_applied_frontier(frontier)?;
+    }
+
+    let runtime = MetadataRuntimeHandle::default();
+
+    let state_machine = HostedMetadataStateMachine::new(state_machine, runtime.clone());
+
+    let group = ReadyLoopHostedGroup::new(ready_loop, state_machine, snapshot_store);
+
+    Ok((Box::new(group), runtime))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataReplicaStartupError {
+    #[error("invalid metadata Raft bootstrap: {0}")]
+    Bootstrap(#[from] RaftGroupBootstrapError),
+
+    #[error("replica {0:?} is not present in the durable metadata bootstrap")]
+    ReplicaMissingFromBootstrap(ReplicaId),
+
+    #[error("recovered metadata Raft identity does not match durable bootstrap")]
+    RecoveredIdentityMismatch,
+
+    #[error("invalid metadata replica identity: {0}")]
+    Identity(String),
+
+    #[error("metadata Raft initialization failed: {0}")]
+    RaftInitialization(String),
+
+    #[error("metadata Raft storage adapter failed: {0}")]
+    RaftAdapter(String),
+
+    #[error("metadata snapshot store failed: {0}")]
+    SnapshotStore(String),
+
+    #[error("metadata state-machine failed: {0}")]
+    StateMachine(#[from] MetadataStateMachineError),
+
+    #[error(
+        "metadata Raft log is compacted through {truncated_through} but has no durable state-machine snapshot"
+    )]
+    MissingSnapshotForCompactedLog { truncated_through: u64 },
+
+    #[error("committed metadata suffix has a gap: expected index {expected}, received {received}")]
+    CommittedSuffixGap { expected: u64, received: u64 },
+
+    #[error("metadata HardState commit {commit} reconstructed only through index {applied}")]
+    CommitNotReconstructed { commit: u64, applied: u64 },
+
+    #[error("metadata Raft persistence initialization failed: {0}")]
+    Persistence(#[from] RaftPersistenceError),
+
+    #[error("metadata Ready-loop initialization failed: {0}")]
+    Ready(#[from] ReadyLoopError),
 }
 
 /// One deterministic reconciliation step.

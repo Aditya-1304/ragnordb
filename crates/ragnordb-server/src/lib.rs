@@ -1,4 +1,5 @@
 pub mod admin;
+mod bootstrap;
 pub mod build_info;
 pub mod config;
 pub mod data_directory_lock;

@@ -43,52 +43,80 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
             admin_addr: unused_address(),
         })
         .collect::<Vec<_>>();
-    let mut nodes = Vec::new();
+    // Replicated startup waits for metadata initialization to commit and apply.
+    // Start every configured node together so the metadata Raft group can form
+    // its initial quorum before any startup call waits for completion.
+    let startup_handles = seeds
+        .iter()
+        .cloned()
+        .map(|seed| {
+            let all_seeds = seeds.clone();
 
-    for seed in &seeds {
-        let data = tempfile::tempdir().unwrap();
-        let config = NodeConfig {
-            node_id: seed.id,
-            data_dir: data.path().to_path_buf(),
-            listen_addr: seed.sql_addr,
-            admin_addr: seed.admin_addr,
-            max_connections: 8,
-            statement_timeout_ms: 5_000,
-            shutdown_grace_period_ms: 1_000,
-            statement_logging: ragnordb_server::config::StatementLogging::Off,
-            cluster_id: Some("runtime-test".to_string()),
-            bootstrap: true,
-            seed_nodes: seeds.clone(),
-            snapshot_interval_entries: 100_000,
-            snapshot_interval_bytes: 256 * 1024 * 1024,
-            snapshot_min_elapsed_ms: 300_000,
-            max_snapshot_file_bytes: 512 * 1024 * 1024,
-            snapshot_chunk_bytes: 1024 * 1024,
-        };
-        let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
+            tokio::task::spawn_blocking(move || {
+                let data = tempfile::tempdir().unwrap();
+                let config = NodeConfig {
+                    node_id: seed.id,
+                    data_dir: data.path().to_path_buf(),
+                    listen_addr: seed.sql_addr,
+                    admin_addr: seed.admin_addr,
+                    max_connections: 8,
+                    statement_timeout_ms: 5_000,
+                    shutdown_grace_period_ms: 1_000,
+                    statement_logging: ragnordb_server::config::StatementLogging::Off,
+                    cluster_id: Some("runtime-test".to_string()),
+                    bootstrap: true,
+                    seed_nodes: all_seeds,
+                    snapshot_interval_entries: 100_000,
+                    snapshot_interval_bytes: 256 * 1024 * 1024,
+                    snapshot_min_elapsed_ms: 300_000,
+                    max_snapshot_file_bytes: 512 * 1024 * 1024,
+                    snapshot_chunk_bytes: 1024 * 1024,
+                };
+                let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
 
-        let configurations =
-            MultiRaftRuntime::recovery_configurations(&config, &data_directory_lock).unwrap();
+                let configurations =
+                    MultiRaftRuntime::recovery_configurations(&config, &data_directory_lock)
+                        .unwrap();
 
-        let (database, _, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
-            &config.data_dir,
-            config.node_id,
-            &configurations,
-            data_directory_lock,
-        )
-        .unwrap();
-        let wal = database.wal_handle().unwrap();
-        let database = database.into_shared();
-        let runtime =
-            MultiRaftRuntime::start_from_shared_recovery(&config, wal, database.clone(), recovered)
+                let (database, _, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
+                    &config.data_dir,
+                    config.node_id,
+                    &configurations,
+                    data_directory_lock,
+                )
                 .unwrap();
-        database.lock().await.replace_commit_log(runtime.handle());
-        database.lock().await.replace_catalog_log(runtime.handle());
-        nodes.push(TestNode {
-            database,
-            runtime,
-            _data: data,
-        });
+                let wal = database.wal_handle().unwrap();
+                let database = database.into_shared();
+                let runtime = MultiRaftRuntime::start_from_shared_recovery(
+                    &config,
+                    wal,
+                    database.clone(),
+                    recovered,
+                )
+                .unwrap();
+
+                TestNode {
+                    database,
+                    runtime,
+                    _data: data,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut nodes = Vec::with_capacity(startup_handles.len());
+
+    for startup in startup_handles {
+        let node = startup.await.unwrap();
+        let handle = node.runtime.handle();
+
+        node.database
+            .lock()
+            .await
+            .replace_commit_log(handle.clone());
+        node.database.lock().await.replace_catalog_log(handle);
+
+        nodes.push(node);
     }
 
     let leader = tokio::time::timeout(Duration::from_secs(8), async {

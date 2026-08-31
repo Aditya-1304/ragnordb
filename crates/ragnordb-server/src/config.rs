@@ -422,15 +422,35 @@ impl NodeConfig {
             }
         }
 
-        if !self.seed_nodes.is_empty()
-            && !self.seed_nodes.iter().any(|seed| seed.id == self.node_id)
-        {
-            return Err(Error::Configuration(format!(
-                "local node ID {} is missing from the static seed-node list",
-                self.node_id.0
-            )));
-        }
+        if !self.seed_nodes.is_empty() {
+            let local_seed = self
+                .seed_nodes
+                .iter()
+                .find(|seed| seed.id == self.node_id)
+                .ok_or_else(|| {
+                    Error::Configuration(format!(
+                        "local node ID {} is missing from the static seed-node list",
+                        self.node_id.0,
+                    ))
+                })?;
 
+            // Metadata will publish these addresses as the durable physical-node
+            // directory. Publishing an address different from the one this process
+            // actually binds would make otherwise correct routing permanently wrong.
+            if local_seed.sql_addr != self.listen_addr {
+                return Err(Error::Configuration(format!(
+                    "local seed SQL address {} does not match listen_addr {}",
+                    local_seed.sql_addr, self.listen_addr,
+                )));
+            }
+
+            if local_seed.admin_addr != self.admin_addr {
+                return Err(Error::Configuration(format!(
+                    "local seed admin address {} does not match admin_addr {}",
+                    local_seed.admin_addr, self.admin_addr,
+                )));
+            }
+        }
         Ok(())
     }
 }
