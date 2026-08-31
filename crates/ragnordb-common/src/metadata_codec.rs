@@ -20,14 +20,25 @@ use crate::{
 /// intentionally rejected rather than silently reinterpreted.
 pub const METADATA_COMMAND_VERSION: u32 = 2;
 
-/// First metadata state-machine snapshot format.
-pub const METADATA_SNAPSHOT_VERSION: u32 = 1;
+/// Snapshot format before metadata-owned allocation history was persisted.
+pub const LEGACY_METADATA_SNAPSHOT_VERSION: u32 = 1;
+
+/// Snapshot format carrying explicit identity high-water marks.
+///
+/// Version 2 prevents an older reader from silently ignoring allocator history
+/// that may no longer be derivable from visible objects after metadata deletion.
+pub const METADATA_SNAPSHOT_VERSION: u32 = 2;
 
 /// Compatibility high-water marks reserved by the M4 runtime and metadata
 /// Raft group. New metadata allocations begin strictly above these values.
 pub const INITIAL_METADATA_TABLE_HIGH_WATER: u64 = 1;
 pub const INITIAL_METADATA_TABLET_HIGH_WATER: u64 = 1;
-pub const INITIAL_METADATA_RAFT_GROUP_HIGH_WATER: u64 = 2;
+
+/// Durable identity occupied by the metadata Raft group. Tablet metadata must
+/// never assign this group to a SQL tablet.
+pub const RESERVED_METADATA_RAFT_GROUP_ID: RaftGroupId = RaftGroupId(2);
+
+pub const INITIAL_METADATA_RAFT_GROUP_HIGH_WATER: u64 = RESERVED_METADATA_RAFT_GROUP_ID.0;
 
 /// Deterministic transition proposed to the metadata Raft group.
 #[derive(Debug, Clone, PartialEq)]
@@ -578,6 +589,15 @@ impl TabletDescriptor {
             return Err(MetadataCommandCodecError::ZeroRaftGroupId);
         }
 
+        // Group 2 is the metadata state machine's own Raft group. Allowing a
+        // tablet to claim it would alias two independent authorities onto one
+        // log and persistence namespace.
+        if self.raft_group_id == RESERVED_METADATA_RAFT_GROUP_ID {
+            return Err(
+                MetadataCommandCodecError::MetadataRaftGroupAssignedToTablet(self.raft_group_id),
+            );
+        }
+
         if self.tablet_epoch == 0 {
             return Err(MetadataCommandCodecError::ZeroTabletEpoch);
         }
@@ -1005,9 +1025,13 @@ impl MetadataSnapshot {
     }
 
     fn from_proto(proto: metadata::MetadataSnapshot) -> Result<Self, MetadataCommandCodecError> {
-        if proto.format_version != METADATA_SNAPSHOT_VERSION {
+        let snapshot_version = proto.format_version;
+
+        if snapshot_version != LEGACY_METADATA_SNAPSHOT_VERSION
+            && snapshot_version != METADATA_SNAPSHOT_VERSION
+        {
             return Err(MetadataCommandCodecError::UnsupportedSnapshotVersion(
-                proto.format_version,
+                snapshot_version,
             ));
         }
 
@@ -1060,10 +1084,19 @@ impl MetadataSnapshot {
             .map(RetiredReplicaLifetime::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let allocator = match allocator_state {
-            Some(allocator) => MetadataAllocatorState::from_proto(allocator)?,
+        let allocator = match (snapshot_version, allocator_state) {
+            (METADATA_SNAPSHOT_VERSION, Some(allocator))
+            | (LEGACY_METADATA_SNAPSHOT_VERSION, Some(allocator)) => {
+                MetadataAllocatorState::from_proto(allocator)?
+            }
 
-            None => MetadataAllocatorState {
+            (METADATA_SNAPSHOT_VERSION, None) => {
+                return Err(MetadataCommandCodecError::MissingField(
+                    "snapshot.allocator_state",
+                ));
+            }
+
+            (LEGACY_METADATA_SNAPSHOT_VERSION, None) => MetadataAllocatorState {
                 max_table_id: tables
                     .iter()
                     .map(|table| table.table_id)
@@ -1090,6 +1123,8 @@ impl MetadataSnapshot {
                     .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER)
                     .max(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER),
             },
+
+            _ => unreachable!("snapshot version checked above"),
         };
 
         let snapshot = Self {
@@ -1217,6 +1252,12 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata Raft group ID must be non-zero")]
     ZeroRaftGroupId,
+
+    #[error(
+        "Raft group {} is reserved for cluster metadata and cannot be assigned to a tablet",
+        .0.0
+    )]
+    MetadataRaftGroupAssignedToTablet(RaftGroupId),
 
     #[error("metadata tablet epoch must be non-zero")]
     ZeroTabletEpoch,

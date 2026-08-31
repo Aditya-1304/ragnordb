@@ -186,6 +186,88 @@ fn atomic_create_table_publishes_complete_initial_topology() {
 }
 
 #[test]
+fn atomic_create_table_uses_canonical_node_id_order() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    for descriptor in [node(30, 8700), node(10, 8100), node(20, 8400)] {
+        assert_eq!(
+            state.apply(MetadataCommand::RegisterNode(descriptor)),
+            MetadataApplyOutcome::Applied,
+        );
+    }
+
+    assert!(matches!(
+        state.apply(MetadataCommand::CreateTableTopology(create_request(
+            "ordered"
+        ))),
+        MetadataApplyOutcome::TableCreated(_)
+    ));
+
+    let placement = state.desired_placement(TabletId(2)).unwrap();
+
+    assert_eq!(
+        placement
+            .replicas
+            .iter()
+            .map(|replica| (replica.replica_id, replica.node_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (ReplicaId(1), NodeId(10)),
+            (ReplicaId(2), NodeId(20)),
+            (ReplicaId(3), NodeId(30)),
+        ],
+    );
+}
+
+#[test]
+fn atomic_create_table_caps_initial_replication_at_three_nodes() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    for descriptor in [
+        node(10, 8100),
+        node(20, 8400),
+        node(30, 8700),
+        node(40, 9000),
+    ] {
+        assert_eq!(
+            state.apply(MetadataCommand::RegisterNode(descriptor)),
+            MetadataApplyOutcome::Applied,
+        );
+    }
+
+    assert!(matches!(
+        state.apply(MetadataCommand::CreateTableTopology(create_request(
+            "bounded"
+        ))),
+        MetadataApplyOutcome::TableCreated(_)
+    ));
+
+    let placement = state.desired_placement(TabletId(2)).unwrap();
+
+    assert_eq!(placement.replicas.len(), 3);
+    assert!(
+        placement
+            .replicas
+            .iter()
+            .all(|replica| replica.node_id != NodeId(40))
+    );
+}
+
+#[test]
 fn rejected_duplicate_table_name_does_not_advance_allocators() {
     let mut state = initialized_state_with_nodes();
 
