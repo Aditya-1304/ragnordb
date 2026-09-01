@@ -362,6 +362,19 @@ impl MetadataState {
         self.tablets.get(&tablet_id)
     }
 
+    /// Return all committed tablet descriptors for one table.
+    ///
+    /// The returned descriptors are detached from the state machine so a
+    /// caller can validate completeness and publish an immutable routing view
+    /// without holding any metadata-state borrow across execution work.
+    pub fn tablets_for_table(&self, table_id: TableId) -> Vec<TabletDescriptor> {
+        self.tablets
+            .values()
+            .filter(|tablet| tablet.table_id == table_id)
+            .cloned()
+            .collect()
+    }
+
     pub fn tablet_for_raft_group(&self, raft_group_id: RaftGroupId) -> Option<&TabletDescriptor> {
         let tablet_id = self.tablet_ids_by_raft_group.get(&raft_group_id)?;
 

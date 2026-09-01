@@ -36,11 +36,12 @@ use ragnordb_catalog::{
 use ragnordb_common::{
     Error, Result,
     catalog_codec::DataType,
+    catalog_codec::TableDefinition,
     codec::{Row, Value, WriteKind},
     command_codec::SingleShardCommitCommand,
     encoding::encode_row,
     ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
-    metadata_codec::{CreateTableRequest, MetadataCommandCodecError},
+    metadata_codec::{CreateTableRequest, MetadataCommandCodecError, TabletDescriptor},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_sql::{
@@ -55,7 +56,7 @@ use ragnordb_storage::{
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit},
 };
 
-use ragnordb_tablet::{RowMutation, Tablet};
+use ragnordb_tablet::{RowMutation, Tablet, TabletRouter};
 use ragnordb_txn::{
     CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
     TransactionManager,
@@ -88,6 +89,39 @@ pub trait MetadataTableCreator: Send + Sync {
         timeout: Duration,
     ) -> Result<ragnordb_common::catalog_codec::TableDefinition>;
 
+    /// Return the committed tablet descriptors for one metadata-owned table.
+    ///
+    /// A schema definition without its complete partition map is not a usable
+    /// routing view. Implementations that can create tables should override
+    /// this method, while the default keeps older test doubles fail-closed.
+    fn table_descriptors(&self, _table_id: TableId) -> Result<Vec<TabletDescriptor>> {
+        Err(Error::NotImplemented(
+            "metadata tablet topology lookup is unavailable",
+        ))
+    }
+
+    /// Return the schema and the topology observed for one CREATE TABLE.
+    ///
+    /// The default composes the legacy schema method with the topology lookup
+    /// so existing metadata clients can adopt the stronger contract
+    /// incrementally. The server implementation overrides this at the
+    /// proposal/apply boundary to return both values from one committed view.
+    fn create_table_topology(
+        &self,
+        request: CreateTableRequest,
+        request_id: ragnordb_common::ids::RequestId,
+        timeout: Duration,
+    ) -> Result<MetadataTableTopology> {
+        let definition = self.create_table(request, request_id, timeout)?;
+        let table_id = TableId(definition.table_id);
+        let tablets = self.table_descriptors(table_id)?;
+
+        Ok(MetadataTableTopology {
+            definition,
+            tablets,
+        })
+    }
+
     /// Return the latest committed metadata definitions for local catalog
     /// cache refresh. Definitions are authoritative but remain read-only here.
     fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition>;
@@ -95,6 +129,14 @@ pub trait MetadataTableCreator: Send + Sync {
 
 /// Shared metadata CREATE TABLE client installed by the server runtime.
 pub type SharedMetadataTableCreator = Arc<dyn MetadataTableCreator>;
+
+/// Authoritative schema and complete tablet partition map returned by metadata
+/// after a committed CREATE TABLE apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataTableTopology {
+    pub definition: TableDefinition,
+    pub tablets: Vec<TabletDescriptor>,
+}
 
 type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
@@ -157,12 +199,14 @@ impl DurableCommitLog for InMemoryCommitLog {
 
 /// Local single-node executor
 ///
-/// Every locally created table receives one dedicated tablet. Using a separate
-/// tablet per table preserves the ownership boundary introduced in Phase 2.6,
-/// even though distributed routing is not implemented yet.
+/// Every locally created table receives one dedicated compatibility tablet.
+/// Metadata-backed routes are stored separately and are consulted by every
+/// point lookup and scan; physical multi-tablet ownership remains a later
+/// lifecycle concern and is never guessed from the table ID.
 pub struct LocalExecutor {
     catalog: LocalCatalog,
     tablets: BTreeMap<TableId, LocalTablet>,
+    tablet_routers: BTreeMap<TableId, TabletRouter>,
     metadata_table_creator: Option<SharedMetadataTableCreator>,
     metadata_table_ids: BTreeSet<TableId>,
     commit_log: SharedCommitLog,
@@ -210,6 +254,7 @@ impl LocalExecutor {
         Self {
             catalog: DurableCatalog::new(catalog_log),
             tablets: BTreeMap::new(),
+            tablet_routers: BTreeMap::new(),
             metadata_table_creator: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
@@ -251,15 +296,25 @@ impl LocalExecutor {
     /// analysis and `SHOW TABLES`, while DML correctly remains unavailable until
     /// a routed tablet is installed.
     pub fn refresh_metadata_catalog(&mut self) -> Result<()> {
-        let Some(creator) = &self.metadata_table_creator else {
+        let Some(creator) = self.metadata_table_creator.clone() else {
             return Ok(());
         };
 
         for definition in creator.list_tables() {
-            let schema = self
-                .catalog
-                .catalog()
-                .table_by_id(TableId(definition.table_id));
+            let table_id = TableId(definition.table_id);
+            let descriptors = creator.table_descriptors(table_id)?;
+            let router = self.build_metadata_router(&definition, &descriptors)?;
+
+            if let Some(existing_router) = self.tablet_routers.get(&table_id)
+                && existing_router != &router
+            {
+                return Err(Error::CorruptData(format!(
+                    "metadata routing map for table {} changed in the local SQL cache",
+                    table_id.0
+                )));
+            }
+
+            let schema = self.catalog.catalog().table_by_id(table_id);
 
             if let Some(existing) = schema {
                 if existing.to_definition() != definition {
@@ -273,7 +328,8 @@ impl LocalExecutor {
                     .install_replicated_definition(definition.clone())?;
             }
 
-            self.metadata_table_ids.insert(TableId(definition.table_id));
+            self.tablet_routers.entry(table_id).or_insert(router);
+            self.metadata_table_ids.insert(table_id);
         }
 
         Ok(())
@@ -286,15 +342,36 @@ impl LocalExecutor {
     ) -> Result<()> {
         let ragnordb_common::command_codec::CatalogOperation::CreateTable(operation) =
             &command.operation;
+        if operation.table_def.tablet_count != 1 {
+            return Err(Error::CorruptData(format!(
+                "replicated catalog table {} declares {} tablets without a metadata routing map",
+                operation.table_def.table_id, operation.table_def.tablet_count
+            )));
+        }
+
+        let table_id = TableId(operation.table_def.table_id);
+        let router = TabletRouter::for_single_tablet(table_id, TabletId(table_id.0))?;
+        if let Some(existing) = self.tablet_routers.get(&table_id)
+            && existing != &router
+        {
+            return Err(Error::CorruptData(format!(
+                "replicated catalog route conflicts with metadata routing for table {}",
+                table_id.0
+            )));
+        }
+
         let schema = self
             .catalog
             .install_replicated_definition(operation.table_def.clone())?;
+
         if !self.tablets.contains_key(&schema.id) {
             let tablet = Tablet::new(TabletId(schema.id.0), schema.id)?;
             let coordinator =
                 SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
             self.tablets.insert(schema.id, coordinator);
         }
+
+        self.tablet_routers.entry(table_id).or_insert(router);
         Ok(())
     }
 
@@ -344,7 +421,8 @@ impl LocalExecutor {
             })?;
 
         let expected_request = request.clone();
-        let definition = creator.create_table(request, request_id, timeout)?;
+        let topology = creator.create_table_topology(request, request_id, timeout)?;
+        let definition = topology.definition;
 
         if definition.table_id <= 1 {
             return Err(Error::CorruptData(format!(
@@ -357,7 +435,6 @@ impl LocalExecutor {
             || definition.columns != expected_request.columns
             || definition.primary_key_column_ids != expected_request.primary_key_column_ids
             || definition.schema_version != 1
-            || definition.tablet_count != 1
         {
             return Err(Error::CorruptData(
                 "metadata CREATE TABLE returned a definition different from the requested schema"
@@ -366,8 +443,10 @@ impl LocalExecutor {
         }
 
         let table_id = TableId(definition.table_id);
+        let router = self.build_metadata_router(&definition, &topology.tablets)?;
 
         self.catalog.install_replicated_definition(definition)?;
+        self.tablet_routers.insert(table_id, router);
         self.metadata_table_ids.insert(table_id);
 
         Ok(ExecutionResult::CreatedTable { table_id })
@@ -382,14 +461,23 @@ impl LocalExecutor {
         let first_key = command.writes.first().ok_or_else(|| {
             Error::InvalidArgument("replicated commit contains no writes".to_string())
         })?;
-        let table_id = decode_row_key(&first_key.key)?.table_id;
+        let first_row_key = decode_row_key(&first_key.key)?;
+        let table_id = first_row_key.table_id;
+        let tablet_id = self.route_row_key(&first_row_key)?;
         let mut transaction = Transaction::new(command.txn_id, command.start_timestamp)?;
 
         for write in &command.writes {
-            let write_table_id = decode_row_key(&write.key)?.table_id;
+            let write_row_key = decode_row_key(&write.key)?;
+            let write_table_id = write_row_key.table_id;
             if write_table_id != table_id {
                 return Err(Error::InvalidArgument(
                     "replicated single-shard commit spans multiple tables".to_string(),
+                ));
+            }
+
+            if self.route_row_key(&write_row_key)? != tablet_id {
+                return Err(Error::InvalidArgument(
+                    "replicated single-shard commit spans multiple routed tablets".to_string(),
                 ));
             }
 
@@ -408,6 +496,14 @@ impl LocalExecutor {
             }
         }
 
+        if self.local_tablet_id(table_id)? != tablet_id {
+            return Err(Error::UnsupportedSql(format!(
+                "replicated commit targets tablet {}, but the local SQL mirror owns tablet {}",
+                tablet_id.0,
+                self.local_tablet_id(table_id)?.0
+            )));
+        }
+
         self.tablets
             .get_mut(&table_id)
             .ok_or_else(|| Error::CorruptData(format!(
@@ -424,13 +520,26 @@ impl LocalExecutor {
         table_id: TableId,
         storage: InMemoryMvcc,
     ) -> Result<bool> {
-        if self.catalog.catalog().table_by_id(table_id).is_none() {
+        let Some(schema) = self.catalog.catalog().table_by_id(table_id) else {
             return Ok(false);
+        };
+
+        if !self.tablet_routers.contains_key(&table_id) && schema.tablet_count != 1 {
+            return Err(Error::CorruptData(format!(
+                "table {} declares {} tablets but has no authoritative routing map",
+                table_id.0, schema.tablet_count
+            )));
         }
+
         let tablet = Tablet::with_storage(TabletId(table_id.0), table_id, storage)?;
         let coordinator =
             SingleNodeCommitCoordinator::with_participant(tablet, self.commit_log.clone())?;
         self.tablets.insert(table_id, coordinator);
+
+        if !self.tablet_routers.contains_key(&table_id) {
+            self.install_single_tablet_router(table_id)?;
+        }
+
         Ok(true)
     }
 
@@ -475,6 +584,7 @@ impl LocalExecutor {
         }
 
         let mut tablets = BTreeMap::new();
+        let mut tablet_routers = BTreeMap::new();
 
         for (table_id, storage) in mvcc_by_table {
             let tablet = Tablet::with_storage(TabletId(table_id.0), table_id, storage).map_err(
@@ -498,11 +608,23 @@ impl LocalExecutor {
                 )?;
 
             tablets.insert(table_id, coordinator);
+            tablet_routers.insert(
+                table_id,
+                TabletRouter::for_single_tablet(table_id, TabletId(table_id.0)).map_err(
+                    |source| {
+                        Error::CorruptData(format!(
+                            "failed to construct recovered tablet router for table {}: {}",
+                            table_id.0, source
+                        ))
+                    },
+                )?,
+            );
         }
 
         Ok(Self {
             catalog: DurableCatalog::from_recovered(catalog, catalog_log),
             tablets,
+            tablet_routers,
             metadata_table_creator: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
@@ -642,6 +764,7 @@ impl LocalExecutor {
         }
 
         let mut table_ids = BTreeSet::new();
+        let mut tablet_ids = BTreeSet::new();
 
         for encoded_key in transaction.write_set().keys() {
             let row_key = decode_row_key(encoded_key)?;
@@ -659,12 +782,13 @@ impl LocalExecutor {
             }
 
             table_ids.insert(row_key.table_id);
+            tablet_ids.insert(self.route_row_key(&row_key)?);
         }
 
-        if table_ids.len() != 1 {
+        if table_ids.len() != 1 || tablet_ids.len() != 1 {
             return Err(Error::UnsupportedSql(
-                "a local transaction may write only one tablet; \
-                 cross-table transactions require distributed coordination"
+                "a local transaction may write only one routed tablet; \
+                 cross-table or cross-tablet transactions require distributed coordination"
                     .to_string(),
             ));
         }
@@ -679,6 +803,16 @@ impl LocalExecutor {
                 table_id.0
             ))
         })?;
+
+        let tablet_id = *tablet_ids
+            .first()
+            .expect("non-empty tablet-ID set was checked above");
+        if tablet_id != TabletId(table_id.0) {
+            return Err(Error::UnsupportedSql(format!(
+                "tablet {} is not installed in the local single-tablet commit path",
+                tablet_id.0
+            )));
+        }
 
         let outcome = coordinator.commit(transaction, timestamp_allocator)?;
 
@@ -774,6 +908,7 @@ impl LocalExecutor {
                 })?;
 
         self.tablets.insert(table_id, coordinator);
+        self.install_single_tablet_router(table_id)?;
 
         self.replay_from_end_lsn = self.replay_from_end_lsn.max(replay_from_end_lsn);
 
@@ -816,7 +951,6 @@ impl LocalExecutor {
         } = plan;
 
         let schema = self.resolve_table(&table)?;
-        let tablet = self.tablet_for(schema.id)?;
 
         for column in &target_columns {
             validate_bound_column(schema.as_ref(), column)?;
@@ -841,6 +975,9 @@ impl LocalExecutor {
 
             prepared.push((key, row));
         }
+
+        let tablet_id = self.single_destination(schema.id, prepared.iter().map(|(key, _)| key))?;
+        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
 
         // Check every destination before buffering any mutation. Since this
         // executor holds exclusive access during the call, a later apply pass
@@ -881,7 +1018,6 @@ impl LocalExecutor {
         } = plan;
 
         let schema = self.resolve_table(&table)?;
-        let tablet = self.tablet_for(schema.id)?;
 
         if projection.is_empty() {
             return Err(Error::SchemaMismatch(
@@ -897,7 +1033,7 @@ impl LocalExecutor {
             validate_filter(schema.as_ref(), filter)?;
         }
 
-        let matching = matching_rows(tablet, transaction, schema.as_ref(), filter.as_ref())?;
+        let matching = self.matching_rows(transaction, schema.as_ref(), filter.as_ref())?;
 
         let rows = matching
             .iter()
@@ -928,7 +1064,6 @@ impl LocalExecutor {
         } = plan;
 
         let schema = self.resolve_table(&table)?;
-        let tablet = self.tablet_for(schema.id)?;
 
         if assignments.is_empty() {
             return Err(Error::InvalidArgument(
@@ -942,7 +1077,7 @@ impl LocalExecutor {
             validate_update_assignment(schema.as_ref(), assignment)?;
         }
 
-        let matching = matching_rows(tablet, transaction, schema.as_ref(), Some(&filter))?;
+        let matching = self.matching_rows(transaction, schema.as_ref(), Some(&filter))?;
 
         let mut prepared = Vec::with_capacity(matching.len());
 
@@ -972,6 +1107,8 @@ impl LocalExecutor {
         }
 
         let affected_rows = prepared.len();
+        let tablet_id = self.single_destination(schema.id, prepared.iter().map(|(key, _)| key))?;
+        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
 
         tablet.buffer_batch(
             transaction,
@@ -994,16 +1131,17 @@ impl LocalExecutor {
         let DeletePlan { table, filter } = plan;
 
         let schema = self.resolve_table(&table)?;
-        let tablet = self.tablet_for(schema.id)?;
 
         validate_filter(schema.as_ref(), &filter)?;
 
-        let matching = matching_rows(tablet, transaction, schema.as_ref(), Some(&filter))?;
+        let matching = self.matching_rows(transaction, schema.as_ref(), Some(&filter))?;
 
         // Matching completes before the atomic buffer operation, so neither a
         // filter error nor a mutation-encoding error can partially apply this
         // statement to the transaction.
         let affected_rows = matching.len();
+        let tablet_id = self.single_destination(schema.id, matching.iter().map(|row| &row.key))?;
+        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
 
         tablet.buffer_batch(
             transaction,
@@ -1045,24 +1183,201 @@ impl LocalExecutor {
             )));
         }
 
-        if schema.tablet_count != 1 {
-            return Err(Error::UnsupportedSql(format!(
-                "Phase 2.7 local execution requires exactly one \
-                 tablet for table {}, found {}",
-                schema.name, schema.tablet_count
-            )));
-        }
-
         Ok(schema)
     }
 
-    fn tablet_for(&self, table_id: TableId) -> Result<&Tablet> {
+    fn build_metadata_router(
+        &self,
+        definition: &TableDefinition,
+        descriptors: &[TabletDescriptor],
+    ) -> Result<TabletRouter> {
+        let table_id = TableId(definition.table_id);
+        if definition.tablet_count == 0 {
+            return Err(Error::CorruptData(format!(
+                "metadata table {} declares zero tablets",
+                definition.table_id
+            )));
+        }
+
+        if descriptors.len() != definition.tablet_count as usize {
+            return Err(Error::CorruptData(format!(
+                "metadata table {} declares {} tablets but returned {} descriptors",
+                definition.table_id,
+                definition.tablet_count,
+                descriptors.len()
+            )));
+        }
+
+        let router = TabletRouter::new(table_id, descriptors).map_err(|error| {
+            Error::CorruptData(format!(
+                "metadata table {} returned an invalid tablet routing map: {}",
+                definition.table_id, error
+            ))
+        })?;
+
+        if router.tablet_count() != definition.tablet_count {
+            return Err(Error::CorruptData(format!(
+                "metadata table {} routing map declares {} buckets, expected {}",
+                definition.table_id,
+                router.tablet_count(),
+                definition.tablet_count
+            )));
+        }
+
+        Ok(router)
+    }
+
+    fn install_single_tablet_router(&mut self, table_id: TableId) -> Result<()> {
+        let router = TabletRouter::for_single_tablet(table_id, TabletId(table_id.0))?;
+
+        if let Some(existing) = self.tablet_routers.get(&table_id) {
+            if existing != &router {
+                return Err(Error::CorruptData(format!(
+                    "single-tablet compatibility route conflicts with table {} metadata",
+                    table_id.0
+                )));
+            }
+
+            return Ok(());
+        }
+
+        self.tablet_routers.insert(table_id, router);
+        Ok(())
+    }
+
+    fn router_for(&self, table_id: TableId) -> Result<&TabletRouter> {
+        self.tablet_routers.get(&table_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "catalog table {} has no authoritative tablet routing map",
+                table_id.0
+            ))
+        })
+    }
+
+    fn route_row_key(&self, row_key: &RowKey) -> Result<TabletId> {
+        self.router_for(row_key.table_id)?
+            .route_point(&row_key.primary_key_bytes)
+    }
+
+    fn local_tablet_id(&self, table_id: TableId) -> Result<TabletId> {
+        self.tablets
+            .get(&table_id)
+            .map(|_| TabletId(table_id.0))
+            .ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "catalog table {} has no local commit coordinator",
+                    table_id.0
+                ))
+            })
+    }
+
+    fn local_tablet_for_route(&self, table_id: TableId, tablet_id: TabletId) -> Result<&Tablet> {
+        let local_tablet_id = self.local_tablet_id(table_id)?;
+        if tablet_id != local_tablet_id {
+            return Err(Error::UnsupportedSql(format!(
+                "tablet {} for table {} is not installed on this local executor",
+                tablet_id.0, table_id.0
+            )));
+        }
+
         self.tablets
             .get(&table_id)
             .map(SingleNodeCommitCoordinator::participant)
             .ok_or_else(|| {
-                Error::CorruptData(format!("catalog table {} has no local tablet", table_id.0))
+                Error::CorruptData(format!(
+                    "catalog table {} has no local commit coordinator",
+                    table_id.0
+                ))
             })
+    }
+
+    fn single_destination<'a, I>(&self, table_id: TableId, keys: I) -> Result<TabletId>
+    where
+        I: IntoIterator<Item = &'a RowKey>,
+    {
+        let mut destinations = BTreeSet::new();
+        for key in keys {
+            if key.table_id != table_id {
+                return Err(Error::CorruptData(format!(
+                    "row key belongs to table {}, expected table {}",
+                    key.table_id.0, table_id.0
+                )));
+            }
+
+            destinations.insert(self.route_row_key(key)?);
+        }
+
+        match destinations.len() {
+            0 => self.local_tablet_id(table_id),
+            1 => Ok(*destinations
+                .first()
+                .expect("single destination set contains one tablet")),
+            _ => Err(Error::UnsupportedSql(
+                "one local statement may buffer mutations for only one routed tablet; \
+                 distributed transaction coordination is required for a multi-tablet mutation"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn matching_rows(
+        &self,
+        transaction: &Transaction,
+        schema: &TableSchema,
+        filter: Option<&BoundExpr>,
+    ) -> Result<Vec<KeyedRow>> {
+        let candidates = match choose_access_path(schema, filter)? {
+            AccessPath::Empty => Vec::new(),
+
+            AccessPath::Point(key) => {
+                let tablet_id = self.route_row_key(&key)?;
+                let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
+
+                tablet
+                    .get(transaction, &key)?
+                    .map(|row| vec![(key, row)])
+                    .unwrap_or_default()
+            }
+
+            AccessPath::Scan => {
+                let tablet_ids = self.router_for(schema.id)?.route_scan();
+                let mut rows = Vec::new();
+
+                for tablet_id in tablet_ids {
+                    let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
+
+                    for (key, row) in tablet.scan(transaction, None, None)? {
+                        if self.route_row_key(&key)? != tablet_id {
+                            return Err(Error::CorruptData(format!(
+                                "tablet {} returned row key routed to another tablet for table {}",
+                                tablet_id.0, schema.id.0
+                            )));
+                        }
+
+                        rows.push((key, row));
+                    }
+                }
+
+                rows
+            }
+        };
+
+        let source = MaterializedRows::new(candidates);
+        let mut filtered = FilterRows::new(source, schema, filter);
+        let mut rows = Vec::new();
+
+        while let Some(row) = filtered.next()? {
+            if rows.len() == MAX_MATERIALIZED_RESULT_ROWS {
+                return Err(Error::InvalidArgument(format!(
+                    "query result exceeds the materialized row limit of \
+                     {MAX_MATERIALIZED_RESULT_ROWS}; add a selective predicate"
+                )));
+            }
+
+            rows.push(row);
+        }
+
+        Ok(rows)
     }
 }
 
@@ -1153,41 +1468,6 @@ enum AccessPath {
     Empty,
     Point(RowKey),
     Scan,
-}
-
-fn matching_rows(
-    tablet: &Tablet,
-    transaction: &Transaction,
-    schema: &TableSchema,
-    filter: Option<&BoundExpr>,
-) -> Result<Vec<KeyedRow>> {
-    let candidates = match choose_access_path(schema, filter)? {
-        AccessPath::Empty => Vec::new(),
-
-        AccessPath::Point(key) => tablet
-            .get(transaction, &key)?
-            .map(|row| vec![(key, row)])
-            .unwrap_or_default(),
-
-        AccessPath::Scan => tablet.scan(transaction, None, None)?,
-    };
-
-    let source = MaterializedRows::new(candidates);
-    let mut filtered = FilterRows::new(source, schema, filter);
-    let mut rows = Vec::new();
-
-    while let Some(row) = filtered.next()? {
-        if rows.len() == MAX_MATERIALIZED_RESULT_ROWS {
-            return Err(Error::InvalidArgument(format!(
-                "query result exceeds the materialized row limit of \
-                 {MAX_MATERIALIZED_RESULT_ROWS}; add a selective predicate"
-            )));
-        }
-
-        rows.push(row);
-    }
-
-    Ok(rows)
 }
 
 fn ensure_result_row_limit(row_count: usize) -> Result<()> {

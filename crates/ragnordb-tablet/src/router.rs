@@ -23,7 +23,7 @@ const HASH_ROUTING_DOMAIN: &[u8] = b"ragnordb/tablet-hash";
 pub const HASH_ROUTING_VERSION: u8 = 1;
 
 /// Stateless hash partitioner for table primary keys.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HashTabletPartitioner;
 
 impl HashTabletPartitioner {
@@ -93,7 +93,7 @@ impl HashTabletPartitioner {
 /// This turns metadata validation into a routing invariant: a point operation
 /// always resolves to one tablet, while a scan always has a complete and stable
 /// bucket-ordered fan-out set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletRouter {
     table_id: TableId,
     bucket_count: u32,
@@ -102,6 +102,33 @@ pub struct TabletRouter {
 }
 
 impl TabletRouter {
+    /// Builds the compatibility route used by the local single-tablet engine.
+    ///
+    /// This constructor intentionally does not manufacture a metadata
+    /// [`TabletDescriptor`]. A local compatibility tablet has no independent
+    /// metadata Raft identity yet, so callers must use [`Self::new`] whenever
+    /// the route comes from authoritative metadata.
+    pub fn for_single_tablet(table_id: TableId, tablet_id: TabletId) -> Result<Self> {
+        if table_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet routing requires a non-zero table ID".to_string(),
+            ));
+        }
+
+        if tablet_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet routing requires a non-zero tablet ID".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            table_id,
+            bucket_count: 1,
+            partitioner: HashTabletPartitioner::new(),
+            tablet_ids_by_bucket: BTreeMap::from([(0, tablet_id)]),
+        })
+    }
+
     /// Builds a router from the authoritative metadata descriptors for one table.
     ///
     /// Descriptors may arrive in any order, but they must describe the same

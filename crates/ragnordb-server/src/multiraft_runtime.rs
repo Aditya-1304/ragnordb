@@ -25,6 +25,7 @@ use ragnordb_common::{
     ids::{NodeId, RequestId},
     metadata_codec::{
         CreateTableRequest, MetadataCommand, MetadataCommandEnvelope, NodeDescriptor,
+        TabletDescriptor,
     },
 };
 
@@ -41,7 +42,7 @@ use ragnordb_multiraft::{
     transport::{NodeRaftEndpoint, NodeRaftTransport},
 };
 
-use ragnordb_exec::{MetadataTableCreator, SharedMetadataTableCreator};
+use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
 use ragnordb_tablet::snapshot::FileTabletSnapshotStore;
 
 use wal::{io::directory::FsSegmentDirectory, wal::WalHandle};
@@ -101,10 +102,10 @@ impl MetadataProposalClient {
         Self { requests, metadata }
     }
 
-    fn table_definition_for_outcome(
+    fn table_topology_for_outcome(
         &self,
         outcome: MetadataApplyOutcome,
-    ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
+    ) -> Result<MetadataTableTopology> {
         let MetadataApplyOutcome::TableCreated(created) = outcome else {
             return match outcome {
                 MetadataApplyOutcome::Rejected(rejection) => {
@@ -129,38 +130,53 @@ impl MetadataProposalClient {
             ))
         })?;
 
-        let tablet = state.tablet(created.tablet_id).ok_or_else(|| {
+        let created_tablet = state.tablet(created.tablet_id).ok_or_else(|| {
             Error::CorruptData(format!(
                 "metadata CREATE TABLE returned tablet {} without a tablet descriptor",
                 created.tablet_id.0,
             ))
         })?;
 
-        if tablet.table_id != created.table_id || tablet.raft_group_id != created.raft_group_id {
+        if created_tablet.table_id != created.table_id
+            || created_tablet.raft_group_id != created.raft_group_id
+        {
             return Err(Error::CorruptData(format!(
                 "metadata CREATE TABLE returned topology inconsistent with tablet {}",
                 created.tablet_id.0,
             )));
         }
 
-        if state.desired_placement(created.tablet_id).is_none() {
+        let tablets = state.tablets_for_table(created.table_id);
+        if tablets.len() != table.tablet_count as usize {
             return Err(Error::CorruptData(format!(
-                "metadata CREATE TABLE returned tablet {} without desired placement",
-                created.tablet_id.0,
+                "metadata table {} declares {} tablets but state exposes {} descriptors",
+                created.table_id.0,
+                table.tablet_count,
+                tablets.len()
             )));
         }
 
-        Ok(table.to_definition())
-    }
-}
+        for tablet in &tablets {
+            if state.desired_placement(tablet.tablet_id).is_none() {
+                return Err(Error::CorruptData(format!(
+                    "metadata table {} returned tablet {} without desired placement",
+                    created.table_id.0, tablet.tablet_id.0
+                )));
+            }
+        }
 
-impl MetadataTableCreator for MetadataProposalClient {
-    fn create_table(
+        Ok(MetadataTableTopology {
+            definition: table.to_definition(),
+            tablets,
+        })
+    }
+
+    fn propose_create_table_topology(
         &self,
         request: CreateTableRequest,
         request_id: RequestId,
         timeout: Duration,
-    ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
+    ) -> Result<MetadataTableTopology> {
         let command = MetadataCommand::CreateTableTopology(request);
         let envelope = MetadataCommandEnvelope::new(request_id.clone(), command)
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
@@ -196,7 +212,62 @@ impl MetadataTableCreator for MetadataProposalClient {
                 },
             })??;
 
-        self.table_definition_for_outcome(outcome)
+        self.table_topology_for_outcome(outcome)
+    }
+}
+
+impl MetadataTableCreator for MetadataProposalClient {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        request_id: RequestId,
+        timeout: Duration,
+    ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
+        self.propose_create_table_topology(request, request_id, timeout)
+            .map(|topology| topology.definition)
+    }
+
+    fn table_descriptors(
+        &self,
+        table_id: ragnordb_common::ids::TableId,
+    ) -> Result<Vec<TabletDescriptor>> {
+        let state = self.metadata.state_snapshot();
+        let table = state.table(table_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "metadata table {} is missing from the committed state",
+                table_id.0
+            ))
+        })?;
+        let tablets = state.tablets_for_table(table_id);
+
+        if tablets.len() != table.tablet_count as usize {
+            return Err(Error::CorruptData(format!(
+                "metadata table {} declares {} tablets but state exposes {} descriptors",
+                table_id.0,
+                table.tablet_count,
+                tablets.len()
+            )));
+        }
+
+        for tablet in &tablets {
+            if state.desired_placement(tablet.tablet_id).is_none() {
+                return Err(Error::CorruptData(format!(
+                    "metadata table {} returned tablet {} without desired placement",
+                    table_id.0, tablet.tablet_id.0
+                )));
+            }
+        }
+
+        Ok(tablets)
+    }
+
+    fn create_table_topology(
+        &self,
+        request: CreateTableRequest,
+        request_id: RequestId,
+        timeout: Duration,
+    ) -> Result<MetadataTableTopology> {
+        self.propose_create_table_topology(request, request_id, timeout)
     }
 
     fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition> {

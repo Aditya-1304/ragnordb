@@ -6,13 +6,16 @@ use ragnordb_common::{
     Error, Result,
     catalog_codec::TableDefinition,
     codec::{Row, Value},
-    ids::{RaftGroupId, RequestId, TableId, Timestamp, TxnId},
-    metadata_codec::CreateTableRequest,
+    ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
+    metadata_codec::{CreateTableRequest, PartitionSpec, TabletDescriptor},
 };
 use ragnordb_exec::{
     DmlOperation, ExecutionResult, LocalExecutor, MetadataTableCreator, ResultSet,
 };
 use ragnordb_sql::{BoundExprKind, Plan, analyze, parse_one, plan};
+use ragnordb_storage::key::encode_primary_key;
+use ragnordb_storage::mvcc::InMemoryMvcc;
+use ragnordb_tablet::HashTabletPartitioner;
 use ragnordb_txn::Transaction;
 
 fn build(executor: &LocalExecutor, sql: &str) -> Result<Plan> {
@@ -50,7 +53,10 @@ fn result_set(result: ExecutionResult) -> ResultSet {
     result
 }
 
-struct TestMetadataTableCreator;
+struct TestMetadataTableCreator {
+    with_topology: bool,
+    tablet_count: u32,
+}
 
 impl MetadataTableCreator for TestMetadataTableCreator {
     fn create_table(
@@ -67,19 +73,86 @@ impl MetadataTableCreator for TestMetadataTableCreator {
             columns: request.columns,
             primary_key_column_ids: request.primary_key_column_ids,
             schema_version: 1,
-            tablet_count: 1,
+            tablet_count: self.tablet_count,
         })
     }
 
     fn list_tables(&self) -> Vec<TableDefinition> {
         Vec::new()
     }
+
+    fn table_descriptors(&self, table_id: TableId) -> Result<Vec<TabletDescriptor>> {
+        if !self.with_topology {
+            return Err(Error::NotImplemented(
+                "metadata tablet topology lookup is unavailable",
+            ));
+        }
+
+        Ok((0..self.tablet_count)
+            .map(|bucket| TabletDescriptor {
+                tablet_id: TabletId(table_id.0 + u64::from(bucket)),
+                table_id,
+                raft_group_id: RaftGroupId(3 + u64::from(bucket)),
+                tablet_epoch: 1,
+                partition: PartitionSpec::Hash {
+                    bucket,
+                    bucket_count: self.tablet_count,
+                },
+            })
+            .collect())
+    }
+}
+
+fn key_for_bucket(table_id: TableId, bucket: u32, bucket_count: u32) -> i64 {
+    let partitioner = HashTabletPartitioner::new();
+
+    (1..10_000)
+        .find(|candidate| {
+            let primary_key = encode_primary_key(&[Value::Int(*candidate)]).unwrap();
+            partitioner
+                .bucket_for(table_id, &primary_key, bucket_count)
+                .unwrap()
+                == bucket
+        })
+        .expect("test key search must find every bucket")
+}
+
+#[test]
+fn metadata_create_requires_authoritative_tablet_topology() {
+    let mut executor = LocalExecutor::new();
+    executor.replace_metadata_table_creator(Arc::new(TestMetadataTableCreator {
+        with_topology: false,
+        tablet_count: 1,
+    }));
+
+    let Plan::CreateTable(plan) =
+        build(&executor, "CREATE TABLE authoritative (id INT PRIMARY KEY)").unwrap()
+    else {
+        panic!("expected CREATE TABLE plan");
+    };
+
+    let error = executor
+        .execute_create_table_with_metadata(
+            plan,
+            RequestId {
+                client_id: 7,
+                sequence: 1,
+                raft_group_id: RaftGroupId(2),
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, Error::NotImplemented(_)));
 }
 
 #[test]
 fn metadata_create_installs_the_identity_returned_by_metadata() {
     let mut executor = LocalExecutor::new();
-    executor.replace_metadata_table_creator(Arc::new(TestMetadataTableCreator));
+    executor.replace_metadata_table_creator(Arc::new(TestMetadataTableCreator {
+        with_topology: true,
+        tablet_count: 1,
+    }));
 
     let Plan::CreateTable(plan) =
         build(&executor, "CREATE TABLE authoritative (id INT PRIMARY KEY)").unwrap()
@@ -107,6 +180,99 @@ fn metadata_create_installs_the_identity_returned_by_metadata() {
     );
     assert!(executor.catalog().table_by_id(TableId(42)).is_some());
     assert!(executor.catalog().table_by_id(TableId(1)).is_none());
+}
+
+#[test]
+fn metadata_routing_drives_point_lookup_and_scan_fanout() {
+    let mut executor = LocalExecutor::new();
+    executor.replace_metadata_table_creator(Arc::new(TestMetadataTableCreator {
+        with_topology: true,
+        tablet_count: 2,
+    }));
+
+    let Plan::CreateTable(plan) =
+        build(&executor, "CREATE TABLE authoritative (id INT PRIMARY KEY)").unwrap()
+    else {
+        panic!("expected CREATE TABLE plan");
+    };
+
+    executor
+        .execute_create_table_with_metadata(
+            plan,
+            RequestId {
+                client_id: 7,
+                sequence: 1,
+                raft_group_id: RaftGroupId(2),
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+    let table_id = TableId(42);
+    let local_key = key_for_bucket(table_id, 0, 2);
+    let remote_key = key_for_bucket(table_id, 1, 2);
+
+    // The compatibility executor has one physically installed tablet. The
+    // metadata router still decides whether a key belongs to that tablet;
+    // another bucket must fail closed instead of reading the local mirror.
+    assert!(
+        executor
+            .install_replicated_storage(table_id, InMemoryMvcc::new())
+            .unwrap()
+    );
+
+    let mut writer = transaction(1, 1);
+    let insert = build(
+        &executor,
+        &format!("INSERT INTO authoritative (id) VALUES ({local_key})"),
+    )
+    .unwrap();
+    executor.execute(insert, Some(&mut writer)).unwrap();
+    executor.commit_transaction(writer, Timestamp(2)).unwrap();
+
+    let mut reader = transaction(2, 3);
+    let point = build(
+        &executor,
+        &format!("SELECT id FROM authoritative WHERE id = {local_key}"),
+    )
+    .unwrap();
+    assert_eq!(
+        result_set(executor.execute(point, Some(&mut reader)).unwrap())
+            .rows
+            .len(),
+        1
+    );
+
+    let remote_point = build(
+        &executor,
+        &format!("SELECT id FROM authoritative WHERE id = {remote_key}"),
+    )
+    .unwrap();
+    assert!(matches!(
+        executor.execute(remote_point, Some(&mut reader)),
+        Err(Error::UnsupportedSql(_))
+    ));
+
+    let scan = build(&executor, "SELECT id FROM authoritative").unwrap();
+    assert!(matches!(
+        executor.execute(scan, Some(&mut reader)),
+        Err(Error::UnsupportedSql(_))
+    ));
+
+    // A statement spanning buckets is rejected before it contributes any
+    // buffered writes, preserving the current single-coordinator durability
+    // boundary until shard-aware transaction records exist.
+    let mut cross_tablet = transaction(3, 4);
+    let multi_insert = build(
+        &executor,
+        &format!("INSERT INTO authoritative (id) VALUES ({local_key}), ({remote_key})"),
+    )
+    .unwrap();
+    assert!(matches!(
+        executor.execute(multi_insert, Some(&mut cross_tablet)),
+        Err(Error::UnsupportedSql(_))
+    ));
+    assert_eq!(cross_tablet.len(), 0);
 }
 
 #[test]
