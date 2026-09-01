@@ -11,7 +11,10 @@
 
 pub mod command;
 pub mod read;
+pub mod router;
 pub mod snapshot;
+
+pub use router::HashTabletPartitioner;
 use std::collections::BTreeMap;
 
 use ragnordb_common::{
