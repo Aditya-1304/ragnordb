@@ -1,6 +1,11 @@
-use ragnordb_common::{Error, codec::Value, ids::TableId};
+use ragnordb_common::{
+    Error,
+    codec::Value,
+    ids::{RaftGroupId, TableId, TabletId},
+    metadata_codec::{PartitionSpec, TabletDescriptor},
+};
 use ragnordb_storage::key::encode_primary_key;
-use ragnordb_tablet::HashTabletPartitioner;
+use ragnordb_tablet::{HashTabletPartitioner, TabletRouter};
 
 const ROUTING_DOMAIN: &[u8] = b"ragnordb/tablet-hash";
 const ROUTING_VERSION: u8 = 1;
@@ -18,6 +23,25 @@ fn expected_bucket(table_id: TableId, primary_key_bytes: &[u8], bucket_count: u3
     prefix.copy_from_slice(&digest.as_bytes()[..8]);
 
     (u64::from_be_bytes(prefix) % u64::from(bucket_count)) as u32
+}
+
+fn descriptor(
+    table_id: TableId,
+    tablet_id: u64,
+    raft_group_id: u64,
+    bucket: u32,
+    bucket_count: u32,
+) -> TabletDescriptor {
+    TabletDescriptor {
+        tablet_id: TabletId(tablet_id),
+        table_id,
+        raft_group_id: RaftGroupId(raft_group_id),
+        tablet_epoch: 1,
+        partition: PartitionSpec::Hash {
+            bucket,
+            bucket_count,
+        },
+    }
 }
 
 #[test]
@@ -89,6 +113,75 @@ fn invalid_hash_inputs_are_rejected_without_modulo_or_decode_panics() {
     ));
     assert!(matches!(
         partitioner.bucket_for(TableId(1), &[0xff], 1),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn metadata_backed_point_route_selects_the_hash_bucket_tablet() {
+    let table_id = TableId(17);
+    let bucket_count = 4;
+    let descriptors = vec![
+        descriptor(table_id, 103, 203, 3, bucket_count),
+        descriptor(table_id, 100, 200, 0, bucket_count),
+        descriptor(table_id, 102, 202, 2, bucket_count),
+        descriptor(table_id, 101, 201, 1, bucket_count),
+    ];
+    let primary_key_bytes = encode_primary_key(&[Value::Int(42)]).unwrap();
+    let expected_bucket = expected_bucket(table_id, &primary_key_bytes, bucket_count);
+    let router = TabletRouter::new(table_id, &descriptors).unwrap();
+
+    assert_eq!(
+        router.route_point(&primary_key_bytes).unwrap(),
+        TabletId(100 + u64::from(expected_bucket))
+    );
+}
+
+#[test]
+fn metadata_backed_scan_route_returns_every_tablet_in_bucket_order() {
+    let table_id = TableId(17);
+    let descriptors = vec![
+        descriptor(table_id, 202, 302, 2, 4),
+        descriptor(table_id, 200, 300, 0, 4),
+        descriptor(table_id, 203, 303, 3, 4),
+        descriptor(table_id, 201, 301, 1, 4),
+    ];
+    let router = TabletRouter::new(table_id, &descriptors).unwrap();
+
+    assert_eq!(
+        router.route_scan(),
+        vec![TabletId(200), TabletId(201), TabletId(202), TabletId(203)]
+    );
+}
+
+#[test]
+fn incomplete_or_foreign_metadata_is_rejected_before_routing() {
+    let table_id = TableId(17);
+
+    assert!(matches!(
+        TabletRouter::new(table_id, &[descriptor(table_id, 100, 200, 0, 2)]),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    assert!(matches!(
+        TabletRouter::new(
+            table_id,
+            &[
+                descriptor(table_id, 100, 200, 0, 2),
+                descriptor(table_id, 101, 201, 0, 2),
+            ]
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    assert!(matches!(
+        TabletRouter::new(
+            table_id,
+            &[
+                descriptor(table_id, 100, 200, 0, 2),
+                descriptor(TableId(18), 101, 201, 1, 2),
+            ]
+        ),
         Err(Error::InvalidArgument(_))
     ));
 }
