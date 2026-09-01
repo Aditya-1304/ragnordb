@@ -1,9 +1,15 @@
-use ragnordb_common::durability::DurabilityGate;
 use ragnordb_common::protocol::read_frame;
+use ragnordb_common::{
+    durability::DurabilityGate,
+    ids::{NodeId, RaftGroupId, ReplicaId},
+};
+use ragnordb_multiraft::host::{
+    MultiRaftGroupStatus, MultiRaftHostState, MultiRaftHostStatus, SharedMultiRaftHostStatus,
+};
 use ragnordb_server::admin::AdminState;
 use ragnordb_server::database::LocalDatabase;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -81,6 +87,55 @@ async fn admin_status_returns_json() {
     let addr = listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
 
+    let multiraft_status: SharedMultiRaftHostStatus = Arc::new(RwLock::new(MultiRaftHostStatus {
+        node_id: NodeId(7),
+        state: MultiRaftHostState::Active,
+        pending_message_count: 0,
+        pending_message_bytes: 0,
+        groups: vec![
+            MultiRaftGroupStatus {
+                identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity::new(
+                    RaftGroupId(2),
+                    ReplicaId(1),
+                )
+                .unwrap(),
+                role: None,
+                leader_replica_id: None,
+                term: 0,
+                commit_index: 0,
+                last_log_index: 0,
+                applied_index: 0,
+                snapshot_index: 0,
+                uncommitted_bytes: 0,
+                replication_inflight_bytes: 0,
+                pending_work: false,
+                pending_messages: 0,
+                pending_message_bytes: 0,
+                quarantine_reason: None,
+            },
+            MultiRaftGroupStatus {
+                identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity::new(
+                    RaftGroupId(20),
+                    ReplicaId(101),
+                )
+                .unwrap(),
+                role: None,
+                leader_replica_id: None,
+                term: 0,
+                commit_index: 0,
+                last_log_index: 0,
+                applied_index: 0,
+                snapshot_index: 0,
+                uncommitted_bytes: 0,
+                replication_inflight_bytes: 0,
+                pending_work: false,
+                pending_messages: 0,
+                pending_message_bytes: 0,
+                quarantine_reason: None,
+            },
+        ],
+    }));
+
     let state = Arc::new(AdminState {
         durability_gate: DurabilityGate::new(),
         started_at: 123,
@@ -88,6 +143,7 @@ async fn admin_status_returns_json() {
         max_connections: 10,
         database: LocalDatabase::shared(),
         replicated_tablet: None,
+        multiraft_status: Some(multiraft_status),
     });
 
     let server_task = {
@@ -109,6 +165,8 @@ async fn admin_status_returns_json() {
     assert!(json["infra"]["raft"].is_string());
     assert_eq!(json["durability"]["state"], "healthy");
     assert_eq!(json["durability"]["recovery_required"], false);
+    assert_eq!(json["multiraft"]["node_id"], 7);
+    assert_eq!(json["multiraft"]["groups"].as_array().unwrap().len(), 2);
 
     shutdown.cancel();
     server_task.await.unwrap();
@@ -130,6 +188,7 @@ async fn admin_metrics_returns_prometheus_text() {
         durability_gate: DurabilityGate::new(),
         database: LocalDatabase::shared(),
         replicated_tablet: None,
+        multiraft_status: None,
     });
 
     let server_task = {
@@ -217,6 +276,7 @@ async fn admin_status_uses_json_content_type() {
         durability_gate: DurabilityGate::new(),
         database: LocalDatabase::shared(),
         replicated_tablet: None,
+        multiraft_status: None,
     });
 
     let server_task = {

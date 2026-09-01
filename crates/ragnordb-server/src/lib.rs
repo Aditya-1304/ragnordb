@@ -146,6 +146,9 @@ impl Server {
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
         let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
+        let multiraft_status = replicated_runtime
+            .as_ref()
+            .map(MultiRaftRuntime::host_status_handle);
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),
@@ -153,6 +156,7 @@ impl Server {
             durability_gate: database.lock().await.durability_gate(),
             database: database.clone(),
             replicated_tablet: replicated_handle.clone(),
+            multiraft_status,
         });
 
         info!(

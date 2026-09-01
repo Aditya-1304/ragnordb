@@ -6,7 +6,10 @@
 //! are coalesced into one shared A-WAL sync when a scheduler turn has multiple
 //! eligible groups. Shared A-WAL uncertainty still fences every local replica.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, RwLock},
+};
 
 use raft::{
     core::{
@@ -15,7 +18,7 @@ use raft::{
     },
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::LogIndex,
+    types::{LogIndex, Role},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 
@@ -80,6 +83,85 @@ impl Default for MultiRaftTurnBudget {
         }
     }
 }
+
+/// Role reported by one hosted Raft replica in the node status snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiRaftRole {
+    Leader,
+    Follower,
+    Candidate,
+}
+
+impl MultiRaftRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Follower => "follower",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+impl From<Role> for MultiRaftRole {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::Leader => Self::Leader,
+            Role::Follower => Self::Follower,
+            Role::Candidate => Self::Candidate,
+        }
+    }
+}
+
+/// Read-only status for one local Raft group and replica lifetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRaftGroupStatus {
+    pub identity: RaftReplicaIdentity,
+    pub role: Option<MultiRaftRole>,
+    pub leader_replica_id: Option<ReplicaId>,
+    pub term: u64,
+    pub commit_index: u64,
+    pub last_log_index: u64,
+    pub applied_index: u64,
+    pub snapshot_index: u64,
+    pub uncommitted_bytes: usize,
+    pub replication_inflight_bytes: usize,
+    pub pending_work: bool,
+    pub pending_messages: usize,
+    pub pending_message_bytes: usize,
+    pub quarantine_reason: Option<String>,
+}
+
+/// Lifecycle state of the physical MultiRaft host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiRaftHostState {
+    Registering,
+    Active,
+    RecoveryRequired,
+}
+
+impl MultiRaftHostState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registering => "registering",
+            Self::Active => "active",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Point-in-time node status. The group list is authoritative for every local
+/// group, including groups that are quarantined and therefore no longer
+/// runnable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRaftHostStatus {
+    pub node_id: NodeId,
+    pub state: MultiRaftHostState,
+    pub pending_message_count: usize,
+    pub pending_message_bytes: usize,
+    pub groups: Vec<MultiRaftGroupStatus>,
+}
+
+pub type SharedMultiRaftHostStatus = Arc<RwLock<MultiRaftHostStatus>>;
 
 /// Work performed by one hosted group operation.
 ///
@@ -223,6 +305,18 @@ struct PendingPersistenceGroup {
 }
 
 impl PendingGroupMessages {
+    fn len(&self) -> usize {
+        self.control.len() + self.bulk.len()
+    }
+
+    fn wire_bytes(&self) -> usize {
+        self.control
+            .iter()
+            .chain(self.bulk.iter())
+            .map(|message| crate::transport::routed_message_wire_size(message).unwrap_or(0))
+            .sum()
+    }
+
     fn is_empty(&self) -> bool {
         self.control.is_empty() && self.bulk.is_empty()
     }
@@ -252,7 +346,7 @@ impl PendingGroupMessages {
     }
 }
 
-fn is_control_message(message: &RaftMessageEnvelope) -> bool {
+pub(crate) fn is_control_message(message: &RaftMessageEnvelope) -> bool {
     matches!(
         message.msg,
         raft::message::Message::PreVote(_)
@@ -287,6 +381,28 @@ fn group_budget_for_completion(budget: MultiRaftTurnBudget) -> MultiRaftTurnBudg
 /// persistence/apply.
 pub trait HostedRaftGroup: Send {
     fn identity(&self) -> RaftReplicaIdentity;
+
+    /// Return the adapter-owned portion of the node status. The host adds
+    /// queue and quarantine information because those counters belong to the
+    /// physical-node scheduler rather than to an individual Raft core.
+    fn status(&self) -> MultiRaftGroupStatus {
+        MultiRaftGroupStatus {
+            identity: self.identity(),
+            role: None,
+            leader_replica_id: None,
+            term: 0,
+            commit_index: 0,
+            last_log_index: 0,
+            applied_index: 0,
+            snapshot_index: 0,
+            uncommitted_bytes: 0,
+            replication_inflight_bytes: 0,
+            pending_work: self.has_pending_work(),
+            pending_messages: 0,
+            pending_message_bytes: 0,
+            quarantine_reason: None,
+        }
+    }
 
     /// Returns whether work from an earlier operation must be resumed before a
     /// new Raft mutation is admitted. Lightweight adapters may use the
@@ -531,6 +647,35 @@ where
 {
     fn identity(&self) -> RaftReplicaIdentity {
         self.ready_loop.persistence().log_view().identity()
+    }
+
+    fn status(&self) -> MultiRaftGroupStatus {
+        let raft = self.ready_loop.raft();
+        let identity = self.identity();
+        let replication_inflight_bytes = raft
+            .conf_state()
+            .replication_targets()
+            .into_iter()
+            .filter_map(|replica_id| raft.progress(replica_id))
+            .map(|progress| progress.inflight_bytes)
+            .sum();
+
+        MultiRaftGroupStatus {
+            identity,
+            role: Some((*raft.role()).into()),
+            leader_replica_id: raft.leader_id().map(ReplicaId::from_raft),
+            term: raft.hard_state().current_term,
+            commit_index: raft.commit_index(),
+            last_log_index: raft.last_log_index(),
+            applied_index: raft.last_applied(),
+            snapshot_index: raft.first_log_index().saturating_sub(1),
+            uncommitted_bytes: raft.uncommitted_bytes(),
+            replication_inflight_bytes,
+            pending_work: self.has_pending_work(),
+            pending_messages: 0,
+            pending_message_bytes: 0,
+            quarantine_reason: None,
+        }
     }
 
     fn has_pending_work(&self) -> bool {
@@ -850,6 +995,46 @@ where
 
     pub fn group_failure(&self, raft_group_id: RaftGroupId) -> Option<&str> {
         self.quarantined.get(&raft_group_id).map(String::as_str)
+    }
+
+    /// Capture a point-in-time view of every local group and scheduler queue.
+    ///
+    /// This method is observational: it does not acquire a persistence handle,
+    /// advance a Ready generation, or change runnable-queue membership. A
+    /// caller may therefore publish the returned value to an admin endpoint
+    /// without weakening the host's durability boundary.
+    pub fn status(&self) -> MultiRaftHostStatus {
+        let state = match self.state {
+            HostState::Registering => MultiRaftHostState::Registering,
+            HostState::Active => MultiRaftHostState::Active,
+            HostState::RecoveryRequired => MultiRaftHostState::RecoveryRequired,
+        };
+
+        let mut pending_message_count = 0_usize;
+        let mut pending_message_bytes = 0_usize;
+        let groups = self
+            .groups
+            .iter()
+            .map(|(raft_group_id, group)| {
+                let mut status = group.status();
+                let pending = self.pending_messages.get(raft_group_id);
+                status.pending_messages = pending.map_or(0, PendingGroupMessages::len);
+                status.pending_message_bytes = pending.map_or(0, PendingGroupMessages::wire_bytes);
+                status.quarantine_reason = self.quarantined.get(raft_group_id).cloned();
+                pending_message_count += status.pending_messages;
+                pending_message_bytes =
+                    pending_message_bytes.saturating_add(status.pending_message_bytes);
+                status
+            })
+            .collect();
+
+        MultiRaftHostStatus {
+            node_id: self.node_id,
+            state,
+            pending_message_count,
+            pending_message_bytes,
+            groups,
+        }
     }
 
     pub fn register_new_group(
@@ -2491,5 +2676,50 @@ mod tests {
         assert_eq!(turn.messages_processed, 1);
         assert_eq!(bulk_stepped.load(Ordering::SeqCst), 0);
         assert_eq!(control_stepped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn status_lists_every_local_group_including_quarantined_groups() {
+        let failing_identity = identity(10, 101);
+        let healthy_identity = identity(20, 202);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _failing_writer = host.issue_group_writer(failing_identity).unwrap();
+        let _healthy_writer = host.issue_group_writer(healthy_identity).unwrap();
+
+        host.register_new_group(Box::new(TestGroup {
+            identity: failing_identity,
+            tick_behavior: TickBehavior::GroupFailure,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: healthy_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.tick_all(1).unwrap();
+
+        let status = host.status();
+        assert_eq!(status.node_id, NodeId(7));
+        assert_eq!(status.state, MultiRaftHostState::Active);
+        assert_eq!(
+            status
+                .groups
+                .iter()
+                .map(|group| group.identity.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![RaftGroupId(10), RaftGroupId(20)]
+        );
+        assert_eq!(
+            status.groups[0].quarantine_reason.as_deref(),
+            Some("injected group-local failure")
+        );
+        assert!(status.groups[1].quarantine_reason.is_none());
     }
 }

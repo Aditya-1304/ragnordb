@@ -10,6 +10,7 @@ use crate::build_info::BUILD_INFO;
 use crate::database::SharedLocalDatabase;
 use crate::metrics;
 use crate::replicated_tablet::ReplicatedTabletHandle;
+use ragnordb_multiraft::host::SharedMultiRaftHostStatus;
 
 /// Thread-safe error type returned by administrative server tasks.
 ///
@@ -24,6 +25,7 @@ pub struct AdminState {
     pub durability_gate: DurabilityGate,
     pub database: SharedLocalDatabase,
     pub replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
+    pub multiraft_status: Option<SharedMultiRaftHostStatus>,
 }
 
 pub async fn start_admin_server(
@@ -115,6 +117,43 @@ async fn handle_status(
             "runtime_error": status.runtime_error,
         })
     });
+    let multiraft = state.multiraft_status.as_ref().map(|status_handle| {
+        let status = status_handle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let groups = status
+            .groups
+            .iter()
+            .map(|group| {
+                serde_json::json!({
+                    "raft_group_id": group.identity.raft_group_id.0,
+                    "replica_id": group.identity.replica_id.0,
+                    "role": group.role.map(|role| role.as_str()),
+                    "leader_replica_id": group.leader_replica_id.map(|replica_id| replica_id.0),
+                    "term": group.term,
+                    "commit_index": group.commit_index,
+                    "last_log_index": group.last_log_index,
+                    "applied_index": group.applied_index,
+                    "snapshot_index": group.snapshot_index,
+                    "uncommitted_bytes": group.uncommitted_bytes,
+                    "replication_inflight_bytes": group.replication_inflight_bytes,
+                    "pending_work": group.pending_work,
+                    "pending_messages": group.pending_messages,
+                    "pending_message_bytes": group.pending_message_bytes,
+                    "quarantine_reason": group.quarantine_reason,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "node_id": status.node_id.0,
+            "state": status.state.as_str(),
+            "pending_message_count": status.pending_message_count,
+            "pending_message_bytes": status.pending_message_bytes,
+            "groups": groups,
+        })
+    });
 
     Json(serde_json::json!({
         "build": {
@@ -139,6 +178,7 @@ async fn handle_status(
         },
         "durability": durability,
         "replication": replication,
+        "multiraft": multiraft,
         "storage": storage.map(|storage| serde_json::json!({
             "durable_lsn": storage.durable_lsn,
             "replay_frontier": storage.replay_frontier,

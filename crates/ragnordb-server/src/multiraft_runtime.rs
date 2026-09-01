@@ -11,7 +11,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -31,7 +31,10 @@ use ragnordb_common::{
 
 use ragnordb_multiraft::{
     bootstrap::FileBootstrapStore,
-    host::{MultiRaftHost, MultiRaftHostError, MultiRaftTurnBudget, RoutedRaftMessage},
+    host::{
+        MultiRaftHost, MultiRaftHostError, MultiRaftHostStatus, MultiRaftTurnBudget,
+        RoutedRaftMessage, SharedMultiRaftHostStatus,
+    },
     meta::{MetadataRuntimeHandle, bootstrap_metadata_group, recover_metadata_group},
     snapshot::SnapshotWorkController,
     storage::{
@@ -39,7 +42,7 @@ use ragnordb_multiraft::{
         persistence::{NodeRaftWal, RaftWal},
         recovery::RecoveredRaftStorage,
     },
-    transport::{NodeRaftEndpoint, NodeRaftTransport},
+    transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport},
 };
 
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
@@ -290,6 +293,8 @@ pub struct MultiRaftRuntime {
     metadata: MetadataRuntimeHandle,
 
     metadata_creator: SharedMetadataTableCreator,
+
+    host_status: SharedMultiRaftHostStatus,
 
     /// Explicitly retain ownership of the one physical snapshot transport for
     /// the complete node runtime lifetime.
@@ -577,6 +582,8 @@ impl MultiRaftRuntime {
 
         host.activate().map_err(host_error)?;
 
+        let host_status = Arc::new(RwLock::new(host.status()));
+
         database
             .try_lock()
             .map_err(|_| {
@@ -601,6 +608,7 @@ impl MultiRaftRuntime {
         let worker_shutdown = Arc::clone(&shutdown);
 
         let worker_metadata = metadata_handle.clone();
+        let worker_host_status = Arc::clone(&host_status);
 
         let (metadata_ready_tx, metadata_ready_rx) = mpsc::sync_channel(1);
 
@@ -614,6 +622,7 @@ impl MultiRaftRuntime {
                     metadata_request_rx,
                     worker_shutdown,
                     worker_metadata,
+                    worker_host_status,
                     cluster_id,
                     metadata_nodes,
                     metadata_ready_tx,
@@ -678,6 +687,8 @@ impl MultiRaftRuntime {
 
             metadata_creator,
 
+            host_status,
+
             _snapshot_transport: snapshot_transport,
 
             shutdown,
@@ -706,16 +717,30 @@ impl MultiRaftRuntime {
     pub fn metadata_table_creator(&self) -> SharedMetadataTableCreator {
         self.metadata_creator.clone()
     }
+
+    /// Return the last published point-in-time status for every local Raft
+    /// group. The host worker remains the sole owner of mutable Raft state.
+    pub fn host_status(&self) -> MultiRaftHostStatus {
+        self.host_status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn host_status_handle(&self) -> SharedMultiRaftHostStatus {
+        Arc::clone(&self.host_status)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_host<W>(
     mut host: MultiRaftHost<W>,
     transport: NodeRaftTransport,
-    inbound: std::sync::mpsc::Receiver<RoutedRaftMessage>,
+    inbound: NodeRaftInbound,
     metadata_requests: mpsc::Receiver<MetadataHostRequest>,
     shutdown: Arc<AtomicBool>,
     metadata: MetadataRuntimeHandle,
+    host_status: SharedMultiRaftHostStatus,
     cluster_id: String,
     metadata_nodes: Vec<NodeDescriptor>,
     metadata_ready: mpsc::SyncSender<std::result::Result<(), String>>,
@@ -723,6 +748,8 @@ fn run_host<W>(
     W: RaftWal,
 {
     let mut next_tick = Instant::now() + TICK_INTERVAL;
+
+    publish_host_status(&host_status, &host);
 
     let mut pending_metadata = BTreeMap::<u64, PendingMetadataProposal>::new();
     let mut pending_metadata_by_request = HashMap::<RequestId, u64>::new();
@@ -739,6 +766,7 @@ fn run_host<W>(
             &mut pending_metadata,
             &mut pending_metadata_by_request,
         ) {
+            publish_host_status(&host_status, &host);
             fail_pending_metadata(
                 &mut pending_metadata,
                 &mut pending_metadata_by_request,
@@ -759,6 +787,7 @@ fn run_host<W>(
                 Ok(()) => admitted_messages += 1,
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
+                    publish_host_status(&host_status, &host);
                     signal_metadata_failure(
                         &mut startup_sender,
                         "shared Raft WAL requires node recovery".to_string(),
@@ -797,6 +826,7 @@ fn run_host<W>(
             Ok(turn) => send_outbound(&transport, turn.outbound),
 
             Err(MultiRaftHostError::RecoveryRequired) => {
+                publish_host_status(&host_status, &host);
                 signal_metadata_failure(
                     &mut startup_sender,
                     "shared Raft WAL requires node recovery".to_string(),
@@ -832,6 +862,7 @@ fn run_host<W>(
                 }
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
+                    publish_host_status(&host_status, &host);
                     signal_metadata_failure(
                         &mut startup_sender,
                         "shared Raft WAL requires node recovery".to_string(),
@@ -938,8 +969,16 @@ fn run_host<W>(
             next_metadata_attempt = now + METADATA_BOOTSTRAP_RETRY_INTERVAL;
         }
 
+        publish_host_status(&host_status, &host);
+
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn publish_host_status(status: &SharedMultiRaftHostStatus, host: &MultiRaftHost<impl RaftWal>) {
+    *status
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = host.status();
 }
 
 fn service_metadata_requests<W>(
@@ -1157,13 +1196,11 @@ fn signal_metadata_failure(
 }
 
 fn send_outbound(transport: &NodeRaftTransport, messages: Vec<RoutedRaftMessage>) {
-    for message in messages {
-        if let Err(source) = transport.try_send(message) {
-            tracing::warn!(
-                error = %source,
-                "Raft message could not be delivered; Raft will retry",
-            );
-        }
+    if let Err(source) = transport.try_send_all(messages) {
+        tracing::warn!(
+            error = %source,
+            "Raft message could not be delivered; Raft will retry",
+        );
     }
 }
 
