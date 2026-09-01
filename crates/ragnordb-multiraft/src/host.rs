@@ -1,10 +1,11 @@
 //! Physical-node host for the independent Raft replicas assigned to one server.
 //!
-//! The host deliberately performs no fair scheduling or cross-group batching.
-//! Its responsibility is narrower: preserve each group's Ready ordering while
-//! ensuring that a shared A-WAL recovery fence stops every local replica.
+//! The host owns the cross-group admission boundary. It schedules one group
+//! operation at a time, keeps inbound work tagged by group, and preserves the
+//! per-group Ready ordering delegated to each [`HostedRaftGroup`]. Shared A-WAL
+//! uncertainty still fences every local replica.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use raft::{
     core::{
@@ -50,6 +51,204 @@ pub struct HostedProposal {
     pub outbound: Vec<RoutedRaftMessage>,
 }
 
+/// Work limits for one physical-node host turn.
+///
+/// `max_groups` limits the number of group operations, while
+/// `max_messages` limits inbound message operations. The remaining limits are
+/// passed to group implementations through [`HostedGroupTurn`] accounting;
+/// this keeps the node-level scheduler independent from tablet-specific apply
+/// and snapshot implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiRaftTurnBudget {
+    pub max_groups: usize,
+    pub max_messages: usize,
+    pub max_ready_generations: usize,
+    pub max_apply_entries: usize,
+    pub max_snapshot_bytes: usize,
+}
+
+impl Default for MultiRaftTurnBudget {
+    fn default() -> Self {
+        Self {
+            max_groups: 64,
+            max_messages: 256,
+            max_ready_generations: 1,
+            max_apply_entries: 128,
+            max_snapshot_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// Work performed by one hosted group operation.
+///
+/// The node host can enforce group and message fairness without knowing how a
+/// group applies committed entries or transfers snapshots. Concrete group
+/// adapters report those finer-grained counters so callers can observe the
+/// same budget boundary across metadata and tablet groups.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HostedGroupTurn {
+    pub outbound: Vec<RaftMessageEnvelope>,
+    pub ready_generations: usize,
+    pub apply_entries: usize,
+    pub snapshot_bytes: usize,
+}
+
+/// Result of one bounded host turn.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MultiRaftTurnResult {
+    pub groups_serviced: usize,
+    pub messages_processed: usize,
+    pub ready_generations: usize,
+    pub apply_entries: usize,
+    pub snapshot_bytes: usize,
+    pub outbound: Vec<RoutedRaftMessage>,
+}
+
+#[derive(Debug, Default)]
+struct RunnableGroupQueue {
+    control: VecDeque<RaftGroupId>,
+    bulk: VecDeque<RaftGroupId>,
+    queued: BTreeSet<RaftGroupId>,
+    control_queued: BTreeSet<RaftGroupId>,
+}
+
+impl RunnableGroupQueue {
+    fn enqueue(&mut self, raft_group_id: RaftGroupId) {
+        if self.queued.insert(raft_group_id) {
+            self.bulk.push_back(raft_group_id);
+        }
+    }
+
+    fn enqueue_control(&mut self, raft_group_id: RaftGroupId) {
+        if self.control_queued.insert(raft_group_id) {
+            self.bulk.retain(|queued| *queued != raft_group_id);
+            self.control.push_back(raft_group_id);
+            self.queued.insert(raft_group_id);
+        }
+    }
+
+    fn pop(&mut self) -> Option<RaftGroupId> {
+        let raft_group_id = self.control.pop_front().or_else(|| self.bulk.pop_front())?;
+        let removed = self.queued.remove(&raft_group_id);
+        debug_assert!(removed);
+        self.control_queued.remove(&raft_group_id);
+        Some(raft_group_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct GroupTimerScheduler {
+    now: u64,
+    deadlines: BTreeMap<u64, BTreeSet<RaftGroupId>>,
+    scheduled: BTreeMap<RaftGroupId, u64>,
+}
+
+impl GroupTimerScheduler {
+    fn schedule_after(&mut self, raft_group_id: RaftGroupId, delay: u64) {
+        let deadline = self.now.saturating_add(delay);
+
+        if self
+            .scheduled
+            .get(&raft_group_id)
+            .is_some_and(|existing| *existing <= deadline)
+        {
+            return;
+        }
+
+        self.remove(raft_group_id);
+        self.deadlines
+            .entry(deadline)
+            .or_default()
+            .insert(raft_group_id);
+        self.scheduled.insert(raft_group_id, deadline);
+    }
+
+    fn advance(&mut self, ticks: u64) -> Vec<RaftGroupId> {
+        self.now = self.now.saturating_add(ticks);
+        let due_deadlines: Vec<u64> = self
+            .deadlines
+            .range(..=self.now)
+            .map(|(deadline, _)| *deadline)
+            .collect();
+        let mut due_groups = Vec::new();
+
+        for deadline in due_deadlines {
+            if let Some(groups) = self.deadlines.remove(&deadline) {
+                for raft_group_id in groups {
+                    self.scheduled.remove(&raft_group_id);
+                    due_groups.push(raft_group_id);
+                }
+            }
+        }
+
+        due_groups
+    }
+
+    fn remove(&mut self, raft_group_id: RaftGroupId) {
+        let Some(deadline) = self.scheduled.remove(&raft_group_id) else {
+            return;
+        };
+
+        if let Some(groups) = self.deadlines.get_mut(&deadline) {
+            groups.remove(&raft_group_id);
+            if groups.is_empty() {
+                self.deadlines.remove(&deadline);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingGroupMessages {
+    control: VecDeque<RoutedRaftMessage>,
+    bulk: VecDeque<RoutedRaftMessage>,
+}
+
+impl PendingGroupMessages {
+    fn is_empty(&self) -> bool {
+        self.control.is_empty() && self.bulk.is_empty()
+    }
+
+    fn has_control(&self) -> bool {
+        !self.control.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<RoutedRaftMessage> {
+        self.control.pop_front().or_else(|| self.bulk.pop_front())
+    }
+
+    fn push_front(&mut self, message: RoutedRaftMessage) {
+        if is_control_message(&message.envelope) {
+            self.control.push_front(message);
+        } else {
+            self.bulk.push_front(message);
+        }
+    }
+
+    fn push_back(&mut self, message: RoutedRaftMessage) {
+        if is_control_message(&message.envelope) {
+            self.control.push_back(message);
+        } else {
+            self.bulk.push_back(message);
+        }
+    }
+}
+
+fn is_control_message(message: &RaftMessageEnvelope) -> bool {
+    matches!(
+        message.msg,
+        raft::message::Message::PreVote(_)
+            | raft::message::Message::PreVoteResponse(_)
+            | raft::message::Message::RequestVote(_)
+            | raft::message::Message::RequestVoteResponse(_)
+            | raft::message::Message::AppendEntriesResponse(_)
+            | raft::message::Message::InstallSnapshotResponse(_)
+    ) || matches!(
+        &message.msg,
+        raft::message::Message::AppendEntries(request) if request.entries.is_empty()
+    )
+}
+
 /// Type-erased lifecycle boundary for one hosted Raft replica.
 ///
 /// A single call performs the triggering Raft operation and drains the
@@ -57,6 +256,13 @@ pub struct HostedProposal {
 /// from interleaving work between `step()` and persistence/apply.
 pub trait HostedRaftGroup: Send {
     fn identity(&self) -> RaftReplicaIdentity;
+
+    /// Returns whether work from an earlier operation must be resumed before a
+    /// new Raft mutation is admitted. Lightweight adapters may use the
+    /// compatibility default because their operation is host-atomic.
+    fn has_pending_work(&self) -> bool {
+        false
+    }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError>;
 
@@ -70,6 +276,33 @@ pub trait HostedRaftGroup: Send {
         command: Vec<u8>,
         encoded_len: usize,
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError>;
+
+    /// Executes one bounded group turn. Group adapters with finer-grained
+    /// apply or snapshot work can override this method; the default preserves
+    /// the existing host-group contract while the host still enforces
+    /// cross-group fairness and inbound message limits.
+    fn tick_and_drain_budgeted(
+        &mut self,
+        ticks: u64,
+        _budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.tick_and_drain(ticks).map(|outbound| HostedGroupTurn {
+            outbound,
+            ..HostedGroupTurn::default()
+        })
+    }
+
+    fn step_and_drain_budgeted(
+        &mut self,
+        message: RaftMessageEnvelope,
+        _budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.step_and_drain(message)
+            .map(|outbound| HostedGroupTurn {
+                outbound,
+                ..HostedGroupTurn::default()
+            })
+    }
 }
 
 /// Error reported by an individual hosted group.
@@ -133,22 +366,55 @@ where
         &self.ready_loop
     }
 
-    fn drain_ready(&mut self) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-        let mut outbound = Vec::new();
+    fn drain_ready(&mut self) -> Result<HostedGroupTurn, HostedGroupError> {
+        let progress = self
+            .ready_loop
+            .persist_and_apply_next_ready_budgeted(
+                &mut self.snapshot_store,
+                &mut self.state_machine,
+                MultiRaftTurnBudget {
+                    max_groups: usize::MAX,
+                    max_messages: usize::MAX,
+                    max_ready_generations: 1,
+                    max_apply_entries: usize::MAX,
+                    max_snapshot_bytes: usize::MAX,
+                },
+            )
+            .map_err(classify_apply_error)?;
 
-        loop {
-            match self
-                .ready_loop
-                .persist_and_apply_next_ready(&mut self.snapshot_store, &mut self.state_machine)
-                .map_err(classify_apply_error)?
-            {
-                Some(ready) => {
-                    outbound.extend(ready.messages);
-                }
+        Ok(HostedGroupTurn {
+            outbound: progress
+                .ready
+                .map(|ready| ready.messages)
+                .unwrap_or_default(),
+            ready_generations: progress.ready_generations,
+            apply_entries: progress.apply_entries,
+            snapshot_bytes: progress.snapshot_bytes,
+        })
+    }
 
-                None => return Ok(outbound),
-            }
-        }
+    fn drain_ready_budgeted(
+        &mut self,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        let progress = self
+            .ready_loop
+            .persist_and_apply_next_ready_budgeted(
+                &mut self.snapshot_store,
+                &mut self.state_machine,
+                budget,
+            )
+            .map_err(classify_apply_error)?;
+
+        Ok(HostedGroupTurn {
+            outbound: progress
+                .ready
+                .map(|ready| ready.messages)
+                .unwrap_or_default(),
+            ready_generations: progress.ready_generations,
+            apply_entries: progress.apply_entries,
+            snapshot_bytes: progress.snapshot_bytes,
+        })
     }
 }
 
@@ -164,31 +430,47 @@ where
         self.ready_loop.persistence().log_view().identity()
     }
 
+    fn has_pending_work(&self) -> bool {
+        self.ready_loop.has_pending_work()
+    }
+
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
         // A previous retryable persistence operation may have left a Ready
         // generation pending. Finish it before mutating Raft again.
-        let mut outbound = self.drain_ready()?;
+        let mut turn = self.drain_ready()?;
+
+        if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
+            return Ok(turn.outbound);
+        }
 
         self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
 
-        outbound.extend(self.drain_ready()?);
+        let after_tick = self.drain_ready()?;
+        turn.outbound.extend(after_tick.outbound);
 
-        Ok(outbound)
+        Ok(turn.outbound)
     }
 
     fn step_and_drain(
         &mut self,
         message: RaftMessageEnvelope,
     ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-        let mut outbound = self.drain_ready()?;
+        let mut turn = self.drain_ready()?;
+
+        if self.ready_loop.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still being resumed".to_string(),
+            ));
+        }
 
         self.ready_loop
             .step(message)
             .map_err(classify_ready_error)?;
 
-        outbound.extend(self.drain_ready()?);
+        let after_step = self.drain_ready()?;
+        turn.outbound.extend(after_step.outbound);
 
-        Ok(outbound)
+        Ok(turn.outbound)
     }
 
     fn propose_and_drain(
@@ -196,16 +478,70 @@ where
         command: Vec<u8>,
         encoded_len: usize,
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
-        let mut outbound = self.drain_ready()?;
+        let mut turn = self.drain_ready()?;
+
+        if self.ready_loop.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still being resumed".to_string(),
+            ));
+        }
 
         let index = self
             .ready_loop
             .propose(command, encoded_len)
             .map_err(classify_ready_error)?;
 
-        outbound.extend(self.drain_ready()?);
+        let after_proposal = self.drain_ready()?;
+        turn.outbound.extend(after_proposal.outbound);
 
-        Ok((index, outbound))
+        Ok((index, turn.outbound))
+    }
+
+    fn tick_and_drain_budgeted(
+        &mut self,
+        ticks: u64,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        let mut turn = self.drain_ready_budgeted(budget)?;
+
+        if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
+            return Ok(turn);
+        }
+
+        self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
+        let after_tick = self.drain_ready_budgeted(budget);
+        match after_tick {
+            Ok(after_tick) => {
+                turn.outbound.extend(after_tick.outbound);
+                turn.ready_generations += after_tick.ready_generations;
+                turn.apply_entries += after_tick.apply_entries;
+                turn.snapshot_bytes += after_tick.snapshot_bytes;
+                Ok(turn)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn step_and_drain_budgeted(
+        &mut self,
+        message: RaftMessageEnvelope,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        let mut turn = self.drain_ready_budgeted(budget)?;
+
+        if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
+            return Ok(turn);
+        }
+
+        self.ready_loop
+            .step(message)
+            .map_err(classify_ready_error)?;
+        let after_step = self.drain_ready_budgeted(budget)?;
+        turn.outbound.extend(after_step.outbound);
+        turn.ready_generations += after_step.ready_generations;
+        turn.apply_entries += after_step.apply_entries;
+        turn.snapshot_bytes += after_step.snapshot_bytes;
+        Ok(turn)
     }
 }
 
@@ -274,6 +610,19 @@ where
 
     groups: BTreeMap<RaftGroupId, Box<dyn HostedRaftGroup>>,
 
+    /// Fair FIFO work queue. Membership is deduplicated so repeated wakeups
+    /// cannot turn one group into an unbounded sequence of adjacent turns.
+    runnable: RunnableGroupQueue,
+
+    /// One logical timer wheel shared by all local groups. Timer expiration
+    /// only makes a group runnable; it never bypasses the group-turn budget.
+    timers: GroupTimerScheduler,
+
+    /// Inbound messages remain owned by their tagged group until that group is
+    /// serviced. Control messages are kept ahead of bulk append traffic within
+    /// the same group, but no message is acknowledged by merely queueing it.
+    pending_messages: BTreeMap<RaftGroupId, PendingGroupMessages>,
+
     /// Durable identities discovered by the one shared-WAL scan which have
     /// not yet been accounted for by startup reconstruction.
     pending_recovered: BTreeSet<RaftReplicaIdentity>,
@@ -302,6 +651,9 @@ where
             node_wal,
             state: HostState::Registering,
             groups: BTreeMap::new(),
+            runnable: RunnableGroupQueue::default(),
+            timers: GroupTimerScheduler::default(),
+            pending_messages: BTreeMap::new(),
             pending_recovered: BTreeSet::new(),
             issued_writers: BTreeSet::new(),
             quarantined: BTreeMap::new(),
@@ -318,6 +670,9 @@ where
             node_wal,
             state: HostState::Registering,
             groups: BTreeMap::new(),
+            runnable: RunnableGroupQueue::default(),
+            timers: GroupTimerScheduler::default(),
+            pending_messages: BTreeMap::new(),
             pending_recovered: recovered
                 .replicas()
                 .map(|(identity, _)| *identity)
@@ -447,8 +802,318 @@ where
         Ok(())
     }
 
-    /// Delivers an inbound group-tagged Raft message and then drains that
-    /// group's full Ready persistence/application lifecycle.
+    /// Makes one registered group eligible for the next host turn.
+    pub fn schedule_group_now(
+        &mut self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_schedulable_group(raft_group_id)?;
+        self.runnable.enqueue(raft_group_id);
+        Ok(())
+    }
+
+    /// Schedules one registered group after a number of logical host ticks.
+    ///
+    /// The deadline is coalesced with an earlier deadline for the same group;
+    /// a later wakeup must never postpone an already-due Raft timer.
+    pub fn schedule_group_after(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        delay: u64,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_schedulable_group(raft_group_id)?;
+        self.timers.schedule_after(raft_group_id, delay);
+        Ok(())
+    }
+
+    /// Queues a tagged inbound message for bounded processing by its group.
+    ///
+    /// Validation happens at admission so an unknown group or wrong recipient
+    /// cannot occupy scheduler capacity. Processing and Ready completion still
+    /// happen only from [`Self::run_turn`].
+    pub fn enqueue_message(
+        &mut self,
+        message: RoutedRaftMessage,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        let raft_group_id = message.raft_group_id;
+        self.validate_message(&message)?;
+        let control = is_control_message(&message.envelope);
+
+        self.pending_messages
+            .entry(raft_group_id)
+            .or_default()
+            .push_back(message);
+        if control {
+            self.runnable.enqueue_control(raft_group_id);
+        } else {
+            self.runnable.enqueue(raft_group_id);
+        }
+        Ok(())
+    }
+
+    /// Runs a bounded, fair host turn.
+    ///
+    /// Timer advancement is independent from work admission. A hot group can
+    /// therefore remain runnable without preventing other queued groups from
+    /// receiving a turn, and an inbound message remains queued when the
+    /// message budget is exhausted. Group-local failures quarantine only that
+    /// group; shared-WAL uncertainty fences the complete host.
+    pub fn run_turn(
+        &mut self,
+        ticks: u64,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<MultiRaftTurnResult, MultiRaftHostError> {
+        self.ensure_active()?;
+
+        for raft_group_id in self.timers.advance(ticks) {
+            if self.groups.contains_key(&raft_group_id)
+                && !self.quarantined.contains_key(&raft_group_id)
+            {
+                self.runnable.enqueue(raft_group_id);
+            }
+        }
+
+        let mut result = MultiRaftTurnResult::default();
+
+        while result.groups_serviced < budget.max_groups {
+            let Some(raft_group_id) = self.runnable.pop() else {
+                break;
+            };
+
+            if self.quarantined.contains_key(&raft_group_id) {
+                self.pending_messages.remove(&raft_group_id);
+                continue;
+            }
+
+            let mut pending_message = if budget.max_messages == 0 {
+                None
+            } else {
+                self.pending_messages
+                    .get_mut(&raft_group_id)
+                    .and_then(PendingGroupMessages::pop)
+            };
+            let had_message = pending_message.is_some();
+
+            if had_message && result.messages_processed >= budget.max_messages {
+                let control = is_control_message(
+                    &pending_message
+                        .as_ref()
+                        .expect("message was checked above")
+                        .envelope,
+                );
+                self.pending_messages
+                    .get_mut(&raft_group_id)
+                    .expect("popped message implies a group queue")
+                    .push_front(pending_message.expect("message was checked above"));
+                if control {
+                    self.runnable.enqueue_control(raft_group_id);
+                } else {
+                    self.runnable.enqueue(raft_group_id);
+                }
+                break;
+            }
+
+            let group_has_pending_work = self
+                .groups
+                .get(&raft_group_id)
+                .is_some_and(|group| group.has_pending_work());
+            let process_message = had_message && !group_has_pending_work;
+            let retry_message = process_message.then(|| {
+                pending_message
+                    .as_ref()
+                    .expect("a processed message must be present")
+                    .clone()
+            });
+
+            if had_message && !process_message {
+                self.pending_messages
+                    .get_mut(&raft_group_id)
+                    .expect("popped message implies a group queue")
+                    .push_front(pending_message.take().expect("message was checked above"));
+            }
+
+            let group_budget = MultiRaftTurnBudget {
+                max_groups: budget.max_groups.saturating_sub(result.groups_serviced),
+                max_messages: budget
+                    .max_messages
+                    .saturating_sub(result.messages_processed),
+                max_ready_generations: budget
+                    .max_ready_generations
+                    .saturating_sub(result.ready_generations),
+                max_apply_entries: budget
+                    .max_apply_entries
+                    .saturating_sub(result.apply_entries),
+                max_snapshot_bytes: budget
+                    .max_snapshot_bytes
+                    .saturating_sub(result.snapshot_bytes),
+            };
+
+            let group_result = {
+                let group = self
+                    .groups
+                    .get_mut(&raft_group_id)
+                    .expect("runnable group came from the active registry");
+
+                match (process_message, pending_message.take()) {
+                    (true, Some(message)) => {
+                        group.step_and_drain_budgeted(message.envelope, group_budget)
+                    }
+                    (false, None) | (false, Some(_)) => {
+                        group.tick_and_drain_budgeted(ticks, group_budget)
+                    }
+                    (true, None) => unreachable!("message selection was checked above"),
+                }
+            };
+
+            result.groups_serviced += 1;
+            if process_message {
+                result.messages_processed += 1;
+            }
+
+            match group_result {
+                Ok(turn) => {
+                    result.ready_generations += turn.ready_generations;
+                    result.apply_entries += turn.apply_entries;
+                    result.snapshot_bytes += turn.snapshot_bytes;
+                    result
+                        .outbound
+                        .extend(turn.outbound.into_iter().map(|envelope| RoutedRaftMessage {
+                            raft_group_id,
+                            envelope,
+                        }));
+
+                    self.ensure_shared_wal_healthy()?;
+                    self.reschedule_after_turn(raft_group_id);
+                }
+
+                Err(HostedGroupError::RecoveryRequired) => {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                Err(HostedGroupError::Group(reason)) => {
+                    if self.node_wal.recovery_required() {
+                        self.state = HostState::RecoveryRequired;
+                        return Err(MultiRaftHostError::RecoveryRequired);
+                    }
+                    self.quarantined.insert(raft_group_id, reason);
+                    self.pending_messages.remove(&raft_group_id);
+                }
+
+                Err(HostedGroupError::Retryable(reason)) => {
+                    if self.node_wal.recovery_required() {
+                        self.state = HostState::RecoveryRequired;
+                        return Err(MultiRaftHostError::RecoveryRequired);
+                    }
+                    if let Some(message) = retry_message {
+                        let control = is_control_message(&message.envelope);
+                        self.pending_messages
+                            .get_mut(&raft_group_id)
+                            .expect("retrying message implies a group queue")
+                            .push_front(message);
+                        if control {
+                            self.runnable.enqueue_control(raft_group_id);
+                        } else {
+                            self.runnable.enqueue(raft_group_id);
+                        }
+                    } else {
+                        self.reschedule_after_turn(raft_group_id);
+                    }
+                    let _ = reason;
+                }
+
+                Err(HostedGroupError::Rejected(reason)) => {
+                    if self.node_wal.recovery_required() {
+                        self.state = HostState::RecoveryRequired;
+                        return Err(MultiRaftHostError::RecoveryRequired);
+                    }
+                    let _ = reason;
+                    self.reschedule_after_turn(raft_group_id);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn validate_message(&self, message: &RoutedRaftMessage) -> Result<(), MultiRaftHostError> {
+        let raft_group_id = message.raft_group_id;
+
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
+                raft_group_id,
+                reason: reason.clone(),
+            });
+        }
+
+        let identity = self
+            .groups
+            .get(&raft_group_id)
+            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?
+            .identity();
+        let expected = identity
+            .replica_id
+            .to_raft()
+            .expect("registered replica identity is validated");
+
+        if message.envelope.to != expected {
+            return Err(MultiRaftHostError::RecipientMismatch {
+                raft_group_id,
+                expected: identity.replica_id,
+                received: ReplicaId::from_raft(message.envelope.to),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_schedulable_group(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), MultiRaftHostError> {
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
+                raft_group_id,
+                reason: reason.clone(),
+            });
+        }
+
+        if !self.groups.contains_key(&raft_group_id) {
+            return Err(MultiRaftHostError::UnknownGroup(raft_group_id));
+        }
+
+        Ok(())
+    }
+
+    fn reschedule_after_turn(&mut self, raft_group_id: RaftGroupId) {
+        let has_messages = self
+            .pending_messages
+            .get(&raft_group_id)
+            .is_some_and(|messages| !messages.is_empty());
+        let has_control_messages = self
+            .pending_messages
+            .get(&raft_group_id)
+            .is_some_and(PendingGroupMessages::has_control);
+        let has_pending_work = self
+            .groups
+            .get(&raft_group_id)
+            .is_some_and(|group| group.has_pending_work());
+
+        if has_messages || has_pending_work {
+            if has_control_messages {
+                self.runnable.enqueue_control(raft_group_id);
+            } else {
+                self.runnable.enqueue(raft_group_id);
+            }
+        }
+    }
+
+    /// Delivers an inbound group-tagged Raft message through the legacy direct
+    /// path. New host loops should use [`Self::enqueue_message`] and
+    /// [`Self::run_turn`] so message and group budgets remain effective.
     pub fn route(
         &mut self,
         message: RoutedRaftMessage,
@@ -542,6 +1207,7 @@ where
         };
 
         self.ensure_shared_wal_healthy()?;
+        self.reschedule_after_turn(raft_group_id);
 
         Ok(messages
             .into_iter()
@@ -561,73 +1227,21 @@ where
 
         let group_ids: Vec<_> = self.groups.keys().copied().collect();
 
-        let mut outbound = Vec::new();
-
-        for raft_group_id in group_ids {
-            if self.quarantined.contains_key(&raft_group_id) {
-                continue;
-            }
-
-            let result = {
-                let group = self
-                    .groups
-                    .get_mut(&raft_group_id)
-                    .expect("group ID came from group registry");
-
-                group.tick_and_drain(ticks)
-            };
-
-            match result {
-                Ok(messages) => {
-                    // Another group could have discovered shared-WAL
-                    // uncertainty while this group was running.
-                    self.ensure_shared_wal_healthy()?;
-
-                    outbound.extend(messages.into_iter().map(|envelope| RoutedRaftMessage {
-                        raft_group_id,
-                        envelope,
-                    }));
-                }
-
-                Err(HostedGroupError::RecoveryRequired) => {
-                    self.state = HostState::RecoveryRequired;
-
-                    return Err(MultiRaftHostError::RecoveryRequired);
-                }
-
-                Err(HostedGroupError::Group(reason)) => {
-                    // If the underlying shared authority entered recovery,
-                    // this is node-wide even if the outer group adapter lost
-                    // the typed error.
-                    if self.node_wal.recovery_required() {
-                        self.state = HostState::RecoveryRequired;
-
-                        return Err(MultiRaftHostError::RecoveryRequired);
-                    }
-
-                    self.quarantined.insert(raft_group_id, reason);
-
-                    // Continue ticking unrelated groups.
-                }
-
-                Err(HostedGroupError::Retryable(_) | HostedGroupError::Rejected(_)) => {
-                    // Neither outcome proves local group corruption. Shared
-                    // WAL uncertainty still upgrades any group-local-looking
-                    // error to a node-wide recovery fence.
-                    if self.node_wal.recovery_required() {
-                        self.state = HostState::RecoveryRequired;
-
-                        return Err(MultiRaftHostError::RecoveryRequired);
-                    }
-
-                    // Continue servicing unrelated groups. This group remains
-                    // registered and will retry its pending lifecycle on a
-                    // later host turn.
-                }
+        for raft_group_id in group_ids.iter().copied() {
+            if !self.quarantined.contains_key(&raft_group_id) {
+                self.runnable.enqueue(raft_group_id);
             }
         }
 
-        Ok(outbound)
+        self.run_turn(
+            ticks,
+            MultiRaftTurnBudget {
+                max_groups: group_ids.len(),
+                max_messages: 0,
+                ..MultiRaftTurnBudget::default()
+            },
+        )
+        .map(|turn| turn.outbound)
     }
 
     pub fn propose(
@@ -1076,5 +1690,245 @@ mod tests {
             classify_ready_error(retryable),
             HostedGroupError::Retryable(_)
         ));
+    }
+
+    #[test]
+    fn runnable_groups_are_serviced_round_robin_with_a_group_budget() {
+        let first_ticks = Arc::new(AtomicU64::new(0));
+        let second_ticks = Arc::new(AtomicU64::new(0));
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+
+        host.register_new_group(Box::new(TestGroup {
+            identity: first_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&first_ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: second_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&second_ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+
+        host.schedule_group_now(first_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(second_identity.raft_group_id)
+            .unwrap();
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_snapshot_bytes: 1,
+        };
+
+        let first_turn = host.run_turn(1, budget).unwrap();
+        let second_turn = host.run_turn(1, budget).unwrap();
+
+        assert_eq!(first_turn.groups_serviced, 1);
+        assert_eq!(second_turn.groups_serviced, 1);
+        assert_eq!(
+            first_ticks.load(Ordering::SeqCst) + second_ticks.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(first_ticks.load(Ordering::SeqCst), 1);
+        assert_eq!(second_ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scheduling_same_group_twice_does_not_duplicate_runnable_work() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: group_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+
+        host.schedule_group_now(group_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(group_identity.raft_group_id)
+            .unwrap();
+
+        let result = host
+            .run_turn(
+                1,
+                MultiRaftTurnBudget {
+                    max_groups: 2,
+                    max_messages: 0,
+                    max_ready_generations: 1,
+                    max_apply_entries: 1,
+                    max_snapshot_bytes: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.groups_serviced, 1);
+        assert_eq!(ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shared_timer_does_not_run_a_group_before_its_deadline() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: group_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_after(group_identity.raft_group_id, 2)
+            .unwrap();
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_snapshot_bytes: 1,
+        };
+
+        assert_eq!(host.run_turn(1, budget).unwrap().groups_serviced, 0);
+        assert_eq!(ticks.load(Ordering::SeqCst), 0);
+        assert_eq!(host.run_turn(1, budget).unwrap().groups_serviced, 1);
+        assert_eq!(ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn queued_messages_remain_bounded_and_are_not_dropped_between_turns() {
+        let stepped = Arc::new(AtomicU64::new(0));
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: group_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::clone(&stepped),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+
+        for from in [20, 21] {
+            host.enqueue_message(RoutedRaftMessage {
+                raft_group_id: group_identity.raft_group_id,
+                envelope: Envelope {
+                    from: RaftReplicaId::must(from),
+                    to: RaftReplicaId::must(group_identity.replica_id.0),
+                    msg: Message::PreVoteResponse(raft::message::PreVoteResponse {
+                        term: 0,
+                        vote_granted: true,
+                    }),
+                },
+            })
+            .unwrap();
+        }
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 2,
+            max_messages: 1,
+            ..MultiRaftTurnBudget::default()
+        };
+
+        assert_eq!(host.run_turn(0, budget).unwrap().messages_processed, 1);
+        assert_eq!(stepped.load(Ordering::SeqCst), 1);
+        assert_eq!(host.run_turn(0, budget).unwrap().messages_processed, 1);
+        assert_eq!(stepped.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn control_message_promotes_its_group_ahead_of_bulk_work() {
+        let bulk_stepped = Arc::new(AtomicU64::new(0));
+        let control_stepped = Arc::new(AtomicU64::new(0));
+        let bulk_identity = identity(10, 101);
+        let control_identity = identity(20, 202);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _bulk_writer = host.issue_group_writer(bulk_identity).unwrap();
+        let _control_writer = host.issue_group_writer(control_identity).unwrap();
+
+        host.register_new_group(Box::new(TestGroup {
+            identity: bulk_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::clone(&bulk_stepped),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: control_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::new(AtomicU64::new(0)),
+            stepped: Arc::clone(&control_stepped),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+
+        host.enqueue_message(RoutedRaftMessage {
+            raft_group_id: bulk_identity.raft_group_id,
+            envelope: Envelope {
+                from: RaftReplicaId::must(1),
+                to: RaftReplicaId::must(101),
+                msg: Message::AppendEntries(raft::message::AppendEntriesRequest {
+                    term: 1,
+                    leader_id: RaftReplicaId::must(1),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![raft::entry::LogEntry::normal(1, 1, vec![1])],
+                    leader_commit: 0,
+                }),
+            },
+        })
+        .unwrap();
+        host.enqueue_message(RoutedRaftMessage {
+            raft_group_id: control_identity.raft_group_id,
+            envelope: Envelope {
+                from: RaftReplicaId::must(1),
+                to: RaftReplicaId::must(202),
+                msg: Message::RequestVoteResponse(raft::message::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            },
+        })
+        .unwrap();
+
+        let turn = host
+            .run_turn(
+                0,
+                MultiRaftTurnBudget {
+                    max_groups: 1,
+                    max_messages: 1,
+                    ..MultiRaftTurnBudget::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(turn.messages_processed, 1);
+        assert_eq!(bulk_stepped.load(Ordering::SeqCst), 0);
+        assert_eq!(control_stepped.load(Ordering::SeqCst), 1);
     }
 }

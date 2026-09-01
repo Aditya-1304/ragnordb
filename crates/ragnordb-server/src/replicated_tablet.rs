@@ -1025,6 +1025,7 @@ where
                 match control {
                     RaftHostControl::Tick { ticks, reply } => {
                         let result: std::result::Result<(), HostedGroupError> = (|| {
+                            let had_pending_ready = ready_loop.has_pending_work();
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
                                 &mut tablet,
@@ -1038,6 +1039,9 @@ where
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
+                            }
+                            if had_pending_ready {
+                                return Ok(());
                             }
                             ready_loop.tick(ticks).map_err(classify_ready_error)?;
                             if let Some(metadata) = drain_ready(
@@ -1067,6 +1071,7 @@ where
 
                     RaftHostControl::Step { message, reply } => {
                         let result: std::result::Result<(), HostedGroupError> = (|| {
+                            let had_pending_ready = ready_loop.has_pending_work();
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
                                 &mut tablet,
@@ -1080,6 +1085,12 @@ where
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
+                            }
+                            if had_pending_ready {
+                                return Err(HostedGroupError::Retryable(
+                                    "a previous Ready generation is still being resumed"
+                                        .to_string(),
+                                ));
                             }
                             ready_loop.step(message).map_err(classify_ready_error)?;
                             if let Some(metadata) = drain_ready(
@@ -1113,6 +1124,7 @@ where
                         reply,
                     } => {
                         let result: std::result::Result<LogIndex, HostedGroupError> = (|| {
+                            let had_pending_ready = ready_loop.has_pending_work();
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
                                 &mut tablet,
@@ -1126,6 +1138,12 @@ where
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
+                            }
+                            if had_pending_ready {
+                                return Err(HostedGroupError::Retryable(
+                                    "a previous Ready generation is still being resumed"
+                                        .to_string(),
+                                ));
                             }
                             let index = ready_loop
                                 .propose(command, encoded_len)
@@ -2348,55 +2366,54 @@ where
     LS: LogStore<Vec<u8>>,
     SS: StableStore,
 {
-    let mut snapshot_install = None;
-    while let Some(ready) = ready_loop
+    let Some(ready) = ready_loop
         .persist_next_ready(None)
         .map_err(classify_ready_error)?
-    {
-        let mut frontier = None;
-        for entry in &ready.committed_entries {
-            frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
-            let EntryPayload::Normal(bytes) = &entry.payload else {
-                continue;
-            };
-            let envelope = TabletCommandEnvelope::decode(bytes)
-                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
-            let locally_proposed = registry.is_pending(&envelope.request_id);
-            let disposition = tablet
-                .apply_committed(
-                    ragnordb_multiraft::proposal::ProposalPosition {
-                        term: entry.term,
-                        index: entry.index,
-                    },
-                    bytes,
-                )
-                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
-            snapshot_policy.note_applied(bytes.len());
-            publish_committed_command(
-                &envelope,
-                locally_proposed,
-                disposition,
-                registry,
-                database,
-                catalog_cache,
+    else {
+        return Ok(None);
+    };
+
+    let mut frontier = None;
+    for entry in &ready.committed_entries {
+        frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
+        let EntryPayload::Normal(bytes) = &entry.payload else {
+            continue;
+        };
+        let envelope = TabletCommandEnvelope::decode(bytes)
+            .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+        let locally_proposed = registry.is_pending(&envelope.request_id);
+        let disposition = tablet
+            .apply_committed(
+                ragnordb_multiraft::proposal::ProposalPosition {
+                    term: entry.term,
+                    index: entry.index,
+                },
+                bytes,
             )
-            .map_err(HostedGroupError::Group)?;
-        }
-        if let Some(frontier) = frontier {
-            ready_loop
-                .advance_applied_frontier(frontier)
-                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
-        }
-        if let Some(metadata) = ready.snapshot_install.clone() {
-            snapshot_install = Some(metadata);
-        }
-        send_messages(
-            transport,
-            snapshot_endpoint,
-            latest_snapshot,
-            ready.messages,
-        );
+            .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+        snapshot_policy.note_applied(bytes.len());
+        publish_committed_command(
+            &envelope,
+            locally_proposed,
+            disposition,
+            registry,
+            database,
+            catalog_cache,
+        )
+        .map_err(HostedGroupError::Group)?;
     }
+    if let Some(frontier) = frontier {
+        ready_loop
+            .advance_applied_frontier(frontier)
+            .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    }
+    let snapshot_install = ready.snapshot_install.clone();
+    send_messages(
+        transport,
+        snapshot_endpoint,
+        latest_snapshot,
+        ready.messages,
+    );
     Ok(snapshot_install)
 }
 

@@ -6,15 +6,16 @@ use raft::{
     storage::mem::MemStorage,
     types::{ConfState, Snapshot},
 };
-use ragnordb_common::ids::{RaftGroupId, ReplicaId};
+use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
+    host::{MultiRaftHost, MultiRaftTurnBudget, ReadyLoopHostedGroup},
     runtime::{
         AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
         RaftSnapshotStore, ReadyApplyError, ReadyLoopError,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
-        persistence::{RaftWal, RaftWalStorage},
+        persistence::{NodeRaftWal, RaftWal, RaftWalStorage},
     },
 };
 use wal::{
@@ -197,6 +198,57 @@ fn persisted_ready_applies_committed_entries_before_acknowledging_applied_fronti
         loop_.applied_frontier(),
         Some(AppliedRaftFrontier::new(1, ready.committed_entries[0].term))
     );
+}
+
+/// Catches a host turn acknowledging a Ready after only part of its apply
+/// budget was available, which would either lose the remaining entries or
+/// admit a new Raft mutation before the applied frontier is complete.
+#[test]
+fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+    loop_.propose(b"command".to_vec(), 7).unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let _writer = host.issue_group_writer(identity()).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(identity().raft_group_id).unwrap();
+
+    let blocked = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 0,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+    assert_eq!(blocked.apply_entries, 0);
+    assert_eq!(blocked.ready_generations, 1);
+
+    let resumed = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 1,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed.apply_entries, 1);
+    assert_eq!(resumed.ready_generations, 1);
 }
 
 /// Catches an application failure after WAL persistence from being treated as

@@ -52,6 +52,28 @@ type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
 type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
 type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
 
+/// Progress returned by one bounded Ready/application turn.
+///
+/// A Ready is returned only after all of its committed entries have been
+/// applied and the applied frontier has advanced. Until then the runtime keeps
+/// the exact persisted Ready internally; [`RaftReadyLoop::has_pending_work`]
+/// lets the host schedule the same group again without admitting a new
+/// mutation.
+#[derive(Debug, Default)]
+pub(crate) struct ReadyApplyProgress {
+    pub(crate) ready: Option<ReadyGeneration>,
+    pub(crate) ready_generations: usize,
+    pub(crate) apply_entries: usize,
+    pub(crate) snapshot_bytes: usize,
+}
+
+struct PendingReadyApplication {
+    ready: ReadyGeneration,
+    next_entry: usize,
+    applied_through: LogIndex,
+    applied_frontier: Option<AppliedRaftFrontier>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
     Active,
@@ -378,6 +400,7 @@ where
     persistence: RaftWalStorage<W>,
     state: RuntimeState,
     applied_frontier: Option<AppliedRaftFrontier>,
+    pending_apply: Option<PendingReadyApplication>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -396,6 +419,7 @@ where
             persistence,
             state: RuntimeState::Active,
             applied_frontier: None,
+            pending_apply: None,
         }
     }
 
@@ -414,6 +438,12 @@ where
     /// caller must not substitute the commit index for this value
     pub fn applied_frontier(&self) -> Option<AppliedRaftFrontier> {
         self.applied_frontier
+    }
+
+    /// Returns whether this group has a Ready generation or an applied Ready
+    /// that must be resumed before another Raft mutation is admitted.
+    pub fn has_pending_work(&self) -> bool {
+        self.pending_apply.is_some() || self.raft.has_ready()
     }
 
     /// Release storage retention through the group lifecycle owner.
@@ -468,6 +498,10 @@ where
         snapshot_pointer: Option<RaftSnapshotPointerRecord>,
     ) -> ReadyLoopResult {
         self.ensure_active()?;
+
+        if self.pending_apply.is_some() {
+            return Err(ReadyLoopError::PendingReady);
+        }
 
         let Some(ready) = self.raft.ready() else {
             if snapshot_pointer.is_some() {
@@ -790,8 +824,140 @@ where
         Ok(())
     }
 
-    /// persists the next Ready, restores any verified snapshot, applies
-    /// committed commands in order, and acknowledges the applied frontier
+    /// Persists the next Ready and applies a bounded prefix of its committed
+    /// entries. The exact Ready remains owned by this runtime until its whole
+    /// committed prefix reaches `advance_applied`.
+    pub(crate) fn persist_and_apply_next_ready_budgeted<SM, SF>(
+        &mut self,
+        snapshot_store: &mut SF,
+        state_machine: &mut SM,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+        SF: RaftSnapshotStore,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        if budget.max_ready_generations == 0 {
+            return Ok(ReadyApplyProgress::default());
+        }
+
+        let pending_apply = if let Some(pending_apply) = self.pending_apply.take() {
+            pending_apply
+        } else {
+            let Some(pending) = self.raft.ready() else {
+                return Ok(ReadyApplyProgress::default());
+            };
+
+            if budget.max_apply_entries == 0 && !pending.committed_entries.is_empty() {
+                self.pending_apply = None;
+                return Ok(ReadyApplyProgress {
+                    ready_generations: 1,
+                    ..ReadyApplyProgress::default()
+                });
+            }
+
+            if let Some(snapshot) = pending.snapshot.as_ref()
+                && snapshot.size_bytes > budget.max_snapshot_bytes as u64
+            {
+                return Ok(ReadyApplyProgress {
+                    ready_generations: 1,
+                    ..ReadyApplyProgress::default()
+                });
+            }
+
+            let verified_snapshot = if let Some(snapshot) = pending.snapshot.as_ref() {
+                let identity = self.persistence.log_view().identity();
+
+                let pointer = match snapshot_store.publish(identity, snapshot) {
+                    Ok(pointer) => pointer,
+                    Err(error) => {
+                        self.quarantine();
+                        return Err(ReadyApplyError::SnapshotStore(error.to_string()));
+                    }
+                };
+
+                let verified = match snapshot_store.load_verified(&pointer) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.quarantine();
+                        return Err(ReadyApplyError::SnapshotStore(error.to_string()));
+                    }
+                };
+
+                if verified.metadata() != snapshot.metadata() {
+                    self.quarantine();
+                    return Err(ReadyApplyError::SnapshotMetadataMismatch {
+                        expected: Box::new(snapshot.metadata()),
+                        received: Box::new(verified.metadata()),
+                    });
+                }
+
+                Some((pointer, verified))
+            } else {
+                None
+            };
+
+            let snapshot_bytes = verified_snapshot
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.size_bytes as usize)
+                .unwrap_or(0);
+
+            let pointer = verified_snapshot
+                .as_ref()
+                .map(|(pointer, _)| pointer.clone());
+
+            let ready = self
+                .persist_next_ready(pointer)
+                .map_err(ReadyApplyError::Ready)?
+                .expect("the pending Ready was observed immediately before persistence");
+
+            let mut applied_through = self.raft.last_applied();
+            let mut applied_frontier = self.applied_frontier;
+
+            if let Some((_, snapshot)) = verified_snapshot {
+                if let Err(error) = state_machine.restore_snapshot(&snapshot) {
+                    self.quarantine();
+                    return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
+                }
+
+                self.raft.restore_snapshot(snapshot);
+
+                applied_through = ready
+                    .snapshot
+                    .as_ref()
+                    .expect("snapshot persistence must retain the Ready snapshot")
+                    .last_included_index;
+
+                let snapshot = ready
+                    .snapshot
+                    .as_ref()
+                    .expect("snapshot persistence must retain the Ready snapshot");
+                applied_frontier = Some(AppliedRaftFrontier::new(
+                    snapshot.last_included_index,
+                    snapshot.last_included_term,
+                ));
+            }
+
+            return self.apply_ready_prefix(
+                PendingReadyApplication {
+                    ready,
+                    next_entry: 0,
+                    applied_through,
+                    applied_frontier,
+                },
+                state_machine,
+                budget,
+                snapshot_bytes,
+            );
+        };
+
+        self.apply_ready_prefix(pending_apply, state_machine, budget, 0)
+    }
+
+    /// Compatibility entry point for callers that intentionally drain one
+    /// Ready generation without an application budget.
     pub fn persist_and_apply_next_ready<SM, SF>(
         &mut self,
         snapshot_store: &mut SF,
@@ -801,87 +967,42 @@ where
         SM: RaftReadyStateMachine,
         SF: RaftSnapshotStore,
     {
-        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+        let progress = self.persist_and_apply_next_ready_budgeted(
+            snapshot_store,
+            state_machine,
+            crate::host::MultiRaftTurnBudget {
+                max_groups: usize::MAX,
+                max_messages: usize::MAX,
+                max_ready_generations: 1,
+                max_apply_entries: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )?;
 
-        let Some(pending) = self.raft.ready() else {
-            return Ok(None);
-        };
+        Ok(progress.ready)
+    }
 
-        let verified_snapshot = if let Some(snapshot) = pending.snapshot.as_ref() {
-            let identity = self.persistence.log_view().identity();
-
-            let pointer = match snapshot_store.publish(identity, snapshot) {
-                Ok(pointer) => pointer,
-                Err(error) => {
-                    self.quarantine();
-                    return Err(ReadyApplyError::SnapshotStore(error.to_string()));
-                }
-            };
-
-            let verified = match snapshot_store.load_verified(&pointer) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.quarantine();
-                    return Err(ReadyApplyError::SnapshotStore(error.to_string()));
-                }
-            };
-
-            if verified.metadata() != snapshot.metadata() {
-                self.quarantine();
-                return Err(ReadyApplyError::SnapshotMetadataMismatch {
-                    expected: Box::new(snapshot.metadata()),
-                    received: Box::new(verified.metadata()),
-                });
-            }
-
-            Some((pointer, verified))
-        } else {
-            None
-        };
-
-        let pointer = verified_snapshot
-            .as_ref()
-            .map(|(pointer, _)| pointer.clone());
-
-        let ready = self
-            .persist_next_ready(pointer)
-            .map_err(ReadyApplyError::Ready)?
-            .expect("the pending Ready was observed immediately before persistence");
-
-        let mut applied_through = self.raft.last_applied();
-        let mut applied_frontier = self.applied_frontier;
-
-        if let Some((_, snapshot)) = verified_snapshot {
-            if let Err(error) = state_machine.restore_snapshot(&snapshot) {
-                self.quarantine();
-                return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
-            }
-
-            self.raft.restore_snapshot(snapshot);
-
-            applied_through = ready
-                .snapshot
-                .as_ref()
-                .expect("snapshot persistence must retain the Ready snapshot")
-                .last_included_index;
-
-            let snapshot = ready
-                .snapshot
-                .as_ref()
-                .expect("snapshot persistence must retain the Ready snapshot");
-            applied_frontier = Some(AppliedRaftFrontier::new(
-                snapshot.last_included_index,
-                snapshot.last_included_term,
-            ));
-        }
-
-        for entry in &ready.committed_entries {
-            let expected_index = applied_through.saturating_add(1);
+    fn apply_ready_prefix<SM>(
+        &mut self,
+        mut pending: PendingReadyApplication,
+        state_machine: &mut SM,
+        budget: crate::host::MultiRaftTurnBudget,
+        snapshot_bytes: usize,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+    {
+        let mut applied_entries = 0;
+        while pending.next_entry < pending.ready.committed_entries.len()
+            && applied_entries < budget.max_apply_entries
+        {
+            let entry = &pending.ready.committed_entries[pending.next_entry];
+            let expected_index = pending.applied_through.saturating_add(1);
 
             if entry.index != expected_index {
                 self.quarantine();
                 return Err(ReadyApplyError::ApplyOrder {
-                    previous: applied_through,
+                    previous: pending.applied_through,
                     received: entry.index,
                 });
             }
@@ -896,20 +1017,36 @@ where
                 });
             }
 
-            applied_through = entry.index;
-            applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
+            pending.applied_through = entry.index;
+            pending.applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
+            pending.next_entry += 1;
+            applied_entries += 1;
         }
 
-        if applied_through > self.raft.last_applied()
-            && let Err(error) = self.raft.advance_applied(applied_through)
+        if pending.next_entry < pending.ready.committed_entries.len() {
+            self.pending_apply = Some(pending);
+            return Ok(ReadyApplyProgress {
+                ready_generations: 1,
+                apply_entries: applied_entries,
+                snapshot_bytes,
+                ..ReadyApplyProgress::default()
+            });
+        }
+
+        if pending.applied_through > self.raft.last_applied()
+            && let Err(error) = self.raft.advance_applied(pending.applied_through)
         {
             self.quarantine();
             return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
         }
 
-        self.applied_frontier = applied_frontier;
-
-        Ok(Some(ready))
+        self.applied_frontier = pending.applied_frontier;
+        Ok(ReadyApplyProgress {
+            ready: Some(pending.ready),
+            ready_generations: 1,
+            apply_entries: applied_entries,
+            snapshot_bytes,
+        })
     }
 
     fn ensure_active(&self) -> Result<(), ReadyLoopError> {
@@ -921,7 +1058,7 @@ where
     }
 
     fn ensure_no_pending_ready(&self) -> Result<(), ReadyLoopError> {
-        if self.raft.has_ready() {
+        if self.has_pending_work() {
             return Err(ReadyLoopError::PendingReady);
         }
 

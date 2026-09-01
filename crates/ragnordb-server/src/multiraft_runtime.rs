@@ -31,7 +31,7 @@ use ragnordb_common::{
 
 use ragnordb_multiraft::{
     bootstrap::FileBootstrapStore,
-    host::{MultiRaftHost, MultiRaftHostError, RoutedRaftMessage},
+    host::{MultiRaftHost, MultiRaftHostError, MultiRaftTurnBudget, RoutedRaftMessage},
     meta::{MetadataRuntimeHandle, bootstrap_metadata_group, recover_metadata_group},
     snapshot::SnapshotWorkController,
     storage::{
@@ -59,6 +59,10 @@ use crate::{
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+const HOST_GROUP_BUDGET: usize = 64;
+
+const HOST_MESSAGE_BUDGET: usize = 256;
 
 const METADATA_ELECTION_TIMEOUT_TICKS: u64 = 10;
 
@@ -745,11 +749,14 @@ fn run_host<W>(
             return;
         }
 
-        while let Ok(message) = inbound.try_recv() {
-            match host.route(message) {
-                Ok(outbound) => {
-                    send_outbound(&transport, outbound);
-                }
+        let mut admitted_messages = 0;
+        while admitted_messages < HOST_MESSAGE_BUDGET {
+            let Ok(message) = inbound.try_recv() else {
+                break;
+            };
+
+            match host.enqueue_message(message) {
+                Ok(()) => admitted_messages += 1,
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
                     signal_metadata_failure(
@@ -776,6 +783,43 @@ fn run_host<W>(
                         "Raft group message was rejected",
                     );
                 }
+            }
+        }
+
+        match host.run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: HOST_GROUP_BUDGET,
+                max_messages: HOST_MESSAGE_BUDGET,
+                ..MultiRaftTurnBudget::default()
+            },
+        ) {
+            Ok(turn) => send_outbound(&transport, turn.outbound),
+
+            Err(MultiRaftHostError::RecoveryRequired) => {
+                signal_metadata_failure(
+                    &mut startup_sender,
+                    "shared Raft WAL requires node recovery".to_string(),
+                );
+
+                tracing::error!("shared Raft WAL requires node recovery");
+
+                fail_pending_metadata(
+                    &mut pending_metadata,
+                    &mut pending_metadata_by_request,
+                    Error::RecoveryRequired {
+                        reason: "shared Raft WAL requires node recovery".to_string(),
+                    },
+                );
+
+                return;
+            }
+
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "bounded MultiRaft host turn failed",
+                );
             }
         }
 
