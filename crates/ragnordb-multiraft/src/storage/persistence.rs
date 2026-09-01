@@ -277,6 +277,39 @@ impl<W> NodeRaftWal<W> {
             .map(|mut state| refresh_recovery_fence(&mut state))
             .unwrap_or(true)
     }
+
+    /// Append one already-ordered node-wide batch through the shared WAL.
+    ///
+    /// The host uses this boundary when several groups have prepared their
+    /// independent Ready generations in the same scheduler turn. The WAL
+    /// result is deliberately returned as one exact extent list so the host
+    /// can acknowledge each group only after the common durability frontier is
+    /// known. This method does not publish any group state by itself.
+    pub fn append_batch_and_sync(
+        &self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, BatchAppendFailure>
+    where
+        W: RaftWal,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BatchAppendFailure::NotStaged(WalError::BrokenDurabilityContract))?;
+
+        append_batch_and_sync_locked(&mut state, records)
+    }
+
+    /// Fence the shared persistence owner after a post-sync contract violation
+    /// that makes the returned durable frontier untrustworthy.
+    pub(crate) fn require_recovery(&self, reason: impl Into<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.recovery_required = true;
+            if let Some(gate) = &state.durability_gate {
+                gate.require_recovery(DurabilityFailureKind::RecoveryRequired, reason);
+            }
+        }
+    }
 }
 
 impl<W> Clone for NodeRaftWal<W> {
@@ -310,27 +343,8 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
             .state
             .lock()
             .map_err(|_| BatchAppendFailure::NotStaged(WalError::BrokenDurabilityContract))?;
-        if refresh_recovery_fence(&mut state) {
-            return Err(BatchAppendFailure::NotStaged(
-                WalError::BrokenDurabilityContract,
-            ));
-        }
-        let result = state.wal.append_batch_and_sync(records);
-        if matches!(result, Err(BatchAppendFailure::OutcomeUnknown { .. }))
-            || result
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.wal_error().requires_recovery())
-        {
-            state.recovery_required = true;
-            if let Some(gate) = &state.durability_gate {
-                gate.require_recovery(
-                    DurabilityFailureKind::RecoveryRequired,
-                    "shared A-WAL Raft persistence outcome is uncertain",
-                );
-            }
-        }
-        result
+
+        append_batch_and_sync_locked(&mut state, records)
     }
 
     fn acquire_retention_pin(
@@ -373,6 +387,34 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
 
         prune_to_slowest_floor(&mut state)
     }
+}
+
+fn append_batch_and_sync_locked<W: RaftWal>(
+    state: &mut NodeRaftWalState<W>,
+    records: &[(RecordType, &[u8])],
+) -> Result<BatchAppendResult, BatchAppendFailure> {
+    if refresh_recovery_fence(state) {
+        return Err(BatchAppendFailure::NotStaged(
+            WalError::BrokenDurabilityContract,
+        ));
+    }
+
+    let result = state.wal.append_batch_and_sync(records);
+    if matches!(result, Err(BatchAppendFailure::OutcomeUnknown { .. }))
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.wal_error().requires_recovery())
+    {
+        state.recovery_required = true;
+        if let Some(gate) = &state.durability_gate {
+            gate.require_recovery(
+                DurabilityFailureKind::RecoveryRequired,
+                "shared A-WAL Raft persistence outcome is uncertain",
+            );
+        }
+    }
+    result
 }
 
 fn prune_to_slowest_floor<W: RaftWal>(state: &mut NodeRaftWalState<W>) -> Result<usize, String> {
@@ -534,12 +576,50 @@ impl<W: RaftWal> RaftWalStorage<W> {
             return Err(RaftPersistenceError::RecoveryRequired);
         }
 
+        let prepared = self.prepare_batch(batch)?;
+        let result = self.append_prepared_batch(&prepared)?;
+        self.commit_prepared_batch(prepared, result)
+    }
+
+    /// Prepare a Ready generation without touching the shared WAL.
+    ///
+    /// The returned value owns the encoded records and the prevalidated logical
+    /// successor state. A caller may combine several such values into one
+    /// shared-WAL append, but must commit each value exactly once and in the
+    /// same per-group order in which it was prepared.
+    pub(crate) fn prepare_persistence_batch(
+        &self,
+        batch: RaftPersistenceBatch,
+    ) -> Result<PreparedBatch, RaftPersistenceError> {
+        if self.recovery_required {
+            return Err(RaftPersistenceError::RecoveryRequired);
+        }
+
+        self.prepare_batch(batch)
+    }
+
+    /// Return owned WAL payloads for a prepared group batch.
+    pub(crate) fn prepared_records(prepared: &PreparedBatch) -> Vec<(RecordType, Vec<u8>)> {
+        prepared
+            .records
+            .iter()
+            .map(|record| (record.kind.as_wal_record_type(), record.payload.clone()))
+            .collect()
+    }
+
+    /// Publish one prepared group batch from the exact extents returned by the
+    /// shared WAL append. No state is advanced until this validation succeeds.
+    pub(crate) fn commit_prepared_batch(
+        &mut self,
+        prepared: PreparedBatch,
+        result: BatchAppendResult,
+    ) -> Result<RaftPersistedBatch, RaftPersistenceError> {
         let PreparedBatch {
             records,
             entry_records,
             snapshot,
             hard_state,
-        } = self.prepare_batch(batch)?;
+        } = prepared;
 
         if records.is_empty() {
             return Ok(RaftPersistedBatch {
@@ -549,35 +629,7 @@ impl<W: RaftWal> RaftWalStorage<W> {
             });
         }
 
-        let borrowed_records: Vec<_> = records
-            .iter()
-            .map(|record| (record.kind.as_wal_record_type(), record.payload.as_slice()))
-            .collect();
-        let extents = match self.wal.append_batch_and_sync(&borrowed_records) {
-            Ok(extents) => extents,
-            Err(BatchAppendFailure::NotStaged(source)) => {
-                let recovery_required = source.requires_recovery();
-                self.recovery_required |= recovery_required;
-                return Err(RaftPersistenceError::NotStaged {
-                    recovery_required,
-                    reason: source.to_string(),
-                });
-            }
-            Err(BatchAppendFailure::OutcomeUnknown { result, source }) => {
-                self.recovery_required = true;
-                return Err(RaftPersistenceError::OutcomeUnknown {
-                    start_lsn: result
-                        .record_extents
-                        .first()
-                        .map(|extent| extent.start_lsn)
-                        .unwrap_or(Lsn::ZERO),
-                    end_lsn: result.final_end_lsn,
-                    reason: source.to_string(),
-                });
-            }
-        };
-        let extents = extents.record_extents;
-
+        let extents = result.record_extents;
         if extents.len() != records.len() {
             self.recovery_required = true;
             return Err(RaftPersistenceError::PostSyncInvariant(
@@ -596,6 +648,13 @@ impl<W: RaftWal> RaftWalStorage<W> {
                 "non-empty persistence batch produced no final WAL extent",
             ),
         )?;
+
+        if result.final_end_lsn != end_lsn {
+            self.recovery_required = true;
+            return Err(RaftPersistenceError::PostSyncInvariant(
+                "A-WAL final durability frontier did not cover the final record".to_string(),
+            ));
+        }
 
         let mut durable_view = self.log_view.clone();
         let mut extent_offset = 0;
@@ -667,6 +726,48 @@ impl<W: RaftWal> RaftWalStorage<W> {
             end_lsn: Some(end_lsn),
             record_count: records.len(),
         })
+    }
+
+    fn append_prepared_batch(
+        &mut self,
+        prepared: &PreparedBatch,
+    ) -> Result<BatchAppendResult, RaftPersistenceError> {
+        if prepared.records.is_empty() {
+            return Ok(BatchAppendResult {
+                record_extents: Vec::new(),
+                final_end_lsn: Lsn::ZERO,
+            });
+        }
+
+        let borrowed_records: Vec<_> = prepared
+            .records
+            .iter()
+            .map(|record| (record.kind.as_wal_record_type(), record.payload.as_slice()))
+            .collect();
+
+        match self.wal.append_batch_and_sync(&borrowed_records) {
+            Ok(result) => Ok(result),
+            Err(BatchAppendFailure::NotStaged(source)) => {
+                let recovery_required = source.requires_recovery();
+                self.recovery_required |= recovery_required;
+                Err(RaftPersistenceError::NotStaged {
+                    recovery_required,
+                    reason: source.to_string(),
+                })
+            }
+            Err(BatchAppendFailure::OutcomeUnknown { result, source }) => {
+                self.recovery_required = true;
+                Err(RaftPersistenceError::OutcomeUnknown {
+                    start_lsn: result
+                        .record_extents
+                        .first()
+                        .map(|extent| extent.start_lsn)
+                        .unwrap_or(Lsn::ZERO),
+                    end_lsn: result.final_end_lsn,
+                    reason: source.to_string(),
+                })
+            }
+        }
     }
 
     fn prepare_batch(
@@ -828,12 +929,12 @@ impl<W: RaftWal> RaftWalStorage<W> {
     }
 }
 
-struct PreparedRecord {
+pub(crate) struct PreparedRecord {
     kind: RaftWalRecordType,
     payload: Vec<u8>,
 }
 
-struct PreparedBatch {
+pub(crate) struct PreparedBatch {
     records: Vec<PreparedRecord>,
     entry_records: Vec<RaftLogEntryRecord>,
     snapshot: Option<RaftSnapshotPointerRecord>,

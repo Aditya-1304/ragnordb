@@ -42,6 +42,7 @@ struct SharedWalState {
     next_lsn: Lsn,
     durable_end_lsn: Lsn,
     records: Vec<WalRecord>,
+    batch_sizes: Vec<usize>,
 }
 
 impl SharedWal {
@@ -50,6 +51,7 @@ impl SharedWal {
             next_lsn: Lsn::new(100),
             durable_end_lsn: Lsn::ZERO,
             records: Vec::new(),
+            batch_sizes: Vec::new(),
         }));
 
         (
@@ -67,6 +69,7 @@ impl RaftWal for SharedWal {
         records: &[(RecordType, &[u8])],
     ) -> Result<BatchAppendResult, BatchAppendFailure> {
         let mut state = self.state.lock().unwrap();
+        state.batch_sizes.push(records.len());
 
         let mut extents = Vec::with_capacity(records.len());
 
@@ -274,6 +277,10 @@ fn two_real_ready_loops_share_one_node_wal_and_recover_without_namespace_collisi
     let (records, durable_end_lsn) = {
         let state = wal_state.lock().unwrap();
 
+        assert!(
+            state.batch_sizes.iter().any(|size| *size >= 2),
+            "the real hosted groups must share at least one cross-group WAL batch",
+        );
         (state.records.clone(), state.durable_end_lsn)
     };
 

@@ -1,9 +1,10 @@
 //! Physical-node host for the independent Raft replicas assigned to one server.
 //!
-//! The host owns the cross-group admission boundary. It schedules one group
-//! operation at a time, keeps inbound work tagged by group, and preserves the
-//! per-group Ready ordering delegated to each [`HostedRaftGroup`]. Shared A-WAL
-//! uncertainty still fences every local replica.
+//! The host owns the cross-group admission boundary. It schedules bounded group
+//! operations, keeps inbound work tagged by group, and preserves the per-group
+//! Ready ordering delegated to each [`HostedRaftGroup`]. Prepared Ready records
+//! are coalesced into one shared A-WAL sync when a scheduler turn has multiple
+//! eligible groups. Shared A-WAL uncertainty still fences every local replica.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -28,6 +29,7 @@ use crate::{
         recovery::RecoveredRaftStorage,
     },
 };
+use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
 
 /// Wire envelope used by the byte-oriented Raft runtime.
 pub type RaftMessageEnvelope = Envelope<Vec<u8>, Vec<u8>>;
@@ -91,6 +93,13 @@ pub struct HostedGroupTurn {
     pub ready_generations: usize,
     pub apply_entries: usize,
     pub snapshot_bytes: usize,
+    pub(crate) persistence: Option<HostedPersistenceBatch>,
+}
+
+/// One group's encoded Ready records awaiting the node-wide WAL boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedPersistenceBatch {
+    pub(crate) records: Vec<(RecordType, Vec<u8>)>,
 }
 
 /// Result of one bounded host turn.
@@ -204,6 +213,15 @@ struct PendingGroupMessages {
     bulk: VecDeque<RoutedRaftMessage>,
 }
 
+struct PendingPersistenceGroup {
+    raft_group_id: RaftGroupId,
+    batch: HostedPersistenceBatch,
+    /// Outbound envelopes are held until the group's Ready persistence has
+    /// completed. This keeps custom group adapters subject to the same
+    /// persistence-before-message invariant as the built-in adapter.
+    outbound: Vec<RaftMessageEnvelope>,
+}
+
 impl PendingGroupMessages {
     fn is_empty(&self) -> bool {
         self.control.is_empty() && self.bulk.is_empty()
@@ -249,11 +267,24 @@ fn is_control_message(message: &RaftMessageEnvelope) -> bool {
     )
 }
 
+fn group_budget_for_completion(budget: MultiRaftTurnBudget) -> MultiRaftTurnBudget {
+    MultiRaftTurnBudget {
+        max_groups: 1,
+        max_messages: 0,
+        max_ready_generations: budget.max_ready_generations,
+        max_apply_entries: budget.max_apply_entries,
+        max_snapshot_bytes: budget.max_snapshot_bytes,
+    }
+}
+
 /// Type-erased lifecycle boundary for one hosted Raft replica.
 ///
-/// A single call performs the triggering Raft operation and drains the
-/// resulting Ready lifecycle before returning. This prevents another caller
-/// from interleaving work between `step()` and persistence/apply.
+/// Direct operations drain the complete Ready lifecycle before returning.
+/// Budgeted scheduler operations may instead prepare a Ready and return its
+/// records to the host for cross-group WAL batching; the host then calls
+/// [`HostedRaftGroup::complete_persistence`] before releasing dependent output.
+/// This prevents another caller from interleaving work between `step()` and
+/// persistence/apply.
 pub trait HostedRaftGroup: Send {
     fn identity(&self) -> RaftReplicaIdentity;
 
@@ -302,6 +333,35 @@ pub trait HostedRaftGroup: Send {
                 outbound,
                 ..HostedGroupTurn::default()
             })
+    }
+
+    /// Prepare group work without publishing outbound messages that depend on
+    /// its Ready persistence. The default keeps compatibility with lightweight
+    /// host adapters that do not expose a two-phase persistence lifecycle.
+    fn tick_and_prepare_budgeted(
+        &mut self,
+        ticks: u64,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.tick_and_drain_budgeted(ticks, budget)
+    }
+
+    fn step_and_prepare_budgeted(
+        &mut self,
+        message: RaftMessageEnvelope,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.step_and_drain_budgeted(message, budget)
+    }
+
+    /// Complete a group whose records were included in the shared WAL batch.
+    /// The default has no group-owned persistence to complete.
+    fn complete_persistence(
+        &mut self,
+        _outcome: Result<BatchAppendResult, BatchAppendFailure>,
+        _budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        Ok(HostedGroupTurn::default())
     }
 }
 
@@ -390,6 +450,7 @@ where
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
             snapshot_bytes: progress.snapshot_bytes,
+            persistence: None,
         })
     }
 
@@ -414,6 +475,48 @@ where
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
             snapshot_bytes: progress.snapshot_bytes,
+            persistence: None,
+        })
+    }
+
+    fn prepare_ready_budgeted(
+        &mut self,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            let progress = self
+                .ready_loop
+                .prepare_next_ready_for_batch(&mut self.snapshot_store, budget)
+                .map_err(classify_apply_error)?;
+
+            return Ok(HostedGroupTurn {
+                outbound: Vec::new(),
+                ready_generations: progress.ready_generations,
+                apply_entries: 0,
+                snapshot_bytes: progress.snapshot_bytes,
+                persistence: progress.request.map(|request| HostedPersistenceBatch {
+                    records: request.records,
+                }),
+            });
+        }
+
+        if self.ready_loop.has_pending_apply() {
+            return self.drain_ready_budgeted(budget);
+        }
+
+        let progress = self
+            .ready_loop
+            .prepare_next_ready_for_batch(&mut self.snapshot_store, budget)
+            .map_err(classify_apply_error)?;
+
+        Ok(HostedGroupTurn {
+            outbound: Vec::new(),
+            ready_generations: progress.ready_generations,
+            apply_entries: 0,
+            snapshot_bytes: progress.snapshot_bytes,
+            persistence: progress.request.map(|request| HostedPersistenceBatch {
+                records: request.records,
+            }),
         })
     }
 }
@@ -435,6 +538,12 @@ where
     }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            return Err(HostedGroupError::Retryable(
+                "a shared-WAL batch is still awaiting completion".to_string(),
+            ));
+        }
+
         // A previous retryable persistence operation may have left a Ready
         // generation pending. Finish it before mutating Raft again.
         let mut turn = self.drain_ready()?;
@@ -455,6 +564,12 @@ where
         &mut self,
         message: RaftMessageEnvelope,
     ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            return Err(HostedGroupError::Retryable(
+                "a shared-WAL batch is still awaiting completion".to_string(),
+            ));
+        }
+
         let mut turn = self.drain_ready()?;
 
         if self.ready_loop.has_pending_work() {
@@ -478,6 +593,12 @@ where
         command: Vec<u8>,
         encoded_len: usize,
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            return Err(HostedGroupError::Retryable(
+                "a shared-WAL batch is still awaiting completion".to_string(),
+            ));
+        }
+
         let mut turn = self.drain_ready()?;
 
         if self.ready_loop.has_pending_work() {
@@ -497,51 +618,81 @@ where
         Ok((index, turn.outbound))
     }
 
-    fn tick_and_drain_budgeted(
+    fn tick_and_prepare_budgeted(
         &mut self,
         ticks: u64,
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
-        let mut turn = self.drain_ready_budgeted(budget)?;
+        let mut turn = self.prepare_ready_budgeted(budget)?;
 
-        if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
+        if turn.persistence.is_some()
+            || turn.ready_generations > 0
+            || self.ready_loop.has_pending_work()
+        {
             return Ok(turn);
         }
 
         self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
-        let after_tick = self.drain_ready_budgeted(budget);
+        let after_tick = self.prepare_ready_budgeted(budget);
         match after_tick {
             Ok(after_tick) => {
                 turn.outbound.extend(after_tick.outbound);
                 turn.ready_generations += after_tick.ready_generations;
                 turn.apply_entries += after_tick.apply_entries;
                 turn.snapshot_bytes += after_tick.snapshot_bytes;
+                turn.persistence = after_tick.persistence;
                 Ok(turn)
             }
             Err(error) => Err(error),
         }
     }
 
-    fn step_and_drain_budgeted(
+    fn step_and_prepare_budgeted(
         &mut self,
         message: RaftMessageEnvelope,
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
-        let mut turn = self.drain_ready_budgeted(budget)?;
+        let mut turn = self.prepare_ready_budgeted(budget)?;
 
-        if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
+        if turn.persistence.is_some()
+            || turn.ready_generations > 0
+            || self.ready_loop.has_pending_work()
+        {
             return Ok(turn);
         }
 
         self.ready_loop
             .step(message)
             .map_err(classify_ready_error)?;
-        let after_step = self.drain_ready_budgeted(budget)?;
+        let after_step = self.prepare_ready_budgeted(budget)?;
         turn.outbound.extend(after_step.outbound);
         turn.ready_generations += after_step.ready_generations;
         turn.apply_entries += after_step.apply_entries;
         turn.snapshot_bytes += after_step.snapshot_bytes;
+        turn.persistence = after_step.persistence;
         Ok(turn)
+    }
+
+    fn complete_persistence(
+        &mut self,
+        outcome: Result<BatchAppendResult, BatchAppendFailure>,
+        budget: MultiRaftTurnBudget,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        let progress = self
+            .ready_loop
+            .complete_prepared_ready(outcome, &mut self.state_machine, budget)
+            .map_err(classify_apply_error)?;
+
+        Ok(HostedGroupTurn {
+            outbound: progress
+                .ready
+                .map(|ready| ready.messages)
+                .unwrap_or_default(),
+            ready_generations: 0,
+            apply_entries: progress.apply_entries,
+            snapshot_bytes: progress.snapshot_bytes,
+            persistence: None,
+        })
     }
 }
 
@@ -877,6 +1028,7 @@ where
         }
 
         let mut result = MultiRaftTurnResult::default();
+        let mut persistence_groups = Vec::new();
 
         while result.groups_serviced < budget.max_groups {
             let Some(raft_group_id) = self.runnable.pop() else {
@@ -940,15 +1092,13 @@ where
                 max_messages: budget
                     .max_messages
                     .saturating_sub(result.messages_processed),
-                max_ready_generations: budget
-                    .max_ready_generations
-                    .saturating_sub(result.ready_generations),
-                max_apply_entries: budget
-                    .max_apply_entries
-                    .saturating_sub(result.apply_entries),
-                max_snapshot_bytes: budget
-                    .max_snapshot_bytes
-                    .saturating_sub(result.snapshot_bytes),
+                // These limits are per group. Keeping the same bounded slice
+                // for every group lets the shared WAL batch independent Ready
+                // generations without allowing one group to consume another's
+                // apply or snapshot budget.
+                max_ready_generations: budget.max_ready_generations,
+                max_apply_entries: budget.max_apply_entries,
+                max_snapshot_bytes: budget.max_snapshot_bytes,
             };
 
             let group_result = {
@@ -959,10 +1109,10 @@ where
 
                 match (process_message, pending_message.take()) {
                     (true, Some(message)) => {
-                        group.step_and_drain_budgeted(message.envelope, group_budget)
+                        group.step_and_prepare_budgeted(message.envelope, group_budget)
                     }
                     (false, None) | (false, Some(_)) => {
-                        group.tick_and_drain_budgeted(ticks, group_budget)
+                        group.tick_and_prepare_budgeted(ticks, group_budget)
                     }
                     (true, None) => unreachable!("message selection was checked above"),
                 }
@@ -978,15 +1128,24 @@ where
                     result.ready_generations += turn.ready_generations;
                     result.apply_entries += turn.apply_entries;
                     result.snapshot_bytes += turn.snapshot_bytes;
-                    result
-                        .outbound
-                        .extend(turn.outbound.into_iter().map(|envelope| RoutedRaftMessage {
-                            raft_group_id,
-                            envelope,
-                        }));
 
-                    self.ensure_shared_wal_healthy()?;
-                    self.reschedule_after_turn(raft_group_id);
+                    if let Some(batch) = turn.persistence {
+                        persistence_groups.push(PendingPersistenceGroup {
+                            raft_group_id,
+                            batch,
+                            outbound: turn.outbound,
+                        });
+                    } else {
+                        result
+                            .outbound
+                            .extend(turn.outbound.into_iter().map(|envelope| RoutedRaftMessage {
+                                raft_group_id,
+                                envelope,
+                            }));
+
+                        self.ensure_shared_wal_healthy()?;
+                        self.reschedule_after_turn(raft_group_id);
+                    }
                 }
 
                 Err(HostedGroupError::RecoveryRequired) => {
@@ -1033,6 +1192,121 @@ where
                     let _ = reason;
                     self.reschedule_after_turn(raft_group_id);
                 }
+            }
+        }
+
+        if !persistence_groups.is_empty() {
+            let total_records = persistence_groups
+                .iter()
+                .map(|pending| pending.batch.records.len())
+                .sum::<usize>();
+            let records: Vec<_> = persistence_groups
+                .iter()
+                .flat_map(|pending| pending.batch.records.iter())
+                .map(|(record_type, payload)| (*record_type, payload.as_slice()))
+                .collect();
+
+            let mut shared_outcome = if records.is_empty() {
+                Ok(BatchAppendResult {
+                    record_extents: Vec::new(),
+                    final_end_lsn: wal::lsn::Lsn::ZERO,
+                })
+            } else {
+                self.node_wal.append_batch_and_sync(&records)
+            };
+
+            if let Ok(batch_result) = &shared_outcome
+                && (batch_result.record_extents.len() != total_records
+                    || (total_records > 0
+                        && batch_result
+                            .record_extents
+                            .last()
+                            .is_none_or(|extent| extent.end_lsn != batch_result.final_end_lsn)))
+            {
+                self.node_wal.require_recovery(
+                    "shared A-WAL returned an invalid cross-group batch frontier",
+                );
+                shared_outcome = Err(BatchAppendFailure::OutcomeUnknown {
+                    result: batch_result.clone(),
+                    source: wal::error::WalError::BrokenDurabilityContract,
+                });
+            }
+
+            let mut extent_offset = 0;
+            let mut recovery_required = false;
+
+            for pending in persistence_groups {
+                let record_count = pending.batch.records.len();
+                let group_outcome = match &shared_outcome {
+                    Ok(batch_result) => {
+                        let extents = batch_result
+                            .record_extents
+                            .get(extent_offset..extent_offset + record_count)
+                            .expect("cross-group WAL extent validation precedes splitting");
+                        extent_offset += record_count;
+                        Ok(BatchAppendResult {
+                            record_extents: extents.to_vec(),
+                            final_end_lsn: extents
+                                .last()
+                                .map(|extent| extent.end_lsn)
+                                .unwrap_or(wal::lsn::Lsn::ZERO),
+                        })
+                    }
+                    Err(error) => Err(error.clone()),
+                };
+
+                let completion = {
+                    let group = self
+                        .groups
+                        .get_mut(&pending.raft_group_id)
+                        .expect("a pending persistence batch belongs to an active group");
+                    group.complete_persistence(group_outcome, group_budget_for_completion(budget))
+                };
+
+                match completion {
+                    Ok(turn) => {
+                        result.apply_entries += turn.apply_entries;
+                        result.snapshot_bytes += turn.snapshot_bytes;
+                        result.outbound.extend(
+                            pending
+                                .outbound
+                                .into_iter()
+                                .chain(turn.outbound)
+                                .map(|envelope| RoutedRaftMessage {
+                                    raft_group_id: pending.raft_group_id,
+                                    envelope,
+                                }),
+                        );
+
+                        if self.node_wal.recovery_required() {
+                            recovery_required = true;
+                        } else {
+                            self.reschedule_after_turn(pending.raft_group_id);
+                        }
+                    }
+                    Err(HostedGroupError::RecoveryRequired) => {
+                        recovery_required = true;
+                    }
+                    Err(HostedGroupError::Group(reason)) => {
+                        if self.node_wal.recovery_required() {
+                            recovery_required = true;
+                        } else {
+                            self.quarantined.insert(pending.raft_group_id, reason);
+                            self.pending_messages.remove(&pending.raft_group_id);
+                        }
+                    }
+                    Err(HostedGroupError::Retryable(_reason)) => {
+                        self.reschedule_after_turn(pending.raft_group_id);
+                    }
+                    Err(HostedGroupError::Rejected(_reason)) => {
+                        self.reschedule_after_turn(pending.raft_group_id);
+                    }
+                }
+            }
+
+            if recovery_required || self.node_wal.recovery_required() {
+                self.state = HostState::RecoveryRequired;
+                return Err(MultiRaftHostError::RecoveryRequired);
             }
         }
 
@@ -1432,10 +1706,15 @@ mod tests {
     use raft::{message::Message, types::ReplicaId as RaftReplicaId};
     use ragnordb_common::ids::ReplicaId;
     use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
-    use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
+    use wal::{
+        error::{BatchAppendFailure, WalError},
+        lsn::Lsn,
+        types::RecordType,
+        wal::{AppendResult, BatchAppendResult},
+    };
 
     struct TestWal;
 
@@ -1495,6 +1774,155 @@ mod tests {
             _: usize,
         ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
             Ok((0, std::mem::take(&mut self.outbound)))
+        }
+    }
+
+    #[derive(Clone)]
+    struct BatchWal {
+        state: Arc<Mutex<BatchWalState>>,
+        outcome_unknown: bool,
+    }
+
+    struct BatchWalState {
+        next_lsn: Lsn,
+        append_calls: usize,
+        record_types: Vec<RecordType>,
+    }
+
+    impl BatchWal {
+        fn new(outcome_unknown: bool) -> (Self, Arc<Mutex<BatchWalState>>) {
+            let state = Arc::new(Mutex::new(BatchWalState {
+                next_lsn: Lsn::new(100),
+                append_calls: 0,
+                record_types: Vec::new(),
+            }));
+            (
+                Self {
+                    state: Arc::clone(&state),
+                    outcome_unknown,
+                },
+                state,
+            )
+        }
+    }
+
+    impl RaftWal for BatchWal {
+        fn append_batch_and_sync(
+            &mut self,
+            records: &[(RecordType, &[u8])],
+        ) -> Result<BatchAppendResult, BatchAppendFailure> {
+            let mut state = self.state.lock().unwrap();
+            state.append_calls += 1;
+
+            let mut extents = Vec::with_capacity(records.len());
+            for (record_type, payload) in records {
+                let start_lsn = state.next_lsn;
+                let end_lsn = start_lsn
+                    .checked_add_bytes(payload.len() as u64 + 32)
+                    .unwrap();
+                state.next_lsn = end_lsn;
+                state.record_types.push(*record_type);
+                extents.push(AppendResult { start_lsn, end_lsn });
+            }
+
+            let result = BatchAppendResult {
+                final_end_lsn: extents
+                    .last()
+                    .map(|extent| extent.end_lsn)
+                    .unwrap_or(Lsn::ZERO),
+                record_extents: extents,
+            };
+
+            if self.outcome_unknown {
+                Err(BatchAppendFailure::OutcomeUnknown {
+                    result,
+                    source: WalError::BrokenDurabilityContract,
+                })
+            } else {
+                Ok(result)
+            }
+        }
+    }
+
+    struct PersistenceGroup {
+        identity: RaftReplicaIdentity,
+        records: Vec<(RecordType, Vec<u8>)>,
+        pending: bool,
+        completions: Arc<Mutex<Vec<PersistenceCompletion>>>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    type PersistenceCompletion = Result<(usize, Option<Lsn>), String>;
+
+    impl HostedRaftGroup for PersistenceGroup {
+        fn identity(&self) -> RaftReplicaIdentity {
+            self.identity
+        }
+
+        fn has_pending_work(&self) -> bool {
+            self.pending
+        }
+
+        fn tick_and_drain(&mut self, _: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+            unreachable!("Slice 2 test groups use the two-phase budgeted path")
+        }
+
+        fn step_and_drain(
+            &mut self,
+            _: RaftMessageEnvelope,
+        ) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
+            unreachable!("Slice 2 test groups use the two-phase budgeted path")
+        }
+
+        fn propose_and_drain(
+            &mut self,
+            _: Vec<u8>,
+            _: usize,
+        ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+            unreachable!("Slice 2 test groups use the two-phase budgeted path")
+        }
+
+        fn tick_and_prepare_budgeted(
+            &mut self,
+            _: u64,
+            _: MultiRaftTurnBudget,
+        ) -> Result<HostedGroupTurn, HostedGroupError> {
+            self.pending = true;
+            Ok(HostedGroupTurn {
+                ready_generations: 1,
+                persistence: Some(HostedPersistenceBatch {
+                    records: self.records.clone(),
+                }),
+                ..HostedGroupTurn::default()
+            })
+        }
+
+        fn step_and_prepare_budgeted(
+            &mut self,
+            _: RaftMessageEnvelope,
+            budget: MultiRaftTurnBudget,
+        ) -> Result<HostedGroupTurn, HostedGroupError> {
+            self.tick_and_prepare_budgeted(0, budget)
+        }
+
+        fn complete_persistence(
+            &mut self,
+            outcome: Result<BatchAppendResult, BatchAppendFailure>,
+            _: MultiRaftTurnBudget,
+        ) -> Result<HostedGroupTurn, HostedGroupError> {
+            let completion = match outcome {
+                Ok(result) => {
+                    self.pending = false;
+                    self.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        result.record_extents.len(),
+                        result.record_extents.first().map(|extent| extent.start_lsn),
+                    ))
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            self.completions.lock().unwrap().push(completion);
+            Ok(HostedGroupTurn::default())
         }
     }
 
@@ -1744,6 +2172,139 @@ mod tests {
         );
         assert_eq!(first_ticks.load(Ordering::SeqCst), 1);
         assert_eq!(second_ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn one_shared_wal_sync_completes_every_prepared_group_with_its_extent_range() {
+        let (wal, wal_state) = BatchWal::new(false);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(wal));
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let first_completions = Arc::new(Mutex::new(Vec::new()));
+        let second_completions = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: first_identity,
+            records: vec![
+                (RecordType::new(101), b"first-entry".to_vec()),
+                (RecordType::new(102), b"first-hard-state".to_vec()),
+            ],
+            pending: false,
+            completions: Arc::clone(&first_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: second_identity,
+            records: vec![(RecordType::new(201), b"second-entry".to_vec())],
+            pending: false,
+            completions: Arc::clone(&second_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_now(first_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(second_identity.raft_group_id)
+            .unwrap();
+
+        let turn = host
+            .run_turn(
+                0,
+                MultiRaftTurnBudget {
+                    max_groups: 2,
+                    max_messages: 0,
+                    max_ready_generations: 1,
+                    max_apply_entries: 1,
+                    max_snapshot_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+
+        let wal_state = wal_state.lock().unwrap();
+        assert_eq!(turn.groups_serviced, 2);
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(wal_state.append_calls, 1);
+        assert_eq!(
+            wal_state.record_types,
+            vec![
+                RecordType::new(101),
+                RecordType::new(102),
+                RecordType::new(201)
+            ]
+        );
+        assert_eq!(
+            *first_completions.lock().unwrap(),
+            vec![Ok((2, Some(Lsn::new(100))))]
+        );
+        assert_eq!(
+            *second_completions.lock().unwrap(),
+            vec![Ok((1, Some(Lsn::new(100 + 11 + 32 + 16 + 32))))]
+        );
+    }
+
+    #[test]
+    fn unknown_cross_group_wal_outcome_is_fanned_out_before_host_fences() {
+        let (wal, wal_state) = BatchWal::new(true);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(wal));
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let first_completions = Arc::new(Mutex::new(Vec::new()));
+        let second_completions = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: first_identity,
+            records: vec![(RecordType::new(301), b"first".to_vec())],
+            pending: false,
+            completions: Arc::clone(&first_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: second_identity,
+            records: vec![(RecordType::new(302), b"second".to_vec())],
+            pending: false,
+            completions: Arc::clone(&second_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_now(first_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(second_identity.raft_group_id)
+            .unwrap();
+
+        assert_eq!(
+            host.run_turn(
+                0,
+                MultiRaftTurnBudget {
+                    max_groups: 2,
+                    max_messages: 0,
+                    max_ready_generations: 1,
+                    max_apply_entries: 1,
+                    max_snapshot_bytes: usize::MAX,
+                },
+            )
+            .unwrap_err(),
+            MultiRaftHostError::RecoveryRequired
+        );
+
+        assert_eq!(wal_state.lock().unwrap().append_calls, 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        assert_eq!(first_completions.lock().unwrap().len(), 1);
+        assert_eq!(second_completions.lock().unwrap().len(), 1);
+        assert!(first_completions.lock().unwrap()[0].is_err());
+        assert!(second_completions.lock().unwrap()[0].is_err());
+        assert_eq!(
+            host.run_turn(0, MultiRaftTurnBudget::default()),
+            Err(MultiRaftHostError::RecoveryRequired)
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ use crate::storage::{
         RaftPersistedBatch, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage,
     },
 };
+use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
 
 type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
 type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
@@ -67,11 +68,33 @@ pub(crate) struct ReadyApplyProgress {
     pub(crate) snapshot_bytes: usize,
 }
 
+/// Encoded records staged by one group before the node-wide shared-WAL append.
+/// The host owns the batch boundary; the group retains its prepared logical
+/// successor until the corresponding extent range is committed.
+#[derive(Debug)]
+pub(crate) struct ReadyPersistenceRequest {
+    pub(crate) records: Vec<(RecordType, Vec<u8>)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadyPersistenceProgress {
+    pub(crate) request: Option<ReadyPersistenceRequest>,
+    pub(crate) ready_generations: usize,
+    pub(crate) snapshot_bytes: usize,
+}
+
 struct PendingReadyApplication {
     ready: ReadyGeneration,
     next_entry: usize,
     applied_through: LogIndex,
     applied_frontier: Option<AppliedRaftFrontier>,
+}
+
+struct PendingReadyPersistence {
+    ready: ReadyGeneration,
+    prepared: crate::storage::persistence::PreparedBatch,
+    verified_snapshot: Option<Snapshot<Vec<u8>>>,
+    snapshot_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +424,7 @@ where
     state: RuntimeState,
     applied_frontier: Option<AppliedRaftFrontier>,
     pending_apply: Option<PendingReadyApplication>,
+    pending_persistence: Option<PendingReadyPersistence>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -420,6 +444,7 @@ where
             state: RuntimeState::Active,
             applied_frontier: None,
             pending_apply: None,
+            pending_persistence: None,
         }
     }
 
@@ -443,7 +468,15 @@ where
     /// Returns whether this group has a Ready generation or an applied Ready
     /// that must be resumed before another Raft mutation is admitted.
     pub fn has_pending_work(&self) -> bool {
-        self.pending_apply.is_some() || self.raft.has_ready()
+        self.pending_persistence.is_some() || self.pending_apply.is_some() || self.raft.has_ready()
+    }
+
+    pub(crate) fn has_pending_persistence(&self) -> bool {
+        self.pending_persistence.is_some()
+    }
+
+    pub(crate) fn has_pending_apply(&self) -> bool {
+        self.pending_apply.is_some()
     }
 
     /// Release storage retention through the group lifecycle owner.
@@ -499,7 +532,7 @@ where
     ) -> ReadyLoopResult {
         self.ensure_active()?;
 
-        if self.pending_apply.is_some() {
+        if self.pending_persistence.is_some() || self.pending_apply.is_some() {
             return Err(ReadyLoopError::PendingReady);
         }
 
@@ -573,6 +606,244 @@ where
         }
 
         Ok(Some(ready))
+    }
+
+    /// Prepare the next Ready generation without acknowledging it to Raft.
+    ///
+    /// Snapshot publication and WAL-record validation happen before the
+    /// request is exposed to the host. The exact prepared state remains owned
+    /// by this loop, which prevents a retry or a later Ready from changing the
+    /// bytes represented by the request.
+    pub(crate) fn prepare_next_ready_for_batch<SF>(
+        &mut self,
+        snapshot_store: &mut SF,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyPersistenceProgress, ReadyApplyError>
+    where
+        SF: RaftSnapshotStore,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        if self.pending_apply.is_some() {
+            return Ok(ReadyPersistenceProgress::default());
+        }
+
+        if let Some(pending) = &self.pending_persistence {
+            return Ok(ReadyPersistenceProgress {
+                request: Some(ReadyPersistenceRequest {
+                    records: RaftWalStorage::<W>::prepared_records(&pending.prepared),
+                }),
+                ready_generations: 1,
+                snapshot_bytes: pending.snapshot_bytes,
+            });
+        }
+
+        if budget.max_ready_generations == 0 {
+            return Ok(ReadyPersistenceProgress::default());
+        }
+
+        let Some(ready) = self.raft.ready() else {
+            return Ok(ReadyPersistenceProgress::default());
+        };
+
+        if budget.max_apply_entries == 0 && !ready.committed_entries.is_empty() {
+            return Ok(ReadyPersistenceProgress {
+                ready_generations: 1,
+                ..ReadyPersistenceProgress::default()
+            });
+        }
+
+        let verified_snapshot = if let Some(snapshot) = ready.snapshot.as_ref() {
+            if snapshot.size_bytes > budget.max_snapshot_bytes as u64 {
+                return Ok(ReadyPersistenceProgress {
+                    ready_generations: 1,
+                    ..ReadyPersistenceProgress::default()
+                });
+            }
+
+            let identity = self.persistence.log_view().identity();
+            let pointer = snapshot_store
+                .publish(identity, snapshot)
+                .map_err(|error| {
+                    self.quarantine();
+                    ReadyApplyError::SnapshotStore(error.to_string())
+                })?;
+            let verified = snapshot_store.load_verified(&pointer).map_err(|error| {
+                self.quarantine();
+                ReadyApplyError::SnapshotStore(error.to_string())
+            })?;
+
+            if verified.metadata() != snapshot.metadata() {
+                self.quarantine();
+                return Err(ReadyApplyError::SnapshotMetadataMismatch {
+                    expected: Box::new(snapshot.metadata()),
+                    received: Box::new(verified.metadata()),
+                });
+            }
+
+            Some((pointer, verified))
+        } else {
+            None
+        };
+
+        let pointer = verified_snapshot
+            .as_ref()
+            .map(|(pointer, _)| pointer.clone());
+        let prepared = self
+            .persistence
+            .prepare_persistence_batch(RaftPersistenceBatch {
+                snapshot: pointer,
+                entries: ready.entries_to_persist.clone(),
+                hard_state: ready.hard_state.clone(),
+            })
+            .map_err(|error| {
+                self.quarantine();
+                ReadyApplyError::Ready(ReadyLoopError::PersistenceRejected(error))
+            })?;
+        let records = RaftWalStorage::<W>::prepared_records(&prepared);
+        let snapshot_bytes = verified_snapshot
+            .as_ref()
+            .map(|(_, snapshot)| snapshot.size_bytes as usize)
+            .unwrap_or(0);
+
+        self.pending_persistence = Some(PendingReadyPersistence {
+            ready,
+            prepared,
+            verified_snapshot: verified_snapshot.map(|(_, snapshot)| snapshot),
+            snapshot_bytes,
+        });
+
+        Ok(ReadyPersistenceProgress {
+            request: Some(ReadyPersistenceRequest { records }),
+            ready_generations: 1,
+            snapshot_bytes,
+        })
+    }
+
+    /// Complete a prepared Ready after the host's shared-WAL batch returns.
+    ///
+    /// A retryable pre-staging failure restores the exact pending request. An
+    /// outcome-unknown failure reports that Ready to Raft and fences this loop;
+    /// callers must not acknowledge or retry it in the current process.
+    pub(crate) fn complete_prepared_ready<SM>(
+        &mut self,
+        outcome: Result<BatchAppendResult, BatchAppendFailure>,
+        state_machine: &mut SM,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        let pending = self
+            .pending_persistence
+            .take()
+            .ok_or(ReadyApplyError::Ready(ReadyLoopError::PendingReady))?;
+
+        let result = match outcome {
+            Ok(result) => result,
+            Err(BatchAppendFailure::NotStaged(source)) => {
+                let recovery_required = source.requires_recovery();
+                if !recovery_required {
+                    self.pending_persistence = Some(pending);
+                    return Err(ReadyApplyError::Ready(
+                        ReadyLoopError::RetryablePersistence(RaftPersistenceError::NotStaged {
+                            recovery_required: false,
+                            reason: source.to_string(),
+                        }),
+                    ));
+                }
+
+                self.state = RuntimeState::RecoveryRequired;
+                return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+            }
+            Err(BatchAppendFailure::OutcomeUnknown { .. }) => {
+                let report_result = self
+                    .raft
+                    .report_persistence_outcome_unknown(pending.ready.id);
+                self.state = RuntimeState::RecoveryRequired;
+                if let Err(error) = report_result {
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
+                }
+                return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+            }
+        };
+
+        if let Err(error) = self
+            .persistence
+            .commit_prepared_batch(pending.prepared, result)
+        {
+            match error {
+                RaftPersistenceError::RecoveryRequired
+                | RaftPersistenceError::NotStaged {
+                    recovery_required: true,
+                    ..
+                }
+                | RaftPersistenceError::PostSyncInvariant(_)
+                | RaftPersistenceError::InternalInvariant(_) => {
+                    self.state = RuntimeState::RecoveryRequired;
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+                }
+                other => {
+                    self.quarantine();
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::PersistenceRejected(
+                        other,
+                    )));
+                }
+            }
+        }
+
+        self.raft
+            .advance_persisted(pending.ready.id)
+            .map_err(|error| {
+                self.state = RuntimeState::RecoveryRequired;
+                ReadyApplyError::Ready(ReadyLoopError::Advance(error))
+            })?;
+
+        let mut applied_through = self.raft.last_applied();
+        let mut applied_frontier = self.applied_frontier;
+
+        if let Some(snapshot) = pending.verified_snapshot {
+            if let Err(error) = state_machine.restore_snapshot(&snapshot) {
+                self.quarantine();
+                return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
+            }
+
+            self.raft.restore_snapshot(snapshot.clone());
+            applied_through = pending
+                .ready
+                .snapshot
+                .as_ref()
+                .expect("prepared snapshot must retain the Ready snapshot")
+                .last_included_index;
+            applied_frontier = Some(AppliedRaftFrontier::new(
+                pending
+                    .ready
+                    .snapshot
+                    .as_ref()
+                    .expect("prepared snapshot must retain the Ready snapshot")
+                    .last_included_index,
+                pending
+                    .ready
+                    .snapshot
+                    .as_ref()
+                    .expect("prepared snapshot must retain the Ready snapshot")
+                    .last_included_term,
+            ));
+        }
+
+        self.apply_ready_prefix(
+            PendingReadyApplication {
+                ready: pending.ready,
+                next_entry: 0,
+                applied_through,
+                applied_frontier,
+            },
+            state_machine,
+            budget,
+            pending.snapshot_bytes,
+        )
     }
 
     /// completes an externally transferred snapshot after its image has been
@@ -838,6 +1109,10 @@ where
         SF: RaftSnapshotStore,
     {
         self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        if self.pending_persistence.is_some() {
+            return Err(ReadyApplyError::Ready(ReadyLoopError::PendingReady));
+        }
 
         if budget.max_ready_generations == 0 {
             return Ok(ReadyApplyProgress::default());
