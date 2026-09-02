@@ -55,6 +55,7 @@ use crate::{
     config::NodeConfig,
     data_directory_lock::DataDirectoryLock,
     database::SharedLocalDatabase,
+    replica_registry::{LocalReplicaKey, LocalReplicaRegistry},
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
 };
@@ -333,6 +334,14 @@ impl MultiRaftRuntime {
                 }
             })?;
 
+        // Load the node-local lifecycle authority before deriving any Raft
+        // recovery configuration. A corrupt registry or a registry belonging
+        // to another cluster must fail startup closed rather than allowing
+        // WAL recovery to proceed from an incomplete local view.
+        if let Some(cluster_id) = config.cluster_id.as_deref() {
+            LocalReplicaRegistry::open(config.data_dir.join("replica-registry.json"), cluster_id)?;
+        }
+
         let bootstraps =
             store
                 .load_all_durable_bootstraps()
@@ -386,6 +395,15 @@ impl MultiRaftRuntime {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated MultiRaft runtime requires cluster_id".to_string())
         })?;
+
+        let registry =
+            LocalReplicaRegistry::open(config.data_dir.join("replica-registry.json"), &cluster_id)?;
+        registry.validate_recovered_lifetimes(recovered.replicas().map(|(identity, _)| {
+            LocalReplicaKey {
+                raft_group_id: identity.raft_group_id,
+                replica_id: identity.replica_id,
+            }
+        }))?;
 
         let local_seed = config
             .seed_nodes
