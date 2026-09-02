@@ -85,3 +85,12 @@ message RaftSnapshotPointerRecord {
     // it to equal last_included_index so replay always resumes at index + 1.
     uint64 applied_index = 14;
 }
+
+// Group-tagged transport envelope. The Raft core remains independent of
+// RagnorDB protobufs, so its versioned message bytes are carried as an opaque
+// field while the physical-node identity and logical group are schema-tagged.
+message RaftTransportEnvelope {
+    uint64 from_replica_id = 1;
+    uint64 to_replica_id = 2;
+    bytes raft_message = 3;
+}

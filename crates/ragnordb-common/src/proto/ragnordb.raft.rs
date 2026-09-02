@@ -118,6 +118,18 @@ pub struct RaftSnapshotPointerRecord {
     #[prost(uint64, tag = "14")]
     pub applied_index: u64,
 }
+/// Group-tagged transport envelope. The Raft core remains independent of
+/// RagnorDB protobufs, so its versioned message bytes are carried as an opaque
+/// field while the physical-node identity and logical group are schema-tagged.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaftTransportEnvelope {
+    #[prost(uint64, tag = "1")]
+    pub from_replica_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub to_replica_id: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub raft_message: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RaftConfigurationChangeKind {

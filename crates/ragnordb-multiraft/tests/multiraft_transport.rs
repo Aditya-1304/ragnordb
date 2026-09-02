@@ -153,6 +153,11 @@ fn local_transport_rejects_bulk_work_when_the_byte_budget_is_full() {
             bulk_queue_capacity: 4,
             control_queue_bytes: 1024,
             bulk_queue_bytes: 1,
+            outbound_queue_capacity: 4,
+            outbound_queue_bytes: 1024,
+            inbound_connection_capacity: 4,
+            inbound_connection_workers: 1,
+            cluster_id: None,
         },
     )
     .unwrap();

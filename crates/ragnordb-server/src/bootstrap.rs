@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error, Result,
-    ids::{NodeId, RaftGroupId, ReplicaId},
+    ids::{RaftGroupId, ReplicaId},
     metadata_codec::NodeDescriptor,
     raft_bootstrap::RaftGroupBootstrap,
 };
@@ -49,16 +49,20 @@ pub(crate) struct ResolvedMetadataBootstrap {
 ///
 /// fresh cluster:
 ///
-///     static seed config
-///         -> canonical RaftGroupBootstrap
-///         -> fsync durable bootstrap
-///         -> start metadata group
+/// ```text
+/// fresh cluster:
+///
+/// static seed config
+///     -> canonical RaftGroupBootstrap
+///     -> fsync durable bootstrap
+///     -> start metadata group
 ///
 /// restart:
 ///
-///     durable RaftGroupBootstrap
-///         -> ignore changed static membership
-///         -> combine with recovered committed ConfState
+/// durable RaftGroupBootstrap
+///     -> ignore changed static membership
+///     -> combine with recovered committed ConfState
+/// ```
 ///
 /// a recovered metadata WAL without its bootstrap is fail stop corruption:
 /// membership must never be reconstructed from the current config in that case
@@ -329,8 +333,7 @@ fn validate_recovered_metadata_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf};
-
+    use ragnordb_common::ids::NodeId;
     use tempfile::TempDir;
 
     use super::*;

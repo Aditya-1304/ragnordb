@@ -5,11 +5,11 @@
 //! routing layer required when one process hosts many independent groups.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
     },
@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use prost::Message as ProstMessage;
 use raft::{
     message::Envelope,
     runtime::transport_tcp::TcpEnvelopeCodec,
@@ -24,6 +25,7 @@ use raft::{
 };
 use ragnordb_common::{
     ids::{NodeId, RaftGroupId, ReplicaId},
+    proto::raft::RaftTransportEnvelope,
     raft_bootstrap::RaftGroupBootstrap,
 };
 
@@ -34,6 +36,11 @@ const MULTIRAFT_RAFT_MESSAGE_TYPE: u8 = 0x01;
 const MULTIRAFT_FRAME_HEADER_BYTES: usize = 14;
 const MAX_MULTIRAFT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const HANDSHAKE_MAGIC: &[u8; 8] = b"RAGNOMR1";
+const HANDSHAKE_VERSION: u8 = 1;
+const HANDSHAKE_FIXED_BYTES: usize = 8 + 1 + 8 + 2;
 
 /// Node-local limits for the physical MultiRaft transport.
 ///
@@ -41,13 +48,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// of append or snapshot-control traffic therefore cannot consume the queue
 /// reserved for elections and heartbeats. The frame limit is checked before a
 /// payload buffer is allocated by the listener.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRaftTransportConfig {
     pub max_frame_bytes: usize,
     pub control_queue_capacity: usize,
     pub bulk_queue_capacity: usize,
     pub control_queue_bytes: usize,
     pub bulk_queue_bytes: usize,
+    pub outbound_queue_capacity: usize,
+    pub outbound_queue_bytes: usize,
+    pub inbound_connection_capacity: usize,
+    pub inbound_connection_workers: usize,
+    pub cluster_id: Option<String>,
 }
 
 impl Default for NodeRaftTransportConfig {
@@ -58,12 +70,17 @@ impl Default for NodeRaftTransportConfig {
             bulk_queue_capacity: 1_024,
             control_queue_bytes: 256 * 1024,
             bulk_queue_bytes: MAX_MULTIRAFT_FRAME_BYTES + MULTIRAFT_FRAME_HEADER_BYTES,
+            outbound_queue_capacity: 1_024,
+            outbound_queue_bytes: 64 * 1024 * 1024,
+            inbound_connection_capacity: 128,
+            inbound_connection_workers: 16,
+            cluster_id: None,
         }
     }
 }
 
 impl NodeRaftTransportConfig {
-    fn validate(self) -> io::Result<()> {
+    fn validate(&self) -> io::Result<()> {
         if self.max_frame_bytes == 0 || self.max_frame_bytes > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -75,6 +92,11 @@ impl NodeRaftTransportConfig {
             || self.bulk_queue_capacity == 0
             || self.control_queue_bytes == 0
             || self.bulk_queue_bytes == 0
+            || self.outbound_queue_capacity == 0
+            || self.outbound_queue_bytes == 0
+            || self.inbound_connection_capacity == 0
+            || self.inbound_connection_workers == 0
+            || self.inbound_connection_workers > self.inbound_connection_capacity
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -82,7 +104,27 @@ impl NodeRaftTransportConfig {
             ));
         }
 
+        if let Some(cluster_id) = self.cluster_id.as_ref() {
+            if cluster_id.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "MultiRaft cluster identity cannot be empty",
+                ));
+            }
+            if cluster_id.len() > u16::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "MultiRaft cluster identity must fit the handshake length field",
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn with_cluster_id(mut self, cluster_id: impl Into<String>) -> Self {
+        self.cluster_id = Some(cluster_id.into());
+        self
     }
 }
 
@@ -150,7 +192,10 @@ impl NodeRaftInbound {
             }
 
             let Some(deadline) = deadline else {
-                thread::yield_now();
+                // Duration::MAX cannot be represented as an Instant deadline
+                // on all platforms. Keep this effectively-unbounded receive
+                // blocking without turning the overflow case into a hot spin.
+                thread::sleep(Duration::from_millis(10));
                 continue;
             };
 
@@ -279,7 +324,7 @@ impl InboundQueueReceiver {
     }
 }
 
-fn inbound_queues(config: NodeRaftTransportConfig) -> (InboundSenders, NodeRaftInbound) {
+fn inbound_queues(config: &NodeRaftTransportConfig) -> (InboundSenders, NodeRaftInbound) {
     let (control_sender, control_receiver) = mpsc::sync_channel(config.control_queue_capacity);
     let (bulk_sender, bulk_receiver) = mpsc::sync_channel(config.bulk_queue_capacity);
 
@@ -314,22 +359,145 @@ fn inbound_queues(config: NodeRaftTransportConfig) -> (InboundSenders, NodeRaftI
     )
 }
 
+struct QueuedOutbound {
+    payload: Vec<u8>,
+    wire_bytes: usize,
+    raft_group_id: RaftGroupId,
+}
+
+#[derive(Default)]
+struct OutboundPeerState {
+    control: VecDeque<QueuedOutbound>,
+    bulk: VecDeque<QueuedOutbound>,
+    queued_bytes: usize,
+}
+
+struct OutboundPeer {
+    target_node_id: NodeId,
+    address: SocketAddr,
+    local_node_id: NodeId,
+    cluster_id: Option<String>,
+    max_queue_capacity: usize,
+    max_queue_bytes: usize,
+    shutdown: Arc<AtomicBool>,
+    state: Mutex<OutboundPeerState>,
+    wake: Condvar,
+}
+
+impl OutboundPeer {
+    fn try_send(&self, message: RoutedRaftMessage, payload: Vec<u8>) -> io::Result<()> {
+        let wire_bytes = payload.len();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("MultiRaft outbound queue lock is poisoned"))?;
+
+        if wire_bytes > self.max_queue_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MultiRaft outbound queue cannot admit this message",
+            ));
+        }
+
+        if state.control.len() + state.bulk.len() >= self.max_queue_capacity
+            || state.queued_bytes.saturating_add(wire_bytes) > self.max_queue_bytes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MultiRaft outbound queue is full",
+            ));
+        }
+
+        let queued = QueuedOutbound {
+            payload,
+            wire_bytes,
+            raft_group_id: message.raft_group_id,
+        };
+        if crate::host::is_control_message(&message.envelope) {
+            state.control.push_back(queued);
+        } else {
+            state.bulk.push_back(queued);
+        }
+        state.queued_bytes = state.queued_bytes.saturating_add(wire_bytes);
+        drop(state);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn next(&self) -> Option<QueuedOutbound> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return None;
+            }
+
+            if let Some(message) = state.control.pop_front() {
+                return Some(message);
+            }
+            if let Some(message) = state.bulk.pop_front() {
+                return Some(message);
+            }
+
+            state = self
+                .wake
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    fn finish(&self, wire_bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.queued_bytes = state.queued_bytes.saturating_sub(wire_bytes);
+    }
+}
+
 struct NodeRaftListenerLifecycle {
     shutdown: Arc<AtomicBool>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    connection_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    outbound_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    outbound_peers: Vec<Arc<OutboundPeer>>,
 }
 
 impl Drop for NodeRaftListenerLifecycle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        for peer in &self.outbound_peers {
+            peer.wake.notify_all();
+        }
 
-        let worker = self
+        if let Some(worker) = self
             .worker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .take()
+        {
+            let _ = worker.join();
+        }
 
-        if let Some(worker) = worker {
+        for worker in self
+            .connection_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            let _ = worker.join();
+        }
+
+        for worker in self
+            .outbound_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
             let _ = worker.join();
         }
     }
@@ -346,7 +514,7 @@ pub struct NodeRaftTransport {
     routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
     codec: ByteEnvelopeCodec,
     max_frame_bytes: usize,
-    connections: Arc<Mutex<BTreeMap<NodeId, TcpStream>>>,
+    outbound_peers: Arc<BTreeMap<NodeId, Arc<OutboundPeer>>>,
 
     // Used for a rare local destination without unnecessarily entering TCP.
     loopback: InboundSenders,
@@ -389,30 +557,84 @@ impl NodeRaftTransport {
         let local_addr = listener.local_addr()?;
 
         let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
-        let (inbound_tx, inbound_rx) = inbound_queues(config);
+        let (inbound_tx, inbound_rx) = inbound_queues(&config);
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let worker = spawn_listener(
-            listener,
-            inbound_tx.clone(),
-            codec.clone(),
-            Arc::clone(&shutdown),
-            config.max_frame_bytes,
-        )?;
+        let routes = Arc::new(RwLock::new(BTreeMap::new()));
+        let (connection_tx, connection_rx) = mpsc::sync_channel(config.inbound_connection_capacity);
+        let connection_rx = Arc::new(Mutex::new(connection_rx));
+
+        let worker = spawn_listener(listener, connection_tx, Arc::clone(&shutdown))?;
+
+        let mut connection_workers = Vec::with_capacity(config.inbound_connection_workers);
+        for worker_index in 0..config.inbound_connection_workers {
+            let connection_rx = Arc::clone(&connection_rx);
+            let inbound = inbound_tx.clone();
+            let codec = codec.clone();
+            let routes = Arc::clone(&routes);
+            let node_addresses = node_addresses.clone();
+            let cluster_id = config.cluster_id.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let max_frame_bytes = config.max_frame_bytes;
+
+            connection_workers.push(
+                thread::Builder::new()
+                    .name(format!("ragnordb-multiraft-connection-{worker_index}"))
+                    .spawn(move || {
+                        connection_worker(
+                            connection_rx,
+                            inbound,
+                            codec,
+                            routes,
+                            node_addresses,
+                            cluster_id,
+                            local_node_id,
+                            max_frame_bytes,
+                            shutdown,
+                        );
+                    })?,
+            );
+        }
+
+        let mut outbound_peers = BTreeMap::new();
+        let mut outbound_workers = Vec::with_capacity(node_addresses.len());
+        for (target_node_id, address) in &node_addresses {
+            let peer = Arc::new(OutboundPeer {
+                target_node_id: *target_node_id,
+                address: *address,
+                local_node_id,
+                cluster_id: config.cluster_id.clone(),
+                max_queue_capacity: config.outbound_queue_capacity,
+                max_queue_bytes: config.outbound_queue_bytes,
+                shutdown: Arc::clone(&shutdown),
+                state: Mutex::new(OutboundPeerState::default()),
+                wake: Condvar::new(),
+            });
+            let worker_peer = Arc::clone(&peer);
+            outbound_workers.push(
+                thread::Builder::new()
+                    .name(format!("ragnordb-multiraft-outbound-{}", target_node_id.0))
+                    .spawn(move || outbound_worker(worker_peer))?,
+            );
+            outbound_peers.insert(*target_node_id, peer);
+        }
 
         let lifecycle = Arc::new(NodeRaftListenerLifecycle {
             shutdown,
             worker: Mutex::new(Some(worker)),
+            connection_workers: Mutex::new(connection_workers),
+            outbound_workers: Mutex::new(outbound_workers),
+            outbound_peers: outbound_peers.values().cloned().collect(),
         });
 
         let transport = Self {
             local_node_id,
             node_addresses: Arc::new(node_addresses),
-            routes: Arc::new(RwLock::new(BTreeMap::new())),
+            routes,
             codec,
             max_frame_bytes: config.max_frame_bytes,
-            connections: Arc::new(Mutex::new(BTreeMap::new())),
+            outbound_peers: Arc::new(outbound_peers),
             loopback: inbound_tx,
             _lifecycle: lifecycle,
         };
@@ -520,44 +742,29 @@ impl NodeRaftTransport {
                 )
             })?;
 
-        let mut connections = self
-            .connections
-            .lock()
-            .map_err(|_| io::Error::other("MultiRaft connection registry lock is poisoned"))?;
-        let stream = match connections.entry(target_node) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
-                stream.set_nodelay(true)?;
-                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-                entry.insert(stream)
-            }
-        };
+        let peer = self.outbound_peers.get(&target_node).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no outbound transport worker for physical node {}",
+                    target_node.0
+                ),
+            )
+        })?;
 
-        if let Err(error) =
-            write_frame(stream, &payload, self.max_frame_bytes).and_then(|()| stream.flush())
-        {
-            connections.remove(&target_node);
-            return Err(error);
-        }
-
-        Ok(())
+        debug_assert_eq!(peer.address, address);
+        peer.try_send(message, payload)
     }
 
     pub fn try_send_all(
         &self,
         messages: impl IntoIterator<Item = RoutedRaftMessage>,
     ) -> io::Result<()> {
-        let mut messages = messages.into_iter().collect::<Vec<_>>();
-        // Stable sorting preserves the producer's FIFO order within each lane
-        // while ensuring elections and heartbeats are attempted before bulk
-        // append traffic when a node is under pressure.
-        messages.sort_by_key(|message| {
-            usize::from(!crate::host::is_control_message(&message.envelope))
-        });
-
         let mut first_error = None;
 
+        // Priority is enforced by each bounded per-peer queue. Avoid collecting
+        // the iterator here: an outbound Ready burst must not create an
+        // unbounded temporary node-wide Vec before admission control runs.
         for message in messages {
             if let Err(error) = self.try_send(message)
                 && first_error.is_none()
@@ -636,7 +843,15 @@ fn encode_routed_message(
         ));
     }
 
-    let inner = codec.encode_envelope(&message.envelope)?;
+    let raft_message = codec.encode_envelope(&message.envelope)?;
+    let from_replica_id = message.envelope.from.get();
+    let to_replica_id = message.envelope.to.get();
+    let inner = RaftTransportEnvelope {
+        from_replica_id,
+        to_replica_id,
+        raft_message,
+    }
+    .encode_to_vec();
 
     let inner_length = u32::try_from(inner.len()).map_err(|_| {
         io::Error::new(
@@ -712,7 +927,16 @@ fn decode_routed_message(
         ));
     }
 
-    let envelope = codec.decode_envelope(&payload[MULTIRAFT_FRAME_HEADER_BYTES..])?;
+    let wire = RaftTransportEnvelope::decode(&payload[MULTIRAFT_FRAME_HEADER_BYTES..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let envelope = codec.decode_envelope(&wire.raft_message)?;
+
+    if wire.from_replica_id != envelope.from.get() || wire.to_replica_id != envelope.to.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MultiRaft protobuf envelope identity does not match its Raft payload",
+        ));
+    }
 
     Ok(RoutedRaftMessage {
         raft_group_id,
@@ -722,10 +946,8 @@ fn decode_routed_message(
 
 fn spawn_listener(
     listener: TcpListener,
-    inbound: InboundSenders,
-    codec: ByteEnvelopeCodec,
+    connections: SyncSender<TcpStream>,
     shutdown: Arc<AtomicBool>,
-    max_frame_bytes: usize,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("ragnordb-multiraft-listener".to_string())
@@ -733,25 +955,9 @@ fn spawn_listener(
             while !shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let inbound = inbound.clone();
-                        let codec = codec.clone();
-
-                        if let Err(error) = thread::Builder::new()
-                            .name("ragnordb-multiraft-connection".to_string())
-                            .spawn(move || {
-                                if let Err(error) =
-                                    handle_connection(stream, inbound, codec, max_frame_bytes)
-                                {
-                                    tracing::debug!(
-                                        error = %error,
-                                        "MultiRaft connection closed with error",
-                                    );
-                                }
-                            })
-                        {
-                            tracing::warn!(
-                                error = %error,
-                                "MultiRaft connection worker could not be created",
+                        if connections.try_send(stream).is_err() {
+                            tracing::debug!(
+                                "MultiRaft inbound connection queue is full; dropping connection"
                             );
                         }
                     }
@@ -773,21 +979,106 @@ fn spawn_listener(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn connection_worker(
+    connections: Arc<Mutex<Receiver<TcpStream>>>,
+    inbound: InboundSenders,
+    codec: ByteEnvelopeCodec,
+    routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
+    node_addresses: BTreeMap<NodeId, SocketAddr>,
+    cluster_id: Option<String>,
+    local_node_id: NodeId,
+    max_frame_bytes: usize,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        let stream = {
+            let receiver = connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            receiver.recv_timeout(Duration::from_millis(100))
+        };
+
+        let Ok(stream) = stream else {
+            continue;
+        };
+
+        if let Err(error) = handle_connection(
+            stream,
+            inbound.clone(),
+            codec.clone(),
+            routes.clone(),
+            &node_addresses,
+            cluster_id.as_deref(),
+            local_node_id,
+            max_frame_bytes,
+            Arc::clone(&shutdown),
+        ) {
+            tracing::debug!(
+                error = %error,
+                "MultiRaft connection closed with error",
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     inbound: InboundSenders,
     codec: ByteEnvelopeCodec,
+    routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
+    node_addresses: &BTreeMap<NodeId, SocketAddr>,
+    cluster_id: Option<&str>,
+    local_node_id: NodeId,
     max_frame_bytes: usize,
+    shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
+    let remote_node_id = read_handshake(&mut stream, local_node_id, node_addresses, cluster_id)?;
 
     loop {
-        let Some(payload) = read_frame(&mut stream, max_frame_bytes)? else {
-            return Ok(());
+        let payload = match read_frame(&mut stream, max_frame_bytes) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
         };
 
         let message = decode_routed_message(&codec, &payload)?;
+
+        let source_replica_id = ReplicaId::from_raft(message.envelope.from);
+        let source_node_id = routes
+            .read()
+            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?
+            .get(&(message.raft_group_id, source_replica_id))
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "unknown source replica {} for Raft group {}",
+                        source_replica_id.0, message.raft_group_id.0
+                    ),
+                )
+            })?;
+        if source_node_id != remote_node_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Raft source replica is not assigned to the authenticated node",
+            ));
+        }
 
         let control = crate::host::is_control_message(&message.envelope);
         let queue = if control {
@@ -796,6 +1087,122 @@ fn handle_connection(
             &inbound.bulk
         };
         queue.try_send(message, payload.len())?;
+    }
+}
+
+fn write_handshake(
+    stream: &mut TcpStream,
+    local_node_id: NodeId,
+    cluster_id: Option<&str>,
+) -> io::Result<()> {
+    let cluster_id = cluster_id.unwrap_or_default().as_bytes();
+    let cluster_length = u16::try_from(cluster_id.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MultiRaft cluster identity exceeds handshake limit",
+        )
+    })?;
+
+    let mut handshake = Vec::with_capacity(HANDSHAKE_FIXED_BYTES + cluster_id.len());
+    handshake.extend_from_slice(HANDSHAKE_MAGIC);
+    handshake.push(HANDSHAKE_VERSION);
+    handshake.extend_from_slice(&local_node_id.0.to_le_bytes());
+    handshake.extend_from_slice(&cluster_length.to_le_bytes());
+    handshake.extend_from_slice(cluster_id);
+    stream.write_all(&handshake)?;
+    stream.flush()
+}
+
+fn read_handshake(
+    stream: &mut TcpStream,
+    local_node_id: NodeId,
+    node_addresses: &BTreeMap<NodeId, SocketAddr>,
+    cluster_id: Option<&str>,
+) -> io::Result<NodeId> {
+    let mut fixed = [0_u8; HANDSHAKE_FIXED_BYTES];
+    stream.read_exact(&mut fixed)?;
+
+    if &fixed[..HANDSHAKE_MAGIC.len()] != HANDSHAKE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MultiRaft connection handshake magic",
+        ));
+    }
+    if fixed[8] != HANDSHAKE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported MultiRaft connection handshake version",
+        ));
+    }
+
+    let remote_node_id = NodeId(u64::from_le_bytes(
+        fixed[9..17]
+            .try_into()
+            .expect("fixed-size handshake node ID slice"),
+    ));
+    if remote_node_id.0 == 0 || remote_node_id == local_node_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid or self-referential MultiRaft remote node ID",
+        ));
+    }
+    if !node_addresses.contains_key(&remote_node_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "MultiRaft remote node is not configured",
+        ));
+    }
+
+    let cluster_length = u16::from_le_bytes(
+        fixed[17..19]
+            .try_into()
+            .expect("fixed-size handshake cluster length slice"),
+    ) as usize;
+    let mut received_cluster = vec![0_u8; cluster_length];
+    stream.read_exact(&mut received_cluster)?;
+    if received_cluster != cluster_id.unwrap_or_default().as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "MultiRaft remote cluster identity does not match",
+        ));
+    }
+
+    Ok(remote_node_id)
+}
+
+fn outbound_worker(peer: Arc<OutboundPeer>) {
+    let mut stream = None;
+
+    while let Some(message) = peer.next() {
+        let result = (|| -> io::Result<()> {
+            if stream.is_none() {
+                let mut connected = TcpStream::connect_timeout(&peer.address, CONNECT_TIMEOUT)?;
+                connected.set_nodelay(true)?;
+                connected.set_write_timeout(Some(OUTBOUND_WRITE_TIMEOUT))?;
+                write_handshake(
+                    &mut connected,
+                    peer.local_node_id,
+                    peer.cluster_id.as_deref(),
+                )?;
+                stream = Some(connected);
+            }
+
+            let connected = stream.as_mut().expect("outbound stream is initialized");
+            write_frame(connected, &message.payload, MAX_MULTIRAFT_FRAME_BYTES)?;
+            connected.flush()
+        })();
+
+        peer.finish(message.wire_bytes);
+
+        if let Err(error) = result {
+            tracing::debug!(
+                target_node_id = peer.target_node_id.0,
+                raft_group_id = message.raft_group_id.0,
+                error = %error,
+                "MultiRaft outbound connection failed; Raft will retry",
+            );
+            stream = None;
+        }
     }
 }
 

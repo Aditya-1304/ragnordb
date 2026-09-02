@@ -1,8 +1,9 @@
-//! Production owner for the Milestone 4 single replicated tablet.
+//! Production Ready owner for one replicated tablet Raft group.
 //!
-//! This host deliberately owns one Raft group. Multi-group scheduling belongs
-//! to Milestone 5; the correctness boundary here is the complete production
-//! path from SQL commit, through Raft Ready durability, to tablet apply.
+//! The physical MultiRaft scheduler owns cross-group fairness. This module
+//! owns the tablet group's worker boundary: SQL, snapshot, and Ready state
+//! transitions remain serialized here while the scheduler interacts through a
+//! bounded, non-blocking control bridge.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,7 +38,10 @@ use ragnordb_common::{
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
-    host::{HostedGroupError, HostedRaftGroup, RaftMessageEnvelope, classify_ready_error},
+    host::{
+        HostedGroupError, HostedGroupTurn, HostedRaftGroup, MultiRaftGroupStatus, MultiRaftRole,
+        MultiRaftTurnBudget, RaftMessageEnvelope, classify_ready_error,
+    },
     proposal::{ProposalCompletion, ProposalRegistry, ProposalTicket},
     replica_startup::{bootstrap_tablet_replica, recover_tablet_replica},
     runtime::{AppliedRaftFrontier, RaftReadyLoop},
@@ -83,6 +87,8 @@ const TABLET_EPOCH: u64 = 1;
 const ELECTION_TIMEOUT_TICKS: u64 = 10;
 const HEARTBEAT_INTERVAL_TICKS: u64 = 3;
 const CHANNEL_CAPACITY: usize = 1_024;
+const TABLET_CONTROL_BUDGET: usize = 64;
+const TABLET_REQUEST_BUDGET: usize = 64;
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
@@ -91,12 +97,15 @@ type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApp
 /// Point-in-time routing state published without exposing the Ready owner.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicatedTabletStatus {
+    pub role: Option<MultiRaftRole>,
     pub leader_replica_id: Option<u64>,
     pub term: u64,
     pub commit_index: u64,
     pub last_log_index: u64,
     pub applied_index: u64,
     pub snapshot_index: u64,
+    pub uncommitted_bytes: usize,
+    pub replication_inflight_bytes: usize,
     pub serving_leader: bool,
     pub runtime_error: Option<String>,
 }
@@ -122,21 +131,26 @@ enum HostRequest {
 ///
 /// Client SQL work continues to use `HostRequest`. Raft transport and ticking
 /// enter through this separate host-owned channel.
+enum RaftHostControlResult {
+    Completed,
+    Proposed(LogIndex),
+}
+
 enum RaftHostControl {
     Tick {
         ticks: u64,
-        reply: mpsc::Sender<std::result::Result<(), HostedGroupError>>,
+        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     Step {
         message: RaftMessageEnvelope,
-        reply: mpsc::Sender<std::result::Result<(), HostedGroupError>>,
+        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     Propose {
         command: Vec<u8>,
         encoded_len: usize,
-        reply: mpsc::Sender<std::result::Result<LogIndex, HostedGroupError>>,
+        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 }
 
@@ -159,10 +173,10 @@ fn fatal_host_control_reason<T>(
 /// Reject one host operation without mutating Raft while an exact snapshot
 /// durability lifecycle owns the group's outstanding state.
 ///
-/// The physical MultiRaft host is synchronous in Phase 5.0. Leaving the
-/// request queued would block `tick_all()` on this replica and prevent
-/// unrelated groups from running. Returning `Retryable` preserves both the
-/// snapshot ordering invariant and cross-group failure isolation.
+/// Leaving the request queued would keep this group's host-control operation
+/// outstanding and prevent the scheduler from making progress on that group.
+/// Returning `Retryable` preserves both the snapshot ordering invariant and
+/// cross-group failure isolation.
 fn reply_snapshot_blocked_host_control(control: RaftHostControl, reason: &str) {
     match control {
         RaftHostControl::Tick { reply, .. } | RaftHostControl::Step { reply, .. } => {
@@ -278,15 +292,82 @@ struct PendingLocalSnapshotPublication {
     raft_pointer: RaftSnapshotPointerRecord,
 }
 
-#[derive(Clone)]
 pub(crate) struct ReplicatedTabletGroupProxy {
     identity: RaftReplicaIdentity,
     control: SyncSender<RaftHostControl>,
+    status: Arc<RwLock<ReplicatedTabletStatus>>,
+    pending: Option<mpsc::Receiver<std::result::Result<RaftHostControlResult, HostedGroupError>>>,
 }
 
 impl ReplicatedTabletGroupProxy {
     fn control_unavailable() -> HostedGroupError {
         HostedGroupError::Group("replicated tablet worker has stopped".to_string())
+    }
+
+    fn poll_pending(&mut self) -> std::result::Result<Option<HostedGroupTurn>, HostedGroupError> {
+        let Some(response) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+
+        match response.try_recv() {
+            Ok(result) => {
+                self.pending = None;
+                result.map(|_| Some(HostedGroupTurn::default()))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(Some(HostedGroupTurn::default())),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                Err(Self::control_unavailable())
+            }
+        }
+    }
+
+    fn submit_budgeted(
+        &mut self,
+        control: impl FnOnce(
+            mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        ) -> RaftHostControl,
+    ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
+        if let Some(turn) = self.poll_pending()? {
+            return Ok(turn);
+        }
+
+        let (reply, response) = mpsc::channel();
+        match self.control.try_send(control(reply)) {
+            Ok(()) => {
+                self.pending = Some(response);
+                Ok(HostedGroupTurn::default())
+            }
+            Err(mpsc::TrySendError::Full(_)) => Err(HostedGroupError::Retryable(
+                "replicated tablet host-control queue is full".to_string(),
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(Self::control_unavailable()),
+        }
+    }
+
+    fn submit_direct(
+        &self,
+        control: RaftHostControl,
+    ) -> std::result::Result<RaftHostControlResult, HostedGroupError> {
+        let (reply, response) = mpsc::channel();
+        let control = match control {
+            RaftHostControl::Tick { ticks, .. } => RaftHostControl::Tick { ticks, reply },
+            RaftHostControl::Step { message, .. } => RaftHostControl::Step { message, reply },
+            RaftHostControl::Propose {
+                command,
+                encoded_len,
+                ..
+            } => RaftHostControl::Propose {
+                command,
+                encoded_len,
+                reply,
+            },
+        };
+
+        self.control
+            .send(control)
+            .map_err(|_| Self::control_unavailable())?;
+        response.recv().map_err(|_| Self::control_unavailable())?
     }
 }
 
@@ -295,17 +376,48 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         self.identity
     }
 
+    fn status(&self) -> MultiRaftGroupStatus {
+        let status = self
+            .status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        MultiRaftGroupStatus {
+            identity: self.identity,
+            role: status.role,
+            leader_replica_id: status.leader_replica_id.map(ReplicaId),
+            term: status.term,
+            commit_index: status.commit_index,
+            last_log_index: status.last_log_index,
+            applied_index: status.applied_index,
+            snapshot_index: status.snapshot_index,
+            uncommitted_bytes: status.uncommitted_bytes,
+            replication_inflight_bytes: status.replication_inflight_bytes,
+            pending_work: self.has_pending_work(),
+            pending_messages: 0,
+            pending_message_bytes: 0,
+            quarantine_reason: status.runtime_error,
+        }
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.pending.is_some()
+    }
+
     fn tick_and_drain(
         &mut self,
         ticks: u64,
     ) -> std::result::Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-        let (reply, response) = mpsc::channel();
-
-        self.control
-            .send(RaftHostControl::Tick { ticks, reply })
-            .map_err(|_| Self::control_unavailable())?;
-
-        response.recv().map_err(|_| Self::control_unavailable())??;
+        if self.pending.is_some() {
+            return Err(HostedGroupError::Retryable(
+                "replicated tablet operation is still pending".to_string(),
+            ));
+        }
+        self.submit_direct(RaftHostControl::Tick {
+            ticks,
+            reply: mpsc::channel().0,
+        })?;
 
         // The tablet worker sends its Ready messages through its
         // group-scoped view of the one physical node transport.
@@ -316,13 +428,15 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         &mut self,
         message: RaftMessageEnvelope,
     ) -> std::result::Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
-        let (reply, response) = mpsc::channel();
-
-        self.control
-            .send(RaftHostControl::Step { message, reply })
-            .map_err(|_| Self::control_unavailable())?;
-
-        response.recv().map_err(|_| Self::control_unavailable())??;
+        if self.pending.is_some() {
+            return Err(HostedGroupError::Retryable(
+                "replicated tablet operation is still pending".to_string(),
+            ));
+        }
+        self.submit_direct(RaftHostControl::Step {
+            message,
+            reply: mpsc::channel().0,
+        })?;
 
         Ok(Vec::new())
     }
@@ -332,19 +446,39 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         command: Vec<u8>,
         encoded_len: usize,
     ) -> std::result::Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
-        let (reply, response) = mpsc::channel();
-
-        self.control
-            .send(RaftHostControl::Propose {
-                command,
-                encoded_len,
-                reply,
-            })
-            .map_err(|_| Self::control_unavailable())?;
-
-        let index = response.recv().map_err(|_| Self::control_unavailable())??;
+        if self.pending.is_some() {
+            return Err(HostedGroupError::Retryable(
+                "replicated tablet operation is still pending".to_string(),
+            ));
+        }
+        let result = self.submit_direct(RaftHostControl::Propose {
+            command,
+            encoded_len,
+            reply: mpsc::channel().0,
+        })?;
+        let RaftHostControlResult::Proposed(index) = result else {
+            return Err(HostedGroupError::Group(
+                "tablet proposal control returned a non-proposal result".to_string(),
+            ));
+        };
 
         Ok((index, Vec::new()))
+    }
+
+    fn tick_and_prepare_budgeted(
+        &mut self,
+        ticks: u64,
+        _budget: MultiRaftTurnBudget,
+    ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
+        self.submit_budgeted(|reply| RaftHostControl::Tick { ticks, reply })
+    }
+
+    fn step_and_prepare_budgeted(
+        &mut self,
+        message: RaftMessageEnvelope,
+        _budget: MultiRaftTurnBudget,
+    ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
+        self.submit_budgeted(|reply| RaftHostControl::Step { message, reply })
     }
 }
 
@@ -492,6 +626,8 @@ impl ReplicatedTabletRuntime {
         ReplicatedTabletGroupProxy {
             identity: self.identity,
             control: self.host_control.clone(),
+            status: self.handle.status.clone(),
+            pending: None,
         }
     }
 
@@ -1021,7 +1157,13 @@ where
                 "post-snapshot Ready persistence is awaiting retry",
             );
         } else {
-            while let Ok(control) = host_control.try_recv() {
+            let mut serviced_controls = 0;
+            while serviced_controls < TABLET_CONTROL_BUDGET {
+                let Ok(control) = host_control.try_recv() else {
+                    break;
+                };
+                serviced_controls += 1;
+
                 match control {
                     RaftHostControl::Tick { ticks, reply } => {
                         let result: std::result::Result<(), HostedGroupError> = (|| {
@@ -1063,7 +1205,7 @@ where
                         );
 
                         let fatal_reason = fatal_host_control_reason(&result);
-                        let _ = reply.send(result);
+                        let _ = reply.send(result.map(|()| RaftHostControlResult::Completed));
                         if let Some(reason) = fatal_reason {
                             return Err(reason);
                         }
@@ -1112,7 +1254,7 @@ where
                         );
 
                         let fatal_reason = fatal_host_control_reason(&result);
-                        let _ = reply.send(result);
+                        let _ = reply.send(result.map(|()| RaftHostControlResult::Completed));
                         if let Some(reason) = fatal_reason {
                             return Err(reason);
                         }
@@ -1167,7 +1309,7 @@ where
                         );
 
                         let fatal_reason = fatal_host_control_reason(&result);
-                        let _ = reply.send(result);
+                        let _ = reply.send(result.map(RaftHostControlResult::Proposed));
                         if let Some(reason) = fatal_reason {
                             return Err(reason);
                         }
@@ -1560,7 +1702,13 @@ where
             Err(error) => return Err(error.to_string()),
         }
 
-        while let Ok(request) = requests.try_recv() {
+        let mut admitted_requests = 0;
+        while admitted_requests < TABLET_REQUEST_BUDGET {
+            let Ok(request) = requests.try_recv() else {
+                break;
+            };
+            admitted_requests += 1;
+
             admit_request(
                 request,
                 &mut ready_loop,
@@ -2566,6 +2714,7 @@ fn publish_status<W, LS, SS>(
         .raft()
         .leader_id()
         .map(|replica_id| replica_id.get());
+    published.role = Some((*ready_loop.raft().role()).into());
     published.term = ready_loop.raft().hard_state().current_term;
     published.commit_index = ready_loop.raft().hard_state().commit;
     published.last_log_index = ready_loop.raft().last_log_index();
@@ -2575,6 +2724,15 @@ fn publish_status<W, LS, SS>(
         .applied_frontier()
         .map(|frontier| frontier.index)
         .unwrap_or(0);
+    published.uncommitted_bytes = ready_loop.raft().uncommitted_bytes();
+    published.replication_inflight_bytes = ready_loop
+        .raft()
+        .conf_state()
+        .replication_targets()
+        .into_iter()
+        .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
+        .map(|progress| progress.inflight_bytes)
+        .sum();
 }
 
 #[cfg(test)]
@@ -2638,7 +2796,7 @@ mod tests {
                 RaftHostControl::Tick { ticks, reply } => {
                     assert_eq!(ticks, 1);
                     reply
-                        .send(Ok(()))
+                        .send(Ok(RaftHostControlResult::Completed))
                         .expect("the tick reply must be delivered");
                 }
                 RaftHostControl::Step { .. } | RaftHostControl::Propose { .. } => {

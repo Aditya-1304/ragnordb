@@ -69,6 +69,7 @@ pub struct MultiRaftTurnBudget {
     pub max_messages: usize,
     pub max_ready_generations: usize,
     pub max_apply_entries: usize,
+    pub max_apply_bytes: usize,
     pub max_snapshot_bytes: usize,
 }
 
@@ -79,8 +80,61 @@ impl Default for MultiRaftTurnBudget {
             max_messages: 256,
             max_ready_generations: 1,
             max_apply_entries: 128,
+            max_apply_bytes: 4 * 1024 * 1024,
             max_snapshot_bytes: 4 * 1024 * 1024,
         }
+    }
+}
+
+/// Admission limits owned by one physical MultiRaft host.
+///
+/// Transport queues bound bytes before the host owns a message. These limits
+/// protect the second boundary: messages already admitted to a slow group's
+/// scheduler queue. Without both limits, a peer can continuously refill the
+/// host while that group is waiting on a retryable Ready or persistence step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiRaftHostConfig {
+    pub max_pending_messages: usize,
+    pub max_pending_message_bytes: usize,
+    pub max_pending_group_messages: usize,
+    pub max_pending_group_message_bytes: usize,
+    pub max_proposal_bytes: usize,
+}
+
+impl Default for MultiRaftHostConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_messages: 8 * 1024,
+            max_pending_message_bytes: 64 * 1024 * 1024,
+            max_pending_group_messages: 2 * 1024,
+            max_pending_group_message_bytes: 16 * 1024 * 1024,
+            max_proposal_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl MultiRaftHostConfig {
+    fn validate(self) -> Result<(), MultiRaftHostError> {
+        if self.max_pending_messages == 0
+            || self.max_pending_message_bytes == 0
+            || self.max_pending_group_messages == 0
+            || self.max_pending_group_message_bytes == 0
+            || self.max_proposal_bytes == 0
+        {
+            return Err(MultiRaftHostError::InvalidConfiguration(
+                "MultiRaft host limits must be non-zero".to_string(),
+            ));
+        }
+
+        if self.max_pending_group_messages > self.max_pending_messages
+            || self.max_pending_group_message_bytes > self.max_pending_message_bytes
+        {
+            return Err(MultiRaftHostError::InvalidConfiguration(
+                "per-group pending limits cannot exceed node limits".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -225,6 +279,17 @@ impl RunnableGroupQueue {
         self.control_queued.remove(&raft_group_id);
         Some(raft_group_id)
     }
+
+    fn remove(&mut self, raft_group_id: RaftGroupId) -> bool {
+        if !self.queued.remove(&raft_group_id) {
+            return false;
+        }
+
+        self.control_queued.remove(&raft_group_id);
+        self.control.retain(|queued| *queued != raft_group_id);
+        self.bulk.retain(|queued| *queued != raft_group_id);
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -354,6 +419,7 @@ pub(crate) fn is_control_message(message: &RaftMessageEnvelope) -> bool {
             | raft::message::Message::RequestVote(_)
             | raft::message::Message::RequestVoteResponse(_)
             | raft::message::Message::AppendEntriesResponse(_)
+            | raft::message::Message::InstallSnapshot(_)
             | raft::message::Message::InstallSnapshotResponse(_)
     ) || matches!(
         &message.msg,
@@ -367,6 +433,7 @@ fn group_budget_for_completion(budget: MultiRaftTurnBudget) -> MultiRaftTurnBudg
         max_messages: 0,
         max_ready_generations: budget.max_ready_generations,
         max_apply_entries: budget.max_apply_entries,
+        max_apply_bytes: budget.max_apply_bytes,
         max_snapshot_bytes: budget.max_snapshot_bytes,
     }
 }
@@ -548,13 +615,7 @@ where
             .persist_and_apply_next_ready_budgeted(
                 &mut self.snapshot_store,
                 &mut self.state_machine,
-                MultiRaftTurnBudget {
-                    max_groups: usize::MAX,
-                    max_messages: usize::MAX,
-                    max_ready_generations: 1,
-                    max_apply_entries: usize::MAX,
-                    max_snapshot_bytes: usize::MAX,
-                },
+                MultiRaftTurnBudget::default(),
             )
             .map_err(classify_apply_error)?;
 
@@ -902,6 +963,9 @@ where
     /// The one physical Raft persistence authority for this node.
     node_wal: NodeRaftWal<W>,
 
+    /// Node-local admission limits for work already handed to the scheduler.
+    config: MultiRaftHostConfig,
+
     state: HostState,
 
     groups: BTreeMap<RaftGroupId, Box<dyn HostedRaftGroup>>,
@@ -918,6 +982,9 @@ where
     /// serviced. Control messages are kept ahead of bulk append traffic within
     /// the same group, but no message is acknowledged by merely queueing it.
     pending_messages: BTreeMap<RaftGroupId, PendingGroupMessages>,
+
+    pending_message_count: usize,
+    pending_message_bytes: usize,
 
     /// Durable identities discovered by the one shared-WAL scan which have
     /// not yet been accounted for by startup reconstruction.
@@ -942,18 +1009,32 @@ where
     W: RaftWal,
 {
     pub fn new(node_id: NodeId, node_wal: NodeRaftWal<W>) -> Self {
-        Self {
+        Self::new_with_config(node_id, node_wal, MultiRaftHostConfig::default())
+            .expect("MultiRaftHostConfig::default must be valid")
+    }
+
+    pub fn new_with_config(
+        node_id: NodeId,
+        node_wal: NodeRaftWal<W>,
+        config: MultiRaftHostConfig,
+    ) -> Result<Self, MultiRaftHostError> {
+        config.validate()?;
+
+        Ok(Self {
             node_id,
             node_wal,
+            config,
             state: HostState::Registering,
             groups: BTreeMap::new(),
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
             pending_messages: BTreeMap::new(),
+            pending_message_count: 0,
+            pending_message_bytes: 0,
             pending_recovered: BTreeSet::new(),
             issued_writers: BTreeSet::new(),
             quarantined: BTreeMap::new(),
-        }
+        })
     }
 
     pub fn from_recovered(
@@ -961,21 +1042,41 @@ where
         node_wal: NodeRaftWal<W>,
         recovered: &RecoveredRaftStorage,
     ) -> Self {
-        Self {
+        Self::from_recovered_with_config(
             node_id,
             node_wal,
+            recovered,
+            MultiRaftHostConfig::default(),
+        )
+        .expect("MultiRaftHostConfig::default must be valid")
+    }
+
+    pub fn from_recovered_with_config(
+        node_id: NodeId,
+        node_wal: NodeRaftWal<W>,
+        recovered: &RecoveredRaftStorage,
+        config: MultiRaftHostConfig,
+    ) -> Result<Self, MultiRaftHostError> {
+        config.validate()?;
+
+        Ok(Self {
+            node_id,
+            node_wal,
+            config,
             state: HostState::Registering,
             groups: BTreeMap::new(),
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
             pending_messages: BTreeMap::new(),
+            pending_message_count: 0,
+            pending_message_bytes: 0,
             pending_recovered: recovered
                 .replicas()
                 .map(|(identity, _)| *identity)
                 .collect(),
             issued_writers: BTreeSet::new(),
             quarantined: BTreeMap::new(),
-        }
+        })
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -997,6 +1098,10 @@ where
         self.quarantined.get(&raft_group_id).map(String::as_str)
     }
 
+    pub fn config(&self) -> MultiRaftHostConfig {
+        self.config
+    }
+
     /// Capture a point-in-time view of every local group and scheduler queue.
     ///
     /// This method is observational: it does not acquire a persistence handle,
@@ -1010,8 +1115,6 @@ where
             HostState::RecoveryRequired => MultiRaftHostState::RecoveryRequired,
         };
 
-        let mut pending_message_count = 0_usize;
-        let mut pending_message_bytes = 0_usize;
         let groups = self
             .groups
             .iter()
@@ -1021,9 +1124,6 @@ where
                 status.pending_messages = pending.map_or(0, PendingGroupMessages::len);
                 status.pending_message_bytes = pending.map_or(0, PendingGroupMessages::wire_bytes);
                 status.quarantine_reason = self.quarantined.get(raft_group_id).cloned();
-                pending_message_count += status.pending_messages;
-                pending_message_bytes =
-                    pending_message_bytes.saturating_add(status.pending_message_bytes);
                 status
             })
             .collect();
@@ -1031,8 +1131,8 @@ where
         MultiRaftHostStatus {
             node_id: self.node_id,
             state,
-            pending_message_count,
-            pending_message_bytes,
+            pending_message_count: self.pending_message_count,
+            pending_message_bytes: self.pending_message_bytes,
             groups,
         }
     }
@@ -1164,6 +1264,34 @@ where
         Ok(())
     }
 
+    fn account_pending_addition(&mut self, wire_bytes: usize) {
+        self.pending_message_count = self.pending_message_count.saturating_add(1);
+        self.pending_message_bytes = self.pending_message_bytes.saturating_add(wire_bytes);
+    }
+
+    fn account_pending_removal(&mut self, wire_bytes: usize) {
+        self.pending_message_count = self.pending_message_count.saturating_sub(1);
+        self.pending_message_bytes = self.pending_message_bytes.saturating_sub(wire_bytes);
+    }
+
+    fn account_pending_group_removal(&mut self, pending: &PendingGroupMessages) {
+        self.pending_message_count = self.pending_message_count.saturating_sub(pending.len());
+        self.pending_message_bytes = self
+            .pending_message_bytes
+            .saturating_sub(pending.wire_bytes());
+    }
+
+    fn remove_pending_group(&mut self, raft_group_id: RaftGroupId) {
+        if let Some(pending) = self.pending_messages.remove(&raft_group_id) {
+            self.account_pending_group_removal(&pending);
+        }
+    }
+
+    fn message_wire_bytes(message: &RoutedRaftMessage) -> usize {
+        crate::transport::routed_message_wire_size(message)
+            .expect("a message admitted by the host must remain serializable")
+    }
+
     /// Queues a tagged inbound message for bounded processing by its group.
     ///
     /// Validation happens at admission so an unknown group or wrong recipient
@@ -1177,11 +1305,37 @@ where
         let raft_group_id = message.raft_group_id;
         self.validate_message(&message)?;
         let control = is_control_message(&message.envelope);
+        let wire_bytes = crate::transport::routed_message_wire_size(&message)
+            .map_err(|error| MultiRaftHostError::InvalidMessage(error.to_string()))?;
+
+        let (group_messages, group_bytes) = self
+            .pending_messages
+            .get(&raft_group_id)
+            .map(|pending| (pending.len(), pending.wire_bytes()))
+            .unwrap_or_default();
+        if group_messages >= self.config.max_pending_group_messages
+            || group_bytes.saturating_add(wire_bytes) > self.config.max_pending_group_message_bytes
+        {
+            return Err(MultiRaftHostError::PendingMessagesFull {
+                raft_group_id,
+                reason: "per-group pending-message limit reached".to_string(),
+            });
+        }
+        if self.pending_message_count >= self.config.max_pending_messages
+            || self.pending_message_bytes.saturating_add(wire_bytes)
+                > self.config.max_pending_message_bytes
+        {
+            return Err(MultiRaftHostError::PendingMessagesFull {
+                raft_group_id,
+                reason: "node pending-message limit reached".to_string(),
+            });
+        }
 
         self.pending_messages
             .entry(raft_group_id)
             .or_default()
             .push_back(message);
+        self.account_pending_addition(wire_bytes);
         if control {
             self.runnable.enqueue_control(raft_group_id);
         } else {
@@ -1221,7 +1375,7 @@ where
             };
 
             if self.quarantined.contains_key(&raft_group_id) {
-                self.pending_messages.remove(&raft_group_id);
+                self.remove_pending_group(raft_group_id);
                 continue;
             }
 
@@ -1233,6 +1387,9 @@ where
                     .and_then(PendingGroupMessages::pop)
             };
             let had_message = pending_message.is_some();
+            if let Some(message) = pending_message.as_ref() {
+                self.account_pending_removal(Self::message_wire_bytes(message));
+            }
 
             if had_message && result.messages_processed >= budget.max_messages {
                 let control = is_control_message(
@@ -1241,10 +1398,12 @@ where
                         .expect("message was checked above")
                         .envelope,
                 );
+                let message = pending_message.expect("message was checked above");
                 self.pending_messages
                     .get_mut(&raft_group_id)
                     .expect("popped message implies a group queue")
-                    .push_front(pending_message.expect("message was checked above"));
+                    .push_front(message.clone());
+                self.account_pending_addition(Self::message_wire_bytes(&message));
                 if control {
                     self.runnable.enqueue_control(raft_group_id);
                 } else {
@@ -1266,10 +1425,12 @@ where
             });
 
             if had_message && !process_message {
+                let message = pending_message.take().expect("message was checked above");
                 self.pending_messages
                     .get_mut(&raft_group_id)
                     .expect("popped message implies a group queue")
-                    .push_front(pending_message.take().expect("message was checked above"));
+                    .push_front(message.clone());
+                self.account_pending_addition(Self::message_wire_bytes(&message));
             }
 
             let group_budget = MultiRaftTurnBudget {
@@ -1283,6 +1444,7 @@ where
                 // apply or snapshot budget.
                 max_ready_generations: budget.max_ready_generations,
                 max_apply_entries: budget.max_apply_entries,
+                max_apply_bytes: budget.max_apply_bytes,
                 max_snapshot_bytes: budget.max_snapshot_bytes,
             };
 
@@ -1344,7 +1506,7 @@ where
                         return Err(MultiRaftHostError::RecoveryRequired);
                     }
                     self.quarantined.insert(raft_group_id, reason);
-                    self.pending_messages.remove(&raft_group_id);
+                    self.remove_pending_group(raft_group_id);
                 }
 
                 Err(HostedGroupError::Retryable(reason)) => {
@@ -1357,7 +1519,8 @@ where
                         self.pending_messages
                             .get_mut(&raft_group_id)
                             .expect("retrying message implies a group queue")
-                            .push_front(message);
+                            .push_front(message.clone());
+                        self.account_pending_addition(Self::message_wire_bytes(&message));
                         if control {
                             self.runnable.enqueue_control(raft_group_id);
                         } else {
@@ -1477,7 +1640,7 @@ where
                             recovery_required = true;
                         } else {
                             self.quarantined.insert(pending.raft_group_id, reason);
-                            self.pending_messages.remove(&pending.raft_group_id);
+                            self.remove_pending_group(pending.raft_group_id);
                         }
                     }
                     Err(HostedGroupError::Retryable(_reason)) => {
@@ -1578,103 +1741,52 @@ where
         message: RoutedRaftMessage,
     ) -> Result<Vec<RoutedRaftMessage>, MultiRaftHostError> {
         self.ensure_active()?;
-
         let raft_group_id = message.raft_group_id;
+        self.validate_message(&message)?;
 
-        if let Some(reason) = self.quarantined.get(&raft_group_id) {
-            return Err(MultiRaftHostError::GroupQuarantined {
-                raft_group_id,
-                reason: reason.clone(),
-            });
-        }
-
-        let identity = self
+        if self
             .groups
             .get(&raft_group_id)
-            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?
-            .identity();
-
-        let expected = identity
-            .replica_id
-            .to_raft()
-            .expect("registered replica identity is validated");
-
-        if message.envelope.to != expected {
-            return Err(MultiRaftHostError::RecipientMismatch {
+            .is_some_and(|group| group.has_pending_work())
+            || self
+                .pending_messages
+                .get(&raft_group_id)
+                .is_some_and(|pending| !pending.is_empty())
+        {
+            return Err(MultiRaftHostError::GroupRetryable {
                 raft_group_id,
-                expected: identity.replica_id,
-                received: ReplicaId::from_raft(message.envelope.to),
+                reason: "group already has queued work; use the bounded host turn".to_string(),
             });
         }
 
-        let result = {
-            let group = self
-                .groups
-                .get_mut(&raft_group_id)
-                .expect("group was resolved above");
-
-            group.step_and_drain(message.envelope)
-        };
-
-        let messages = match result {
-            Ok(messages) => messages,
-
-            Err(HostedGroupError::RecoveryRequired) => {
-                self.state = HostState::RecoveryRequired;
-
-                return Err(MultiRaftHostError::RecoveryRequired);
-            }
-
-            Err(HostedGroupError::Group(reason)) => {
-                if self.node_wal.recovery_required() {
-                    self.state = HostState::RecoveryRequired;
-
-                    return Err(MultiRaftHostError::RecoveryRequired);
-                }
-
-                self.quarantined.insert(raft_group_id, reason.clone());
-
-                return Err(MultiRaftHostError::Group {
-                    raft_group_id,
-                    reason,
-                });
-            }
-
-            Err(HostedGroupError::Retryable(reason)) => {
-                if self.node_wal.recovery_required() {
-                    self.state = HostState::RecoveryRequired;
-                    return Err(MultiRaftHostError::RecoveryRequired);
-                }
-
-                return Err(MultiRaftHostError::GroupRetryable {
-                    raft_group_id,
-                    reason,
-                });
-            }
-
-            Err(HostedGroupError::Rejected(reason)) => {
-                if self.node_wal.recovery_required() {
-                    self.state = HostState::RecoveryRequired;
-                    return Err(MultiRaftHostError::RecoveryRequired);
-                }
-
-                return Err(MultiRaftHostError::GroupRejected {
-                    raft_group_id,
-                    reason,
-                });
-            }
-        };
-
-        self.ensure_shared_wal_healthy()?;
-        self.reschedule_after_turn(raft_group_id);
-
-        Ok(messages
-            .into_iter()
-            .map(|envelope| RoutedRaftMessage {
-                raft_group_id,
-                envelope,
-            })
-            .collect())
+        let control = is_control_message(&message.envelope);
+        self.enqueue_message(message)?;
+        assert!(
+            self.runnable.remove(raft_group_id),
+            "a newly admitted route message must make its group runnable"
+        );
+        if control {
+            self.runnable.enqueue_control(raft_group_id);
+        } else {
+            self.runnable.enqueue(raft_group_id);
+        }
+        self.run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 1,
+                max_ready_generations: 1,
+                max_apply_entries: 128,
+                max_apply_bytes: 4 * 1024 * 1024,
+                max_snapshot_bytes: 4 * 1024 * 1024,
+            },
+        )
+        .map(|turn| {
+            turn.outbound
+                .into_iter()
+                .filter(|message| message.raft_group_id == raft_group_id)
+                .collect()
+        })
     }
 
     /// Tick every healthy local group once.
@@ -1710,6 +1822,14 @@ where
         encoded_len: usize,
     ) -> Result<HostedProposal, MultiRaftHostError> {
         self.ensure_active()?;
+
+        if encoded_len > self.config.max_proposal_bytes {
+            return Err(MultiRaftHostError::ProposalTooLarge {
+                raft_group_id,
+                encoded_len,
+                max_bytes: self.config.max_proposal_bytes,
+            });
+        }
 
         if let Some(reason) = self.quarantined.get(&raft_group_id) {
             return Err(MultiRaftHostError::GroupQuarantined {
@@ -1777,6 +1897,7 @@ where
         };
 
         self.ensure_shared_wal_healthy()?;
+        self.reschedule_after_turn(raft_group_id);
 
         Ok(HostedProposal {
             index,
@@ -1821,6 +1942,8 @@ where
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MultiRaftHostError {
+    #[error("invalid MultiRaft host configuration: {0}")]
+    InvalidConfiguration(String),
     #[error("the host has not completed local replica registration")]
     NotActive,
     #[error("the host is already active")]
@@ -1829,6 +1952,23 @@ pub enum MultiRaftHostError {
     RecoveryRequired,
     #[error("no local replica is registered for Raft group {0:?}")]
     UnknownGroup(RaftGroupId),
+    #[error("invalid Raft envelope: {0}")]
+    InvalidMessage(String),
+    #[error(
+        "pending Raft messages for group {raft_group_id:?} exceeded the admission limit: {reason}"
+    )]
+    PendingMessagesFull {
+        raft_group_id: RaftGroupId,
+        reason: String,
+    },
+    #[error(
+        "proposal for Raft group {raft_group_id:?} is {encoded_len} bytes, maximum is {max_bytes}"
+    )]
+    ProposalTooLarge {
+        raft_group_id: RaftGroupId,
+        encoded_len: usize,
+        max_bytes: usize,
+    },
     #[error(
         "Raft envelope for group {raft_group_id:?} targets replica {received:?}, not local replica {expected:?}"
     )]
@@ -1888,7 +2028,10 @@ pub enum MultiRaftHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft::{message::Message, types::ReplicaId as RaftReplicaId};
+    use raft::{
+        message::{InstallSnapshotRequest, Message},
+        types::{ReplicaId as RaftReplicaId, SnapshotMetadata},
+    };
     use ragnordb_common::ids::ReplicaId;
     use std::sync::{
         Arc, Mutex,
@@ -2343,6 +2486,7 @@ mod tests {
             max_messages: 0,
             max_ready_generations: 1,
             max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
             max_snapshot_bytes: 1,
         };
 
@@ -2404,6 +2548,7 @@ mod tests {
                     max_messages: 0,
                     max_ready_generations: 1,
                     max_apply_entries: 1,
+                    max_apply_bytes: usize::MAX,
                     max_snapshot_bytes: usize::MAX,
                 },
             )
@@ -2473,6 +2618,7 @@ mod tests {
                     max_messages: 0,
                     max_ready_generations: 1,
                     max_apply_entries: 1,
+                    max_apply_bytes: usize::MAX,
                     max_snapshot_bytes: usize::MAX,
                 },
             )
@@ -2521,6 +2667,7 @@ mod tests {
                     max_messages: 0,
                     max_ready_generations: 1,
                     max_apply_entries: 1,
+                    max_apply_bytes: usize::MAX,
                     max_snapshot_bytes: 1,
                 },
             )
@@ -2553,6 +2700,7 @@ mod tests {
             max_messages: 0,
             max_ready_generations: 1,
             max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
             max_snapshot_bytes: 1,
         };
 
@@ -2603,6 +2751,51 @@ mod tests {
         assert_eq!(stepped.load(Ordering::SeqCst), 1);
         assert_eq!(host.run_turn(0, budget).unwrap().messages_processed, 1);
         assert_eq!(stepped.load(Ordering::SeqCst), 2);
+    }
+
+    /// Realistic bug caught: a slow group can keep receiving transport wakeups
+    /// faster than the shared scheduler services it, allowing an unbounded
+    /// in-memory queue while node status reports no admission pressure.
+    #[test]
+    fn pending_message_admission_enforces_node_and_group_limits() {
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new_with_config(
+            NodeId(7),
+            NodeRaftWal::new(TestWal),
+            MultiRaftHostConfig {
+                max_pending_messages: 1,
+                max_pending_group_messages: 1,
+                ..MultiRaftHostConfig::default()
+            },
+        )
+        .unwrap();
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(healthy_group(group_identity, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+
+        let message = || RoutedRaftMessage {
+            raft_group_id: group_identity.raft_group_id,
+            envelope: Envelope {
+                from: RaftReplicaId::must(20),
+                to: RaftReplicaId::must(101),
+                msg: Message::PreVoteResponse(raft::message::PreVoteResponse {
+                    term: 0,
+                    vote_granted: true,
+                }),
+            },
+        };
+
+        host.enqueue_message(message()).unwrap();
+        assert!(matches!(
+            host.enqueue_message(message()),
+            Err(MultiRaftHostError::PendingMessagesFull { .. })
+        ));
+        assert_eq!(host.status().pending_message_count, 1);
+
+        host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+        assert_eq!(host.status().pending_message_count, 0);
+        assert_eq!(host.status().pending_message_bytes, 0);
     }
 
     #[test]
@@ -2676,6 +2869,29 @@ mod tests {
         assert_eq!(turn.messages_processed, 1);
         assert_eq!(bulk_stepped.load(Ordering::SeqCst), 0);
         assert_eq!(control_stepped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn snapshot_install_requests_use_the_control_lane() {
+        let message = Envelope {
+            from: RaftReplicaId::must(1),
+            to: RaftReplicaId::must(101),
+            msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+                1,
+                RaftReplicaId::must(1),
+                SnapshotMetadata {
+                    snapshot_id: 1,
+                    last_included_index: 1,
+                    last_included_term: 1,
+                    conf_state: raft::types::ConfState::new(1, [RaftReplicaId::must(101)], [])
+                        .unwrap(),
+                    size_bytes: 0,
+                    checksum: [0; 32],
+                },
+            )),
+        };
+
+        assert!(is_control_message(&message));
     }
 
     #[test]

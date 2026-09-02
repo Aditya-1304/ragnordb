@@ -228,6 +228,7 @@ fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
                 max_messages: 0,
                 max_ready_generations: 1,
                 max_apply_entries: 0,
+                max_apply_bytes: usize::MAX,
                 max_snapshot_bytes: usize::MAX,
             },
         )
@@ -243,6 +244,7 @@ fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
                 max_messages: 0,
                 max_ready_generations: 1,
                 max_apply_entries: 1,
+                max_apply_bytes: usize::MAX,
                 max_snapshot_bytes: usize::MAX,
             },
         )

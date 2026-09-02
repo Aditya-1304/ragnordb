@@ -39,7 +39,7 @@ use crate::{
         RaftSnapshotStore, ReadyLoopError,
     },
     storage::{
-        adapter::{RaftLogStoreAdapter, RaftStableStoreAdapter, RaftStorageAdapters},
+        adapter::RaftStorageAdapters,
         codec::{DurableRaftEntryPayload, RaftReplicaIdentity},
         persistence::{RaftPersistenceError, RaftWal, RaftWalStorage},
         recovery::RecoveredRaftReplica,
@@ -281,11 +281,6 @@ impl RaftReadyStateMachine for HostedMetadataStateMachine {
     }
 }
 
-type BootstrappedMetadataReadyLoop<W> =
-    RaftReadyLoop<W, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
-
-type RecoveredMetadataReadyLoop<W> = RaftReadyLoop<W, RaftLogStoreAdapter, RaftStableStoreAdapter>;
-
 /// Construct a genuinely new metadata replica from an already durable
 /// RaftGroupBootstrap.
 ///
@@ -355,6 +350,7 @@ where
 /// Static seed membership is intentionally absent from this function. The
 /// supplied bootstrap and the recovered committed ConfState are the only
 /// membership authorities.
+#[allow(clippy::too_many_arguments)]
 pub fn recover_metadata_group<W>(
     bootstrap: &RaftGroupBootstrap,
     local_replica_id: ReplicaId,

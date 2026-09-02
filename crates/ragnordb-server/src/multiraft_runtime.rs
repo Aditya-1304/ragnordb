@@ -32,8 +32,8 @@ use ragnordb_common::{
 use ragnordb_multiraft::{
     bootstrap::FileBootstrapStore,
     host::{
-        MultiRaftHost, MultiRaftHostError, MultiRaftHostStatus, MultiRaftTurnBudget,
-        RoutedRaftMessage, SharedMultiRaftHostStatus,
+        MultiRaftHost, MultiRaftHostConfig, MultiRaftHostError, MultiRaftHostStatus,
+        MultiRaftTurnBudget, RoutedRaftMessage, SharedMultiRaftHostStatus,
     },
     meta::{MetadataRuntimeHandle, bootstrap_metadata_group, recover_metadata_group},
     snapshot::SnapshotWorkController,
@@ -42,7 +42,7 @@ use ragnordb_multiraft::{
         persistence::{NodeRaftWal, RaftWal},
         recovery::RecoveredRaftStorage,
     },
-    transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport},
+    transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig},
 };
 
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
@@ -76,6 +76,8 @@ const METADATA_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const METADATA_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 const METADATA_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+
+const METADATA_REQUEST_BUDGET: usize = 64;
 
 enum MetadataHostRequest {
     CreateTable {
@@ -427,8 +429,13 @@ impl MultiRaftRuntime {
             transport,
             inbound,
             local_addr,
-        } = NodeRaftTransport::bind(config.node_id, local_seed.raft_addr, node_addresses)
-            .map_err(|source| Error::Configuration(format!("bind MultiRaft endpoint: {source}")))?;
+        } = NodeRaftTransport::bind_with_config(
+            config.node_id,
+            local_seed.raft_addr,
+            node_addresses,
+            NodeRaftTransportConfig::default().with_cluster_id(cluster_id.clone()),
+        )
+        .map_err(|source| Error::Configuration(format!("bind MultiRaft endpoint: {source}")))?;
 
         let snapshot_store = Arc::new(
             FileTabletSnapshotStore::new(
@@ -462,7 +469,13 @@ impl MultiRaftRuntime {
 
         let node_wal = NodeRaftWal::with_durability_gate(wal.clone(), durability_gate);
 
-        let mut host = MultiRaftHost::from_recovered(config.node_id, node_wal, &recovered);
+        let mut host = MultiRaftHost::from_recovered_with_config(
+            config.node_id,
+            node_wal,
+            &recovered,
+            MultiRaftHostConfig::default(),
+        )
+        .map_err(host_error)?;
 
         // --------------------------------------------------------------
         // Metadata group.
@@ -765,6 +778,7 @@ fn run_host<W>(
             &metadata_requests,
             &mut pending_metadata,
             &mut pending_metadata_by_request,
+            METADATA_REQUEST_BUDGET,
         ) {
             publish_host_status(&host_status, &host);
             fail_pending_metadata(
@@ -987,11 +1001,18 @@ fn service_metadata_requests<W>(
     requests: &mpsc::Receiver<MetadataHostRequest>,
     pending: &mut BTreeMap<u64, PendingMetadataProposal>,
     pending_by_request: &mut HashMap<RequestId, u64>,
+    max_requests: usize,
 ) -> bool
 where
     W: RaftWal,
 {
-    while let Ok(request) = requests.try_recv() {
+    let mut serviced = 0;
+    while serviced < max_requests {
+        let Ok(request) = requests.try_recv() else {
+            break;
+        };
+        serviced += 1;
+
         match request {
             MetadataHostRequest::CreateTable {
                 envelope,

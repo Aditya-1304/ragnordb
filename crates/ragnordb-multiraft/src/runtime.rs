@@ -1250,6 +1250,7 @@ where
                 max_messages: usize::MAX,
                 max_ready_generations: 1,
                 max_apply_entries: usize::MAX,
+                max_apply_bytes: usize::MAX,
                 max_snapshot_bytes: usize::MAX,
             },
         )?;
@@ -1268,10 +1269,22 @@ where
         SM: RaftReadyStateMachine,
     {
         let mut applied_entries = 0;
+        let mut applied_bytes = 0_usize;
         while pending.next_entry < pending.ready.committed_entries.len()
             && applied_entries < budget.max_apply_entries
         {
             let entry = &pending.ready.committed_entries[pending.next_entry];
+            let entry_bytes = match &entry.payload {
+                EntryPayload::Normal(command) => command.len(),
+                EntryPayload::Configuration(_) => 0,
+            };
+
+            if (applied_entries == 0 && budget.max_apply_bytes == 0)
+                || (applied_entries > 0
+                    && applied_bytes.saturating_add(entry_bytes) > budget.max_apply_bytes)
+            {
+                break;
+            }
             let expected_index = pending.applied_through.saturating_add(1);
 
             if entry.index != expected_index {
@@ -1296,6 +1309,7 @@ where
             pending.applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
             pending.next_entry += 1;
             applied_entries += 1;
+            applied_bytes = applied_bytes.saturating_add(entry_bytes);
         }
 
         if pending.next_entry < pending.ready.committed_entries.len() {
