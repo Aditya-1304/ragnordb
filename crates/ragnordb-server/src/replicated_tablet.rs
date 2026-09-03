@@ -91,6 +91,21 @@ const TABLET_CONTROL_BUDGET: usize = 64;
 const TABLET_REQUEST_BUDGET: usize = 64;
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 
+/// Identity that must remain consistent across the Raft Ready owner and the
+/// tablet snapshot contract. Keeping these values together prevents a worker
+/// for a metadata-created tablet from accidentally publishing legacy group
+/// identifiers in proposals, snapshots, or replicated SQL storage.
+#[derive(Debug, Clone)]
+struct TabletRuntimeIdentity {
+    target: TabletSnapshotInstallTarget,
+}
+
+impl TabletRuntimeIdentity {
+    fn new(target: TabletSnapshotInstallTarget) -> Self {
+        Self { target }
+    }
+}
+
 type LocalWal = WalHandle<FsSegmentDirectory, ()>;
 type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApplyError>;
 
@@ -103,7 +118,9 @@ pub struct ReplicatedTabletStatus {
     pub commit_index: u64,
     pub last_log_index: u64,
     pub applied_index: u64,
+    pub applied_term: u64,
     pub snapshot_index: u64,
+    pub snapshot_term: u64,
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
     pub serving_leader: bool,
@@ -699,13 +716,74 @@ impl ReplicatedTabletRuntime {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
         })?;
+        let target = TabletSnapshotInstallTarget {
+            cluster_id,
+            raft_group_id: TABLET_RAFT_GROUP_ID,
+            tablet_id: TABLET_ID,
+            table_id: TABLE_ID,
+            tablet_epoch: TABLET_EPOCH,
+        };
+        Self::start_hosted_tablet_from_shared_recovery(
+            config,
+            wal,
+            database,
+            bootstrap,
+            target,
+            group_wal,
+            transport,
+            snapshot_store,
+            snapshot_work,
+            snapshot_endpoint,
+            recovered,
+            start_gate,
+            true,
+            None,
+        )
+    }
 
-        if bootstrap.cluster_id != cluster_id {
+    /// Start a tablet worker whose identity comes from metadata rather than
+    /// the legacy Milestone 4 constants. The bootstrap and snapshot target
+    /// are checked together so a Raft group cannot be paired with another
+    /// tablet's state machine or snapshot files.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_hosted_tablet_from_shared_recovery(
+        config: &NodeConfig,
+        wal: LocalWal,
+        database: SharedLocalDatabase,
+        bootstrap: RaftGroupBootstrap,
+        target: TabletSnapshotInstallTarget,
+        group_wal: NodeRaftWalHandle<LocalWal>,
+        transport: GroupRaftTransport,
+        snapshot_store: Arc<FileTabletSnapshotStore>,
+        snapshot_work: SnapshotWorkController,
+        snapshot_endpoint: GroupSnapshotEndpoint,
+        recovered: &RecoveredRaftStorage,
+        start_gate: Arc<AtomicBool>,
+        install_sql_mirror: bool,
+        provided_durability_gate: Option<DurabilityGate>,
+    ) -> Result<Self> {
+        let cluster_id = config.cluster_id.clone().ok_or_else(|| {
+            Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
+        })?;
+
+        if target.cluster_id != cluster_id {
             return Err(Error::RecoveryFailed {
                 reason: format!(
-                    "tablet bootstrap belongs to cluster {}, \
+                    "tablet snapshot target belongs to cluster {}, \
                      configured cluster is {}",
-                    bootstrap.cluster_id, cluster_id,
+                    target.cluster_id, cluster_id,
+                ),
+            });
+        }
+
+        if bootstrap.cluster_id != cluster_id || bootstrap.raft_group_id != target.raft_group_id {
+            return Err(Error::RecoveryFailed {
+                reason: format!(
+                    "tablet bootstrap identity ({}, {}) does not match target ({}, {})",
+                    bootstrap.cluster_id,
+                    bootstrap.raft_group_id.0,
+                    target.cluster_id,
+                    target.raft_group_id.0,
                 ),
             });
         }
@@ -718,16 +796,10 @@ impl ReplicatedTabletRuntime {
             ))
         })?;
 
-        let identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
+        let raft_identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
             .map_err(|source| Error::Configuration(source.to_string()))?;
 
-        let target = TabletSnapshotInstallTarget {
-            cluster_id: cluster_id.clone(),
-            raft_group_id: TABLET_RAFT_GROUP_ID,
-            tablet_id: TABLET_ID,
-            table_id: TABLE_ID,
-            tablet_epoch: TABLET_EPOCH,
-        };
+        let runtime_identity = TabletRuntimeIdentity::new(target);
 
         let mut bootstrap_store = FileBootstrapStore::open(config.data_dir.join("raft-bootstrap"))
             .map_err(|source| Error::RecoveryFailed {
@@ -735,11 +807,10 @@ impl ReplicatedTabletRuntime {
             })?;
 
         let durable_bootstrap =
-            load_durable_group_bootstrap(&bootstrap_store, TABLET_RAFT_GROUP_ID).map_err(
-                |source| Error::RecoveryFailed {
-                    reason: source.to_string(),
-                },
-            )?;
+            load_durable_group_bootstrap(&bootstrap_store, runtime_identity.target.raft_group_id)
+                .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?;
 
         let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
 
@@ -761,12 +832,15 @@ impl ReplicatedTabletRuntime {
             status: status.clone(),
         });
 
-        let durability_gate = database
-            .try_lock()
-            .map_err(|_| {
-                Error::Configuration("database is busy during tablet startup".to_string())
-            })?
-            .durability_gate();
+        let durability_gate = match provided_durability_gate {
+            Some(gate) => gate,
+            None => database
+                .try_lock()
+                .map_err(|_| {
+                    Error::Configuration("database is busy during tablet startup".to_string())
+                })?
+                .durability_gate(),
+        };
 
         let catalog_cache: Arc<dyn CatalogCacheWriter> = Arc::new(FencedCatalogCache {
             adapter: RagnorDbWalAdapter::new(wal.clone()),
@@ -775,28 +849,28 @@ impl ReplicatedTabletRuntime {
 
         let worker_shutdown = shutdown.clone();
 
-        let worker = if let Some(durable_bootstrap) = durable_bootstrap {
+        let worker = if recovered.replica(raft_identity).is_some() {
+            let durable_bootstrap = durable_bootstrap.ok_or_else(|| Error::RecoveryFailed {
+                reason: format!(
+                    "Raft WAL contains {:?} state but its durable bootstrap is missing",
+                    raft_identity,
+                ),
+            })?;
             if durable_bootstrap != bootstrap {
                 return Err(Error::RecoveryFailed {
                     reason: format!(
                         "resolved bootstrap for Raft group {} \
                          changed during startup",
-                        TABLET_RAFT_GROUP_ID.0,
+                        runtime_identity.target.raft_group_id.0,
                     ),
                 });
             }
 
-            let replica = recovered
-                .replica(identity)
-                .ok_or_else(|| Error::RecoveryFailed {
-                    reason: format!(
-                        "durable bootstrap exists for {:?} \
-                             without matching shared-WAL state",
-                        identity,
-                    ),
-                })?;
+            let replica = recovered.replica(raft_identity).expect("checked above");
 
-            install_recovered_catalog(&database, replica)?;
+            if install_sql_mirror {
+                install_recovered_catalog(&database, replica)?;
+            }
 
             let recovered_replica = recover_tablet_replica(
                 durable_bootstrap,
@@ -805,7 +879,7 @@ impl ReplicatedTabletRuntime {
                 wal.durable_lsn(),
                 replica,
                 &snapshot_store,
-                &target,
+                &runtime_identity.target,
                 ELECTION_TIMEOUT_TICKS,
                 HEARTBEAT_INTERVAL_TICKS,
             )
@@ -813,7 +887,13 @@ impl ReplicatedTabletRuntime {
                 reason: source.to_string(),
             })?;
 
-            install_recovered_sql_mirror(&database, &recovered_replica.tablet)?;
+            if install_sql_mirror {
+                install_recovered_sql_mirror(
+                    &database,
+                    runtime_identity.target.table_id,
+                    &recovered_replica.tablet,
+                )?;
+            }
 
             spawn_ready_owner(
                 recovered_replica.ready_loop,
@@ -830,6 +910,7 @@ impl ReplicatedTabletRuntime {
                 snapshot_work,
                 snapshot_endpoint,
                 cluster_id,
+                runtime_identity.clone(),
                 catalog_cache,
                 snapshot_policy,
             )
@@ -839,7 +920,7 @@ impl ReplicatedTabletRuntime {
                 &bootstrap,
                 local_replica_id,
                 group_wal,
-                &target,
+                &runtime_identity.target,
                 ELECTION_TIMEOUT_TICKS,
                 HEARTBEAT_INTERVAL_TICKS,
             )
@@ -847,12 +928,18 @@ impl ReplicatedTabletRuntime {
                 reason: source.to_string(),
             })?;
 
-            install_recovered_sql_mirror(&database, &bootstrapped.tablet)?;
+            if install_sql_mirror {
+                install_recovered_sql_mirror(
+                    &database,
+                    runtime_identity.target.table_id,
+                    &bootstrapped.tablet,
+                )?;
+            }
 
             spawn_ready_owner(
                 bootstrapped.ready_loop,
                 bootstrapped.tablet,
-                Some(bootstrapped.initial_ready),
+                bootstrapped.initial_ready,
                 transport,
                 host_control_rx,
                 request_rx,
@@ -864,6 +951,7 @@ impl ReplicatedTabletRuntime {
                 snapshot_work,
                 snapshot_endpoint,
                 cluster_id,
+                runtime_identity.clone(),
                 catalog_cache,
                 snapshot_policy,
             )
@@ -871,7 +959,7 @@ impl ReplicatedTabletRuntime {
 
         Ok(Self {
             handle,
-            identity,
+            identity: raft_identity,
             host_control: host_control_tx,
             shutdown,
             worker: Some(worker),
@@ -906,6 +994,7 @@ fn requested_bootstrap(config: &NodeConfig) -> Result<RaftGroupBootstrap> {
 
 fn install_recovered_sql_mirror(
     database: &SharedLocalDatabase,
+    table_id: TableId,
     tablet: &TabletCommandApplier,
 ) -> Result<()> {
     let storage = tablet.state_machine().tablet().storage().clone();
@@ -915,7 +1004,7 @@ fn install_recovered_sql_mirror(
                 .to_string(),
         )
     })?;
-    database.install_replicated_storage(TABLE_ID, storage)?;
+    database.install_replicated_storage(table_id, storage)?;
     Ok(())
 }
 
@@ -979,6 +1068,7 @@ fn spawn_ready_owner<W, LS, SS>(
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: GroupSnapshotEndpoint,
     cluster_id: String,
+    identity: TabletRuntimeIdentity,
     catalog_cache: Arc<dyn CatalogCacheWriter>,
     snapshot_policy: SnapshotPolicy,
 ) -> thread::JoinHandle<()>
@@ -988,7 +1078,7 @@ where
     SS: StableStore + Send + 'static,
 {
     thread::Builder::new()
-        .name("ragnordb-tablet-1".to_string())
+        .name(format!("ragnordb-tablet-{}", identity.target.tablet_id.0))
         .spawn(move || {
             let failure_status = status.clone();
             if let Err(source) = run_ready_owner(
@@ -1006,6 +1096,7 @@ where
                 snapshot_work,
                 snapshot_endpoint,
                 cluster_id,
+                identity,
                 catalog_cache,
                 snapshot_policy,
             ) {
@@ -1035,6 +1126,7 @@ fn run_ready_owner<W, LS, SS>(
     snapshot_work: SnapshotWorkController,
     snapshot_endpoint: GroupSnapshotEndpoint,
     cluster_id: String,
+    identity: TabletRuntimeIdentity,
     catalog_cache: Arc<dyn CatalogCacheWriter>,
     snapshot_policy: SnapshotPolicy,
 ) -> std::result::Result<(), String>
@@ -1119,6 +1211,7 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
                 &mut last_snapshot_at,
+                &identity,
             ) {
                 Ok(()) => {
                     debug_assert!(
@@ -1178,6 +1271,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1196,6 +1290,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1224,6 +1319,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1245,6 +1341,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1277,6 +1374,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1300,6 +1398,7 @@ where
                                 &latest_snapshot,
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
+                                &identity,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1378,11 +1477,11 @@ where
                 Err(error) => return Err(error.to_string()),
             };
             let target = TabletSnapshotInstallTarget {
-                cluster_id: cluster_id.clone(),
-                raft_group_id: TABLET_RAFT_GROUP_ID,
-                tablet_id: TABLET_ID,
-                table_id: TABLE_ID,
-                tablet_epoch: TABLET_EPOCH,
+                cluster_id: identity.target.cluster_id.clone(),
+                raft_group_id: identity.target.raft_group_id,
+                tablet_id: identity.target.tablet_id,
+                table_id: identity.target.table_id,
+                tablet_epoch: identity.target.tablet_epoch,
             };
             match prepare_incoming_tablet_snapshot(
                 snapshot_store.as_ref(),
@@ -1550,7 +1649,7 @@ where
                     database
                         .blocking_lock()
                         .install_replicated_storage(
-                            TABLE_ID,
+                            identity.target.table_id,
                             tablet.state_machine().tablet().storage().clone(),
                         )
                         .map_err(|e| e.to_string())?;
@@ -1583,6 +1682,7 @@ where
                             &mut registry,
                             &database,
                             catalog_cache.as_ref(),
+                            identity.target.table_id,
                         )
                         .map_err(|e| e.to_string())?;
                     }
@@ -1656,6 +1756,7 @@ where
             &snapshot_policy,
             &mut leader_activation,
             &mut internal_barrier_allocator,
+            &identity,
         ) {
             Ok(()) => {}
             Err(HostedGroupError::Retryable(error)) | Err(HostedGroupError::Rejected(error)) => {
@@ -1683,6 +1784,7 @@ where
             &latest_snapshot,
             catalog_cache.as_ref(),
             &snapshot_policy,
+            &identity,
         ) {
             Ok(Some(metadata)) => {
                 expected_snapshot_install = Some(metadata);
@@ -1717,6 +1819,7 @@ where
                 &mut clients,
                 serving_leader,
                 &mut internal_barrier_allocator,
+                &identity,
             );
             match drain_ready(
                 &mut ready_loop,
@@ -1728,6 +1831,7 @@ where
                 &latest_snapshot,
                 catalog_cache.as_ref(),
                 &snapshot_policy,
+                &identity,
             ) {
                 Ok(_) => {}
                 Err(HostedGroupError::Retryable(error))
@@ -1776,6 +1880,7 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
                 &mut last_snapshot_at,
+                &identity,
             ) {
                 Ok(()) => {}
                 Err(HostedGroupError::Retryable(error))
@@ -1793,8 +1898,13 @@ where
             serving_leader,
             latest_snapshot
                 .as_ref()
-                .map(|image| image.metadata.last_included_index)
-                .unwrap_or(0),
+                .map(|image| {
+                    (
+                        image.metadata.last_included_index,
+                        image.metadata.last_included_term,
+                    )
+                })
+                .unwrap_or((0, 0)),
             &status,
         );
         thread::sleep(Duration::from_millis(2));
@@ -1821,6 +1931,7 @@ impl InternalBarrierAllocator {
         &mut self,
         term: u64,
         tablet: &TabletCommandApplier,
+        raft_group_id: RaftGroupId,
     ) -> std::result::Result<RequestId, TabletCommandApplyError> {
         if self.term != Some(term) {
             let client_id = internal_barrier_client_id(term);
@@ -1828,10 +1939,18 @@ impl InternalBarrierAllocator {
             self.next_sequence = Some(tablet.state_machine().next_sequence_for_client(client_id)?);
         }
 
-        self.candidate_for_active_term()
+        self.candidate_for_group(raft_group_id)
     }
 
+    #[cfg(test)]
     fn candidate_for_active_term(&self) -> std::result::Result<RequestId, TabletCommandApplyError> {
+        self.candidate_for_group(TABLET_RAFT_GROUP_ID)
+    }
+
+    fn candidate_for_group(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> std::result::Result<RequestId, TabletCommandApplyError> {
         let term = self
             .term
             .expect("barrier allocator must select a term before a candidate");
@@ -1842,7 +1961,7 @@ impl InternalBarrierAllocator {
         Ok(RequestId {
             client_id,
             sequence,
-            raft_group_id: TABLET_RAFT_GROUP_ID,
+            raft_group_id,
         })
     }
 
@@ -1870,6 +1989,7 @@ const fn internal_barrier_client_id(term: u64) -> u128 {
     (INTERNAL_BARRIER_CLIENT_NAMESPACE as u128) << 64 | term as u128
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_request<W, LS, SS>(
     request: HostRequest,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
@@ -1878,6 +1998,7 @@ fn admit_request<W, LS, SS>(
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
     internal_barrier_allocator: &mut InternalBarrierAllocator,
+    identity: &TabletRuntimeIdentity,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -1900,7 +2021,7 @@ fn admit_request<W, LS, SS>(
             commit,
             reply,
             deadline,
-        } => match envelope_from_commit(local_id.get(), commit) {
+        } => match envelope_from_commit_for_identity(local_id.get(), commit, identity) {
             Ok(envelope) => (envelope, deadline, ClientReply::Commit(reply), None),
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -1911,7 +2032,7 @@ fn admit_request<W, LS, SS>(
             update,
             reply,
             deadline,
-        } => match envelope_from_catalog(local_id.get(), &update) {
+        } => match envelope_from_catalog_for_identity(local_id.get(), &update, identity) {
             Ok(envelope) => (envelope, deadline, ClientReply::Catalog(reply), None),
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -1919,9 +2040,11 @@ fn admit_request<W, LS, SS>(
             }
         },
         HostRequest::Barrier { reply, deadline } => {
-            let request_id = match internal_barrier_allocator
-                .candidate(ready_loop.raft().hard_state().current_term, tablet)
-            {
+            let request_id = match internal_barrier_allocator.candidate(
+                ready_loop.raft().hard_state().current_term,
+                tablet,
+                identity.target.raft_group_id,
+            ) {
                 Ok(request_id) => request_id,
                 Err(source) => {
                     let _ = reply.send(Err(Error::RecoveryRequired {
@@ -1932,8 +2055,8 @@ fn admit_request<W, LS, SS>(
             };
             let envelope = TabletCommandEnvelope::new(
                 request_id.clone(),
-                TABLET_ID,
-                TABLET_EPOCH,
+                identity.target.tablet_id,
+                identity.target.tablet_epoch,
                 TabletCommand::Noop(NoopCommand),
             )
             .map_err(|source| Error::InvalidArgument(source.to_string()));
@@ -2020,6 +2143,7 @@ fn refresh_leader_activation<W, LS, SS>(
     snapshot_policy: &SnapshotPolicy,
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
     internal_barrier_allocator: &mut InternalBarrierAllocator,
+    identity: &TabletRuntimeIdentity,
 ) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
@@ -2047,15 +2171,16 @@ where
         latest_snapshot,
         catalog_cache,
         snapshot_policy,
+        identity,
     )?;
 
     let request_id = internal_barrier_allocator
-        .candidate(term, tablet)
+        .candidate(term, tablet, identity.target.raft_group_id)
         .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     let envelope = TabletCommandEnvelope::new(
         request_id.clone(),
-        TABLET_ID,
-        TABLET_EPOCH,
+        identity.target.tablet_id,
+        identity.target.tablet_epoch,
         TabletCommand::Noop(NoopCommand),
     )
     .map_err(|error| HostedGroupError::Group(error.to_string()))?;
@@ -2077,6 +2202,7 @@ where
         latest_snapshot,
         catalog_cache,
         snapshot_policy,
+        identity,
     )?;
     Ok(())
 }
@@ -2098,6 +2224,7 @@ fn maybe_publish_snapshot<W, LS, SS>(
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
     last_snapshot_at: &mut Instant,
+    identity: &TabletRuntimeIdentity,
 ) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
@@ -2123,6 +2250,7 @@ where
             latest_snapshot,
             catalog_cache,
             snapshot_policy,
+            identity,
         )?;
 
         // `drain_ready` may have advanced application state, so snapshot the
@@ -2139,7 +2267,11 @@ where
         let conf_state = tablet_snapshot_conf_state(ready_loop.raft().conf_state())
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
         let snapshot_id = store
-            .allocate_snapshot_id(TABLET_RAFT_GROUP_ID, local_replica_id, TABLET_ID)
+            .allocate_snapshot_id(
+                identity.target.raft_group_id,
+                local_replica_id,
+                identity.target.tablet_id,
+            )
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
         let image = generate_tablet_snapshot_from_ready_loop(
             work,
@@ -2213,6 +2345,7 @@ where
         latest_snapshot,
         catalog_cache,
         snapshot_policy,
+        identity,
     )?;
     release_replica_retention(ready_loop)
         .map_err(|error| HostedGroupError::Group(error.to_string()))?;
@@ -2238,6 +2371,7 @@ fn install_received_snapshot<W, LS, SS>(
     latest_snapshot: &mut Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
+    identity: &TabletRuntimeIdentity,
 ) -> std::result::Result<(), String>
 where
     W: RaftWal,
@@ -2252,10 +2386,10 @@ where
     }
     let target = TabletSnapshotInstallTarget {
         cluster_id: cluster_id.to_string(),
-        raft_group_id: TABLET_RAFT_GROUP_ID,
-        tablet_id: TABLET_ID,
-        table_id: TABLE_ID,
-        tablet_epoch: TABLET_EPOCH,
+        raft_group_id: identity.target.raft_group_id,
+        tablet_id: identity.target.tablet_id,
+        table_id: identity.target.table_id,
+        tablet_epoch: identity.target.tablet_epoch,
     };
     let mut hard_state = ready_loop.raft().hard_state();
     hard_state.commit = hard_state.commit.max(received.metadata.last_included_index);
@@ -2277,8 +2411,8 @@ where
     ready_loop
         .complete_snapshot_install(core_snapshot)
         .map_err(|error| error.to_string())?;
-    let identity = ready_loop.persistence().log_view().identity();
-    let raft_pointer = raft_pointer_for_tablet(identity, &durable.installed.pointer)
+    let raft_identity = ready_loop.persistence().log_view().identity();
+    let raft_pointer = raft_pointer_for_tablet(raft_identity, &durable.installed.pointer)
         .map_err(|error| error.to_string())?;
     let ready = ready_loop
         .persist_ready_after_snapshot_boundary(&raft_pointer)
@@ -2288,7 +2422,10 @@ where
     *tablet = TabletCommandApplier::new(durable.installed.state_machine);
     database
         .blocking_lock()
-        .install_replicated_storage(TABLE_ID, tablet.state_machine().tablet().storage().clone())
+        .install_replicated_storage(
+            identity.target.table_id,
+            tablet.state_machine().tablet().storage().clone(),
+        )
         .map_err(|error| error.to_string())?;
 
     let mut frontier = AppliedRaftFrontier::new(
@@ -2319,6 +2456,7 @@ where
             registry,
             database,
             catalog_cache,
+            identity.target.table_id,
         )?;
     }
     ready_loop
@@ -2378,14 +2516,15 @@ fn tablet_snapshot_conf_state(
     .map_err(|error| error.to_string())
 }
 
-fn envelope_from_commit(
+fn envelope_from_commit_for_identity(
     local_id: u64,
     commit: SingleNodeTxnCommit,
+    identity: &TabletRuntimeIdentity,
 ) -> Result<TabletCommandEnvelope> {
-    if commit.table_id != TABLE_ID {
+    if commit.table_id != identity.target.table_id {
         return Err(Error::InvalidArgument(format!(
-            "Milestone 4 replicated tablet owns table {}, received table {}",
-            TABLE_ID.0, commit.table_id.0
+            "replicated tablet owns table {}, received table {}",
+            identity.target.table_id.0, commit.table_id.0
         )));
     }
     let writes = commit
@@ -2409,10 +2548,10 @@ fn envelope_from_commit(
         RequestId {
             client_id,
             sequence: 1,
-            raft_group_id: TABLET_RAFT_GROUP_ID,
+            raft_group_id: identity.target.raft_group_id,
         },
-        TABLET_ID,
-        TABLET_EPOCH,
+        identity.target.tablet_id,
+        identity.target.tablet_epoch,
         TabletCommand::SingleShardCommit(SingleShardCommitCommand {
             txn_id: commit.txn_id,
             start_timestamp: commit.start_timestamp,
@@ -2423,9 +2562,25 @@ fn envelope_from_commit(
     .map_err(|source| Error::InvalidArgument(source.to_string()))
 }
 
+#[cfg(test)]
 fn envelope_from_catalog(
     local_id: u64,
     update: &CatalogLogRecord,
+) -> Result<TabletCommandEnvelope> {
+    let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+        cluster_id: String::new(),
+        raft_group_id: TABLET_RAFT_GROUP_ID,
+        tablet_id: TABLET_ID,
+        table_id: TABLE_ID,
+        tablet_epoch: TABLET_EPOCH,
+    });
+    envelope_from_catalog_for_identity(local_id, update, &identity)
+}
+
+fn envelope_from_catalog_for_identity(
+    local_id: u64,
+    update: &CatalogLogRecord,
+    identity: &TabletRuntimeIdentity,
 ) -> Result<TabletCommandEnvelope> {
     let namespace = local_id.rotate_left(17) ^ update.table_id.0;
     let client_id = (u128::from(update.update_timestamp.0) << 64) | u128::from(namespace);
@@ -2433,10 +2588,10 @@ fn envelope_from_catalog(
         RequestId {
             client_id,
             sequence: 1,
-            raft_group_id: TABLET_RAFT_GROUP_ID,
+            raft_group_id: identity.target.raft_group_id,
         },
-        TABLET_ID,
-        TABLET_EPOCH,
+        identity.target.tablet_id,
+        identity.target.tablet_epoch,
         TabletCommand::Catalog(update.command.clone()),
     )
     .map_err(|source| Error::InvalidArgument(source.to_string()))
@@ -2456,6 +2611,7 @@ fn publish_committed_command(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     catalog_cache: &dyn CatalogCacheWriter,
+    table_id: TableId,
 ) -> std::result::Result<(), String> {
     if matches!(disposition, CommittedTabletCommandDisposition::Applied(_)) {
         if let TabletCommand::SingleShardCommit(command) = &envelope.command
@@ -2472,7 +2628,7 @@ fn publish_committed_command(
                 ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64);
             catalog_cache
                 .append_catalog_update(&CatalogLogRecord {
-                    table_id: TABLE_ID,
+                    table_id,
                     update_timestamp,
                     command: command.clone(),
                 })
@@ -2508,6 +2664,7 @@ fn drain_ready<W, LS, SS>(
     latest_snapshot: &Option<TabletSnapshotImage>,
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
+    identity: &TabletRuntimeIdentity,
 ) -> std::result::Result<Option<SnapshotMetadata>, HostedGroupError>
 where
     W: RaftWal,
@@ -2547,6 +2704,7 @@ where
             registry,
             database,
             catalog_cache,
+            identity.target.table_id,
         )
         .map_err(HostedGroupError::Group)?;
     }
@@ -2700,7 +2858,7 @@ fn send_client_error(reply: ClientReply, error: Error) {
 fn publish_status<W, LS, SS>(
     ready_loop: &RaftReadyLoop<W, LS, SS>,
     serving_leader: bool,
-    snapshot_index: u64,
+    snapshot: (u64, u64),
     status: &RwLock<ReplicatedTabletStatus>,
 ) where
     W: RaftWal,
@@ -2719,11 +2877,15 @@ fn publish_status<W, LS, SS>(
     published.commit_index = ready_loop.raft().hard_state().commit;
     published.last_log_index = ready_loop.raft().last_log_index();
     published.serving_leader = serving_leader;
-    published.snapshot_index = snapshot_index;
-    published.applied_index = ready_loop
-        .applied_frontier()
-        .map(|frontier| frontier.index)
-        .unwrap_or(0);
+    published.snapshot_index = snapshot.0;
+    published.snapshot_term = snapshot.1;
+    if let Some(frontier) = ready_loop.applied_frontier() {
+        published.applied_index = frontier.index;
+        published.applied_term = frontier.term;
+    } else {
+        published.applied_index = 0;
+        published.applied_term = 0;
+    }
     published.uncommitted_bytes = ready_loop.raft().uncommitted_bytes();
     published.replication_inflight_bytes = ready_loop
         .raft()
@@ -2946,12 +3108,52 @@ mod tests {
             &mut registry,
             &crate::database::LocalDatabase::shared(),
             &OutcomeUnknownCatalogCache,
+            TABLE_ID,
         )
         .expect_err("uncertain catalog persistence must stop Ready publication");
 
         assert!(error.contains("injected synchronization ambiguity"));
         assert_eq!(registry.pending_count(), 1);
         assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    /// Realistic bug caught: a metadata-created tablet could still emit a
+    /// legacy group/tablet identity in a catalog proposal, causing followers
+    /// to reject an otherwise valid command as belonging to another tablet.
+    #[test]
+    fn metadata_tablet_proposal_uses_its_declared_identity() {
+        let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+            cluster_id: "cluster-5-5".to_string(),
+            raft_group_id: RaftGroupId(42),
+            tablet_id: TabletId(9),
+            table_id: TableId(77),
+            tablet_epoch: 3,
+        });
+        let record = CatalogLogRecord {
+            table_id: identity.target.table_id,
+            update_timestamp: Timestamp(7),
+            command: CatalogCommand {
+                operation: CatalogOperation::CreateTable(CreateTableOperation {
+                    table_def: TableDefinition {
+                        table_id: identity.target.table_id.0,
+                        name: "metadata_users".to_string(),
+                        columns: Vec::new(),
+                        primary_key_column_ids: Vec::new(),
+                        schema_version: 1,
+                        tablet_count: 1,
+                    },
+                }),
+            },
+        };
+
+        let envelope = envelope_from_catalog_for_identity(1, &record, &identity)
+            .expect("metadata tablet catalog envelope must encode");
+        assert_eq!(
+            envelope.request_id.raft_group_id,
+            identity.target.raft_group_id
+        );
+        assert_eq!(envelope.tablet_id, identity.target.tablet_id);
+        assert_eq!(envelope.expected_epoch, identity.target.tablet_epoch);
     }
 
     /// Realistic bug caught: Raft can reject a barrier before appending it when

@@ -362,6 +362,16 @@ impl MetadataState {
         self.tablets.get(&tablet_id)
     }
 
+    /// Return every committed tablet descriptor in canonical tablet-ID order.
+    ///
+    /// Server lifecycle reconciliation needs a detached view of all tablets,
+    /// not only the tablets belonging to a caller-selected table. Exposing an
+    /// iterator keeps metadata as the read-only placement authority without
+    /// permitting callers to mutate the state-machine maps.
+    pub fn tablets(&self) -> impl Iterator<Item = &TabletDescriptor> {
+        self.tablets.values()
+    }
+
     /// Return all committed tablet descriptors for one table.
     ///
     /// The returned descriptors are detached from the state machine so a

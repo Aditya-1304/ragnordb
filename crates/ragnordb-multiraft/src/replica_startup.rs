@@ -52,9 +52,10 @@ pub struct BootstrappedTabletReplica<W: RaftWal> {
     pub bootstrap: RaftGroupBootstrap,
     pub ready_loop: BootstrappedTabletReadyLoop<W>,
     pub tablet: TabletCommandApplier,
-    /// host may release these messages only after receiving this value;
-    /// construction has already acknowledged the corresponding Ready
-    pub initial_ready: Ready<Vec<u8>, Vec<u8>>,
+    /// Host may release these messages only after receiving this value. A
+    /// durable bootstrap can legitimately produce no Ready records when a
+    /// process restarts before Raft has emitted any persistent state.
+    pub initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
 }
 
 /// existing tablet replica reconstructed entirely from durable authorities
@@ -120,9 +121,7 @@ where
         .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
     let tablet = TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
     let mut ready_loop = RaftReadyLoop::new(raft, RaftWalStorage::new(wal, identity));
-    let initial_ready = ready_loop
-        .persist_next_ready(None)?
-        .ok_or(TabletReplicaStartupError::MissingBootstrapReady)?;
+    let initial_ready = ready_loop.persist_next_ready(None)?;
 
     Ok(BootstrappedTabletReplica {
         bootstrap,

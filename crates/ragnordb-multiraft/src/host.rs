@@ -1222,6 +1222,53 @@ where
             .map_err(MultiRaftHostError::WalRegistration)
     }
 
+    /// Issue a writer for a metadata-created replica after the host is live.
+    ///
+    /// The host remains the sole owner of writer issuance. The new identity is
+    /// inserted into shared-WAL retention with an empty floor before any
+    /// tablet worker is started, preventing a concurrent prune from deleting
+    /// the prefix that the worker will need to recover or publish.
+    pub fn issue_group_writer_after_activation(
+        &mut self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<NodeRaftWalHandle<W>, MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_shared_wal_healthy()?;
+
+        if !self.issued_writers.insert(identity) {
+            return Err(MultiRaftHostError::WalWriterAlreadyIssued(identity));
+        }
+
+        match self.node_wal.group_writer_for_active(identity) {
+            Ok(writer) => Ok(writer),
+            Err(error) => {
+                self.issued_writers.remove(&identity);
+                Err(MultiRaftHostError::WalRegistration(error))
+            }
+        }
+    }
+
+    /// Register one fully constructed metadata tablet while the host is
+    /// active and make it runnable on the next bounded scheduler turn.
+    pub fn register_active_group(
+        &mut self,
+        group: Box<dyn HostedRaftGroup>,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_shared_wal_healthy()?;
+        let identity = group.identity();
+        if !self.issued_writers.contains(&identity) {
+            return Err(MultiRaftHostError::WalWriterNotIssued(identity));
+        }
+        if self.groups.contains_key(&identity.raft_group_id) {
+            return Err(MultiRaftHostError::DuplicateGroup(identity.raft_group_id));
+        }
+        let group_id = identity.raft_group_id;
+        self.groups.insert(group_id, group);
+        self.runnable.enqueue(group_id);
+        Ok(())
+    }
+
     /// Seals local replica discovery and permits Ready processing.
     pub fn activate(&mut self) -> Result<(), MultiRaftHostError> {
         self.ensure_registering()?;
@@ -2312,6 +2359,29 @@ mod tests {
                 raft_group_id: RaftGroupId(11),
                 envelope: outbound
             }]
+        );
+    }
+
+    #[test]
+    fn active_host_can_register_a_new_group_after_retention_sealing() {
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let first = identity(10, 10);
+        let second = identity(11, 11);
+        let _writer = host.issue_group_writer(first).unwrap();
+        host.register_new_group(Box::new(healthy_group(first, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+
+        let _late_writer = host.issue_group_writer_after_activation(second).unwrap();
+        host.register_active_group(Box::new(healthy_group(second, Vec::new())))
+            .unwrap();
+
+        assert_eq!(host.group_count(), 2);
+        assert!(
+            host.status()
+                .groups
+                .iter()
+                .any(|group| group.identity == second)
         );
     }
 

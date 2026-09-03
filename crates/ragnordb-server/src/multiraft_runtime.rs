@@ -22,15 +22,16 @@ use std::{
 use ragnordb_catalog::{Catalog, MetadataApplyOutcome};
 use ragnordb_common::{
     Error, Result,
-    ids::{NodeId, RequestId},
+    ids::{NodeId, RequestId, TabletId},
     metadata_codec::{
-        CreateTableRequest, MetadataCommand, MetadataCommandEnvelope, NodeDescriptor,
-        TabletDescriptor,
+        CreateTableRequest, DesiredReplicaRole, MetadataCommand, MetadataCommandEnvelope,
+        NodeDescriptor, TabletDescriptor,
     },
+    raft_bootstrap::RaftGroupBootstrap,
 };
 
 use ragnordb_multiraft::{
-    bootstrap::FileBootstrapStore,
+    bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
     host::{
         MultiRaftHost, MultiRaftHostConfig, MultiRaftHostError, MultiRaftHostStatus,
         MultiRaftTurnBudget, RoutedRaftMessage, SharedMultiRaftHostStatus,
@@ -47,6 +48,7 @@ use ragnordb_multiraft::{
 
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
 use ragnordb_tablet::snapshot::FileTabletSnapshotStore;
+use ragnordb_tablet::snapshot::TabletSnapshotInstallTarget;
 
 use wal::{io::directory::FsSegmentDirectory, wal::WalHandle};
 
@@ -55,7 +57,10 @@ use crate::{
     config::NodeConfig,
     data_directory_lock::DataDirectoryLock,
     database::SharedLocalDatabase,
-    replica_registry::{LocalReplicaKey, LocalReplicaRegistry},
+    replica_registry::{
+        DurableFrontier, LocalReplicaKey, LocalReplicaRecord, LocalReplicaRegistry,
+        ReplicaLifecycle,
+    },
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
 };
@@ -92,6 +97,368 @@ struct PendingMetadataProposal {
     request_id: RequestId,
     reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
     deadline: Instant,
+}
+
+/// Owns metadata-driven tablet workers for the lifetime of the node host.
+///
+/// The metadata Raft state machine is the placement authority; this controller
+/// only materializes replicas assigned to the local physical node. Every
+/// identity is persisted as `Creating` before bootstrap. Recovered lifetimes
+/// are promoted to `Active` after their Ready owner is registered; a fresh
+/// group can remain `Creating` until it has emitted a recovery-visible WAL
+/// frontier. The map of runtime guards is also the in-process idempotency
+/// fence: a committed metadata replay cannot spawn a second worker for the
+/// same replica lifetime.
+struct TabletLifecycleManager {
+    config: NodeConfig,
+    wal: LocalWal,
+    database: SharedLocalDatabase,
+    transport: NodeRaftTransport,
+    snapshot_store: Arc<FileTabletSnapshotStore>,
+    snapshot_work: SnapshotWorkController,
+    snapshot_transport: NodeSnapshotTransport,
+    registry: LocalReplicaRegistry,
+    recovered: RecoveredRaftStorage,
+    start_gate: Arc<AtomicBool>,
+    runtimes: BTreeMap<RaftReplicaIdentity, ReplicatedTabletRuntime>,
+}
+
+impl TabletLifecycleManager {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: NodeConfig,
+        wal: LocalWal,
+        database: SharedLocalDatabase,
+        transport: NodeRaftTransport,
+        snapshot_store: Arc<FileTabletSnapshotStore>,
+        snapshot_work: SnapshotWorkController,
+        snapshot_transport: NodeSnapshotTransport,
+        registry: LocalReplicaRegistry,
+        recovered: RecoveredRaftStorage,
+        start_gate: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            config,
+            wal,
+            database,
+            transport,
+            snapshot_store,
+            snapshot_work,
+            snapshot_transport,
+            registry,
+            recovered,
+            start_gate,
+            runtimes: BTreeMap::new(),
+        }
+    }
+
+    /// Materialize all currently desired local tablet replicas.
+    ///
+    /// Startup calls this while the host is still registering recovered
+    /// identities. Subsequent calls run on the host owner thread after
+    /// metadata apply and use the active-registration APIs. A failure is
+    /// returned to the host loop rather than silently leaving metadata ahead
+    /// of the local durable execution state.
+    fn reconcile(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+        active: bool,
+    ) -> Result<()> {
+        for (identity, runtime) in &self.runtimes {
+            let status = runtime.handle().status();
+            let key = LocalReplicaKey {
+                raft_group_id: identity.raft_group_id,
+                replica_id: identity.replica_id,
+            };
+            let snapshot_frontier = (status.snapshot_index > 0 && status.snapshot_term > 0)
+                .then(|| DurableFrontier::new(status.snapshot_index, status.snapshot_term));
+            let apply_frontier = (status.applied_index > 0 && status.applied_term > 0)
+                .then(|| DurableFrontier::new(status.applied_index, status.applied_term));
+            let existing = self.registry.record(key)?.ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "tablet runtime {:?} has no local registry record",
+                    identity
+                ))
+            })?;
+            let snapshot_frontier = snapshot_frontier.or(existing.snapshot_frontier);
+            let apply_frontier = apply_frontier.or(existing.apply_frontier);
+            if existing.snapshot_frontier != snapshot_frontier
+                || existing.apply_frontier != apply_frontier
+            {
+                self.registry
+                    .update_frontiers(key, snapshot_frontier, apply_frontier)?;
+            }
+            if status.last_log_index > 0 || status.applied_index > 0 {
+                self.registry.mark_active(key)?;
+            }
+        }
+
+        let state = metadata.state_snapshot();
+        if state.cluster_id() != Some(self.config.cluster_id.as_deref().unwrap_or_default()) {
+            return Ok(());
+        }
+
+        let descriptors = state.tablets().cloned().collect::<Vec<_>>();
+        for descriptor in descriptors {
+            let Some(placement) = state.desired_placement(descriptor.tablet_id).cloned() else {
+                return Err(Error::CorruptData(format!(
+                    "tablet {} has no desired replica placement",
+                    descriptor.tablet_id.0
+                )));
+            };
+            let Some(desired_local) = placement
+                .replicas
+                .iter()
+                .find(|replica| replica.node_id == self.config.node_id)
+            else {
+                continue;
+            };
+
+            let requested_bootstrap = metadata_tablet_bootstrap(
+                self.config.cluster_id.as_deref().unwrap_or_default(),
+                &descriptor,
+                &placement,
+            )?;
+            let bootstrap_store = FileBootstrapStore::open(
+                self.config.data_dir.join("raft-bootstrap"),
+            )
+            .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?;
+            let bootstrap =
+                load_durable_group_bootstrap(&bootstrap_store, descriptor.raft_group_id).map_err(
+                    |source| Error::RecoveryFailed {
+                        reason: source.to_string(),
+                    },
+                )?;
+            let bootstrap = resolve_metadata_tablet_bootstrap(
+                requested_bootstrap,
+                bootstrap,
+                descriptor.tablet_id,
+            )?;
+
+            let local_replica_id =
+                bootstrap
+                    .replica_on_node(self.config.node_id)
+                    .ok_or_else(|| {
+                        Error::Configuration(format!(
+                            "tablet group {} has no local replica assignment",
+                            descriptor.raft_group_id.0
+                        ))
+                    })?;
+            if desired_local.replica_id != local_replica_id {
+                return Err(Error::RecoveryFailed {
+                    reason: format!(
+                        "metadata placement for tablet {} disagrees with durable local replica {}",
+                        descriptor.tablet_id.0, local_replica_id.0
+                    ),
+                });
+            }
+
+            // SQL executes CREATE TABLE while holding the database owner lock
+            // and waits for metadata apply. Do not start a tablet worker from
+            // that same critical section: a non-blocking probe lets the
+            // metadata response complete, after which the next host turn can
+            // safely install the local storage mirror.
+            let durability_gate = match self.database.try_lock() {
+                Ok(database) => database.durability_gate(),
+                Err(_) => continue,
+            };
+
+            // From this point onward construction uses the already-acquired
+            // gate, so the ordinary SQL owner-lock race cannot leave an issued
+            // writer or transport route behind a failed retry. Any later
+            // error is a durable/configuration failure and is intentionally
+            // surfaced to the host instead of being retried against unknown
+            // state.
+
+            let identity = RaftReplicaIdentity::new(descriptor.raft_group_id, local_replica_id)
+                .map_err(|source| Error::Configuration(source.to_string()))?;
+            if self.runtimes.contains_key(&identity) {
+                continue;
+            }
+
+            let record = LocalReplicaRecord::new(
+                descriptor.raft_group_id,
+                local_replica_id,
+                descriptor.tablet_id,
+                descriptor.table_id,
+                descriptor.tablet_epoch,
+                ReplicaLifecycle::Creating,
+            );
+            self.registry.ensure_replica(record)?;
+
+            let group_wal = if active {
+                host.issue_group_writer_after_activation(identity)
+                    .map_err(host_error)?
+            } else {
+                host.issue_group_writer(identity).map_err(host_error)?
+            };
+            let group_transport = self
+                .transport
+                .register_group(&bootstrap)
+                .map_err(|source| {
+                    Error::Configuration(format!("register tablet Raft transport: {source}"))
+                })?;
+            let snapshot_endpoint = self
+                .snapshot_transport
+                .register_group(
+                    descriptor.raft_group_id,
+                    local_replica_id,
+                    self.snapshot_store.clone(),
+                )
+                .map_err(|source| {
+                    Error::Configuration(format!("register tablet snapshot route: {source}"))
+                })?;
+            let target = TabletSnapshotInstallTarget {
+                cluster_id: self.config.cluster_id.clone().unwrap_or_default(),
+                raft_group_id: descriptor.raft_group_id,
+                tablet_id: descriptor.tablet_id,
+                table_id: descriptor.table_id,
+                tablet_epoch: descriptor.tablet_epoch,
+            };
+            // Slice 2 materializes the replicated tablet state machine. The
+            // SQL-side storage/router mirror remains a Phase 5.6 concern and
+            // must not reacquire the owner lock while CREATE TABLE completes.
+            let runtime = ReplicatedTabletRuntime::start_hosted_tablet_from_shared_recovery(
+                &self.config,
+                self.wal.clone(),
+                self.database.clone(),
+                bootstrap,
+                target,
+                group_wal,
+                group_transport,
+                self.snapshot_store.clone(),
+                self.snapshot_work.clone(),
+                snapshot_endpoint,
+                &self.recovered,
+                self.start_gate.clone(),
+                false,
+                Some(durability_gate),
+            )?;
+            let recovered = self.recovered.replica(identity).is_some();
+            let hosted_group = Box::new(runtime.hosted_group());
+            if active {
+                host.register_active_group(hosted_group)
+                    .map_err(host_error)?;
+            } else if recovered {
+                host.register_recovered_group(hosted_group)
+                    .map_err(host_error)?;
+            } else {
+                host.register_new_group(hosted_group).map_err(host_error)?;
+            }
+            // A freshly bootstrapped Raft group may have an empty initial
+            // Ready generation and therefore no shared-WAL record yet. Keep
+            // its durable intent in `Creating` until the first recovery-visible
+            // frontier exists; this lets restart replay the exact bootstrap
+            // authority without falsely claiming an active WAL lifetime.
+            if recovered {
+                self.registry.mark_active(LocalReplicaKey {
+                    raft_group_id: identity.raft_group_id,
+                    replica_id: identity.replica_id,
+                })?;
+            }
+            self.runtimes.insert(identity, runtime);
+        }
+        Ok(())
+    }
+
+    /// Reject recovered lifetimes that cannot be explained by the committed
+    /// metadata placement or the explicitly supported legacy group. Removal
+    /// tombstones are a later phase; silently retaining an unknown lifetime
+    /// here would allow stale state to survive a restart without authority.
+    fn register_unmaterialized_recovered(
+        &mut self,
+        metadata_identity: RaftReplicaIdentity,
+        legacy_identity: RaftReplicaIdentity,
+    ) -> Result<()> {
+        let materialized = self
+            .runtimes
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for identity in self.recovered.replicas().map(|(identity, _)| *identity) {
+            if identity == metadata_identity
+                || identity == legacy_identity
+                || materialized.contains(&identity)
+            {
+                continue;
+            }
+            return Err(Error::RecoveryFailed {
+                reason: format!(
+                    "recovered local replica {:?} has no committed metadata placement",
+                    identity
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn metadata_tablet_bootstrap(
+    cluster_id: &str,
+    descriptor: &TabletDescriptor,
+    placement: &ragnordb_common::metadata_codec::DesiredReplicaPlacement,
+) -> Result<RaftGroupBootstrap> {
+    if descriptor.tablet_id != placement.tablet_id {
+        return Err(Error::CorruptData(format!(
+            "tablet {} placement references tablet {}",
+            descriptor.tablet_id.0, placement.tablet_id.0
+        )));
+    }
+    let mut replica_to_node = BTreeMap::new();
+    let mut voters = std::collections::BTreeSet::new();
+    let mut learners = std::collections::BTreeSet::new();
+    for replica in &placement.replicas {
+        if replica_to_node
+            .insert(replica.replica_id, replica.node_id)
+            .is_some()
+        {
+            return Err(Error::CorruptData(format!(
+                "tablet {} placement repeats replica {}",
+                descriptor.tablet_id.0, replica.replica_id.0
+            )));
+        }
+        match replica.role {
+            DesiredReplicaRole::Voter => {
+                voters.insert(replica.replica_id);
+            }
+            DesiredReplicaRole::Learner => {
+                learners.insert(replica.replica_id);
+            }
+        }
+    }
+    RaftGroupBootstrap::new(
+        cluster_id.to_string(),
+        descriptor.raft_group_id,
+        placement.configuration_epoch,
+        replica_to_node,
+        voters,
+        learners,
+    )
+    .map_err(|source| Error::Configuration(source.to_string()))
+}
+
+/// Resolve one tablet's bootstrap without allowing a stale local file to
+/// override committed metadata placement. Membership transitions are not part
+/// of Slice 2, so any mismatch is a recovery error rather than a best-effort
+/// reconciliation.
+fn resolve_metadata_tablet_bootstrap(
+    requested: RaftGroupBootstrap,
+    durable: Option<RaftGroupBootstrap>,
+    tablet_id: TabletId,
+) -> Result<RaftGroupBootstrap> {
+    match durable {
+        Some(durable) if durable != requested => Err(Error::RecoveryFailed {
+            reason: format!(
+                "durable bootstrap for tablet {} conflicts with committed metadata placement",
+                tablet_id.0
+            ),
+        }),
+        Some(durable) => Ok(durable),
+        None => Ok(requested),
+    }
 }
 
 /// Client-side proposal boundary for metadata-owned SQL schema operations.
@@ -586,13 +953,13 @@ impl MultiRaftRuntime {
 
         let tablet_runtime = ReplicatedTabletRuntime::start_hosted_from_shared_recovery(
             config,
-            wal,
+            wal.clone(),
             database.clone(),
             bootstrap,
             group_wal,
             group_transport,
-            snapshot_store,
-            snapshot_work,
+            snapshot_store.clone(),
+            snapshot_work.clone(),
             group_snapshot_endpoint,
             &recovered,
             Arc::clone(&start_gate),
@@ -606,6 +973,21 @@ impl MultiRaftRuntime {
         } else {
             host.register_new_group(hosted_group).map_err(host_error)?;
         }
+
+        let mut tablet_lifecycle = TabletLifecycleManager::new(
+            config.clone(),
+            wal,
+            database.clone(),
+            transport.clone(),
+            snapshot_store,
+            snapshot_work,
+            snapshot_transport.clone(),
+            registry,
+            recovered,
+            Arc::clone(&start_gate),
+        );
+        tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
+        tablet_lifecycle.register_unmaterialized_recovered(metadata_identity, identity)?;
 
         // --------------------------------------------------------------
         // One physical activation boundary.
@@ -657,6 +1039,7 @@ impl MultiRaftRuntime {
                     cluster_id,
                     metadata_nodes,
                     metadata_ready_tx,
+                    tablet_lifecycle,
                 )
             })
             .map_err(|source| Error::Configuration(format!("spawn MultiRaft host: {source}")))?;
@@ -764,8 +1147,8 @@ impl MultiRaftRuntime {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_host<W>(
-    mut host: MultiRaftHost<W>,
+fn run_host(
+    mut host: MultiRaftHost<LocalWal>,
     transport: NodeRaftTransport,
     inbound: NodeRaftInbound,
     metadata_requests: mpsc::Receiver<MetadataHostRequest>,
@@ -775,9 +1158,8 @@ fn run_host<W>(
     cluster_id: String,
     metadata_nodes: Vec<NodeDescriptor>,
     metadata_ready: mpsc::SyncSender<std::result::Result<(), String>>,
-) where
-    W: RaftWal,
-{
+    mut tablet_lifecycle: TabletLifecycleManager,
+) {
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
     publish_host_status(&host_status, &host);
@@ -929,6 +1311,17 @@ fn run_host<W>(
             &mut pending_metadata,
             &mut pending_metadata_by_request,
         );
+        if let Err(error) = tablet_lifecycle.reconcile(&mut host, &metadata, true) {
+            publish_host_status(&host_status, &host);
+            signal_metadata_failure(&mut startup_sender, error.to_string());
+            fail_pending_metadata(
+                &mut pending_metadata,
+                &mut pending_metadata_by_request,
+                error,
+            );
+            tracing::error!("metadata tablet lifecycle reconciliation failed");
+            return;
+        }
         expire_metadata_proposals(&mut pending_metadata, &mut pending_metadata_by_request, now);
 
         if startup_sender.is_some() && now >= next_metadata_attempt {
@@ -1269,7 +1662,10 @@ impl Drop for MultiRaftRuntime {
 mod tests {
     use super::*;
 
-    use ragnordb_common::{ids::NodeId, metadata_codec::NodeDescriptor};
+    use ragnordb_common::{
+        ids::{NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
+        metadata_codec::{DesiredReplica, DesiredReplicaPlacement, NodeDescriptor, PartitionSpec},
+    };
 
     fn node(id: u64) -> NodeDescriptor {
         NodeDescriptor {
@@ -1295,5 +1691,84 @@ mod tests {
                 cluster_id: "cluster-a".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn metadata_tablet_bootstrap_preserves_committed_membership_roles() {
+        let descriptor = TabletDescriptor {
+            tablet_id: TabletId(8),
+            table_id: TableId(9),
+            raft_group_id: RaftGroupId(10),
+            tablet_epoch: 1,
+            partition: PartitionSpec::Hash {
+                bucket: 0,
+                bucket_count: 1,
+            },
+        };
+        let placement = DesiredReplicaPlacement {
+            tablet_id: descriptor.tablet_id,
+            configuration_epoch: 4,
+            replicas: vec![
+                DesiredReplica {
+                    replica_id: ReplicaId(1),
+                    node_id: NodeId(3),
+                    role: DesiredReplicaRole::Voter,
+                },
+                DesiredReplica {
+                    replica_id: ReplicaId(2),
+                    node_id: NodeId(4),
+                    role: DesiredReplicaRole::Learner,
+                },
+            ],
+        };
+
+        let bootstrap = metadata_tablet_bootstrap("cluster-a", &descriptor, &placement).unwrap();
+        assert_eq!(bootstrap.configuration_epoch, 4);
+        assert_eq!(bootstrap.node_for_replica(ReplicaId(1)), Some(NodeId(3)));
+        assert_eq!(
+            bootstrap.initial_voters,
+            [ReplicaId(1)].into_iter().collect()
+        );
+        assert_eq!(
+            bootstrap.initial_learners,
+            [ReplicaId(2)].into_iter().collect()
+        );
+    }
+
+    /// Realistic bug caught: a stale bootstrap file could retain the same
+    /// local replica while changing a peer, role, or configuration epoch.
+    /// Starting that file would split Raft membership under one group ID.
+    #[test]
+    fn metadata_tablet_bootstrap_rejects_durable_placement_divergence() {
+        let descriptor = TabletDescriptor {
+            tablet_id: TabletId(8),
+            table_id: TableId(9),
+            raft_group_id: RaftGroupId(10),
+            tablet_epoch: 1,
+            partition: PartitionSpec::Hash {
+                bucket: 0,
+                bucket_count: 1,
+            },
+        };
+        let requested_placement = DesiredReplicaPlacement {
+            tablet_id: descriptor.tablet_id,
+            configuration_epoch: 4,
+            replicas: vec![DesiredReplica {
+                replica_id: ReplicaId(1),
+                node_id: NodeId(3),
+                role: DesiredReplicaRole::Voter,
+            }],
+        };
+        let stale_placement = DesiredReplicaPlacement {
+            configuration_epoch: 5,
+            ..requested_placement.clone()
+        };
+        let requested =
+            metadata_tablet_bootstrap("cluster-a", &descriptor, &requested_placement).unwrap();
+        let stale = metadata_tablet_bootstrap("cluster-a", &descriptor, &stale_placement).unwrap();
+
+        let error = resolve_metadata_tablet_bootstrap(requested, Some(stale), descriptor.tablet_id)
+            .expect_err("stale durable placement must fail closed");
+        assert!(matches!(error, Error::RecoveryFailed { .. }));
     }
 }

@@ -257,6 +257,45 @@ impl<W> NodeRaftWal<W> {
         })
     }
 
+    /// Register a replica lifetime after the initial discovery barrier.
+    ///
+    /// The retention registry is sealed before the host begins serving work,
+    /// so an ordinary `group_writer_for` call must remain closed afterwards.
+    /// A metadata-driven tablet created while the node is live is different:
+    /// it is a new identity with no recoverable prefix yet. Registering it
+    /// with an empty floor is safe because the node-wide retention calculation
+    /// cannot prune past that lifetime until the new Ready owner publishes its
+    /// first durable frontier.
+    pub fn group_writer_for_active(
+        &self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<NodeRaftWalHandle<W>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
+        }
+        if !state.retention_registry_sealed {
+            return Err(
+                "active replica registration requires the retention registry to be sealed"
+                    .to_string(),
+            );
+        }
+        if state.retention_floors.contains_key(&identity) {
+            return Err(format!(
+                "Raft replica lifetime {:?} is already registered",
+                identity
+            ));
+        }
+        state.retention_floors.insert(identity, None);
+        Ok(NodeRaftWalHandle {
+            state: Arc::clone(&self.state),
+            owner: Some(identity),
+        })
+    }
+
     /// seal registration after shared recovery has discovered every local
     /// Raft replica lifetime that may be represented in candidate segments.
     pub fn seal_retention_registry(&self) -> Result<(), String> {

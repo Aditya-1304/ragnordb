@@ -1,10 +1,16 @@
 use std::{
     net::TcpListener,
     sync::{Arc, Barrier},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use ragnordb_common::{Error, codec::Value, ids::NodeId};
+use ragnordb_common::{
+    Error,
+    catalog_codec::{ColumnDefinition, DataType},
+    codec::Value,
+    ids::{ColumnId, NodeId, RaftGroupId, RequestId},
+    metadata_codec::CreateTableRequest,
+};
 use ragnordb_exec::{ExecutionResult, SqlSession};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
@@ -132,6 +138,64 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     })
     .await
     .expect("the production hosts must elect a leader");
+
+    // Metadata CREATE TABLE is the lifecycle trigger for a non-legacy tablet.
+    // Materialization runs on the bounded host thread after the SQL owner
+    // lock is released, so every assigned node must eventually expose the
+    // new Raft group through its authoritative host status.
+    let request = CreateTableRequest {
+        table_name: "metadata_users".to_string(),
+        columns: vec![ColumnDefinition {
+            column_id: ColumnId(1),
+            name: "id".to_string(),
+            ty: DataType::Int,
+            nullable: false,
+        }],
+        primary_key_column_ids: vec![ColumnId(1)],
+    };
+    let request_id = RequestId {
+        client_id: 0x55,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let topology = 'accepted: loop {
+        for node in &nodes {
+            let creator = node.runtime.metadata_table_creator();
+            let attempt = tokio::task::spawn_blocking({
+                let request = request.clone();
+                let request_id = request_id.clone();
+                move || {
+                    creator.create_table_topology(request, request_id, Duration::from_millis(500))
+                }
+            })
+            .await
+            .expect("metadata proposal task must not panic");
+            match attempt {
+                Ok(topology) => break 'accepted topology,
+                Err(Error::NotLeader { .. } | Error::ProposalUnavailable { .. }) => continue,
+                Err(error) => panic!("metadata CREATE TABLE failed permanently: {error}"),
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("metadata CREATE TABLE did not reach a leader before the deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(topology.definition.table_id > 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if nodes
+                .iter()
+                .all(|node| node.runtime.host_status().groups.len() >= 3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every assigned node must materialize the metadata tablet group");
 
     // Both callers must receive independently tracked barriers. A shared
     // request identity would reject one caller before Raft can commit either
