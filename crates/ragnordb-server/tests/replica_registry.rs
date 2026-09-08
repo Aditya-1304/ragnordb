@@ -5,7 +5,8 @@ use ragnordb_common::{
     ids::{RaftGroupId, ReplicaId, TableId, TabletId},
 };
 use ragnordb_server::replica_registry::{
-    DurableFrontier, LocalReplicaRecord, LocalReplicaRegistry, RegistryMutation, ReplicaLifecycle,
+    DurableFrontier, InitialReplicaConfiguration, LocalReplicaRecord, LocalReplicaRegistry,
+    RegistryMutation, ReplicaLifecycle,
 };
 
 fn registry_path() -> (tempfile::TempDir, PathBuf) {
@@ -221,4 +222,107 @@ fn active_registry_record_must_be_present_in_recovered_lifetimes() {
     registry
         .validate_recovered_lifetimes([expected.key()])
         .unwrap();
+}
+
+/// Realistic bug caught: cleanup must publish a terminal tombstone before any
+/// local files or routes are removed, and replaying the destroy request must
+/// never reopen the same `(group, replica)` lifetime.
+#[test]
+fn destruction_is_durable_and_tombstoned_identity_cannot_be_recreated() {
+    let (_directory, path) = registry_path();
+    let mut registry = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    let expected = record();
+    registry.ensure_replica(expected.clone()).unwrap();
+    registry.mark_active(expected.key()).unwrap();
+
+    registry.mark_destroying(expected.key()).unwrap();
+    assert_eq!(
+        registry.record(expected.key()).unwrap().unwrap().lifecycle,
+        ReplicaLifecycle::Destroying
+    );
+    registry.mark_tombstoned(expected.key()).unwrap();
+    registry.mark_tombstoned(expected.key()).unwrap();
+
+    drop(registry);
+    let mut reopened = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    assert_eq!(
+        reopened.record(expected.key()).unwrap().unwrap().lifecycle,
+        ReplicaLifecycle::Tombstoned
+    );
+
+    let error = reopened
+        .ensure_replica(LocalReplicaRecord::new(
+            expected.raft_group_id,
+            expected.replica_id,
+            expected.tablet_id,
+            expected.table_id,
+            expected.tablet_epoch,
+            ReplicaLifecycle::Creating,
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("tombstoned"));
+}
+
+/// Realistic bug caught: an interrupted destroy may leave a `Creating` record
+/// behind; the recovery path must be able to fence that identity without
+/// pretending that a Raft worker became active.
+#[test]
+fn creating_lifetime_can_resume_destroy_to_tombstone() {
+    let (_directory, path) = registry_path();
+    let mut registry = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    let expected = record();
+    registry.ensure_replica(expected.clone()).unwrap();
+
+    registry.mark_destroying(expected.key()).unwrap();
+    registry.mark_tombstoned(expected.key()).unwrap();
+
+    assert_eq!(
+        registry.record(expected.key()).unwrap().unwrap().lifecycle,
+        ReplicaLifecycle::Tombstoned
+    );
+}
+
+/// Realistic bug caught: deleting a bootstrap must leave enough durable
+/// initial-membership information for replaying retained configuration entries
+/// after restart.
+#[test]
+fn initial_membership_witness_survives_registry_reopen() {
+    let (_directory, path) = registry_path();
+    let mut registry = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    let expected = record();
+    registry.ensure_replica(expected.clone()).unwrap();
+    let witness = InitialReplicaConfiguration {
+        version: 1,
+        voters: [ReplicaId(3), ReplicaId(4)].into_iter().collect(),
+        learners: [ReplicaId(5)].into_iter().collect(),
+    };
+    registry
+        .set_initial_configuration(expected.key(), witness.clone())
+        .unwrap();
+    drop(registry);
+
+    let reopened = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    assert_eq!(
+        reopened
+            .record(expected.key())
+            .unwrap()
+            .unwrap()
+            .initial_configuration,
+        Some(witness)
+    );
+}
+
+/// Realistic bug caught: lifecycle transitions must remain monotonic so a
+/// stale activation retry cannot resurrect a permanently deleted replica.
+#[test]
+fn tombstoned_lifecycle_cannot_be_reactivated_or_skipped() {
+    let (_directory, path) = registry_path();
+    let mut registry = LocalReplicaRegistry::open(&path, "cluster-a").unwrap();
+    let expected = record();
+    registry.ensure_replica(expected.clone()).unwrap();
+
+    assert!(registry.mark_tombstoned(expected.key()).is_err());
+    registry.mark_destroying(expected.key()).unwrap();
+    registry.mark_tombstoned(expected.key()).unwrap();
+    assert!(registry.mark_active(expected.key()).is_err());
 }

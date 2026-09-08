@@ -194,6 +194,35 @@ impl FileBootstrapStore {
 
         Ok(bootstraps)
     }
+
+    /// Remove one durable bootstrap after its initial membership witness has
+    /// been copied into the local lifecycle registry.
+    ///
+    /// This operation is intentionally explicit and idempotent. Callers must
+    /// persist the witness before invoking it; otherwise a restart could no
+    /// longer reconstruct committed configuration entries from retained WAL.
+    pub fn remove_durable_bootstrap(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<bool, BootstrapStoreError> {
+        let path = self.final_path(raft_group_id);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_directory(&self.directory).map_err(|error| {
+                    BootstrapStoreError::OutcomeUnknown(format!(
+                        "synchronize removed bootstrap {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(BootstrapStoreError::Unavailable(format!(
+                "remove bootstrap {}: {error}",
+                path.display()
+            ))),
+        }
+    }
 }
 
 impl BootstrapStore for FileBootstrapStore {

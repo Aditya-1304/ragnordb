@@ -19,10 +19,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ragnordb_catalog::{Catalog, MetadataApplyOutcome};
+use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
 use ragnordb_common::{
     Error, Result,
-    ids::{NodeId, RequestId, TabletId},
+    ids::{NodeId, ReplicaId, RequestId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplicaRole, MetadataCommand, MetadataCommandEnvelope,
         NodeDescriptor, TabletDescriptor,
@@ -40,7 +40,7 @@ use ragnordb_multiraft::{
     snapshot::SnapshotWorkController,
     storage::{
         codec::RaftReplicaIdentity,
-        persistence::{NodeRaftWal, RaftWal},
+        persistence::{NodeRaftWal, NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
     transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig},
@@ -58,8 +58,8 @@ use crate::{
     data_directory_lock::DataDirectoryLock,
     database::SharedLocalDatabase,
     replica_registry::{
-        DurableFrontier, LocalReplicaKey, LocalReplicaRecord, LocalReplicaRegistry,
-        ReplicaLifecycle,
+        DurableFrontier, InitialReplicaConfiguration, LocalReplicaKey, LocalReplicaRecord,
+        LocalReplicaRegistry, ReplicaLifecycle,
     },
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
@@ -121,6 +121,10 @@ struct TabletLifecycleManager {
     recovered: RecoveredRaftStorage,
     start_gate: Arc<AtomicBool>,
     runtimes: BTreeMap<RaftReplicaIdentity, ReplicatedTabletRuntime>,
+    /// Retention handles outlive a detached runtime until its safe WAL floor
+    /// has been published. Keeping them here also makes interrupted cleanup
+    /// restartable without reopening a second writer for the same identity.
+    writers: BTreeMap<RaftReplicaIdentity, NodeRaftWalHandle<LocalWal>>,
 }
 
 impl TabletLifecycleManager {
@@ -149,6 +153,7 @@ impl TabletLifecycleManager {
             recovered,
             start_gate,
             runtimes: BTreeMap::new(),
+            writers: BTreeMap::new(),
         }
     }
 
@@ -198,6 +203,8 @@ impl TabletLifecycleManager {
         if state.cluster_id() != Some(self.config.cluster_id.as_deref().unwrap_or_default()) {
             return Ok(());
         }
+
+        self.reconcile_retired(host, &state, active)?;
 
         let descriptors = state.tablets().cloned().collect::<Vec<_>>();
         for descriptor in descriptors {
@@ -295,6 +302,7 @@ impl TabletLifecycleManager {
             } else {
                 host.issue_group_writer(identity).map_err(host_error)?
             };
+            let retention_writer = group_wal.clone();
             let group_transport = self
                 .transport
                 .register_group(&bootstrap)
@@ -360,31 +368,293 @@ impl TabletLifecycleManager {
                 })?;
             }
             self.runtimes.insert(identity, runtime);
+            self.writers.insert(identity, retention_writer);
+        }
+        Ok(())
+    }
+
+    /// Reconcile local lifetimes whose removal has been durably authorized by
+    /// metadata and by the recovered/current Raft ConfState.
+    ///
+    /// Desired-placement absence is deliberately insufficient: a stale
+    /// placement can be observed before the corresponding committed
+    /// membership removal. The terminal registry tombstone is published before
+    /// route, runtime, snapshot, or retention cleanup so every crash point
+    /// resumes from a permanent identity fence.
+    fn reconcile_retired(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataState,
+        active: bool,
+    ) -> Result<()> {
+        for record in self.registry.records()? {
+            let key = record.key();
+            let identity = RaftReplicaIdentity::new(key.raft_group_id, key.replica_id)
+                .map_err(|source| Error::Configuration(source.to_string()))?;
+
+            if !metadata.is_replica_retired(key.raft_group_id, key.replica_id) {
+                if record.lifecycle == ReplicaLifecycle::Tombstoned {
+                    return Err(Error::RecoveryFailed {
+                        reason: format!(
+                            "local tombstone for replica {} of group {} has no metadata retirement authority",
+                            key.replica_id.0, key.raft_group_id.0
+                        ),
+                    });
+                }
+                continue;
+            }
+
+            if record.lifecycle != ReplicaLifecycle::Tombstoned
+                && !self.conf_state_proves_removed(identity)
+            {
+                // Membership removal may be committed in metadata before the
+                // local Ready owner has published the matching ConfState.
+                // Keep serving and retry; deleting without that proof would
+                // strand a still-voting replica.
+                continue;
+            }
+
+            if record.lifecycle != ReplicaLifecycle::Tombstoned {
+                if let Some(bootstrap) = self.durable_bootstrap(identity)? {
+                    let initial =
+                        bootstrap
+                            .to_core_conf_state()
+                            .map_err(|source| Error::RecoveryFailed {
+                                reason: source.to_string(),
+                            })?;
+                    self.registry.set_initial_configuration(
+                        key,
+                        InitialReplicaConfiguration::from_core(&initial)?,
+                    )?;
+                }
+                self.registry.mark_destroying(key)?;
+                // This write is the identity fence. It intentionally precedes
+                // every cleanup operation below.
+                self.registry.mark_tombstoned(key)?;
+            }
+
+            if active {
+                host.tombstone_group(identity).map_err(host_error)?;
+                self.cleanup_retired_replica(record, identity)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn conf_state_proves_removed(&self, identity: RaftReplicaIdentity) -> bool {
+        if let Some(runtime) = self.runtimes.get(&identity) {
+            return runtime.handle().status().replica_in_conf_state == Some(false);
+        }
+
+        self.recovered
+            .replica(identity)
+            .and_then(|replica| replica.conf_state())
+            .is_some_and(|conf_state| conf_state_excludes_replica(conf_state, identity.replica_id))
+    }
+
+    /// Remove in-process routes and local snapshot artifacts after the
+    /// terminal tombstone has been durably published.
+    fn cleanup_retired_replica(
+        &mut self,
+        record: LocalReplicaRecord,
+        identity: RaftReplicaIdentity,
+    ) -> Result<()> {
+        let bootstrap = self.durable_bootstrap(identity)?;
+
+        if let Some(bootstrap) = &bootstrap
+            && self
+                .registry
+                .record(record.key())?
+                .and_then(|record| record.initial_configuration)
+                .is_none()
+        {
+            let initial =
+                bootstrap
+                    .to_core_conf_state()
+                    .map_err(|source| Error::RecoveryFailed {
+                        reason: source.to_string(),
+                    })?;
+            self.registry.set_initial_configuration(
+                record.key(),
+                InitialReplicaConfiguration::from_core(&initial)?,
+            )?;
+        }
+
+        if let Some(bootstrap) = bootstrap {
+            self.transport
+                .unregister_group(&bootstrap)
+                .map_err(|source| Error::RecoveryFailed {
+                    reason: format!("unregister tablet Raft transport: {source}"),
+                })?;
+        }
+        self.snapshot_transport
+            .unregister_group(identity.raft_group_id, identity.replica_id)
+            .map_err(|source| Error::RecoveryFailed {
+                reason: format!("unregister tablet snapshot route: {source}"),
+            })?;
+
+        // Detach the host proxy before dropping the runtime so no scheduler
+        // turn can race with worker shutdown.
+        drop(self.runtimes.remove(&identity));
+
+        if let Some(mut writer) = self.writers.remove(&identity) {
+            writer
+                .prune_before(self.wal.durable_lsn())
+                .map_err(|reason| Error::RecoveryFailed {
+                    reason: format!("release tombstoned replica WAL retention: {reason}"),
+                })?;
+            writer
+                .release_retention()
+                .map_err(|reason| Error::RecoveryFailed {
+                    reason: format!("remove tombstoned replica WAL retention: {reason}"),
+                })?;
+        }
+
+        self.snapshot_store
+            .remove_replica_state(record.raft_group_id, record.replica_id, record.tablet_id)
+            .map_err(|source| Error::RecoveryFailed {
+                reason: format!("remove tombstoned tablet snapshots: {source}"),
+            })?;
+
+        let bootstrap_store = FileBootstrapStore::open(self.config.data_dir.join("raft-bootstrap"))
+            .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?;
+        bootstrap_store
+            .remove_durable_bootstrap(identity.raft_group_id)
+            .map_err(|source| Error::RecoveryFailed {
+                reason: format!("remove tombstoned tablet bootstrap: {source}"),
+            })?;
+        Ok(())
+    }
+
+    fn durable_bootstrap(
+        &self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<Option<RaftGroupBootstrap>> {
+        let store = FileBootstrapStore::open(self.config.data_dir.join("raft-bootstrap")).map_err(
+            |source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            },
+        )?;
+        load_durable_group_bootstrap(&store, identity.raft_group_id).map_err(|source| {
+            Error::RecoveryFailed {
+                reason: source.to_string(),
+            }
+        })
+    }
+
+    fn ensure_tombstone_writer(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        identity: RaftReplicaIdentity,
+        active: bool,
+    ) -> Result<()> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.writers.entry(identity) {
+            let writer = if active {
+                host.issue_group_writer_after_activation(identity)
+                    .map_err(host_error)?
+            } else {
+                host.issue_group_writer(identity).map_err(host_error)?
+            };
+            entry.insert(writer);
+        }
+        if active {
+            host.tombstone_group(identity).map_err(host_error)?;
+        } else {
+            host.register_tombstoned_identity(identity)
+                .map_err(host_error)?;
+        }
+        Ok(())
+    }
+
+    /// Account tombstoned registry records that have no corresponding WAL
+    /// records after an earlier cleanup. They still need a live admission
+    /// fence and an identity-bound retention entry before activation.
+    fn register_local_tombstones(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+    ) -> Result<()> {
+        let state = metadata.state_snapshot();
+        for record in self.registry.records()? {
+            if record.lifecycle != ReplicaLifecycle::Tombstoned {
+                continue;
+            }
+            if !state.is_replica_retired(record.raft_group_id, record.replica_id) {
+                return Err(Error::RecoveryFailed {
+                    reason: format!(
+                        "local tombstone for replica {} of group {} has no metadata retirement authority",
+                        record.replica_id.0, record.raft_group_id.0
+                    ),
+                });
+            }
+            let identity = RaftReplicaIdentity::new(record.raft_group_id, record.replica_id)
+                .map_err(|source| Error::Configuration(source.to_string()))?;
+            self.ensure_tombstone_writer(host, identity, false)?;
         }
         Ok(())
     }
 
     /// Reject recovered lifetimes that cannot be explained by the committed
-    /// metadata placement or the explicitly supported legacy group. Removal
-    /// tombstones are a later phase; silently retaining an unknown lifetime
-    /// here would allow stale state to survive a restart without authority.
+    /// metadata placement, an explicitly supported legacy group, or a durable
+    /// retirement/tombstone record. Retired identities are registered as
+    /// tombstones before activation so stale traffic is fenced during startup.
     fn register_unmaterialized_recovered(
         &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
         metadata_identity: RaftReplicaIdentity,
         legacy_identity: RaftReplicaIdentity,
     ) -> Result<()> {
+        let metadata_state = metadata.state_snapshot();
         let materialized = self
             .runtimes
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        for identity in self.recovered.replicas().map(|(identity, _)| *identity) {
+        let recovered_identities = self
+            .recovered
+            .replicas()
+            .map(|(identity, _)| *identity)
+            .collect::<Vec<_>>();
+        for identity in recovered_identities {
             if identity == metadata_identity
                 || identity == legacy_identity
                 || materialized.contains(&identity)
             {
                 continue;
             }
+
+            let key = LocalReplicaKey {
+                raft_group_id: identity.raft_group_id,
+                replica_id: identity.replica_id,
+            };
+            if let Some(record) = self.registry.record(key)?
+                && matches!(
+                    record.lifecycle,
+                    ReplicaLifecycle::Active
+                        | ReplicaLifecycle::Destroying
+                        | ReplicaLifecycle::Tombstoned
+                )
+                && metadata_state.is_replica_retired(key.raft_group_id, key.replica_id)
+            {
+                if !self.conf_state_proves_removed(identity) {
+                    return Err(Error::RecoveryFailed {
+                        reason: format!(
+                            "retired local replica {:?} has no durable ConfState removal proof",
+                            identity
+                        ),
+                    });
+                }
+                if record.lifecycle != ReplicaLifecycle::Tombstoned {
+                    self.registry.mark_destroying(key)?;
+                    self.registry.mark_tombstoned(key)?;
+                }
+                self.ensure_tombstone_writer(host, identity, false)?;
+                continue;
+            }
+
             return Err(Error::RecoveryFailed {
                 reason: format!(
                     "recovered local replica {:?} has no committed metadata placement",
@@ -394,6 +664,17 @@ impl TabletLifecycleManager {
         }
         Ok(())
     }
+}
+
+/// Return whether a durable Raft configuration has completely removed a
+/// replica, including the outgoing voter set used during joint consensus.
+fn conf_state_excludes_replica(conf_state: &raft::types::ConfState, replica_id: ReplicaId) -> bool {
+    let Ok(replica_id) = replica_id.to_raft() else {
+        return false;
+    };
+    !conf_state.voters.contains(&replica_id)
+        && !conf_state.learners.contains(&replica_id)
+        && !conf_state.outgoing_voters.contains(&replica_id)
 }
 
 fn metadata_tablet_bootstrap(
@@ -705,9 +986,16 @@ impl MultiRaftRuntime {
         // recovery configuration. A corrupt registry or a registry belonging
         // to another cluster must fail startup closed rather than allowing
         // WAL recovery to proceed from an incomplete local view.
-        if let Some(cluster_id) = config.cluster_id.as_deref() {
-            LocalReplicaRegistry::open(config.data_dir.join("replica-registry.json"), cluster_id)?;
-        }
+        let registry = config
+            .cluster_id
+            .as_deref()
+            .map(|cluster_id| {
+                LocalReplicaRegistry::open(
+                    config.data_dir.join("replica-registry.json"),
+                    cluster_id,
+                )
+            })
+            .transpose()?;
 
         let bootstraps =
             store
@@ -748,6 +1036,33 @@ impl MultiRaftRuntime {
                     })?;
 
             configurations.insert(identity, conf_state);
+        }
+
+        // A tombstoned group may have already removed its bootstrap file. In
+        // that case the registry's immutable initial-membership witness is the
+        // only safe source for replaying retained configuration entries.
+        if let Some(registry) = registry {
+            for record in registry.records()? {
+                let Some(initial) = record.initial_configuration else {
+                    continue;
+                };
+                let identity = RaftReplicaIdentity::new(record.raft_group_id, record.replica_id)
+                    .map_err(|source| Error::RecoveryFailed {
+                        reason: source.to_string(),
+                    })?;
+                let conf_state = initial.to_core()?;
+                if let Some(existing) = configurations.get(&identity)
+                    && existing != &conf_state
+                {
+                    return Err(Error::RecoveryFailed {
+                        reason: format!(
+                            "registry initial configuration for {:?} conflicts with durable bootstrap",
+                            identity
+                        ),
+                    });
+                }
+                configurations.insert(identity, conf_state);
+            }
         }
 
         Ok(configurations)
@@ -987,7 +1302,13 @@ impl MultiRaftRuntime {
             Arc::clone(&start_gate),
         );
         tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
-        tablet_lifecycle.register_unmaterialized_recovered(metadata_identity, identity)?;
+        tablet_lifecycle.register_unmaterialized_recovered(
+            &mut host,
+            &metadata_handle,
+            metadata_identity,
+            identity,
+        )?;
+        tablet_lifecycle.register_local_tombstones(&mut host, &metadata_handle)?;
 
         // --------------------------------------------------------------
         // One physical activation boundary.
@@ -1770,5 +2091,90 @@ mod tests {
         let error = resolve_metadata_tablet_bootstrap(requested, Some(stale), descriptor.tablet_id)
             .expect_err("stale durable placement must fail closed");
         assert!(matches!(error, Error::RecoveryFailed { .. }));
+    }
+
+    /// Realistic bug caught: a replica in the outgoing voter set is still
+    /// participating in joint consensus and must not be destroyed merely
+    /// because it disappeared from the current voter set.
+    #[test]
+    fn conf_state_removal_proof_rejects_joint_consensus_members() {
+        let mut conf_state = raft::types::ConfState::new(
+            4,
+            [raft::types::ReplicaId::must(101)],
+            [raft::types::ReplicaId::must(202)],
+        )
+        .unwrap();
+        conf_state
+            .outgoing_voters
+            .insert(raft::types::ReplicaId::must(303));
+
+        assert!(!conf_state_excludes_replica(&conf_state, ReplicaId(303)));
+        assert!(!conf_state_excludes_replica(&conf_state, ReplicaId(202)));
+        assert!(conf_state_excludes_replica(&conf_state, ReplicaId(404)));
+    }
+
+    /// Realistic bug caught: once tombstone cleanup removes a bootstrap file,
+    /// startup must still derive the initial configuration from the durable
+    /// registry witness instead of treating retained configuration entries as
+    /// unrecoverable.
+    #[test]
+    fn recovery_configuration_uses_registry_witness_after_bootstrap_removal() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::new(
+            NodeId(7),
+            data.path().to_path_buf(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        config.cluster_id = Some("cluster-a".to_string());
+
+        let bootstrap = RaftGroupBootstrap::new(
+            "cluster-a".to_string(),
+            RaftGroupId(10),
+            1,
+            BTreeMap::from([(ReplicaId(101), NodeId(7)), (ReplicaId(202), NodeId(8))]),
+            [ReplicaId(101), ReplicaId(202)].into_iter().collect(),
+            std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        let bootstrap_store = FileBootstrapStore::open(data.path().join("raft-bootstrap")).unwrap();
+        let mut registry =
+            LocalReplicaRegistry::open(data.path().join("replica-registry.json"), "cluster-a")
+                .unwrap();
+        let record = LocalReplicaRecord::new(
+            RaftGroupId(10),
+            ReplicaId(101),
+            TabletId(20),
+            TableId(30),
+            1,
+            ReplicaLifecycle::Creating,
+        );
+        registry.ensure_replica(record.clone()).unwrap();
+        registry.mark_destroying(record.key()).unwrap();
+        registry.mark_tombstoned(record.key()).unwrap();
+        registry
+            .set_initial_configuration(
+                record.key(),
+                InitialReplicaConfiguration::from_core(&bootstrap.to_core_conf_state().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(registry);
+        let mut bootstrap_store = bootstrap_store;
+        ragnordb_multiraft::bootstrap::bootstrap_group_exactly_once(
+            &mut bootstrap_store,
+            &bootstrap,
+        )
+        .unwrap();
+        bootstrap_store
+            .remove_durable_bootstrap(bootstrap.raft_group_id)
+            .unwrap();
+
+        let lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
+        let recovered = MultiRaftRuntime::recovery_configurations(&config, &lock).unwrap();
+        assert_eq!(
+            recovered[&RaftReplicaIdentity::new(RaftGroupId(10), ReplicaId(101)).unwrap()].voters,
+            bootstrap.to_core_conf_state().unwrap().voters
+        );
     }
 }

@@ -652,7 +652,9 @@ impl NodeRaftTransport {
 
     /// Register the durable replica-to-node mapping for one Raft group.
     ///
-    /// Exact replay is harmless. Conflicting routing authority is rejected.
+    /// Exact replay is harmless. Conflicting routing authority is rejected;
+    /// Slice 3 removes mappings only after the local lifecycle tombstone is
+    /// durable.
     pub fn register_group(&self, bootstrap: &RaftGroupBootstrap) -> io::Result<GroupRaftTransport> {
         bootstrap
             .validate()
@@ -690,6 +692,27 @@ impl NodeRaftTransport {
             raft_group_id: bootstrap.raft_group_id,
             transport: self.clone(),
         })
+    }
+
+    /// Remove every route owned by one durable group bootstrap.
+    ///
+    /// The caller must have durably tombstoned the local replica before
+    /// unregistering routes. Keeping this operation exact to the bootstrap's
+    /// `(group, replica)` mappings prevents an unrelated group's route from
+    /// being removed when group IDs are reused by a future metadata epoch.
+    pub fn unregister_group(&self, bootstrap: &RaftGroupBootstrap) -> io::Result<()> {
+        bootstrap
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?;
+        for replica_id in bootstrap.replica_to_node.keys() {
+            routes.remove(&(bootstrap.raft_group_id, *replica_id));
+        }
+        Ok(())
     }
 
     pub fn try_send(&self, message: RoutedRaftMessage) -> io::Result<()> {

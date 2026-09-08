@@ -927,6 +927,59 @@ impl FileTabletSnapshotStore {
         Ok(removed)
     }
 
+    /// Remove every published snapshot and the monotonic allocator state for
+    /// one exact replica/tablet lifetime.
+    ///
+    /// The filename prefix includes all three identity components, so cleanup
+    /// cannot delete another tablet's image even when replica IDs repeat in a
+    /// different Raft group. The caller must already have durably published a
+    /// lifecycle tombstone; this method only removes local snapshot artifacts
+    /// and never changes Raft or shared-WAL state.
+    pub fn remove_replica_state(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        tablet_id: TabletId,
+    ) -> Result<usize, TabletSnapshotStoreError> {
+        if raft_group_id.0 == 0 || replica_id.0 == 0 || tablet_id.0 == 0 {
+            return Err(TabletSnapshotStoreError::InvalidSnapshotAllocatorIdentity);
+        }
+
+        let prefix = format!(
+            "tablet-{}-{}-{}-",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let allocator_name = format!(
+            "tablet-{}-{}-{}.next-snapshot-id",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let is_snapshot = file_name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".snapshot"))
+                .is_some_and(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            if is_snapshot || file_name == allocator_name {
+                fs::remove_file(entry.path()).map_err(io_error)?;
+                removed += 1;
+            }
+        }
+        if removed != 0 {
+            File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)?;
+        }
+        Ok(removed)
+    }
+
     fn file_name(metadata: &TabletSnapshotMetadata) -> String {
         format!(
             "tablet-{}-{}-{}-{}.snapshot",

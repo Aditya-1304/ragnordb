@@ -68,6 +68,82 @@ pub struct LocalReplicaKey {
     pub replica_id: ReplicaId,
 }
 
+/// Minimal initial membership witness retained when a tombstoned group's
+/// bootstrap file is removed. Shared-WAL recovery still needs the original
+/// membership to replay committed configuration changes, even though the
+/// deleted replica will never be restarted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialReplicaConfiguration {
+    pub version: u64,
+    pub voters: BTreeSet<ReplicaId>,
+    pub learners: BTreeSet<ReplicaId>,
+}
+
+impl InitialReplicaConfiguration {
+    pub fn from_core(conf_state: &raft::types::ConfState) -> Result<Self> {
+        let voters = conf_state
+            .voters
+            .iter()
+            .map(|replica_id| ReplicaId::from_raft(*replica_id))
+            .collect();
+        let learners = conf_state
+            .learners
+            .iter()
+            .map(|replica_id| ReplicaId::from_raft(*replica_id))
+            .collect();
+        let configuration = Self {
+            version: conf_state.version,
+            voters,
+            learners,
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    pub fn to_core(&self) -> Result<raft::types::ConfState> {
+        self.validate()?;
+        let voters = self
+            .voters
+            .iter()
+            .map(|replica_id| {
+                replica_id
+                    .to_raft()
+                    .map_err(|error| Error::CorruptData(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let learners = self
+            .learners
+            .iter()
+            .map(|replica_id| {
+                replica_id
+                    .to_raft()
+                    .map_err(|error| Error::CorruptData(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        raft::types::ConfState::new(self.version, voters, learners)
+            .map_err(|error| Error::CorruptData(format!("invalid initial ConfState: {error:?}")))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version == 0 || self.voters.is_empty() {
+            return Err(Error::CorruptData(
+                "initial replica configuration must have a non-zero version and voter".to_string(),
+            ));
+        }
+        if self.voters.iter().any(|id| id.0 == 0)
+            || self.learners.iter().any(|id| id.0 == 0)
+            || self.voters.iter().any(|id| self.learners.contains(id))
+        {
+            return Err(Error::CorruptData(
+                "initial replica configuration contains an invalid or overlapping identity"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One registry record.  Identity and tablet epoch are immutable after the
 /// record is first persisted; lifecycle and frontiers advance independently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +157,10 @@ pub struct LocalReplicaRecord {
     pub lifecycle: ReplicaLifecycle,
     pub snapshot_frontier: Option<DurableFrontier>,
     pub apply_frontier: Option<DurableFrontier>,
+    /// Original bootstrap membership retained only when cleanup removes the
+    /// bootstrap file while shared-WAL records may still require it for replay.
+    #[serde(default)]
+    pub initial_configuration: Option<InitialReplicaConfiguration>,
 }
 
 impl LocalReplicaRecord {
@@ -102,6 +182,7 @@ impl LocalReplicaRecord {
             lifecycle,
             snapshot_frontier: None,
             apply_frontier: None,
+            initial_configuration: None,
         }
     }
 
@@ -157,6 +238,9 @@ impl LocalReplicaRecord {
             return Err(Error::CorruptData(
                 "snapshot frontier is ahead of apply frontier".to_string(),
             ));
+        }
+        if let Some(configuration) = &self.initial_configuration {
+            configuration.validate()?;
         }
         Ok(())
     }
@@ -375,6 +459,96 @@ impl LocalReplicaRegistry {
 
         let mut next = self.state.clone();
         next.replicas[index].lifecycle = ReplicaLifecycle::Active;
+        self.persist(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// Persist the beginning of local replica destruction.
+    ///
+    /// This transition is intentionally separate from cleanup. A crash after
+    /// `Destroying` is recoverable and can be resumed, while no caller may
+    /// delete local state before the terminal tombstone is durable.
+    pub fn mark_destroying(&mut self, key: LocalReplicaKey) -> Result<()> {
+        self.ensure_healthy()?;
+        let index = self.index_of(key)?;
+        let lifecycle = self.state.replicas[index].lifecycle;
+        if matches!(
+            lifecycle,
+            ReplicaLifecycle::Destroying | ReplicaLifecycle::Tombstoned
+        ) {
+            return Ok(());
+        }
+        if !matches!(
+            lifecycle,
+            ReplicaLifecycle::Creating | ReplicaLifecycle::Active
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "cannot destroy local replica {} of group {} from lifecycle {:?}",
+                key.replica_id.0, key.raft_group_id.0, lifecycle
+            )));
+        }
+
+        let mut next = self.state.clone();
+        next.replicas[index].lifecycle = ReplicaLifecycle::Destroying;
+        self.persist(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// Persist the permanent identity fence before any destructive cleanup.
+    ///
+    /// Once this method returns successfully, a replayed create request for
+    /// the same `(RaftGroupId, ReplicaId)` is rejected even if process cleanup
+    /// is interrupted and the old files remain on disk.
+    pub fn mark_tombstoned(&mut self, key: LocalReplicaKey) -> Result<()> {
+        self.ensure_healthy()?;
+        let index = self.index_of(key)?;
+        let lifecycle = self.state.replicas[index].lifecycle;
+        if lifecycle == ReplicaLifecycle::Tombstoned {
+            return Ok(());
+        }
+        if lifecycle != ReplicaLifecycle::Destroying {
+            return Err(Error::InvalidArgument(format!(
+                "cannot tombstone local replica {} of group {} from lifecycle {:?}",
+                key.replica_id.0, key.raft_group_id.0, lifecycle
+            )));
+        }
+
+        let mut next = self.state.clone();
+        next.replicas[index].lifecycle = ReplicaLifecycle::Tombstoned;
+        self.persist(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// Persist the original Raft membership witness before deleting a
+    /// bootstrap file. Repeated publication is idempotent, while a different
+    /// witness is rejected because it would make replay ambiguous.
+    pub fn set_initial_configuration(
+        &mut self,
+        key: LocalReplicaKey,
+        configuration: InitialReplicaConfiguration,
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        configuration.validate()?;
+        let index = self.index_of(key)?;
+        if self.state.replicas[index]
+            .initial_configuration
+            .as_ref()
+            .is_some_and(|existing| existing != &configuration)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "initial configuration for replica {} of group {} conflicts with the existing witness",
+                key.replica_id.0, key.raft_group_id.0
+            )));
+        }
+        if self.state.replicas[index].initial_configuration.is_some() {
+            return Ok(());
+        }
+
+        let mut next = self.state.clone();
+        next.replicas[index].initial_configuration = Some(configuration);
         self.persist(&next)?;
         self.state = next;
         Ok(())

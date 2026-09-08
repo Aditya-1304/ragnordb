@@ -125,6 +125,11 @@ pub struct ReplicatedTabletStatus {
     pub replication_inflight_bytes: usize,
     pub serving_leader: bool,
     pub runtime_error: Option<String>,
+    /// Whether the local replica is present in the latest durable ConfState.
+    /// `None` means no Ready-owned membership has been published yet, so
+    /// lifecycle destruction must wait rather than infer removal from
+    /// metadata placement alone.
+    pub replica_in_conf_state: Option<bool>,
 }
 
 enum HostRequest {
@@ -2895,6 +2900,11 @@ fn publish_status<W, LS, SS>(
         .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
         .map(|progress| progress.inflight_bytes)
         .sum();
+    let local_replica = ready_loop.raft().id();
+    published.replica_in_conf_state = ready_loop
+        .raft()
+        .durable_conf_state()
+        .map(|conf_state| conf_state.contains(local_replica));
 }
 
 #[cfg(test)]

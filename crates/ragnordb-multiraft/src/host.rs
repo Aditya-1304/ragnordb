@@ -996,6 +996,11 @@ where
     /// handle from the same NodeRaftWal owned by this host.
     issued_writers: BTreeSet<RaftReplicaIdentity>,
 
+    /// Durable lifecycle tombstones mirrored into the live host admission
+    /// boundary. A tombstoned identity is fenced before group lookup so stale
+    /// messages cannot turn an absent group into a new allocation.
+    tombstoned: BTreeSet<RaftReplicaIdentity>,
+
     /// Permanently isolated groups for this process lifetime.
     ///
     /// Group-local corruption/apply/snapshot failures do not stop unrelated
@@ -1033,6 +1038,7 @@ where
             pending_message_bytes: 0,
             pending_recovered: BTreeSet::new(),
             issued_writers: BTreeSet::new(),
+            tombstoned: BTreeSet::new(),
             quarantined: BTreeMap::new(),
         })
     }
@@ -1075,6 +1081,7 @@ where
                 .map(|(identity, _)| *identity)
                 .collect(),
             issued_writers: BTreeSet::new(),
+            tombstoned: BTreeSet::new(),
             quarantined: BTreeMap::new(),
         })
     }
@@ -1175,6 +1182,26 @@ where
         }
     }
 
+    /// Register a durable tombstone discovered during startup recovery.
+    ///
+    /// The identity-bound writer must be issued first so the shared-WAL
+    /// retention registry accounts for the lifetime until cleanup advances its
+    /// floor. The operation is idempotent and consumes a matching recovered
+    /// identity when one was present in the scan.
+    pub fn register_tombstoned_identity(
+        &mut self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_registering()?;
+        self.ensure_shared_wal_healthy()?;
+        if !self.issued_writers.contains(&identity) {
+            return Err(MultiRaftHostError::WalWriterNotIssued(identity));
+        }
+        self.pending_recovered.remove(&identity);
+        self.tombstoned.insert(identity);
+        Ok(())
+    }
+
     fn register_group(
         &mut self,
         group: Box<dyn HostedRaftGroup>,
@@ -1183,6 +1210,9 @@ where
         self.ensure_registering()?;
         self.ensure_shared_wal_healthy()?;
         let identity = group.identity();
+        if self.tombstoned.contains(&identity) {
+            return Err(MultiRaftHostError::TombstonedReplica(identity));
+        }
         if !self.issued_writers.contains(&identity) {
             return Err(MultiRaftHostError::WalWriterNotIssued(identity));
         }
@@ -1213,6 +1243,10 @@ where
         self.ensure_registering()?;
         self.ensure_shared_wal_healthy()?;
 
+        if self.tombstoned.contains(&identity) {
+            return Err(MultiRaftHostError::TombstonedReplica(identity));
+        }
+
         if !self.issued_writers.insert(identity) {
             return Err(MultiRaftHostError::WalWriterAlreadyIssued(identity));
         }
@@ -1234,6 +1268,10 @@ where
     ) -> Result<NodeRaftWalHandle<W>, MultiRaftHostError> {
         self.ensure_active()?;
         self.ensure_shared_wal_healthy()?;
+
+        if self.tombstoned.contains(&identity) {
+            return Err(MultiRaftHostError::TombstonedReplica(identity));
+        }
 
         if !self.issued_writers.insert(identity) {
             return Err(MultiRaftHostError::WalWriterAlreadyIssued(identity));
@@ -1257,6 +1295,9 @@ where
         self.ensure_active()?;
         self.ensure_shared_wal_healthy()?;
         let identity = group.identity();
+        if self.tombstoned.contains(&identity) {
+            return Err(MultiRaftHostError::TombstonedReplica(identity));
+        }
         if !self.issued_writers.contains(&identity) {
             return Err(MultiRaftHostError::WalWriterNotIssued(identity));
         }
@@ -1266,6 +1307,45 @@ where
         let group_id = identity.raft_group_id;
         self.groups.insert(group_id, group);
         self.runnable.enqueue(group_id);
+        Ok(())
+    }
+
+    /// Detach one active group and fence its replica lifetime permanently.
+    ///
+    /// Registry durability is owned by the server lifecycle manager and must
+    /// be committed before this method is called. Removing the scheduler and
+    /// pending-message state here makes the host safe to continue serving
+    /// unrelated groups while delayed envelopes receive a typed tombstone
+    /// error.
+    pub fn tombstone_group(
+        &mut self,
+        identity: RaftReplicaIdentity,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_shared_wal_healthy()?;
+        if self.tombstoned.contains(&identity) {
+            return Ok(());
+        }
+        if !self.issued_writers.contains(&identity) {
+            return Err(MultiRaftHostError::WalWriterNotIssued(identity));
+        }
+
+        if let Some(group) = self.groups.get(&identity.raft_group_id)
+            && group.identity() != identity
+        {
+            return Err(MultiRaftHostError::ReplicaIdentityMismatch {
+                raft_group_id: identity.raft_group_id,
+                expected: group.identity(),
+                received: identity,
+            });
+        }
+
+        self.groups.remove(&identity.raft_group_id);
+        self.runnable.remove(identity.raft_group_id);
+        self.timers.remove(identity.raft_group_id);
+        self.remove_pending_group(identity.raft_group_id);
+        self.quarantined.remove(&identity.raft_group_id);
+        self.tombstoned.insert(identity);
         Ok(())
     }
 
@@ -1711,6 +1791,13 @@ where
     fn validate_message(&self, message: &RoutedRaftMessage) -> Result<(), MultiRaftHostError> {
         let raft_group_id = message.raft_group_id;
 
+        let received = ReplicaId::from_raft(message.envelope.to);
+        let tombstone_identity = RaftReplicaIdentity::new(raft_group_id, received)
+            .map_err(|error| MultiRaftHostError::InvalidMessage(error.to_string()))?;
+        if self.tombstoned.contains(&tombstone_identity) {
+            return Err(MultiRaftHostError::TombstonedReplica(tombstone_identity));
+        }
+
         if let Some(reason) = self.quarantined.get(&raft_group_id) {
             return Err(MultiRaftHostError::GroupQuarantined {
                 raft_group_id,
@@ -1732,7 +1819,7 @@ where
             return Err(MultiRaftHostError::RecipientMismatch {
                 raft_group_id,
                 expected: identity.replica_id,
-                received: ReplicaId::from_raft(message.envelope.to),
+                received,
             });
         }
 
@@ -1999,6 +2086,8 @@ pub enum MultiRaftHostError {
     RecoveryRequired,
     #[error("no local replica is registered for Raft group {0:?}")]
     UnknownGroup(RaftGroupId),
+    #[error("replica lifetime {0:?} is permanently tombstoned")]
+    TombstonedReplica(RaftReplicaIdentity),
     #[error("invalid Raft envelope: {0}")]
     InvalidMessage(String),
     #[error(
@@ -2026,6 +2115,14 @@ pub enum MultiRaftHostError {
     },
     #[error("Raft group {0:?} is already registered on this node")]
     DuplicateGroup(RaftGroupId),
+    #[error(
+        "Raft group {raft_group_id:?} is registered for {expected:?}, not requested lifetime {received:?}"
+    )]
+    ReplicaIdentityMismatch {
+        raft_group_id: RaftGroupId,
+        expected: RaftReplicaIdentity,
+        received: RaftReplicaIdentity,
+    },
     #[error("recovered identity {0:?} must use the recovered startup path")]
     RecoveredIdentityRequiresRecovery(RaftReplicaIdentity),
     #[error("identity {0:?} was not discovered by shared-WAL recovery")]
@@ -3007,5 +3104,69 @@ mod tests {
             Some("injected group-local failure")
         );
         assert!(status.groups[1].quarantine_reason.is_none());
+    }
+
+    /// Realistic bug caught: after local destruction, a delayed envelope must
+    /// be rejected as a tombstoned lifetime instead of being treated as an
+    /// unknown group that a later bootstrap could accidentally recreate.
+    #[test]
+    fn tombstoned_group_fences_delayed_messages_and_re_registration() {
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(healthy_group(group_identity, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+
+        host.tombstone_group(group_identity).unwrap();
+        assert_eq!(host.group_count(), 0);
+
+        let message = RoutedRaftMessage {
+            raft_group_id: group_identity.raft_group_id,
+            envelope: Envelope {
+                from: RaftReplicaId::must(20),
+                to: RaftReplicaId::must(group_identity.replica_id.0),
+                msg: Message::PreVoteResponse(raft::message::PreVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            },
+        };
+        assert_eq!(
+            host.enqueue_message(message),
+            Err(MultiRaftHostError::TombstonedReplica(group_identity))
+        );
+        assert!(matches!(
+            host.issue_group_writer_after_activation(group_identity),
+            Err(MultiRaftHostError::TombstonedReplica(identity)) if identity == group_identity
+        ));
+    }
+
+    /// Realistic bug caught: restart recovery may have no active group object
+    /// left, but it must still install the durable tombstone before activation
+    /// so the first delayed envelope cannot enter an unknown-group path.
+    #[test]
+    fn startup_tombstone_is_admitted_without_a_group_runtime() {
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_tombstoned_identity(group_identity).unwrap();
+        host.activate().unwrap();
+
+        let message = RoutedRaftMessage {
+            raft_group_id: group_identity.raft_group_id,
+            envelope: Envelope {
+                from: RaftReplicaId::must(20),
+                to: RaftReplicaId::must(group_identity.replica_id.0),
+                msg: Message::PreVoteResponse(raft::message::PreVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            },
+        };
+        assert!(matches!(
+            host.enqueue_message(message),
+            Err(MultiRaftHostError::TombstonedReplica(identity)) if identity == group_identity
+        ));
     }
 }

@@ -245,6 +245,41 @@ fn filesystem_bootstrap_store_survives_process_reopen() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Realistic bug caught: tombstone cleanup must publish the bootstrap removal
+/// durably and remain idempotent when a retry observes that the file is gone.
+#[test]
+fn filesystem_bootstrap_store_removal_is_durable_and_idempotent() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "ragnordb-bootstrap-remove-{}-{unique}",
+        process::id()
+    ));
+    let requested = bootstrap();
+
+    let mut store = FileBootstrapStore::open(&directory).unwrap();
+    bootstrap_group_exactly_once(&mut store, &requested).unwrap();
+    assert!(
+        store
+            .remove_durable_bootstrap(requested.raft_group_id)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .remove_durable_bootstrap(requested.raft_group_id)
+            .unwrap()
+    );
+    assert!(
+        load_durable_group_bootstrap(&store, requested.raft_group_id)
+            .unwrap()
+            .is_none()
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 /// Realistic bug caught: a process crash can leave the counter-selected
 /// temporary bootstrap file behind, causing the next process to fail before
 /// it can reconcile or install durable bootstrap state.

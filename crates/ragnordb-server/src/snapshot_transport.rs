@@ -149,9 +149,9 @@ impl NodeSnapshotTransport {
 
     /// Register one local Raft group's snapshot installation boundary.
     ///
-    /// A group may be registered exactly once for the lifetime of this minimum
-    /// Phase 5.0 host. Dynamic group removal/replacement belongs with later
-    /// membership lifecycle work.
+    /// A group may be registered exactly once at a time. Slice 3 can remove a
+    /// tombstoned route, after which an explicitly authorized new lifetime may
+    /// register a fresh route for the same logical group.
     pub fn register_group(
         &self,
         raft_group_id: RaftGroupId,
@@ -203,6 +203,36 @@ impl NodeSnapshotTransport {
             transport: self.clone(),
             inbound: inbound_rx,
         })
+    }
+
+    /// Remove the local receive route for one exact replica lifetime.
+    ///
+    /// Route removal closes the admission path for new snapshot transfers;
+    /// already received sessions still own only temporary files and cannot
+    /// publish through a dropped group receiver.
+    pub fn unregister_group(
+        &self,
+        raft_group_id: RaftGroupId,
+        local_replica_id: ReplicaId,
+    ) -> io::Result<()> {
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| io::Error::other("snapshot route registry lock is poisoned"))?;
+        let Some(route) = routes.get(&raft_group_id) else {
+            return Ok(());
+        };
+        if route.local_replica_id != local_replica_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot route for Raft group {} belongs to replica {}, not {}",
+                    raft_group_id.0, route.local_replica_id.0, local_replica_id.0
+                ),
+            ));
+        }
+        routes.remove(&raft_group_id);
+        Ok(())
     }
 
     fn send(
@@ -654,5 +684,36 @@ mod tests {
         assert_eq!(received_20.metadata.raft_group_id, RaftGroupId(20),);
 
         assert_eq!(received_20.metadata.replica_id, ReplicaId(405),);
+    }
+
+    /// Realistic bug caught: a tombstoned replica must close its snapshot
+    /// receive route so a delayed transfer cannot be queued for a detached
+    /// tablet worker.
+    #[test]
+    fn unregister_group_closes_the_exact_snapshot_route() {
+        let node = NodeSnapshotTransport::bind(
+            unused_address(),
+            BTreeMap::new(),
+            SnapshotWorkController::default(),
+            64 * 1024,
+        )
+        .unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            FileTabletSnapshotStore::new(store_dir.path(), 1024 * 1024).unwrap(),
+        );
+
+        node.transport
+            .register_group(RaftGroupId(40), ReplicaId(401), store.clone())
+            .unwrap();
+        node.transport
+            .unregister_group(RaftGroupId(40), ReplicaId(401))
+            .unwrap();
+
+        // The route is gone, so the same identity can only be observed after
+        // an explicit new registration by the lifecycle manager.
+        node.transport
+            .register_group(RaftGroupId(40), ReplicaId(401), store)
+            .unwrap();
     }
 }

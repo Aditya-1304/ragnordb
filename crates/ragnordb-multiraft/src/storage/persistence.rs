@@ -373,15 +373,63 @@ impl<W> Clone for NodeRaftWalHandle<W> {
     }
 }
 
+impl<W: RaftWal> NodeRaftWalHandle<W> {
+    /// Permanently remove this replica lifetime from node-wide retention.
+    ///
+    /// Callers must first publish the lifetime's final safe floor with
+    /// [`RaftWal::prune_before`]. Removing the floor only after that boundary
+    /// is durable prevents a tombstoned identity from pinning every future
+    /// physical WAL prune, while the owner invalidation rejects stale use of
+    /// the detached handle.
+    pub fn release_retention(&mut self) -> Result<usize, String> {
+        let owner = self.owner.ok_or_else(|| {
+            "retention release requires an identity-bound group writer".to_string()
+        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+
+        if refresh_recovery_fence(&mut state) {
+            return Err("the shared node durability gate requires recovery".to_string());
+        }
+        if !state.retention_registry_sealed {
+            return Err("retention registry must be sealed before release".to_string());
+        }
+        if state.retention_floors.remove(&owner).is_none() {
+            return Err("group writer is not registered for retention release".to_string());
+        }
+
+        // A successful removal means this handle no longer owns a retention
+        // entry. Invalidate it even if the follow-up physical prune fails;
+        // that failure fences the shared WAL and must be recovered at restart.
+        self.owner = None;
+        prune_to_slowest_floor(&mut state)
+    }
+}
+
 impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
     fn append_batch_and_sync(
         &mut self,
         records: &[(RecordType, &[u8])],
     ) -> Result<BatchAppendResult, BatchAppendFailure> {
+        let owner = if let Some(owner) = self.owner {
+            owner
+        } else {
+            return Err(BatchAppendFailure::NotStaged(
+                WalError::BrokenDurabilityContract,
+            ));
+        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| BatchAppendFailure::NotStaged(WalError::BrokenDurabilityContract))?;
+
+        if !state.retention_floors.contains_key(&owner) {
+            return Err(BatchAppendFailure::NotStaged(
+                WalError::BrokenDurabilityContract,
+            ));
+        }
 
         append_batch_and_sync_locked(&mut state, records)
     }
@@ -391,10 +439,17 @@ impl<W: RaftWal> RaftWal for NodeRaftWalHandle<W> {
         holder_name: &str,
         min_lsn: Lsn,
     ) -> Result<Box<dyn RaftWalRetentionPin>, String> {
+        let owner = self
+            .owner
+            .ok_or_else(|| "retention pin requires an active group writer".to_string())?;
         let state = self
             .state
             .lock()
             .map_err(|_| "node-wide Raft WAL lock is poisoned".to_string())?;
+
+        if !state.retention_floors.contains_key(&owner) {
+            return Err("group writer is not registered for retention pins".to_string());
+        }
 
         state.wal.acquire_retention_pin(holder_name, min_lsn)
     }

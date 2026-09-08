@@ -183,3 +183,25 @@ fn local_transport_rejects_bulk_work_when_the_byte_budget_is_full() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// Realistic bug caught: a detached replica must not leave a physical route
+/// that can deliver stale outbound traffic after the local group is gone.
+#[test]
+fn unregister_group_removes_all_replica_routes() {
+    let endpoint = NodeRaftTransport::bind(NodeId(1), unused_address(), BTreeMap::new()).unwrap();
+    let group = local_bootstrap(32);
+    let sender = endpoint.transport.register_group(&group).unwrap();
+    endpoint.transport.unregister_group(&group).unwrap();
+
+    let error = sender
+        .try_send(Envelope {
+            from: CoreReplicaId::must(101),
+            to: CoreReplicaId::must(202),
+            msg: Message::PreVoteResponse(PreVoteResponse {
+                term: 1,
+                vote_granted: true,
+            }),
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}

@@ -333,6 +333,38 @@ fn node_wide_retention_prunes_only_through_the_slowest_registered_group() {
     );
 }
 
+/// Realistic bug caught: leaving a tombstoned replica's last floor in the
+/// shared registry permanently pins future WAL pruning even after its state is
+/// detached. The released handle must also reject stale persistence use.
+#[test]
+fn released_replica_retention_no_longer_pins_shared_wal() {
+    let pruned_through = Arc::new(Mutex::new(Vec::new()));
+    let node_wal = NodeRaftWal::new(RetentionTrackingWal {
+        pruned_through: Arc::clone(&pruned_through),
+    });
+    let first_identity = identity();
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+
+    let mut first = node_wal.group_writer_for(first_identity).unwrap();
+    let mut stale_clone = first.clone();
+    let mut second = node_wal.group_writer_for(second_identity).unwrap();
+    node_wal.seal_retention_registry().unwrap();
+
+    first.prune_before(Lsn::new(200)).unwrap();
+    first.release_retention().unwrap();
+    second.prune_before(Lsn::new(500)).unwrap();
+
+    assert_eq!(*pruned_through.lock().unwrap(), vec![Lsn::new(500)]);
+    assert!(first.prune_before(Lsn::new(600)).is_err());
+    assert!(
+        first
+            .acquire_retention_pin("released-replica", Lsn::new(500))
+            .is_err()
+    );
+    assert!(first.append_batch_and_sync(&[]).is_err());
+    assert!(stale_clone.append_batch_and_sync(&[]).is_err());
+}
+
 /// Realistic bug caught:
 ///
 /// A database checkpoint may advance beyond the oldest Raft record still
