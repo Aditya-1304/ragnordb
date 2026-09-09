@@ -43,7 +43,10 @@ use ragnordb_multiraft::{
         persistence::{NodeRaftWal, NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
-    transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig},
+    transport::{
+        NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig,
+        NodeRpcInbound,
+    },
 };
 
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
@@ -951,6 +954,11 @@ pub struct MultiRaftRuntime {
     /// the complete node runtime lifetime.
     _snapshot_transport: NodeSnapshotTransport,
 
+    /// Retain the shared transport's RPC receive lane until the future
+    /// gateway dispatcher is installed. This preserves bounded admission and
+    /// avoids closing remote peers' request path prematurely.
+    rpc_inbound: Option<NodeRpcInbound>,
+
     shutdown: Arc<AtomicBool>,
 
     worker: Option<thread::JoinHandle<()>>,
@@ -1128,6 +1136,7 @@ impl MultiRaftRuntime {
         let NodeRaftEndpoint {
             transport,
             inbound,
+            rpc_inbound,
             local_addr,
         } = NodeRaftTransport::bind_with_config(
             config.node_id,
@@ -1426,6 +1435,12 @@ impl MultiRaftRuntime {
 
             _snapshot_transport: snapshot_transport,
 
+            // Keep the bounded RPC receive lane alive with the node runtime.
+            // Slice 2 will attach the request dispatcher; dropping it here
+            // would make remote gateway traffic fail with a misleading
+            // broken-pipe error during the Slice 1 transport rollout.
+            rpc_inbound: Some(rpc_inbound),
+
             shutdown,
 
             worker: Some(worker),
@@ -1437,6 +1452,14 @@ impl MultiRaftRuntime {
             .as_ref()
             .expect("tablet runtime exists while MultiRaft runtime is active")
             .handle()
+    }
+
+    /// Transfer ownership of the node RPC receive lane to the future gateway
+    /// dispatcher. Keeping this as an explicit handoff prevents two consumers
+    /// from racing on request ordering while allowing the transport lifecycle
+    /// to remain owned by the MultiRaft runtime until the gateway is ready.
+    pub fn take_rpc_inbound(&mut self) -> Option<NodeRpcInbound> {
+        self.rpc_inbound.take()
     }
 
     /// Read-only committed metadata publication.

@@ -27,6 +27,7 @@ use ragnordb_common::{
     ids::{NodeId, RaftGroupId, ReplicaId},
     proto::raft::RaftTransportEnvelope,
     raft_bootstrap::RaftGroupBootstrap,
+    rpc_codec::{MessageType, RpcFrame},
 };
 
 use crate::host::RoutedRaftMessage;
@@ -44,10 +45,10 @@ const HANDSHAKE_FIXED_BYTES: usize = 8 + 1 + 8 + 2;
 
 /// Node-local limits for the physical MultiRaft transport.
 ///
-/// The two receive lanes have independent byte and message budgets. A burst
-/// of append or snapshot-control traffic therefore cannot consume the queue
-/// reserved for elections and heartbeats. The frame limit is checked before a
-/// payload buffer is allocated by the listener.
+/// Raft control and bulk traffic retain independent receive budgets. RPC
+/// traffic has its own bounded queue and shares the bulk byte/capacity limits
+/// so gateway bursts cannot consume the election/control lane. The frame limit
+/// is checked before a payload buffer is allocated by the listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRaftTransportConfig {
     pub max_frame_bytes: usize,
@@ -158,7 +159,19 @@ type ByteEnvelopeCodec = TcpEnvelopeCodec<Vec<u8>, Vec<u8>, BytesCodec, BytesCod
 pub struct NodeRaftEndpoint {
     pub transport: NodeRaftTransport,
     pub inbound: NodeRaftInbound,
+    pub rpc_inbound: NodeRpcInbound,
     pub local_addr: SocketAddr,
+}
+
+/// An authenticated RPC frame received from another physical node.
+///
+/// The source node comes from the connection handshake rather than the
+/// untrusted protobuf body. Request payloads may still carry a Raft replica
+/// identity, but the physical-node identity is always transport-authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedRpcMessage {
+    pub source_node_id: NodeId,
+    pub frame: RpcFrame,
 }
 
 /// Priority-aware receive side of the physical-node transport.
@@ -170,6 +183,30 @@ pub struct NodeRaftEndpoint {
 pub struct NodeRaftInbound {
     control: InboundQueueReceiver,
     bulk: InboundQueueReceiver,
+}
+
+/// Bounded receive side for gateway, tablet, and metadata RPC traffic.
+///
+/// RPC traffic is intentionally isolated from Raft control and bulk lanes so
+/// a request burst cannot starve elections or consume the Raft scheduler's
+/// queue budget. The byte reservation is released only when the caller takes
+/// ownership of the decoded message.
+pub struct NodeRpcInbound {
+    receiver: InboundRpcQueueReceiver,
+}
+
+impl NodeRpcInbound {
+    pub fn try_recv(&self) -> Result<RoutedRpcMessage, TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<RoutedRpcMessage, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn recv(&self) -> Result<RoutedRpcMessage, mpsc::RecvError> {
+        self.receiver.recv()
+    }
 }
 
 impl NodeRaftInbound {
@@ -236,10 +273,28 @@ struct InboundQueueReceiver {
     available_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+struct QueuedRpcInbound {
+    message: RoutedRpcMessage,
+    wire_bytes: usize,
+}
+
+#[derive(Clone)]
+struct InboundRpcQueueSender {
+    sender: SyncSender<QueuedRpcInbound>,
+    available_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    max_bytes: usize,
+}
+
+struct InboundRpcQueueReceiver {
+    receiver: Receiver<QueuedRpcInbound>,
+    available_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 #[derive(Clone)]
 struct InboundSenders {
     control: InboundQueueSender,
     bulk: InboundQueueSender,
+    rpc: InboundRpcQueueSender,
 }
 
 impl InboundSenders {
@@ -249,6 +304,10 @@ impl InboundSenders {
         } else {
             self.bulk.try_send(message, wire_bytes)
         }
+    }
+
+    fn try_send_rpc(&self, message: RoutedRpcMessage, wire_bytes: usize) -> io::Result<()> {
+        self.rpc.try_send(message, wire_bytes)
     }
 }
 
@@ -324,14 +383,107 @@ impl InboundQueueReceiver {
     }
 }
 
-fn inbound_queues(config: &NodeRaftTransportConfig) -> (InboundSenders, NodeRaftInbound) {
+impl InboundRpcQueueSender {
+    fn try_send(&self, message: RoutedRpcMessage, wire_bytes: usize) -> io::Result<()> {
+        if wire_bytes > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MultiRaft RPC queue cannot admit this message",
+            ));
+        }
+
+        reserve_bytes(
+            &self.available_bytes,
+            wire_bytes,
+            "MultiRaft RPC transport byte budget is full",
+        )?;
+
+        match self.sender.try_send(QueuedRpcInbound {
+            message,
+            wire_bytes,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                release_bytes(&self.available_bytes, wire_bytes);
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "MultiRaft RPC queue is full",
+                ))
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                release_bytes(&self.available_bytes, wire_bytes);
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "MultiRaft RPC inbound receiver has stopped",
+                ))
+            }
+        }
+    }
+}
+
+impl InboundRpcQueueReceiver {
+    fn try_recv(&self) -> Result<RoutedRpcMessage, TryRecvError> {
+        self.receiver.try_recv().map(|queued| {
+            release_bytes(&self.available_bytes, queued.wire_bytes);
+            queued.message
+        })
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<RoutedRpcMessage, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout).map(|queued| {
+            release_bytes(&self.available_bytes, queued.wire_bytes);
+            queued.message
+        })
+    }
+
+    fn recv(&self) -> Result<RoutedRpcMessage, mpsc::RecvError> {
+        self.receiver.recv().map(|queued| {
+            release_bytes(&self.available_bytes, queued.wire_bytes);
+            queued.message
+        })
+    }
+}
+
+fn reserve_bytes(
+    available_bytes: &std::sync::atomic::AtomicUsize,
+    wire_bytes: usize,
+    exhausted_message: &str,
+) -> io::Result<()> {
+    let mut available = available_bytes.load(Ordering::Acquire);
+
+    loop {
+        if available < wire_bytes {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, exhausted_message));
+        }
+
+        match available_bytes.compare_exchange(
+            available,
+            available - wire_bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(updated) => available = updated,
+        }
+    }
+}
+
+fn release_bytes(available_bytes: &std::sync::atomic::AtomicUsize, wire_bytes: usize) {
+    available_bytes.fetch_add(wire_bytes, Ordering::Release);
+}
+
+fn inbound_queues(
+    config: &NodeRaftTransportConfig,
+) -> (InboundSenders, NodeRaftInbound, NodeRpcInbound) {
     let (control_sender, control_receiver) = mpsc::sync_channel(config.control_queue_capacity);
     let (bulk_sender, bulk_receiver) = mpsc::sync_channel(config.bulk_queue_capacity);
+    let (rpc_sender, rpc_receiver) = mpsc::sync_channel(config.bulk_queue_capacity);
 
     let control_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(
         config.control_queue_bytes,
     ));
     let bulk_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
+    let rpc_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
 
     (
         InboundSenders {
@@ -345,6 +497,11 @@ fn inbound_queues(config: &NodeRaftTransportConfig) -> (InboundSenders, NodeRaft
                 available_bytes: Arc::clone(&bulk_bytes),
                 max_bytes: config.bulk_queue_bytes,
             },
+            rpc: InboundRpcQueueSender {
+                sender: rpc_sender,
+                available_bytes: Arc::clone(&rpc_bytes),
+                max_bytes: config.bulk_queue_bytes,
+            },
         },
         NodeRaftInbound {
             control: InboundQueueReceiver {
@@ -356,6 +513,12 @@ fn inbound_queues(config: &NodeRaftTransportConfig) -> (InboundSenders, NodeRaft
                 available_bytes: bulk_bytes,
             },
         },
+        NodeRpcInbound {
+            receiver: InboundRpcQueueReceiver {
+                receiver: rpc_receiver,
+                available_bytes: rpc_bytes,
+            },
+        },
     )
 }
 
@@ -363,11 +526,20 @@ struct QueuedOutbound {
     payload: Vec<u8>,
     wire_bytes: usize,
     raft_group_id: RaftGroupId,
+    class: OutboundClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClass {
+    RaftControl,
+    Rpc,
+    RaftBulk,
 }
 
 #[derive(Default)]
 struct OutboundPeerState {
     control: VecDeque<QueuedOutbound>,
+    rpc: VecDeque<QueuedOutbound>,
     bulk: VecDeque<QueuedOutbound>,
     queued_bytes: usize,
 }
@@ -379,13 +551,19 @@ struct OutboundPeer {
     cluster_id: Option<String>,
     max_queue_capacity: usize,
     max_queue_bytes: usize,
+    max_frame_bytes: usize,
     shutdown: Arc<AtomicBool>,
     state: Mutex<OutboundPeerState>,
     wake: Condvar,
 }
 
 impl OutboundPeer {
-    fn try_send(&self, message: RoutedRaftMessage, payload: Vec<u8>) -> io::Result<()> {
+    fn try_send(
+        &self,
+        payload: Vec<u8>,
+        raft_group_id: RaftGroupId,
+        class: OutboundClass,
+    ) -> io::Result<()> {
         let wire_bytes = payload.len();
         let mut state = self
             .state
@@ -399,7 +577,7 @@ impl OutboundPeer {
             ));
         }
 
-        if state.control.len() + state.bulk.len() >= self.max_queue_capacity
+        if state.control.len() + state.rpc.len() + state.bulk.len() >= self.max_queue_capacity
             || state.queued_bytes.saturating_add(wire_bytes) > self.max_queue_bytes
         {
             return Err(io::Error::new(
@@ -411,12 +589,13 @@ impl OutboundPeer {
         let queued = QueuedOutbound {
             payload,
             wire_bytes,
-            raft_group_id: message.raft_group_id,
+            raft_group_id,
+            class,
         };
-        if crate::host::is_control_message(&message.envelope) {
-            state.control.push_back(queued);
-        } else {
-            state.bulk.push_back(queued);
+        match class {
+            OutboundClass::RaftControl => state.control.push_back(queued),
+            OutboundClass::Rpc => state.rpc.push_back(queued),
+            OutboundClass::RaftBulk => state.bulk.push_back(queued),
         }
         state.queued_bytes = state.queued_bytes.saturating_add(wire_bytes);
         drop(state);
@@ -436,6 +615,9 @@ impl OutboundPeer {
             }
 
             if let Some(message) = state.control.pop_front() {
+                return Some(message);
+            }
+            if let Some(message) = state.rpc.pop_front() {
                 return Some(message);
             }
             if let Some(message) = state.bulk.pop_front() {
@@ -557,7 +739,7 @@ impl NodeRaftTransport {
         let local_addr = listener.local_addr()?;
 
         let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
-        let (inbound_tx, inbound_rx) = inbound_queues(&config);
+        let (inbound_tx, inbound_rx, rpc_inbound_rx) = inbound_queues(&config);
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -607,6 +789,7 @@ impl NodeRaftTransport {
                 cluster_id: config.cluster_id.clone(),
                 max_queue_capacity: config.outbound_queue_capacity,
                 max_queue_bytes: config.outbound_queue_bytes,
+                max_frame_bytes: config.max_frame_bytes,
                 shutdown: Arc::clone(&shutdown),
                 state: Mutex::new(OutboundPeerState::default()),
                 wake: Condvar::new(),
@@ -642,6 +825,7 @@ impl NodeRaftTransport {
         Ok(NodeRaftEndpoint {
             transport,
             inbound: inbound_rx,
+            rpc_inbound: rpc_inbound_rx,
             local_addr,
         })
     }
@@ -776,7 +960,61 @@ impl NodeRaftTransport {
         })?;
 
         debug_assert_eq!(peer.address, address);
-        peer.try_send(message, payload)
+        let class = if crate::host::is_control_message(&message.envelope) {
+            OutboundClass::RaftControl
+        } else {
+            OutboundClass::RaftBulk
+        };
+        peer.try_send(payload, message.raft_group_id, class)
+    }
+
+    /// Send one logical RPC frame to a physical node.
+    ///
+    /// The destination is explicit because metadata and gateway requests are
+    /// addressed to a tablet/metadata service rather than a Raft envelope.
+    /// Local delivery still uses the bounded RPC queue, preserving identical
+    /// admission and demultiplexing behavior for loopback and TCP paths.
+    pub fn try_send_rpc(&self, target_node_id: NodeId, frame: RpcFrame) -> io::Result<()> {
+        if target_node_id.0 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RPC target node ID 0 is reserved",
+            ));
+        }
+        if frame.raft_group_id.0 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RPC Raft group ID 0 is reserved",
+            ));
+        }
+        if frame.msg_type == MessageType::RaftConsensus {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Raft consensus frames must use the Raft transport API",
+            ));
+        }
+
+        let payload = encode_rpc_frame(&frame, self.max_frame_bytes)?;
+        if target_node_id == self.local_node_id {
+            return self.loopback.try_send_rpc(
+                RoutedRpcMessage {
+                    source_node_id: self.local_node_id,
+                    frame,
+                },
+                payload.len(),
+            );
+        }
+
+        let peer = self.outbound_peers.get(&target_node_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no outbound transport worker for physical node {}",
+                    target_node_id.0
+                ),
+            )
+        })?;
+        peer.try_send(payload, frame.raft_group_id, OutboundClass::Rpc)
     }
 
     pub fn try_send_all(
@@ -891,6 +1129,98 @@ fn encode_routed_message(
     payload.extend_from_slice(&inner);
 
     Ok(payload)
+}
+
+fn encode_rpc_frame(frame: &RpcFrame, max_frame_bytes: usize) -> io::Result<Vec<u8>> {
+    frame
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if frame.msg_type == MessageType::RaftConsensus {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Raft consensus frames cannot use the RPC encoder",
+        ));
+    }
+    if frame.payload.len() > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RPC frame exceeds maximum size",
+        ));
+    }
+
+    let inner_length = u32::try_from(frame.payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RPC payload length exceeds u32",
+        )
+    })?;
+    let mut encoded = Vec::with_capacity(MULTIRAFT_FRAME_HEADER_BYTES + frame.payload.len());
+    encoded.push(MULTIRAFT_WIRE_VERSION);
+    encoded.push(frame.msg_type.wire_value());
+    encoded.extend_from_slice(&frame.raft_group_id.0.to_le_bytes());
+    encoded.extend_from_slice(&inner_length.to_le_bytes());
+    encoded.extend_from_slice(&frame.payload);
+    Ok(encoded)
+}
+
+fn decode_rpc_frame(payload: &[u8], max_frame_bytes: usize) -> io::Result<RpcFrame> {
+    if payload.len() < MULTIRAFT_FRAME_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RPC frame is shorter than its fixed header",
+        ));
+    }
+    if payload[0] != MULTIRAFT_WIRE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported RPC wire version {}", payload[0]),
+        ));
+    }
+
+    let msg_type = MessageType::from_wire_value(payload[1])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if msg_type == MessageType::RaftConsensus {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Raft consensus frame is not an RPC frame",
+        ));
+    }
+
+    let raft_group_id = RaftGroupId(u64::from_le_bytes(
+        payload[2..10]
+            .try_into()
+            .expect("fixed-size group ID slice"),
+    ));
+    if raft_group_id.0 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RPC Raft group ID 0 is reserved",
+        ));
+    }
+
+    let declared_length = u32::from_le_bytes(
+        payload[10..14]
+            .try_into()
+            .expect("fixed-size payload length slice"),
+    ) as usize;
+    if declared_length == 0 || declared_length > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid RPC frame length {declared_length}"),
+        ));
+    }
+    if declared_length != payload.len() - MULTIRAFT_FRAME_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RPC frame payload length does not match its header",
+        ));
+    }
+
+    Ok(RpcFrame {
+        msg_type,
+        raft_group_id,
+        payload: payload[MULTIRAFT_FRAME_HEADER_BYTES..].to_vec(),
+    })
 }
 
 pub(crate) fn routed_message_wire_size(message: &RoutedRaftMessage) -> io::Result<usize> {
@@ -1079,37 +1409,57 @@ fn handle_connection(
             Err(error) => return Err(error),
         };
 
-        let message = decode_routed_message(&codec, &payload)?;
+        match payload.get(1).copied() {
+            Some(MULTIRAFT_RAFT_MESSAGE_TYPE) => {
+                let message = decode_routed_message(&codec, &payload)?;
 
-        let source_replica_id = ReplicaId::from_raft(message.envelope.from);
-        let source_node_id = routes
-            .read()
-            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?
-            .get(&(message.raft_group_id, source_replica_id))
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "unknown source replica {} for Raft group {}",
-                        source_replica_id.0, message.raft_group_id.0
-                    ),
-                )
-            })?;
-        if source_node_id != remote_node_id {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Raft source replica is not assigned to the authenticated node",
-            ));
+                let source_replica_id = ReplicaId::from_raft(message.envelope.from);
+                let source_node_id = routes
+                    .read()
+                    .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?
+                    .get(&(message.raft_group_id, source_replica_id))
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "unknown source replica {} for Raft group {}",
+                                source_replica_id.0, message.raft_group_id.0
+                            ),
+                        )
+                    })?;
+                if source_node_id != remote_node_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Raft source replica is not assigned to the authenticated node",
+                    ));
+                }
+
+                let control = crate::host::is_control_message(&message.envelope);
+                let queue = if control {
+                    &inbound.control
+                } else {
+                    &inbound.bulk
+                };
+                queue.try_send(message, payload.len())?;
+            }
+            Some(_) => {
+                let frame = decode_rpc_frame(&payload, max_frame_bytes)?;
+                inbound.try_send_rpc(
+                    RoutedRpcMessage {
+                        source_node_id: remote_node_id,
+                        frame,
+                    },
+                    payload.len(),
+                )?;
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MultiRaft frame is missing its message type",
+                ));
+            }
         }
-
-        let control = crate::host::is_control_message(&message.envelope);
-        let queue = if control {
-            &inbound.control
-        } else {
-            &inbound.bulk
-        };
-        queue.try_send(message, payload.len())?;
     }
 }
 
@@ -1211,7 +1561,7 @@ fn outbound_worker(peer: Arc<OutboundPeer>) {
             }
 
             let connected = stream.as_mut().expect("outbound stream is initialized");
-            write_frame(connected, &message.payload, MAX_MULTIRAFT_FRAME_BYTES)?;
+            write_frame(connected, &message.payload, peer.max_frame_bytes)?;
             connected.flush()
         })();
 
@@ -1221,6 +1571,7 @@ fn outbound_worker(peer: Arc<OutboundPeer>) {
             tracing::debug!(
                 target_node_id = peer.target_node_id.0,
                 raft_group_id = message.raft_group_id.0,
+                class = ?message.class,
                 error = %error,
                 "MultiRaft outbound connection failed; Raft will retry",
             );
@@ -1275,12 +1626,11 @@ fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Opti
         ));
     }
 
-    if header[1] != MULTIRAFT_RAFT_MESSAGE_TYPE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported MultiRaft message type {}", header[1]),
-        ));
-    }
+    // Validate the discriminator while only the fixed header is resident.
+    // This prevents an unknown message type from making the listener allocate
+    // an attacker-controlled payload buffer.
+    MessageType::from_wire_value(header[1])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     if length == 0 || length > max_frame_bytes {
         return Err(io::Error::new(
@@ -1295,4 +1645,59 @@ fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Opti
     stream.read_exact(&mut payload[MULTIRAFT_FRAME_HEADER_BYTES..])?;
 
     Ok(Some(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_decoder_rejects_unknown_message_type() {
+        let mut frame = vec![
+            MULTIRAFT_WIRE_VERSION,
+            0xff,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            9,
+        ];
+        let error = decode_rpc_frame(&frame, 16).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // Keep this assertion explicit so a future decoder cannot accidentally
+        // accept the unknown discriminator after validating only the payload.
+        frame[1] = MessageType::MetadataRequest.wire_value();
+        assert!(decode_rpc_frame(&frame, 16).is_ok());
+    }
+
+    #[test]
+    fn rpc_decoder_rejects_declared_lengths_before_payload_copy() {
+        let frame = vec![
+            MULTIRAFT_WIRE_VERSION,
+            MessageType::MetadataRequest.wire_value(),
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0xff,
+            0xff,
+            0xff,
+            0x7f,
+        ];
+        let error = decode_rpc_frame(&frame, 16).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }

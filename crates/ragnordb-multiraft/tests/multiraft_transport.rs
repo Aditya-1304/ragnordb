@@ -11,6 +11,7 @@ use raft::{
 use ragnordb_common::{
     ids::{NodeId, RaftGroupId, ReplicaId},
     raft_bootstrap::RaftGroupBootstrap,
+    rpc_codec::{MessageType, RpcFrame},
 };
 use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRaftTransportConfig};
 
@@ -204,4 +205,118 @@ fn unregister_group_removes_all_replica_routes() {
         })
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// Realistic bug caught: the physical listener must demultiplex gateway RPC
+/// traffic without feeding it to the Raft scheduler, while retaining the
+/// authenticated source node identity for authorization and diagnostics.
+#[test]
+fn wire_demultiplexes_rpc_frames_and_preserves_source_node() {
+    let node_1_addr = unused_address();
+    let node_2_addr = unused_address();
+
+    let endpoint_1 = NodeRaftTransport::bind(
+        NodeId(1),
+        node_1_addr,
+        BTreeMap::from([(NodeId(2), node_2_addr)]),
+    )
+    .unwrap();
+    let endpoint_2 = NodeRaftTransport::bind(
+        NodeId(2),
+        node_2_addr,
+        BTreeMap::from([(NodeId(1), node_1_addr)]),
+    )
+    .unwrap();
+
+    let frame = RpcFrame {
+        msg_type: MessageType::MetadataRequest,
+        raft_group_id: RaftGroupId(2),
+        payload: vec![9, 8, 7],
+    };
+
+    endpoint_1
+        .transport
+        .try_send_rpc(NodeId(2), frame.clone())
+        .unwrap();
+
+    let received = endpoint_2
+        .rpc_inbound
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(received.source_node_id, NodeId(1));
+    assert_eq!(received.frame, frame);
+}
+
+#[test]
+fn rpc_frame_respects_configured_maximum_before_queue_admission() {
+    let endpoint = NodeRaftTransport::bind_with_config(
+        NodeId(1),
+        unused_address(),
+        BTreeMap::new(),
+        NodeRaftTransportConfig {
+            max_frame_bytes: 2,
+            control_queue_capacity: 4,
+            bulk_queue_capacity: 4,
+            control_queue_bytes: 1024,
+            bulk_queue_bytes: 1024,
+            outbound_queue_capacity: 4,
+            outbound_queue_bytes: 1024,
+            inbound_connection_capacity: 4,
+            inbound_connection_workers: 1,
+            cluster_id: None,
+        },
+    )
+    .unwrap();
+
+    let error = endpoint
+        .transport
+        .try_send_rpc(
+            NodeId(1),
+            RpcFrame {
+                msg_type: MessageType::MetadataRequest,
+                raft_group_id: RaftGroupId(2),
+                payload: vec![1, 2, 3],
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn local_rpc_delivery_uses_the_bounded_rpc_lane() {
+    let endpoint = NodeRaftTransport::bind(NodeId(1), unused_address(), BTreeMap::new()).unwrap();
+    let frame = RpcFrame {
+        msg_type: MessageType::TabletCommandResponse,
+        raft_group_id: RaftGroupId(3),
+        payload: vec![4, 5, 6],
+    };
+
+    endpoint
+        .transport
+        .try_send_rpc(NodeId(1), frame.clone())
+        .unwrap();
+    let received = endpoint
+        .rpc_inbound
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(received.source_node_id, NodeId(1));
+    assert_eq!(received.frame, frame);
+    assert!(endpoint.inbound.try_recv().is_err());
+}
+
+#[test]
+fn rpc_api_rejects_raft_consensus_frames() {
+    let endpoint = NodeRaftTransport::bind(NodeId(1), unused_address(), BTreeMap::new()).unwrap();
+    let error = endpoint
+        .transport
+        .try_send_rpc(
+            NodeId(1),
+            RpcFrame {
+                msg_type: MessageType::RaftConsensus,
+                raft_group_id: RaftGroupId(3),
+                payload: vec![1],
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }

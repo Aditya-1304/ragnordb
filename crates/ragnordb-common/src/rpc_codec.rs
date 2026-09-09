@@ -1,11 +1,15 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::command_codec::TabletCommand;
 use crate::ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp};
 use crate::proto::rpc;
 
-/// A framed inter-node message on the multiplexed TCP transport.
+/// A logical inter-node message on the multiplexed TCP transport.
 ///
-/// Wire format:
-///   [msg_type: u8][raft_group_id: u64][len: u32 LE][prost payload bytes]
+/// The physical transport wraps this value in the versioned frame
+/// `[version:u8][msg_type:u8][raft_group_id:u64][len:u32 LE]` before appending
+/// the payload. Keeping the logical payload separate lets Raft continue using
+/// its existing envelope codec while RPC messages carry typed protobuf bytes.
 ///
 /// msg_type determines how the payload is decoded:
 ///   0x01 — Raft consensus message (AppendEntries, Vote, etc.)
@@ -13,7 +17,7 @@ use crate::proto::rpc;
 ///   0x03 — TabletCommandResponse
 ///   0x04 — MetadataRequest
 ///   0x05 — MetadataResponse
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
     pub raft_group_id: RaftGroupId,
@@ -30,6 +34,31 @@ pub enum MessageType {
 }
 
 impl MessageType {
+    /// Return the stable one-byte discriminator used by the physical
+    /// multiplexed transport. Keeping this mapping beside the protobuf
+    /// mapping prevents a new enum variant from silently acquiring a wire
+    /// value that the listener does not understand.
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::RaftConsensus => 0x01,
+            Self::TabletCommandRequest => 0x02,
+            Self::TabletCommandResponse => 0x03,
+            Self::MetadataRequest => 0x04,
+            Self::MetadataResponse => 0x05,
+        }
+    }
+
+    pub fn from_wire_value(value: u8) -> Result<Self, &'static str> {
+        match value {
+            0x01 => Ok(Self::RaftConsensus),
+            0x02 => Ok(Self::TabletCommandRequest),
+            0x03 => Ok(Self::TabletCommandResponse),
+            0x04 => Ok(Self::MetadataRequest),
+            0x05 => Ok(Self::MetadataResponse),
+            _ => Err("unknown RPC message type"),
+        }
+    }
+
     pub fn to_proto(&self) -> rpc::MessageType {
         match self {
             MessageType::RaftConsensus => rpc::MessageType::RaftConsensus,
@@ -53,6 +82,16 @@ impl MessageType {
 }
 
 impl RpcFrame {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.raft_group_id.0 == 0 {
+            return Err("RPC Raft group ID must be non-zero");
+        }
+        if self.payload.is_empty() {
+            return Err("RPC payload must be non-empty");
+        }
+        Ok(())
+    }
+
     pub fn to_proto(&self) -> rpc::RpcFrame {
         rpc::RpcFrame {
             msg_type: self.msg_type.to_proto() as i32,
@@ -62,7 +101,7 @@ impl RpcFrame {
     }
 
     pub fn from_proto(proto: rpc::RpcFrame) -> Result<Self, &'static str> {
-        Ok(RpcFrame {
+        let frame = RpcFrame {
             msg_type: MessageType::from_proto(
                 rpc::MessageType::try_from(proto.msg_type).map_err(|_| "invalid msg_type")?,
             )?,
@@ -70,7 +109,9 @@ impl RpcFrame {
                 proto.raft_group_id.ok_or("missing raft_group_id")?,
             ),
             payload: proto.payload,
-        })
+        };
+        frame.validate()?;
+        Ok(frame)
     }
 }
 
@@ -195,6 +236,196 @@ pub struct ReplicaRoute {
     pub node_id: NodeId,
 }
 
+/// The immutable routing information returned by metadata for one tablet.
+///
+/// A leader hint is deliberately represented separately from the replica
+/// placement map. Metadata owns placement; leadership changes are Raft state
+/// and therefore remain a cacheable, retryable hint at the gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletRoute {
+    pub tablet_id: TabletId,
+    pub leader_replica_id: ReplicaId,
+    pub replicas: Vec<ReplicaRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TabletRouteError {
+    #[error("tablet ID must be non-zero")]
+    ZeroTabletId,
+    #[error("leader replica ID must be non-zero")]
+    ZeroLeaderReplicaId,
+    #[error("tablet route must contain at least one replica")]
+    EmptyReplicas,
+    #[error("tablet route contains a zero replica or node ID")]
+    ZeroReplicaIdentity,
+    #[error("tablet route contains duplicate replica ID {0:?}")]
+    DuplicateReplica(ReplicaId),
+    #[error("tablet route contains duplicate node ID {0:?}")]
+    DuplicateNode(NodeId),
+    #[error("leader replica {0:?} is absent from the tablet route")]
+    LeaderAbsent(ReplicaId),
+    #[error("metadata response does not contain a tablet route")]
+    NotTabletResponse,
+    #[error("tablet route cache cannot install an empty topology")]
+    EmptyTopology,
+    #[error("tablet route cache contains duplicate tablet ID {0:?}")]
+    DuplicateTablet(TabletId),
+    #[error("tablet route cache is missing tablet ID {0:?}")]
+    MissingTablet(TabletId),
+    #[error("tablet route cache received unexpected tablet ID {0:?}")]
+    UnexpectedTablet(TabletId),
+}
+
+impl TabletRoute {
+    pub fn validate(&self) -> Result<(), TabletRouteError> {
+        if self.tablet_id.0 == 0 {
+            return Err(TabletRouteError::ZeroTabletId);
+        }
+        if self.leader_replica_id.0 == 0 {
+            return Err(TabletRouteError::ZeroLeaderReplicaId);
+        }
+        if self.replicas.is_empty() {
+            return Err(TabletRouteError::EmptyReplicas);
+        }
+
+        let mut replica_ids = BTreeSet::new();
+        let mut node_ids = BTreeSet::new();
+        for route in &self.replicas {
+            if route.replica_id.0 == 0 || route.node_id.0 == 0 {
+                return Err(TabletRouteError::ZeroReplicaIdentity);
+            }
+            if !replica_ids.insert(route.replica_id) {
+                return Err(TabletRouteError::DuplicateReplica(route.replica_id));
+            }
+            if !node_ids.insert(route.node_id) {
+                return Err(TabletRouteError::DuplicateNode(route.node_id));
+            }
+        }
+
+        if !replica_ids.contains(&self.leader_replica_id) {
+            return Err(TabletRouteError::LeaderAbsent(self.leader_replica_id));
+        }
+
+        Ok(())
+    }
+
+    pub fn node_for_replica(&self, replica_id: ReplicaId) -> Option<NodeId> {
+        self.replicas
+            .iter()
+            .find(|route| route.replica_id == replica_id)
+            .map(|route| route.node_id)
+    }
+
+    pub fn leader_node(&self) -> Result<NodeId, TabletRouteError> {
+        self.validate()?;
+        self.node_for_replica(self.leader_replica_id)
+            .ok_or(TabletRouteError::LeaderAbsent(self.leader_replica_id))
+    }
+}
+
+/// Atomically replace the gateway's immutable tablet routing view.
+///
+/// Callers provide the expected tablet IDs from one committed metadata
+/// snapshot. Requiring an exact set makes a partially refreshed topology
+/// impossible to publish to request routing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabletRouteCache {
+    routes: BTreeMap<TabletId, TabletRoute>,
+}
+
+impl TabletRouteCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn replace_exact(
+        &mut self,
+        expected_tablets: &BTreeSet<TabletId>,
+        routes: impl IntoIterator<Item = TabletRoute>,
+    ) -> Result<(), TabletRouteError> {
+        if expected_tablets.is_empty() {
+            return Err(TabletRouteError::EmptyTopology);
+        }
+
+        let mut replacement = BTreeMap::new();
+        for route in routes {
+            route.validate()?;
+            if replacement.insert(route.tablet_id, route.clone()).is_some() {
+                return Err(TabletRouteError::DuplicateTablet(route.tablet_id));
+            }
+        }
+
+        for tablet_id in expected_tablets {
+            if !replacement.contains_key(tablet_id) {
+                return Err(TabletRouteError::MissingTablet(*tablet_id));
+            }
+        }
+        if replacement.len() != expected_tablets.len() {
+            let unexpected = replacement
+                .keys()
+                .find(|tablet_id| !expected_tablets.contains(tablet_id))
+                .copied()
+                .expect("length mismatch implies an unexpected tablet");
+            return Err(TabletRouteError::UnexpectedTablet(unexpected));
+        }
+
+        self.routes = replacement;
+        Ok(())
+    }
+
+    pub fn insert(&mut self, route: TabletRoute) -> Result<(), TabletRouteError> {
+        route.validate()?;
+        self.routes.insert(route.tablet_id, route);
+        Ok(())
+    }
+
+    pub fn get(&self, tablet_id: TabletId) -> Option<&TabletRoute> {
+        self.routes.get(&tablet_id)
+    }
+
+    pub fn node_for_replica(&self, tablet_id: TabletId, replica_id: ReplicaId) -> Option<NodeId> {
+        self.get(tablet_id)?.node_for_replica(replica_id)
+    }
+
+    /// Update only the soft leader hint after a successful request or a
+    /// `NotLeader` response. Placement remains unchanged and an unknown
+    /// replica can never be promoted by a stale response.
+    pub fn update_leader(
+        &mut self,
+        tablet_id: TabletId,
+        leader_replica_id: ReplicaId,
+    ) -> Result<(), TabletRouteError> {
+        let route = self
+            .routes
+            .get_mut(&tablet_id)
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))?;
+        if route.node_for_replica(leader_replica_id).is_none() {
+            return Err(TabletRouteError::LeaderAbsent(leader_replica_id));
+        }
+        route.leader_replica_id = leader_replica_id;
+        Ok(())
+    }
+
+    pub fn leader_node(&self, tablet_id: TabletId) -> Result<NodeId, TabletRouteError> {
+        self.routes
+            .get(&tablet_id)
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))?
+            .leader_node()
+    }
+
+    pub fn remove(&mut self, tablet_id: TabletId) -> Option<TabletRoute> {
+        self.routes.remove(&tablet_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+}
+
 /// Responses from the metadata Raft group.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataResponse {
@@ -213,6 +444,25 @@ pub enum MetadataResponse {
 }
 
 impl MetadataResponse {
+    pub fn tablet_route(&self) -> Result<TabletRoute, TabletRouteError> {
+        match self {
+            Self::LookupTablet {
+                tablet_id,
+                leader_replica_id,
+                replicas,
+            } => {
+                let route = TabletRoute {
+                    tablet_id: *tablet_id,
+                    leader_replica_id: *leader_replica_id,
+                    replicas: replicas.clone(),
+                };
+                route.validate()?;
+                Ok(route)
+            }
+            _ => Err(TabletRouteError::NotTabletResponse),
+        }
+    }
+
     pub fn to_proto(&self) -> rpc::MetadataResponse {
         let response = match self {
             MetadataResponse::AllocateTimestamp { timestamp } => {
@@ -293,8 +543,15 @@ impl MetadataResponse {
                     return Err("leader replica is absent from tablet routes");
                 }
 
-                Ok(MetadataResponse::LookupTablet {
+                let route = TabletRoute {
                     tablet_id: TabletId::from_proto(resp.tablet_id.ok_or("missing tablet_id")?),
+                    leader_replica_id,
+                    replicas: replicas.clone(),
+                };
+                route.validate().map_err(|_| "invalid tablet route")?;
+
+                Ok(MetadataResponse::LookupTablet {
+                    tablet_id: route.tablet_id,
                     leader_replica_id,
                     replicas,
                 })
@@ -335,6 +592,23 @@ mod tests {
         ));
         assert_eq!(decoded.raft_group_id.0, 5);
         assert_eq!(decoded.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rpc_frame_rejects_zero_group_or_empty_payload() {
+        let zero_group = rpc::RpcFrame {
+            msg_type: rpc::MessageType::MetadataRequest as i32,
+            raft_group_id: Some(RaftGroupId(0).to_proto()),
+            payload: vec![1],
+        };
+        assert!(RpcFrame::from_proto(zero_group).is_err());
+
+        let empty_payload = rpc::RpcFrame {
+            msg_type: rpc::MessageType::MetadataRequest as i32,
+            raft_group_id: Some(RaftGroupId(2).to_proto()),
+            payload: Vec::new(),
+        };
+        assert!(RpcFrame::from_proto(empty_payload).is_err());
     }
 
     #[test]
@@ -455,6 +729,106 @@ mod tests {
         assert!(
             matches!(decoded, MetadataResponse::LookupTablet { tablet_id, .. } if tablet_id.0 == 10)
         );
+    }
+
+    #[test]
+    fn tablet_route_rejects_incomplete_replica_identity() {
+        let route = TabletRoute {
+            tablet_id: TabletId(10),
+            leader_replica_id: ReplicaId(11),
+            replicas: vec![ReplicaRoute {
+                replica_id: ReplicaId(12),
+                node_id: NodeId(2),
+            }],
+        };
+
+        assert_eq!(
+            route.validate(),
+            Err(TabletRouteError::LeaderAbsent(ReplicaId(11)))
+        );
+    }
+
+    #[test]
+    fn tablet_route_cache_does_not_publish_partial_topology() {
+        let mut cache = TabletRouteCache::new();
+        let expected = BTreeSet::from([TabletId(10), TabletId(20)]);
+        let route = TabletRoute {
+            tablet_id: TabletId(10),
+            leader_replica_id: ReplicaId(11),
+            replicas: vec![ReplicaRoute {
+                replica_id: ReplicaId(11),
+                node_id: NodeId(1),
+            }],
+        };
+
+        assert_eq!(
+            cache.replace_exact(&expected, [route]),
+            Err(TabletRouteError::MissingTablet(TabletId(20)))
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn tablet_route_cache_updates_only_known_leader_hints() {
+        let mut cache = TabletRouteCache::new();
+        cache
+            .insert(TabletRoute {
+                tablet_id: TabletId(10),
+                leader_replica_id: ReplicaId(11),
+                replicas: vec![
+                    ReplicaRoute {
+                        replica_id: ReplicaId(11),
+                        node_id: NodeId(1),
+                    },
+                    ReplicaRoute {
+                        replica_id: ReplicaId(12),
+                        node_id: NodeId(2),
+                    },
+                ],
+            })
+            .unwrap();
+
+        cache.update_leader(TabletId(10), ReplicaId(12)).unwrap();
+        assert_eq!(cache.leader_node(TabletId(10)), Ok(NodeId(2)));
+        assert_eq!(
+            cache.update_leader(TabletId(10), ReplicaId(99)),
+            Err(TabletRouteError::LeaderAbsent(ReplicaId(99)))
+        );
+        assert_eq!(cache.leader_node(TabletId(10)), Ok(NodeId(2)));
+    }
+
+    #[test]
+    fn metadata_tablet_response_rejects_duplicate_physical_routes() {
+        let response = rpc::MetadataResponse {
+            response: Some(rpc::metadata_response::Response::LookupTablet(
+                rpc::LookupTabletResponse {
+                    tablet_id: Some(TabletId(10).to_proto()),
+                    leader_replica_id: Some(ReplicaId(11).to_proto()),
+                    replicas: vec![
+                        rpc::ReplicaRoute {
+                            replica_id: Some(ReplicaId(11).to_proto()),
+                            node_id: Some(NodeId(1).to_proto()),
+                        },
+                        rpc::ReplicaRoute {
+                            replica_id: Some(ReplicaId(12).to_proto()),
+                            node_id: Some(NodeId(1).to_proto()),
+                        },
+                    ],
+                },
+            )),
+        };
+
+        assert!(MetadataResponse::from_proto(response).is_err());
+    }
+
+    #[test]
+    fn message_type_wire_values_are_stable_and_unknown_values_rejected() {
+        assert_eq!(MessageType::MetadataRequest.wire_value(), 0x04);
+        assert_eq!(
+            MessageType::from_wire_value(0x05),
+            Ok(MessageType::MetadataResponse)
+        );
+        assert!(MessageType::from_wire_value(0xff).is_err());
     }
 
     #[test]
