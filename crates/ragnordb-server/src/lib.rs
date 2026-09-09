@@ -142,6 +142,10 @@ impl Server {
                     .lock()
                     .await
                     .replace_metadata_table_creator(runtime.metadata_table_creator());
+                database
+                    .lock()
+                    .await
+                    .replace_tablet_gateway(Arc::new(runtime.tablet_rpc_client()));
                 Some(runtime)
             }
             (None, None) => None,
@@ -451,6 +455,8 @@ async fn handle_connection_with_policy(
             {
                 Ok(database_guard) if !shutdown.is_cancelled() => {
                     let mut sql_session = std::mem::take(&mut session.sql);
+                    sql_session
+                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result, status) =

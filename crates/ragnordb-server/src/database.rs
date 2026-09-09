@@ -27,7 +27,7 @@ use ragnordb_common::{
 };
 use ragnordb_exec::{
     ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SharedMetadataTableCreator,
-    SqlSession,
+    SharedTabletGateway, SqlSession,
 };
 use ragnordb_multiraft::storage::persistence::NodeRaftWal;
 use ragnordb_multiraft::storage::{
@@ -427,6 +427,13 @@ impl LocalDatabase {
     /// therefore receives its identity only from the metadata state machine.
     pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
         self.executor.replace_metadata_table_creator(creator);
+    }
+
+    /// Install the node-level gateway used when a metadata-routed tablet is not
+    /// materialized in this process. Existing local-table compatibility paths
+    /// remain unchanged and continue to use their direct coordinators.
+    pub fn replace_tablet_gateway(&mut self, gateway: SharedTabletGateway) {
+        self.executor.replace_tablet_gateway(gateway);
     }
 
     /// Clone the serialized A-WAL handle for the Raft persistence owner.

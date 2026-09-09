@@ -49,11 +49,15 @@ pub struct Session {
     pub sql: SqlSession,
     pub statement_timeout_ms: u64,
 
-    /// Monotonic request sequence scoped to this connection identity.
-    ///
-    /// The sequence is allocated for potential metadata-Raft requests. Other
-    /// SQL statements may consume a sequence without creating a metadata entry;
-    /// this keeps request allocation independent from SQL comment syntax.
+    /// Stable per-connection identity used for metadata and tablet request
+    /// deduplication. The process-incarnation component prevents a restarted
+    /// server from reusing an old durable request namespace.
+    client_id: u128,
+
+    /// Monotonic request sequence scoped to this connection identity for
+    /// metadata-Raft requests. Tablet request sequences are retained in the
+    /// embedded `SqlSession` context so the two Raft-group namespaces remain
+    /// independently ordered.
     next_metadata_sequence: u64,
 }
 
@@ -67,12 +71,24 @@ impl Session {
             "process-local session ID allocator exhausted and wrapped to zero"
         );
 
+        let client_id = process_client_id() ^ u128::from(session_id);
+        assert_ne!(
+            client_id, 0,
+            "process client ID allocator produced the reserved zero identity"
+        );
+
         Self {
             session_id: SessionId(session_id),
-            sql: SqlSession::new(),
+            sql: SqlSession::with_client_id(client_id),
             statement_timeout_ms: 30_000,
+            client_id,
             next_metadata_sequence: 1,
         }
+    }
+
+    /// Return the stable client identity shared by metadata and tablet RPCs.
+    pub fn client_id(&self) -> u128 {
+        self.client_id
     }
 
     /// Allocate the next request identity for the metadata Raft group.
@@ -83,12 +99,10 @@ impl Session {
         })?;
 
         Ok(RequestId {
-            // The process-incarnation component prevents a restarted server
-            // from accidentally reusing a durable request identity. The
-            // connection component keeps sessions independent within one
+            // The connection component keeps sessions independent within one
             // process; an explicit retry must reuse its original ID rather
             // than allocate a fresh sequence.
-            client_id: process_client_id() ^ u128::from(self.session_id.0),
+            client_id: self.client_id,
             sequence,
             raft_group_id: RESERVED_METADATA_RAFT_GROUP_ID,
         })

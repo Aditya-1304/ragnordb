@@ -21,7 +21,7 @@ use prost::Message;
 use ragnordb_common::{
     Error, Result,
     command_codec::TabletCommand,
-    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TableId},
+    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp},
     metadata_codec::DesiredReplicaRole,
     proto::rpc,
     rpc_codec::{
@@ -29,6 +29,7 @@ use ragnordb_common::{
         TabletReadRequest, TabletRoute,
     },
 };
+use ragnordb_exec::TabletGateway;
 use ragnordb_multiraft::meta::MetadataRuntimeHandle;
 use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRpcInbound};
 use ragnordb_tablet::TabletRouter;
@@ -301,6 +302,33 @@ impl TabletRpcClient {
                 reason: "tablet RPC response deadline elapsed".to_string(),
             }
         })
+    }
+}
+
+impl TabletGateway for TabletRpcClient {
+    fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute> {
+        TabletRpcClient::lookup_tablet_route(self, table_id, key)
+    }
+
+    fn read_point(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        row_key: RowKey,
+        read_timestamp: Timestamp,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        TabletRpcClient::read_point(self, route, request_id, row_key, read_timestamp, timeout)
+    }
+
+    fn submit_command(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        TabletRpcClient::submit_command(self, route, request_id, command, timeout)
     }
 }
 

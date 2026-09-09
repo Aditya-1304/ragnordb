@@ -1,8 +1,8 @@
 //! Autocommit and explicit SQL transaction behavior.
 //!
-//! `SqlSession` owns only SQL transaction policy and the complete active
-//! `Transaction`. Connection identity, statement deadlines, cancellation, and
-//! client transport state remain server-layer responsibilities.
+//! `SqlSession` owns SQL transaction policy, the complete active `Transaction`,
+//! and the request context passed to metadata-routed tablet operations.
+//! Connection transport and cancellation remain server-layer responsibilities.
 //!
 //! New SQL sessions use autocommit. Standalone DML and SELECT statements receive
 //! an implicit transaction. BEGIN attaches an explicit transaction that remains
@@ -14,7 +14,7 @@ use ragnordb_common::{Error, Result, ids::RequestId, ids::TxnId};
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_txn::{Transaction, TransactionManager};
 
-use crate::{ExecutionResult, LocalExecutor};
+use crate::{ExecutionResult, LocalExecutor, TabletRequestContext};
 
 /// SQL transaction policy and state for one client connection.
 ///
@@ -25,15 +25,37 @@ use crate::{ExecutionResult, LocalExecutor};
 #[derive(Debug)]
 pub struct SqlSession {
     current_transaction: Option<Transaction>,
+    tablet_request_context: TabletRequestContext,
 }
 
 impl SqlSession {
     /// Construct a SQL session with autocommit enabled and no active explicit
     /// transaction.
     pub fn new() -> Self {
+        Self::with_client_id(1)
+    }
+
+    /// Construct a SQL session with an explicit stable client identity.
+    ///
+    /// Server connections use an incarnation-safe identity; tests and embedded
+    /// callers can keep the default constructor when no remote tablet is used.
+    pub fn with_client_id(client_id: u128) -> Self {
         Self {
             current_transaction: None,
+            tablet_request_context: TabletRequestContext::new(client_id)
+                .expect("SQL session client identity must be non-zero"),
         }
+    }
+
+    /// Replace the request identity used by future metadata-routed tablet RPCs.
+    pub fn set_client_id(&mut self, client_id: u128) -> Result<()> {
+        self.tablet_request_context = TabletRequestContext::new(client_id)?;
+        Ok(())
+    }
+
+    /// Update the bounded RPC deadline for this connection's next statement.
+    pub fn set_tablet_request_timeout(&mut self, timeout: Duration) {
+        self.tablet_request_context.set_timeout(timeout);
     }
 
     /// Return whether standalone data statements use implicit transactions.
@@ -203,7 +225,11 @@ impl SqlSession {
             )
         })?;
 
-        let outcome = executor.commit_transaction_outcome(transaction, transaction_manager)?;
+        let outcome = executor.commit_transaction_outcome_with_request_context(
+            transaction,
+            transaction_manager,
+            &mut self.tablet_request_context,
+        )?;
 
         Ok(ExecutionResult::TransactionCommitted {
             transaction_id: outcome.transaction_id,
@@ -239,7 +265,11 @@ impl SqlSession {
             // Phase 2.7 prepares complete statement batches before adding them
             // to the write set, so a failed statement contributes no partial
             // mutations while earlier successful statements remain available.
-            return executor.execute(plan, Some(transaction));
+            return executor.execute_with_request_context(
+                plan,
+                Some(transaction),
+                &mut self.tablet_request_context,
+            );
         }
 
         self.execute_implicit(plan, executor, transaction_manager)
@@ -253,7 +283,11 @@ impl SqlSession {
     ) -> Result<ExecutionResult> {
         let mut transaction = transaction_manager.begin_transaction()?;
 
-        let result = match executor.execute(plan, Some(&mut transaction)) {
+        let result = match executor.execute_with_request_context(
+            plan,
+            Some(&mut transaction),
+            &mut self.tablet_request_context,
+        ) {
             Ok(result) => result,
 
             Err(error) => {
@@ -267,8 +301,11 @@ impl SqlSession {
         // The implicit statement already has its client-facing result. The
         // commit outcome is consumed here as the required durability and MVCC
         // publication gate before that statement result can be acknowledged.
-        let _commit_outcome =
-            executor.commit_transaction_outcome(transaction, transaction_manager)?;
+        let _commit_outcome = executor.commit_transaction_outcome_with_request_context(
+            transaction,
+            transaction_manager,
+            &mut self.tablet_request_context,
+        )?;
 
         Ok(result)
     }

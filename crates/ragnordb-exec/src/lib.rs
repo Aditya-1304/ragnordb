@@ -6,14 +6,14 @@
 //! The local executor owns:
 //!
 //! - the mutable `MemoryCatalog`,
-//! - one in-memory tablet for every locally created table,
-//! - physical access-path selection between point lookup and table scan.
+//! - one in-memory tablet for every locally materialized table,
+//! - physical access-path selection between point lookup and table scan,
+//! - the optional server-provided gateway for remote metadata-routed points.
 //!
 //! The `session` module owns implicit and explicit SQL transaction lifecycles.
-//! `SqlSession` contains only transaction policy and active transaction state;
-//! connection identity, deadlines, and transport concerns remain in the server
-//! crate. The lower-level `LocalExecutor` receives an active `Transaction` and
-//! remains independent from connection-level state.
+//! `SqlSession` contains transaction policy, active transaction state, and the
+//! request identity context needed to make remote tablet calls deterministic.
+//! Transport ownership remains in the server crate.
 //!
 //! The executor never depends directly on `sqlparser`. Unsupported SQL clauses
 //! remain the analyzer's responsibility and cannot reach this layer as a Plan.
@@ -38,11 +38,12 @@ use ragnordb_common::{
     catalog_codec::DataType,
     catalog_codec::TableDefinition,
     codec::{Row, Value, WriteKind},
-    command_codec::SingleShardCommitCommand,
-    encoding::encode_row,
-    ids::{ColumnId, RowKey, TableId, TabletId, Timestamp},
+    command_codec::{SingleShardCommitCommand, TabletCommand, WriteEntry},
+    encoding::{decode_row, encode_row},
+    ids::{ColumnId, RaftGroupId, RequestId, RowKey, TableId, TabletId, Timestamp},
     metadata_codec::{CreateTableRequest, MetadataCommandCodecError, TabletDescriptor},
     proto::snapshot as snapshot_proto,
+    rpc_codec::TabletRoute,
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
@@ -52,10 +53,11 @@ use ragnordb_sql::{
 use ragnordb_storage::{
     checkpoint::CapturedMvccState,
     key::{decode_row_key, make_row_key},
-    mvcc::InMemoryMvcc,
+    mvcc::{InMemoryMvcc, Mutation},
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit},
 };
 
+use ragnordb_tablet::command::TabletCommandApplyOutcome;
 use ragnordb_tablet::{RowMutation, Tablet, TabletRouter};
 use ragnordb_txn::{
     CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
@@ -129,6 +131,106 @@ pub trait MetadataTableCreator: Send + Sync {
 
 /// Shared metadata CREATE TABLE client installed by the server runtime.
 pub type SharedMetadataTableCreator = Arc<dyn MetadataTableCreator>;
+
+/// Gateway operations required by SQL execution for a metadata-routed tablet.
+///
+/// The executor owns SQL semantics but must not depend on the server crate. The
+/// server therefore supplies this narrow object-safe boundary, backed by the
+/// Slice 2 local/remote tablet RPC client. Implementations must preserve the
+/// supplied request identity when forwarding commands so a retry cannot become
+/// a second logical mutation at the tablet.
+pub trait TabletGateway: Send + Sync {
+    fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute>;
+
+    fn read_point(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        row_key: RowKey,
+        read_timestamp: Timestamp,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>>;
+
+    fn submit_command(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome>;
+}
+
+/// Shared server-provided gateway used by metadata-backed SQL tables.
+pub type SharedTabletGateway = Arc<dyn TabletGateway>;
+
+/// Per-connection request identity used for tablet RPCs.
+///
+/// Request sequences are scoped to one client identity and carried into the
+/// destination Raft group. A single context is retained by `SqlSession`, so
+/// every remote read or commit issued by that connection receives a distinct,
+/// non-zero identity while reconnect/retry plumbing can later reuse the same
+/// identity explicitly.
+#[derive(Debug, Clone)]
+pub struct TabletRequestContext {
+    client_id: u128,
+    next_sequence: u64,
+    timeout: Duration,
+}
+
+impl TabletRequestContext {
+    pub fn new(client_id: u128) -> Result<Self> {
+        if client_id == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet request client ID 0 is reserved".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            client_id,
+            next_sequence: 1,
+            timeout: Duration::from_secs(30),
+        })
+    }
+
+    pub fn client_id(&self) -> u128 {
+        self.client_id
+    }
+
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        if !timeout.is_zero() {
+            self.timeout = timeout;
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    fn next_request_id(&mut self, raft_group_id: RaftGroupId) -> Result<RequestId> {
+        if raft_group_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet request Raft group ID 0 is reserved".to_string(),
+            ));
+        }
+
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            Error::Configuration("tablet request sequence space is exhausted".to_string())
+        })?;
+
+        Ok(RequestId {
+            client_id: self.client_id,
+            sequence,
+            raft_group_id,
+        })
+    }
+}
+
+impl Default for TabletRequestContext {
+    fn default() -> Self {
+        Self::new(1).expect("default tablet request identity is non-zero")
+    }
+}
 
 /// Authoritative schema and complete tablet partition map returned by metadata
 /// after a committed CREATE TABLE apply.
@@ -208,6 +310,7 @@ pub struct LocalExecutor {
     tablets: BTreeMap<TableId, LocalTablet>,
     tablet_routers: BTreeMap<TableId, TabletRouter>,
     metadata_table_creator: Option<SharedMetadataTableCreator>,
+    tablet_gateway: Option<SharedTabletGateway>,
     metadata_table_ids: BTreeSet<TableId>,
     commit_log: SharedCommitLog,
     next_local_catalog_timestamp: u64,
@@ -256,6 +359,7 @@ impl LocalExecutor {
             tablets: BTreeMap::new(),
             tablet_routers: BTreeMap::new(),
             metadata_table_creator: None,
+            tablet_gateway: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: 0,
@@ -283,6 +387,14 @@ impl LocalExecutor {
     /// Install the metadata Raft client used for replicated CREATE TABLE.
     pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
         self.metadata_table_creator = Some(creator);
+    }
+
+    /// Install the server-owned gateway used for metadata-routed tablet
+    /// operations. Local compatibility tablets continue to use their direct
+    /// coordinator path; only tables without a local materialized tablet cross
+    /// this boundary.
+    pub fn replace_tablet_gateway(&mut self, gateway: SharedTabletGateway) {
+        self.tablet_gateway = Some(gateway);
     }
 
     pub(crate) fn metadata_table_creator_installed(&self) -> bool {
@@ -626,6 +738,7 @@ impl LocalExecutor {
             tablets,
             tablet_routers,
             metadata_table_creator: None,
+            tablet_gateway: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: catalog_timestamp_high_water.0,
@@ -690,6 +803,26 @@ impl LocalExecutor {
         plan: Plan,
         transaction: Option<&mut Transaction>,
     ) -> Result<ExecutionResult> {
+        self.execute_inner(plan, transaction, None)
+    }
+
+    /// Execute one logical plan with the connection identity needed for
+    /// metadata-routed tablet reads and single-tablet commits.
+    pub fn execute_with_request_context(
+        &mut self,
+        plan: Plan,
+        transaction: Option<&mut Transaction>,
+        request_context: &mut TabletRequestContext,
+    ) -> Result<ExecutionResult> {
+        self.execute_inner(plan, transaction, Some(request_context))
+    }
+
+    fn execute_inner(
+        &mut self,
+        plan: Plan,
+        transaction: Option<&mut Transaction>,
+        request_context: Option<&mut TabletRequestContext>,
+    ) -> Result<ExecutionResult> {
         match plan {
             Plan::CreateTable(plan) => {
                 if transaction.is_some() {
@@ -703,21 +836,29 @@ impl LocalExecutor {
                 self.execute_create_table(plan)
             }
 
-            Plan::Insert(plan) => {
-                self.execute_insert(plan, require_transaction(transaction, "INSERT")?)
-            }
+            Plan::Insert(plan) => self.execute_insert(
+                plan,
+                require_transaction(transaction, "INSERT")?,
+                request_context,
+            ),
 
-            Plan::Select(plan) => {
-                self.execute_select(plan, require_transaction(transaction, "SELECT")?)
-            }
+            Plan::Select(plan) => self.execute_select(
+                plan,
+                require_transaction(transaction, "SELECT")?,
+                request_context,
+            ),
 
-            Plan::Update(plan) => {
-                self.execute_update(plan, require_transaction(transaction, "UPDATE")?)
-            }
+            Plan::Update(plan) => self.execute_update(
+                plan,
+                require_transaction(transaction, "UPDATE")?,
+                request_context,
+            ),
 
-            Plan::Delete(plan) => {
-                self.execute_delete(plan, require_transaction(transaction, "DELETE")?)
-            }
+            Plan::Delete(plan) => self.execute_delete(
+                plan,
+                require_transaction(transaction, "DELETE")?,
+                request_context,
+            ),
 
             Plan::ShowTables => self.execute_show_tables(),
 
@@ -750,6 +891,37 @@ impl LocalExecutor {
         &mut self,
         transaction: Transaction,
         timestamp_allocator: A,
+    ) -> Result<SingleNodeCommitOutcome>
+    where
+        A: CommitTimestampAllocator,
+    {
+        let mut request_context = TabletRequestContext::default();
+        self.commit_transaction_outcome_with_request_context(
+            transaction,
+            timestamp_allocator,
+            &mut request_context,
+        )
+    }
+
+    /// Commit a transaction through either the local coordinator or the
+    /// metadata-routed tablet gateway.
+    pub fn commit_transaction_outcome_with_request_context<A>(
+        &mut self,
+        transaction: Transaction,
+        timestamp_allocator: A,
+        request_context: &mut TabletRequestContext,
+    ) -> Result<SingleNodeCommitOutcome>
+    where
+        A: CommitTimestampAllocator,
+    {
+        self.commit_transaction_outcome_inner(transaction, timestamp_allocator, request_context)
+    }
+
+    fn commit_transaction_outcome_inner<A>(
+        &mut self,
+        transaction: Transaction,
+        mut timestamp_allocator: A,
+        request_context: &mut TabletRequestContext,
     ) -> Result<SingleNodeCommitOutcome>
     where
         A: CommitTimestampAllocator,
@@ -797,30 +969,97 @@ impl LocalExecutor {
             .first()
             .expect("non-empty table-ID set was checked above");
 
-        let coordinator = self.tablets.get_mut(&table_id).ok_or_else(|| {
-            Error::CorruptData(format!(
-                "catalog table {} has no local commit coordinator",
-                table_id.0
-            ))
-        })?;
-
         let tablet_id = *tablet_ids
             .first()
             .expect("non-empty tablet-ID set was checked above");
-        if tablet_id != TabletId(table_id.0) {
-            return Err(Error::UnsupportedSql(format!(
-                "tablet {} is not installed in the local single-tablet commit path",
-                tablet_id.0
+
+        if let Some(coordinator) = self.tablets.get_mut(&table_id) {
+            if tablet_id != TabletId(table_id.0) {
+                return Err(Error::UnsupportedSql(format!(
+                    "tablet {} is not installed in the local single-tablet commit path",
+                    tablet_id.0
+                )));
+            }
+
+            let outcome = coordinator.commit(transaction, timestamp_allocator)?;
+
+            if let Some(extent) = outcome.wal_extent {
+                self.replay_from_end_lsn = self.replay_from_end_lsn.max(extent.end_lsn.as_u64());
+            }
+
+            return Ok(outcome);
+        }
+
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql(format!(
+                "tablet {} for table {} is not installed on this SQL gateway",
+                tablet_id.0, table_id.0
+            ))
+        })?;
+        let first_key = transaction
+            .write_set()
+            .keys()
+            .next()
+            .expect("non-empty transaction has a first write key");
+        let first_row_key = decode_row_key(first_key)?;
+        let route = gateway
+            .lookup_tablet_route(first_row_key.table_id, &first_row_key.primary_key_bytes)?;
+        route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        if route.tablet_id != tablet_id {
+            return Err(Error::CorruptData(format!(
+                "gateway route selected tablet {}, but SQL plan selected tablet {}",
+                route.tablet_id.0, tablet_id.0
             )));
         }
 
-        let outcome = coordinator.commit(transaction, timestamp_allocator)?;
+        let mut writes = Vec::with_capacity(transaction.write_set().len());
+        for (encoded_key, mutation) in transaction.write_set() {
+            let row_key = decode_row_key(encoded_key)?;
+            if row_key.table_id != table_id || self.route_row_key(&row_key)? != tablet_id {
+                return Err(Error::UnsupportedSql(
+                    "a remote single-tablet commit contains a foreign routed key".to_string(),
+                ));
+            }
 
-        if let Some(extent) = outcome.wal_extent {
-            self.replay_from_end_lsn = self.replay_from_end_lsn.max(extent.end_lsn.as_u64());
+            let (op, row) = match mutation {
+                Mutation::Put(encoded_row) => (WriteKind::Put, Some(decode_row(encoded_row)?)),
+                Mutation::Delete => (WriteKind::Delete, None),
+            };
+            writes.push(WriteEntry {
+                key: encoded_key.clone(),
+                row,
+                op,
+            });
         }
 
-        Ok(outcome)
+        let commit_timestamp =
+            timestamp_allocator.finalize_commit_timestamp(transaction.start_ts())?;
+        let command = TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: transaction.id(),
+            start_timestamp: transaction.start_ts(),
+            commit_timestamp,
+            writes,
+        });
+        let request_id = request_context.next_request_id(route.raft_group_id)?;
+        let outcome =
+            gateway.submit_command(&route, request_id, command, request_context.timeout())?;
+        if !matches!(
+            outcome.result,
+            ragnordb_tablet::command::TabletCommandApplyResult::SingleShardCommit
+        ) {
+            return Err(Error::CorruptData(
+                "remote tablet returned a non-commit outcome for a commit command".to_string(),
+            ));
+        }
+
+        Ok(SingleNodeCommitOutcome {
+            transaction_id: transaction.id(),
+            commit_timestamp: Some(commit_timestamp),
+            committed_writes: transaction.len(),
+            wal_extent: None,
+        })
     }
 
     /// Abort an uncommitted transaction by discarding its buffered mutations.
@@ -943,6 +1182,7 @@ impl LocalExecutor {
         &self,
         plan: InsertPlan,
         transaction: &mut Transaction,
+        mut request_context: Option<&mut TabletRequestContext>,
     ) -> Result<ExecutionResult> {
         let InsertPlan {
             table,
@@ -976,14 +1216,19 @@ impl LocalExecutor {
             prepared.push((key, row));
         }
 
+        // Establish the complete routing destination before performing any
+        // duplicate checks. A statement spanning tablets must fail at this
+        // boundary even when one of its keys already exists locally.
         let tablet_id = self.single_destination(schema.id, prepared.iter().map(|(key, _)| key))?;
-        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
 
         // Check every destination before buffering any mutation. Since this
         // executor holds exclusive access during the call, a later apply pass
         // cannot observe a different local storage state.
         for (key, _) in &prepared {
-            if tablet.get(transaction, key)?.is_some() {
+            if self
+                .point_row(transaction, key, &mut request_context)?
+                .is_some()
+            {
                 return Err(Error::ConstraintViolation(format!(
                     "cannot insert duplicate primary key into table {}",
                     schema.name
@@ -993,12 +1238,24 @@ impl LocalExecutor {
 
         let affected_rows = prepared.len();
 
-        tablet.buffer_batch(
-            transaction,
-            prepared
-                .into_iter()
-                .map(|(key, row)| RowMutation::Put { key, row }),
-        )?;
+        if self.tablets.contains_key(&schema.id) {
+            let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
+            tablet.buffer_batch(
+                transaction,
+                prepared
+                    .into_iter()
+                    .map(|(key, row)| RowMutation::Put { key, row }),
+            )?;
+        } else {
+            let mut writes = BTreeMap::new();
+            for (key, row) in prepared {
+                writes.insert(
+                    ragnordb_storage::key::encode_row_key(&key)?,
+                    Mutation::Put(encode_row(&row)?),
+                );
+            }
+            transaction.buffer_batch(writes)?;
+        }
 
         Ok(ExecutionResult::Mutation {
             operation: DmlOperation::Insert,
@@ -1010,6 +1267,7 @@ impl LocalExecutor {
         &self,
         plan: SelectPlan,
         transaction: &Transaction,
+        request_context: Option<&mut TabletRequestContext>,
     ) -> Result<ExecutionResult> {
         let SelectPlan {
             table,
@@ -1033,7 +1291,12 @@ impl LocalExecutor {
             validate_filter(schema.as_ref(), filter)?;
         }
 
-        let matching = self.matching_rows(transaction, schema.as_ref(), filter.as_ref())?;
+        let matching = self.matching_rows(
+            transaction,
+            schema.as_ref(),
+            filter.as_ref(),
+            request_context,
+        )?;
 
         let rows = matching
             .iter()
@@ -1056,6 +1319,7 @@ impl LocalExecutor {
         &self,
         plan: UpdatePlan,
         transaction: &mut Transaction,
+        request_context: Option<&mut TabletRequestContext>,
     ) -> Result<ExecutionResult> {
         let UpdatePlan {
             table,
@@ -1077,7 +1341,8 @@ impl LocalExecutor {
             validate_update_assignment(schema.as_ref(), assignment)?;
         }
 
-        let matching = self.matching_rows(transaction, schema.as_ref(), Some(&filter))?;
+        let matching =
+            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context)?;
 
         let mut prepared = Vec::with_capacity(matching.len());
 
@@ -1107,15 +1372,29 @@ impl LocalExecutor {
         }
 
         let affected_rows = prepared.len();
-        let tablet_id = self.single_destination(schema.id, prepared.iter().map(|(key, _)| key))?;
-        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-
-        tablet.buffer_batch(
-            transaction,
-            prepared
+        if !prepared.is_empty() {
+            let tablet_id =
+                self.single_destination(schema.id, prepared.iter().map(|(key, _)| key))?;
+            let mutations = prepared
                 .into_iter()
-                .map(|(key, row)| RowMutation::Put { key, row }),
-        )?;
+                .map(|(key, row)| RowMutation::Put { key, row });
+            if self.tablets.contains_key(&schema.id) {
+                let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
+                tablet.buffer_batch(transaction, mutations)?;
+            } else {
+                let mut writes = BTreeMap::new();
+                for mutation in mutations {
+                    let RowMutation::Put { key, row } = mutation else {
+                        unreachable!("UPDATE only constructs put mutations")
+                    };
+                    writes.insert(
+                        ragnordb_storage::key::encode_row_key(&key)?,
+                        Mutation::Put(encode_row(&row)?),
+                    );
+                }
+                transaction.buffer_batch(writes)?;
+            }
+        }
 
         Ok(ExecutionResult::Mutation {
             operation: DmlOperation::Update,
@@ -1127,6 +1406,7 @@ impl LocalExecutor {
         &self,
         plan: DeletePlan,
         transaction: &mut Transaction,
+        request_context: Option<&mut TabletRequestContext>,
     ) -> Result<ExecutionResult> {
         let DeletePlan { table, filter } = plan;
 
@@ -1134,21 +1414,36 @@ impl LocalExecutor {
 
         validate_filter(schema.as_ref(), &filter)?;
 
-        let matching = self.matching_rows(transaction, schema.as_ref(), Some(&filter))?;
+        let matching =
+            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context)?;
 
         // Matching completes before the atomic buffer operation, so neither a
         // filter error nor a mutation-encoding error can partially apply this
         // statement to the transaction.
         let affected_rows = matching.len();
-        let tablet_id = self.single_destination(schema.id, matching.iter().map(|row| &row.key))?;
-        let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-
-        tablet.buffer_batch(
-            transaction,
-            matching
+        if !matching.is_empty() {
+            let tablet_id =
+                self.single_destination(schema.id, matching.iter().map(|row| &row.key))?;
+            let mutations = matching
                 .into_iter()
-                .map(|keyed_row| RowMutation::Delete { key: keyed_row.key }),
-        )?;
+                .map(|keyed_row| RowMutation::Delete { key: keyed_row.key });
+            if self.tablets.contains_key(&schema.id) {
+                let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
+                tablet.buffer_batch(transaction, mutations)?;
+            } else {
+                let mut writes = BTreeMap::new();
+                for mutation in mutations {
+                    let RowMutation::Delete { key } = mutation else {
+                        unreachable!("DELETE only constructs delete mutations")
+                    };
+                    writes.insert(
+                        ragnordb_storage::key::encode_row_key(&key)?,
+                        Mutation::Delete,
+                    );
+                }
+                transaction.buffer_batch(writes)?;
+            }
+        }
 
         Ok(ExecutionResult::Mutation {
             operation: DmlOperation::Delete,
@@ -1325,21 +1620,22 @@ impl LocalExecutor {
         transaction: &Transaction,
         schema: &TableSchema,
         filter: Option<&BoundExpr>,
+        mut request_context: Option<&mut TabletRequestContext>,
     ) -> Result<Vec<KeyedRow>> {
         let candidates = match choose_access_path(schema, filter)? {
             AccessPath::Empty => Vec::new(),
 
-            AccessPath::Point(key) => {
-                let tablet_id = self.route_row_key(&key)?;
-                let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-
-                tablet
-                    .get(transaction, &key)?
-                    .map(|row| vec![(key, row)])
-                    .unwrap_or_default()
-            }
+            AccessPath::Point(key) => self
+                .point_row(transaction, &key, &mut request_context)?
+                .map(|row| vec![(key, row)])
+                .unwrap_or_default(),
 
             AccessPath::Scan => {
+                if !self.tablets.contains_key(&schema.id) {
+                    return Err(Error::UnsupportedSql(
+                        "distributed scans are not available in this routing slice".to_string(),
+                    ));
+                }
                 let tablet_ids = self.router_for(schema.id)?.route_scan();
                 let mut rows = Vec::new();
 
@@ -1378,6 +1674,68 @@ impl LocalExecutor {
         }
 
         Ok(rows)
+    }
+
+    /// Read one row from the local compatibility tablet or the server gateway,
+    /// overlaying a transaction's own pending mutation before consulting
+    /// committed remote state.
+    fn point_row(
+        &self,
+        transaction: &Transaction,
+        row_key: &RowKey,
+        request_context: &mut Option<&mut TabletRequestContext>,
+    ) -> Result<Option<Row>> {
+        let encoded_key = ragnordb_storage::key::encode_row_key(row_key)?;
+        if let Some(mutation) = transaction.pending_write(&encoded_key) {
+            return match mutation {
+                Mutation::Put(encoded_row) => decode_row(encoded_row).map(Some),
+                Mutation::Delete => Ok(None),
+            };
+        }
+
+        let tablet_id = self.route_row_key(row_key)?;
+        if self.tablets.contains_key(&row_key.table_id) {
+            return self
+                .local_tablet_for_route(row_key.table_id, tablet_id)?
+                .get(transaction, row_key);
+        }
+
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql(format!(
+                "tablet {} for table {} is not installed on this SQL gateway",
+                tablet_id.0, row_key.table_id.0
+            ))
+        })?;
+        let route = gateway.lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+        route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        if route.tablet_id != tablet_id {
+            return Err(Error::CorruptData(format!(
+                "gateway route selected tablet {}, but SQL plan selected tablet {}",
+                route.tablet_id.0, tablet_id.0
+            )));
+        }
+
+        let request_context = match request_context {
+            Some(context) => &mut **context,
+            None => {
+                return Err(Error::InvalidArgument(
+                    "metadata-routed tablet access requires a request identity".to_string(),
+                ));
+            }
+        };
+        let request_id = request_context.next_request_id(route.raft_group_id)?;
+        gateway
+            .read_point(
+                &route,
+                request_id,
+                row_key.clone(),
+                transaction.start_ts(),
+                request_context.timeout(),
+            )?
+            .map(|encoded_row| decode_row(&encoded_row))
+            .transpose()
     }
 }
 
@@ -1903,7 +2261,154 @@ fn data_type_name(data_type: DataType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ragnordb_common::{
+        catalog_codec::{ColumnDefinition, TableDefinition},
+        command_codec::TabletCommand,
+        ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TxnId},
+        metadata_codec::PartitionSpec,
+        rpc_codec::{ReplicaRoute, TabletRoute},
+    };
     use ragnordb_sql::{analyze, parse_one, plan};
+    use ragnordb_tablet::command::TabletCommandApplyResult;
+    use ragnordb_txn::{LocalTransactionManager, TransactionManager};
+
+    struct StaticMetadata {
+        definition: TableDefinition,
+        descriptor: TabletDescriptor,
+    }
+
+    impl MetadataTableCreator for StaticMetadata {
+        fn create_table(
+            &self,
+            _request: CreateTableRequest,
+            _request_id: RequestId,
+            _timeout: Duration,
+        ) -> Result<TableDefinition> {
+            Err(Error::NotImplemented("static test metadata is read-only"))
+        }
+
+        fn table_descriptors(&self, table_id: TableId) -> Result<Vec<TabletDescriptor>> {
+            if table_id != TableId(self.definition.table_id) {
+                return Err(Error::SchemaMismatch("unknown test table".to_string()));
+            }
+            Ok(vec![self.descriptor.clone()])
+        }
+
+        fn list_tables(&self) -> Vec<TableDefinition> {
+            vec![self.definition.clone()]
+        }
+    }
+
+    struct RecordingGateway {
+        route: TabletRoute,
+        row_key: Vec<u8>,
+        row: Vec<u8>,
+        read_requests: Mutex<Vec<RequestId>>,
+        commands: Mutex<Vec<(RequestId, TabletCommand)>>,
+    }
+
+    impl TabletGateway for RecordingGateway {
+        fn lookup_tablet_route(&self, _table_id: TableId, _key: &[u8]) -> Result<TabletRoute> {
+            Ok(self.route.clone())
+        }
+
+        fn read_point(
+            &self,
+            _route: &TabletRoute,
+            request_id: RequestId,
+            row_key: RowKey,
+            _read_timestamp: Timestamp,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            self.read_requests.lock().unwrap().push(request_id);
+            let encoded = ragnordb_storage::key::encode_row_key(&row_key)?;
+            Ok((encoded == self.row_key).then(|| self.row.clone()))
+        }
+
+        fn submit_command(
+            &self,
+            _route: &TabletRoute,
+            request_id: RequestId,
+            command: TabletCommand,
+            _timeout: Duration,
+        ) -> Result<TabletCommandApplyOutcome> {
+            self.commands.lock().unwrap().push((request_id, command));
+            Ok(TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::SingleShardCommit,
+                deduplicated: false,
+            })
+        }
+    }
+
+    fn remote_executor() -> (LocalExecutor, Arc<RecordingGateway>, RowKey) {
+        let table_id = TableId(42);
+        let tablet_id = TabletId(142);
+        let row_key = RowKey {
+            table_id,
+            primary_key_bytes: make_row_key(table_id, &[Value::Int(7)])
+                .unwrap()
+                .primary_key_bytes,
+        };
+        let descriptor = TabletDescriptor {
+            tablet_id,
+            table_id,
+            raft_group_id: RaftGroupId(242),
+            tablet_epoch: 1,
+            partition: PartitionSpec::Hash {
+                bucket: 0,
+                bucket_count: 1,
+            },
+        };
+        let definition = TableDefinition {
+            table_id: table_id.0,
+            name: "remote_users".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    column_id: ColumnId(1),
+                    name: "id".to_string(),
+                    ty: DataType::Int,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    column_id: ColumnId(2),
+                    name: "name".to_string(),
+                    ty: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            primary_key_column_ids: vec![ColumnId(1)],
+            schema_version: 1,
+            tablet_count: 1,
+        };
+        let route = TabletRoute {
+            raft_group_id: descriptor.raft_group_id,
+            tablet_id,
+            tablet_epoch: descriptor.tablet_epoch,
+            leader_replica_id: ReplicaId(1),
+            replicas: vec![ReplicaRoute {
+                replica_id: ReplicaId(1),
+                node_id: NodeId(9),
+            }],
+        };
+        let row = Row {
+            values: vec![Value::Int(7), Value::Text("alice".to_string())],
+        };
+        let gateway = Arc::new(RecordingGateway {
+            route,
+            row_key: ragnordb_storage::key::encode_row_key(&row_key).unwrap(),
+            row: encode_row(&row).unwrap(),
+            read_requests: Mutex::new(Vec::new()),
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut executor = LocalExecutor::new();
+        executor.replace_metadata_table_creator(Arc::new(StaticMetadata {
+            definition,
+            descriptor,
+        }));
+        executor.refresh_metadata_catalog().unwrap();
+        executor.replace_tablet_gateway(gateway.clone());
+        (executor, gateway, row_key)
+    }
 
     fn build(executor: &LocalExecutor, sql: &str) -> Plan {
         let parsed = parse_one(sql).unwrap();
@@ -1963,5 +2468,106 @@ mod tests {
             ),
             AccessPath::Empty
         );
+    }
+
+    /// Realistic bug caught: metadata-backed tables were visible to SQL
+    /// analysis but a point read still attempted to access a missing local
+    /// coordinator instead of using the gateway route.
+    #[test]
+    fn metadata_point_select_reads_through_tablet_gateway() {
+        let (mut executor, gateway, _) = remote_executor();
+        let plan = build(&executor, "SELECT name FROM remote_users WHERE id = 7");
+        let mut transaction = Transaction::new(TxnId(1), Timestamp(10)).unwrap();
+        let mut context = TabletRequestContext::new(77).unwrap();
+
+        let result = executor
+            .execute_with_request_context(plan, Some(&mut transaction), &mut context)
+            .unwrap();
+
+        let ExecutionResult::Query(result) = result else {
+            panic!("expected a query result");
+        };
+        assert_eq!(
+            result.rows,
+            vec![Row {
+                values: vec![Value::Text("alice".to_string())],
+            }]
+        );
+        assert_eq!(gateway.read_requests.lock().unwrap().len(), 1);
+        assert_eq!(gateway.read_requests.lock().unwrap()[0].client_id, 77);
+    }
+
+    /// Realistic bug caught: a single-tablet mutation on a remote metadata
+    /// route could be buffered locally but had no commit path, causing the
+    /// gateway to reject the transaction after SQL had accepted the write.
+    #[test]
+    fn metadata_single_table_insert_submits_one_replicated_command() {
+        let (mut executor, gateway, _) = remote_executor();
+        let plan = build(
+            &executor,
+            "INSERT INTO remote_users (id, name) VALUES (8, 'alice')",
+        );
+        let mut manager = LocalTransactionManager::new();
+        let mut transaction = manager.begin_transaction().unwrap();
+        let mut context = TabletRequestContext::new(88).unwrap();
+
+        let result = executor
+            .execute_with_request_context(plan, Some(&mut transaction), &mut context)
+            .unwrap();
+        assert_eq!(
+            result,
+            ExecutionResult::Mutation {
+                operation: DmlOperation::Insert,
+                affected_rows: 1,
+            }
+        );
+
+        let outcome = executor
+            .commit_transaction_outcome_with_request_context(
+                transaction,
+                &mut manager,
+                &mut context,
+            )
+            .unwrap();
+        assert_eq!(outcome.committed_writes, 1);
+        assert_eq!(gateway.commands.lock().unwrap().len(), 1);
+        let (request_id, command) = &gateway.commands.lock().unwrap()[0];
+        assert_eq!(request_id.client_id, 88);
+        assert_eq!(request_id.sequence, 2);
+        assert_eq!(request_id.raft_group_id, RaftGroupId(242));
+        assert!(matches!(command, TabletCommand::SingleShardCommit(_)));
+    }
+
+    /// Realistic bug caught: implicit autocommit could use a fresh default
+    /// request context for its commit after the statement used the connection
+    /// context for duplicate checking, producing a colliding identity.
+    #[test]
+    fn implicit_remote_commit_reuses_connection_request_identity() {
+        let (mut executor, gateway, _) = remote_executor();
+        let mut session = SqlSession::with_client_id(99);
+        let mut manager = LocalTransactionManager::new();
+
+        let result = session
+            .execute_sql(
+                "INSERT INTO remote_users (id, name) VALUES (8, 'alice')",
+                &mut executor,
+                &mut manager,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ExecutionResult::Mutation {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        let reads = gateway.read_requests.lock().unwrap();
+        let commands = gateway.commands.lock().unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(reads[0].client_id, 99);
+        assert_eq!(commands[0].0.client_id, 99);
+        assert_eq!(commands[0].0.sequence, reads[0].sequence + 1);
     }
 }
