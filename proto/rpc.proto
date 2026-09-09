@@ -3,6 +3,7 @@ package ragnordb.rpc;
 
 import "ids.proto";
 import "command.proto";
+import "row.proto";
 
 enum MessageType {
     MESSAGE_TYPE_UNSPECIFIED = 0;
@@ -11,6 +12,7 @@ enum MessageType {
     MESSAGE_TYPE_TABLET_COMMAND_RESPONSE = 3;
     MESSAGE_TYPE_METADATA_REQUEST = 4;
     MESSAGE_TYPE_METADATA_RESPONSE = 5;
+    MESSAGE_TYPE_TABLET_READ_REQUEST = 6;
 }
 
 message RpcFrame {
@@ -22,6 +24,16 @@ message RpcFrame {
 message TabletCommandRequest {
         ragnordb.ids.RequestId request_id = 1;
         ragnordb.command.TabletCommand command = 2;
+        ragnordb.ids.TabletId tablet_id = 3;
+        uint64 tablet_epoch = 4;
+}
+
+message TabletReadRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.TabletId tablet_id = 2;
+        uint64 tablet_epoch = 3;
+        ragnordb.row.RowKey row_key = 4;
+        ragnordb.ids.Timestamp read_timestamp = 5;
 }
 
 message TabletCommandResponse {
@@ -31,6 +43,8 @@ message TabletCommandResponse {
     string error_code = 4;
     bool retryable = 5;
     bytes result_data = 6;
+    bool found = 7;
+    uint64 leader_replica_id = 8;
 }
 
 message MetadataRequest {
@@ -79,6 +93,8 @@ message LookupTabletResponse {
 
     ragnordb.ids.ReplicaId leader_replica_id = 4;
     repeated ReplicaRoute replicas = 5;
+    ragnordb.ids.RaftGroupId raft_group_id = 6;
+    uint64 tablet_epoch = 7;
 }
 
 message LookupSchemaResponse {

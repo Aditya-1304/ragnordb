@@ -43,10 +43,7 @@ use ragnordb_multiraft::{
         persistence::{NodeRaftWal, NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
-    transport::{
-        NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig,
-        NodeRpcInbound,
-    },
+    transport::{NodeRaftEndpoint, NodeRaftInbound, NodeRaftTransport, NodeRaftTransportConfig},
 };
 
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
@@ -65,6 +62,7 @@ use crate::{
         LocalReplicaRegistry, ReplicaLifecycle,
     },
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
+    rpc::{SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher},
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
 };
 
@@ -128,6 +126,7 @@ struct TabletLifecycleManager {
     /// has been published. Keeping them here also makes interrupted cleanup
     /// restartable without reopening a second writer for the same identity.
     writers: BTreeMap<RaftReplicaIdentity, NodeRaftWalHandle<LocalWal>>,
+    tablet_handles: SharedTabletHandleRegistry,
 }
 
 impl TabletLifecycleManager {
@@ -143,6 +142,7 @@ impl TabletLifecycleManager {
         registry: LocalReplicaRegistry,
         recovered: RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
+        tablet_handles: SharedTabletHandleRegistry,
     ) -> Self {
         Self {
             config,
@@ -157,6 +157,7 @@ impl TabletLifecycleManager {
             start_gate,
             runtimes: BTreeMap::new(),
             writers: BTreeMap::new(),
+            tablet_handles,
         }
     }
 
@@ -329,9 +330,10 @@ impl TabletLifecycleManager {
                 table_id: descriptor.table_id,
                 tablet_epoch: descriptor.tablet_epoch,
             };
-            // Slice 2 materializes the replicated tablet state machine. The
-            // SQL-side storage/router mirror remains a Phase 5.6 concern and
-            // must not reacquire the owner lock while CREATE TABLE completes.
+            // Materialize the replicated tablet state machine without
+            // reacquiring the SQL owner lock while CREATE TABLE completes.
+            // The gateway reads this runtime through the shared handle registry
+            // after the lifecycle owner has registered the group.
             let runtime = ReplicatedTabletRuntime::start_hosted_tablet_from_shared_recovery(
                 &self.config,
                 self.wal.clone(),
@@ -371,6 +373,10 @@ impl TabletLifecycleManager {
                 })?;
             }
             self.runtimes.insert(identity, runtime);
+            self.tablet_handles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(identity.raft_group_id, self.runtimes[&identity].handle());
             self.writers.insert(identity, retention_writer);
         }
         Ok(())
@@ -499,6 +505,10 @@ impl TabletLifecycleManager {
         // Detach the host proxy before dropping the runtime so no scheduler
         // turn can race with worker shutdown.
         drop(self.runtimes.remove(&identity));
+        self.tablet_handles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&identity.raft_group_id);
 
         if let Some(mut writer) = self.writers.remove(&identity) {
             writer
@@ -954,10 +964,11 @@ pub struct MultiRaftRuntime {
     /// the complete node runtime lifetime.
     _snapshot_transport: NodeSnapshotTransport,
 
-    /// Retain the shared transport's RPC receive lane until the future
-    /// gateway dispatcher is installed. This preserves bounded admission and
-    /// avoids closing remote peers' request path prematurely.
-    rpc_inbound: Option<NodeRpcInbound>,
+    /// Node-level tablet gateway client. The dispatcher owns the receive lane
+    /// and correlates remote responses by RequestId.
+    tablet_rpc: TabletRpcClient,
+
+    rpc_worker: Option<thread::JoinHandle<()>>,
 
     shutdown: Arc<AtomicBool>,
 
@@ -1298,6 +1309,12 @@ impl MultiRaftRuntime {
             host.register_new_group(hosted_group).map_err(host_error)?;
         }
 
+        let tablet_handles = Arc::new(RwLock::new(BTreeMap::new()));
+        tablet_handles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity.raft_group_id, tablet_runtime.handle());
+
         let mut tablet_lifecycle = TabletLifecycleManager::new(
             config.clone(),
             wal,
@@ -1309,6 +1326,7 @@ impl MultiRaftRuntime {
             registry,
             recovered,
             Arc::clone(&start_gate),
+            tablet_handles.clone(),
         );
         tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
         tablet_lifecycle.register_unmaterialized_recovered(
@@ -1349,6 +1367,14 @@ impl MultiRaftRuntime {
         ));
 
         let worker_shutdown = Arc::clone(&shutdown);
+
+        let (tablet_rpc, rpc_worker) = spawn_dispatcher(
+            rpc_inbound,
+            transport.clone(),
+            tablet_handles,
+            metadata_handle.clone(),
+            shutdown.clone(),
+        );
 
         let worker_metadata = metadata_handle.clone();
         let worker_host_status = Arc::clone(&host_status);
@@ -1435,11 +1461,9 @@ impl MultiRaftRuntime {
 
             _snapshot_transport: snapshot_transport,
 
-            // Keep the bounded RPC receive lane alive with the node runtime.
-            // Slice 2 will attach the request dispatcher; dropping it here
-            // would make remote gateway traffic fail with a misleading
-            // broken-pipe error during the Slice 1 transport rollout.
-            rpc_inbound: Some(rpc_inbound),
+            tablet_rpc,
+
+            rpc_worker: Some(rpc_worker),
 
             shutdown,
 
@@ -1454,12 +1478,9 @@ impl MultiRaftRuntime {
             .handle()
     }
 
-    /// Transfer ownership of the node RPC receive lane to the future gateway
-    /// dispatcher. Keeping this as an explicit handoff prevents two consumers
-    /// from racing on request ordering while allowing the transport lifecycle
-    /// to remain owned by the MultiRaft runtime until the gateway is ready.
-    pub fn take_rpc_inbound(&mut self) -> Option<NodeRpcInbound> {
-        self.rpc_inbound.take()
+    /// Return the local/remote tablet gateway client used by SQL routing.
+    pub fn tablet_rpc_client(&self) -> TabletRpcClient {
+        self.tablet_rpc.clone()
     }
 
     /// Read-only committed metadata publication.
@@ -1995,6 +2016,10 @@ impl Drop for MultiRaftRuntime {
         self.shutdown.store(true, Ordering::Release);
 
         if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+
+        if let Some(worker) = self.rpc_worker.take() {
             let _ = worker.join();
         }
 

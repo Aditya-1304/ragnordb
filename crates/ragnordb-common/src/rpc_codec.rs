@@ -17,6 +17,7 @@ use crate::proto::rpc;
 ///   0x03 — TabletCommandResponse
 ///   0x04 — MetadataRequest
 ///   0x05 — MetadataResponse
+///   0x06 — TabletReadRequest
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
@@ -31,6 +32,7 @@ pub enum MessageType {
     TabletCommandResponse,
     MetadataRequest,
     MetadataResponse,
+    TabletReadRequest,
 }
 
 impl MessageType {
@@ -45,6 +47,7 @@ impl MessageType {
             Self::TabletCommandResponse => 0x03,
             Self::MetadataRequest => 0x04,
             Self::MetadataResponse => 0x05,
+            Self::TabletReadRequest => 0x06,
         }
     }
 
@@ -55,6 +58,7 @@ impl MessageType {
             0x03 => Ok(Self::TabletCommandResponse),
             0x04 => Ok(Self::MetadataRequest),
             0x05 => Ok(Self::MetadataResponse),
+            0x06 => Ok(Self::TabletReadRequest),
             _ => Err("unknown RPC message type"),
         }
     }
@@ -66,6 +70,7 @@ impl MessageType {
             MessageType::TabletCommandResponse => rpc::MessageType::TabletCommandResponse,
             MessageType::MetadataRequest => rpc::MessageType::MetadataRequest,
             MessageType::MetadataResponse => rpc::MessageType::MetadataResponse,
+            MessageType::TabletReadRequest => rpc::MessageType::TabletReadRequest,
         }
     }
 
@@ -76,6 +81,7 @@ impl MessageType {
             rpc::MessageType::TabletCommandResponse => Ok(MessageType::TabletCommandResponse),
             rpc::MessageType::MetadataRequest => Ok(MessageType::MetadataRequest),
             rpc::MessageType::MetadataResponse => Ok(MessageType::MetadataResponse),
+            rpc::MessageType::TabletReadRequest => Ok(MessageType::TabletReadRequest),
             rpc::MessageType::Unspecified => Err("unspecified message type"),
         }
     }
@@ -119,6 +125,8 @@ impl RpcFrame {
 /// it includes the RequestId for idempotent retry deduplication
 pub struct TabletCommandRequest {
     pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
     pub command: TabletCommand,
 }
 
@@ -126,14 +134,85 @@ impl TabletCommandRequest {
     pub fn to_proto(&self) -> Result<rpc::TabletCommandRequest, &'static str> {
         Ok(rpc::TabletCommandRequest {
             request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
             command: Some(self.command.to_proto()?),
         })
     }
 
     pub fn from_proto(proto: rpc::TabletCommandRequest) -> Result<Self, &'static str> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+        let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+        if request_id.client_id == 0
+            || request_id.sequence == 0
+            || request_id.raft_group_id.0 == 0
+            || tablet_id.0 == 0
+            || proto.tablet_epoch == 0
+        {
+            return Err("tablet command request contains a reserved zero identity");
+        }
+
         Ok(TabletCommandRequest {
-            request_id: RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?,
+            request_id,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
             command: TabletCommand::from_proto(proto.command.ok_or("missing command")?)?,
+        })
+    }
+}
+
+/// Point read issued by a gateway after metadata has selected one tablet.
+///
+/// The row key and tablet generation are carried together so a delayed request
+/// cannot be interpreted against a replacement tablet that reused the same
+/// physical route. The read timestamp is an MVCC snapshot boundary and is
+/// never allocated by the tablet itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletReadRequest {
+    pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub row_key: crate::ids::RowKey,
+    pub read_timestamp: Timestamp,
+}
+
+impl TabletReadRequest {
+    pub fn to_proto(&self) -> rpc::TabletReadRequest {
+        rpc::TabletReadRequest {
+            request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+            row_key: Some(self.row_key.to_proto()),
+            read_timestamp: Some(self.read_timestamp.to_proto()),
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletReadRequest) -> Result<Self, &'static str> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+        let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+        let row_key = crate::ids::RowKey::from_proto(proto.row_key.ok_or("missing row_key")?)?;
+        let read_timestamp =
+            Timestamp::from_proto(proto.read_timestamp.ok_or("missing read_timestamp")?);
+
+        if request_id.client_id == 0
+            || request_id.sequence == 0
+            || request_id.raft_group_id.0 == 0
+            || tablet_id.0 == 0
+            || proto.tablet_epoch == 0
+            || row_key.table_id.0 == 0
+        {
+            return Err("tablet read request contains a reserved zero identity");
+        }
+        if read_timestamp.0 == 0 {
+            return Err("tablet read timestamp must be non-zero");
+        }
+
+        Ok(Self {
+            request_id,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
+            row_key,
+            read_timestamp,
         })
     }
 }
@@ -154,6 +233,8 @@ pub struct TabletCommandResponse {
     pub error_code: String,
     pub retryable: bool,
     pub result_data: Vec<u8>,
+    pub found: bool,
+    pub leader_replica_id: Option<ReplicaId>,
 }
 
 impl TabletCommandResponse {
@@ -165,6 +246,8 @@ impl TabletCommandResponse {
             error_code: self.error_code.clone(),
             retryable: self.retryable,
             result_data: self.result_data.clone(),
+            found: self.found,
+            leader_replica_id: self.leader_replica_id.map(|id| id.0).unwrap_or(0),
         }
     }
 
@@ -176,6 +259,9 @@ impl TabletCommandResponse {
             error_code: proto.error_code,
             retryable: proto.retryable,
             result_data: proto.result_data,
+            found: proto.found,
+            leader_replica_id: (proto.leader_replica_id != 0)
+                .then_some(ReplicaId(proto.leader_replica_id)),
         })
     }
 }
@@ -243,13 +329,19 @@ pub struct ReplicaRoute {
 /// and therefore remain a cacheable, retryable hint at the gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletRoute {
+    pub raft_group_id: RaftGroupId,
     pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
     pub leader_replica_id: ReplicaId,
     pub replicas: Vec<ReplicaRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TabletRouteError {
+    #[error("tablet route Raft group ID must be non-zero")]
+    ZeroRaftGroupId,
+    #[error("tablet route epoch must be non-zero")]
+    ZeroTabletEpoch,
     #[error("tablet ID must be non-zero")]
     ZeroTabletId,
     #[error("leader replica ID must be non-zero")]
@@ -278,8 +370,14 @@ pub enum TabletRouteError {
 
 impl TabletRoute {
     pub fn validate(&self) -> Result<(), TabletRouteError> {
+        if self.raft_group_id.0 == 0 {
+            return Err(TabletRouteError::ZeroRaftGroupId);
+        }
         if self.tablet_id.0 == 0 {
             return Err(TabletRouteError::ZeroTabletId);
+        }
+        if self.tablet_epoch == 0 {
+            return Err(TabletRouteError::ZeroTabletEpoch);
         }
         if self.leader_replica_id.0 == 0 {
             return Err(TabletRouteError::ZeroLeaderReplicaId);
@@ -433,7 +531,9 @@ pub enum MetadataResponse {
         timestamp: Timestamp,
     },
     LookupTablet {
+        raft_group_id: RaftGroupId,
         tablet_id: TabletId,
+        tablet_epoch: u64,
         leader_replica_id: ReplicaId,
         replicas: Vec<ReplicaRoute>,
     },
@@ -447,12 +547,16 @@ impl MetadataResponse {
     pub fn tablet_route(&self) -> Result<TabletRoute, TabletRouteError> {
         match self {
             Self::LookupTablet {
+                raft_group_id,
                 tablet_id,
+                tablet_epoch,
                 leader_replica_id,
                 replicas,
             } => {
                 let route = TabletRoute {
+                    raft_group_id: *raft_group_id,
                     tablet_id: *tablet_id,
+                    tablet_epoch: *tablet_epoch,
                     leader_replica_id: *leader_replica_id,
                     replicas: replicas.clone(),
                 };
@@ -473,13 +577,17 @@ impl MetadataResponse {
                 ))
             }
             MetadataResponse::LookupTablet {
+                raft_group_id,
                 tablet_id,
+                tablet_epoch,
                 leader_replica_id,
                 replicas,
             } => Some(rpc::metadata_response::Response::LookupTablet(
                 rpc::LookupTabletResponse {
                     tablet_id: Some(tablet_id.to_proto()),
                     leader_replica_id: Some(leader_replica_id.to_proto()),
+                    raft_group_id: Some(raft_group_id.to_proto()),
+                    tablet_epoch: *tablet_epoch,
                     replicas: replicas
                         .iter()
                         .map(|route| rpc::ReplicaRoute {
@@ -510,6 +618,11 @@ impl MetadataResponse {
                 })
             }
             Some(rpc::metadata_response::Response::LookupTablet(resp)) => {
+                let raft_group_id =
+                    RaftGroupId::from_proto(resp.raft_group_id.ok_or("missing raft_group_id")?);
+                if raft_group_id.0 == 0 || resp.tablet_epoch == 0 {
+                    return Err("tablet route identity must be non-zero");
+                }
                 let leader_replica_id = ReplicaId::from_proto(
                     resp.leader_replica_id.ok_or("missing leader_replica_id")?,
                 );
@@ -544,14 +657,18 @@ impl MetadataResponse {
                 }
 
                 let route = TabletRoute {
+                    raft_group_id,
                     tablet_id: TabletId::from_proto(resp.tablet_id.ok_or("missing tablet_id")?),
+                    tablet_epoch: resp.tablet_epoch,
                     leader_replica_id,
                     replicas: replicas.clone(),
                 };
                 route.validate().map_err(|_| "invalid tablet route")?;
 
                 Ok(MetadataResponse::LookupTablet {
+                    raft_group_id,
                     tablet_id: route.tablet_id,
+                    tablet_epoch: route.tablet_epoch,
                     leader_replica_id,
                     replicas,
                 })
@@ -620,6 +737,8 @@ mod tests {
                 sequence: 1,
                 raft_group_id: RaftGroupId(5),
             },
+            tablet_id: TabletId(9),
+            tablet_epoch: 3,
             command: TabletCommand::Commit(CommitCommand {
                 txn_id: crate::ids::TxnId(1),
                 start_timestamp: Timestamp(100),
@@ -630,7 +749,54 @@ mod tests {
         let proto = req.to_proto().unwrap();
         let decoded = TabletCommandRequest::from_proto(proto).unwrap();
         assert_eq!(decoded.request_id.sequence, 1);
+        assert_eq!(decoded.tablet_id, TabletId(9));
+        assert_eq!(decoded.tablet_epoch, 3);
         assert!(matches!(decoded.command, TabletCommand::Commit(_)));
+    }
+
+    #[test]
+    fn tablet_read_request_roundtrip_preserves_generation_and_snapshot() {
+        let request = TabletReadRequest {
+            request_id: RequestId {
+                client_id: 77,
+                sequence: 4,
+                raft_group_id: RaftGroupId(8),
+            },
+            tablet_id: TabletId(12),
+            tablet_epoch: 9,
+            row_key: crate::ids::RowKey {
+                table_id: crate::ids::TableId(12),
+                primary_key_bytes: b"pk".to_vec(),
+            },
+            read_timestamp: Timestamp(100),
+        };
+        let decoded = TabletReadRequest::from_proto(request.to_proto()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn tablet_requests_reject_zero_generation_before_dispatch() {
+        let command = rpc::TabletCommandRequest {
+            request_id: Some(
+                RequestId {
+                    client_id: 1,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(8),
+                }
+                .to_proto(),
+            ),
+            tablet_id: Some(TabletId(12).to_proto()),
+            tablet_epoch: 0,
+            command: Some(
+                crate::command_codec::TabletCommand::Noop(crate::command_codec::NoopCommand)
+                    .to_proto()
+                    .unwrap(),
+            ),
+        };
+        assert!(matches!(
+            TabletCommandRequest::from_proto(command),
+            Err("tablet command request contains a reserved zero identity")
+        ));
     }
 
     #[test]
@@ -646,11 +812,15 @@ mod tests {
             error_code: String::new(),
             retryable: false,
             result_data: vec![10, 20, 30],
+            found: true,
+            leader_replica_id: Some(ReplicaId(2)),
         };
         let proto = resp.to_proto();
         let decoded = TabletCommandResponse::from_proto(proto).unwrap();
         assert!(decoded.success);
         assert_eq!(decoded.result_data, vec![10, 20, 30]);
+        assert!(decoded.found);
+        assert_eq!(decoded.leader_replica_id, Some(ReplicaId(2)));
     }
 
     #[test]
@@ -707,7 +877,9 @@ mod tests {
     #[test]
     fn metadata_response_lookup_tablet_roundtrip() {
         let resp = MetadataResponse::LookupTablet {
+            raft_group_id: RaftGroupId(7),
             tablet_id: TabletId(10),
+            tablet_epoch: 2,
             leader_replica_id: ReplicaId(11),
             replicas: vec![
                 ReplicaRoute {
@@ -734,7 +906,9 @@ mod tests {
     #[test]
     fn tablet_route_rejects_incomplete_replica_identity() {
         let route = TabletRoute {
+            raft_group_id: RaftGroupId(7),
             tablet_id: TabletId(10),
+            tablet_epoch: 2,
             leader_replica_id: ReplicaId(11),
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(12),
@@ -753,7 +927,9 @@ mod tests {
         let mut cache = TabletRouteCache::new();
         let expected = BTreeSet::from([TabletId(10), TabletId(20)]);
         let route = TabletRoute {
+            raft_group_id: RaftGroupId(7),
             tablet_id: TabletId(10),
+            tablet_epoch: 2,
             leader_replica_id: ReplicaId(11),
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(11),
@@ -773,7 +949,9 @@ mod tests {
         let mut cache = TabletRouteCache::new();
         cache
             .insert(TabletRoute {
+                raft_group_id: RaftGroupId(7),
                 tablet_id: TabletId(10),
+                tablet_epoch: 2,
                 leader_replica_id: ReplicaId(11),
                 replicas: vec![
                     ReplicaRoute {
@@ -804,6 +982,8 @@ mod tests {
                 rpc::LookupTabletResponse {
                     tablet_id: Some(TabletId(10).to_proto()),
                     leader_replica_id: Some(ReplicaId(11).to_proto()),
+                    raft_group_id: Some(RaftGroupId(7).to_proto()),
+                    tablet_epoch: 2,
                     replicas: vec![
                         rpc::ReplicaRoute {
                             replica_id: Some(ReplicaId(11).to_proto()),

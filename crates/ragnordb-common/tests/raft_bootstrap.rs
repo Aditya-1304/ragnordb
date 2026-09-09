@@ -25,7 +25,9 @@ fn bootstrap() -> RaftGroupBootstrap {
 #[test]
 fn metadata_lookup_preserves_replica_and_routing_identities() {
     let response = MetadataResponse::LookupTablet {
+        raft_group_id: RaftGroupId(100),
         tablet_id: TabletId(7),
+        tablet_epoch: 1,
         leader_replica_id: ReplicaId(12),
         replicas: vec![
             ReplicaRoute {

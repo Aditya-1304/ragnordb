@@ -32,9 +32,10 @@ use ragnordb_common::{
         NoopCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
     },
     durability::DurabilityGate,
-    encoding::decode_row,
-    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    encoding::{decode_row, encode_row},
+    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, TxnId},
     raft_bootstrap::RaftGroupBootstrap,
+    rpc_codec::{TabletCommandRequest, TabletReadRequest},
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
@@ -147,6 +148,16 @@ enum HostRequest {
         reply: mpsc::Sender<Result<()>>,
         deadline: Instant,
     },
+    Command {
+        request: TabletCommandRequest,
+        reply: mpsc::Sender<Result<TabletCommandApplyOutcome>>,
+        deadline: Instant,
+    },
+    ReadPoint {
+        request: TabletReadRequest,
+        reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+        deadline: Instant,
+    },
 }
 
 /// Node-level MultiRaft control messages.
@@ -236,6 +247,7 @@ enum ClientReply {
     Commit(mpsc::Sender<Result<DurableWalExtent>>),
     Catalog(mpsc::Sender<Result<CatalogLogExtent>>),
     Barrier(mpsc::Sender<Result<()>>),
+    Command(mpsc::Sender<Result<TabletCommandApplyOutcome>>),
 }
 
 struct PendingClient {
@@ -586,6 +598,68 @@ impl ReplicatedTabletHandle {
             .recv_timeout(timeout)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "read barrier deadline elapsed before apply".to_string(),
+            })?
+    }
+
+    /// Submit one already-routed command to this tablet's Raft leader.
+    ///
+    /// The request identity is preserved byte-for-byte through proposal,
+    /// commit, apply, and response. This is the retry safety boundary for a
+    /// gateway: a transport timeout may cause the same request to be sent
+    /// again, but the tablet state machine decides whether it is a fresh or
+    /// deduplicated operation.
+    pub fn submit_command(
+        &self,
+        request: TabletCommandRequest,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("tablet request deadline overflowed".into()))?;
+        let (reply, response) = mpsc::channel();
+        self.requests
+            .send(HostRequest::Command {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "replicated tablet runtime has stopped".to_string(),
+            })?;
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "tablet command deadline elapsed before apply".to_string(),
+            })?
+    }
+
+    /// Read one committed row at a caller-supplied MVCC timestamp.
+    ///
+    /// The Ready owner performs the read on the same thread that owns the
+    /// mutable state machine. This avoids exposing a concurrent `Tablet` read
+    /// view that could race snapshot installation or apply-frontier updates.
+    pub fn read_point(
+        &self,
+        request: TabletReadRequest,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("tablet read deadline overflowed".into()))?;
+        let (reply, response) = mpsc::channel();
+        self.requests
+            .send(HostRequest::ReadPoint {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "replicated tablet runtime has stopped".to_string(),
+            })?;
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "tablet read deadline elapsed before execution".to_string(),
             })?
     }
 }
@@ -1816,16 +1890,31 @@ where
             };
             admitted_requests += 1;
 
-            admit_request(
-                request,
-                &mut ready_loop,
-                &tablet,
-                &mut registry,
-                &mut clients,
-                serving_leader,
-                &mut internal_barrier_allocator,
-                &identity,
-            );
+            match request {
+                HostRequest::ReadPoint {
+                    request,
+                    reply,
+                    deadline,
+                } => admit_read_request(
+                    request,
+                    &tablet,
+                    serving_leader,
+                    ready_loop.raft().leader_id().map(|id| id.get()),
+                    &identity,
+                    reply,
+                    deadline,
+                ),
+                request => admit_request(
+                    request,
+                    &mut ready_loop,
+                    &tablet,
+                    &mut registry,
+                    &mut clients,
+                    serving_leader,
+                    &mut internal_barrier_allocator,
+                    &identity,
+                ),
+            }
             match drain_ready(
                 &mut ready_loop,
                 &mut tablet,
@@ -2078,6 +2167,28 @@ fn admit_request<W, LS, SS>(
                 }
             }
         }
+        HostRequest::Command {
+            request,
+            reply,
+            deadline,
+        } => match TabletCommandEnvelope::new(
+            request.request_id,
+            request.tablet_id,
+            request.tablet_epoch,
+            request.command,
+        ) {
+            Ok(envelope) => (envelope, deadline, ClientReply::Command(reply), None),
+            Err(source) => {
+                let _ = reply.send(Err(Error::InvalidArgument(source.to_string())));
+                return;
+            }
+        },
+        HostRequest::ReadPoint { reply, .. } => {
+            let _ = reply.send(Err(Error::InvalidArgument(
+                "tablet reads must use the read admission path".to_string(),
+            )));
+            return;
+        }
     };
 
     if let Err(source) = tablet.state_machine().validate_proposal(&envelope) {
@@ -2129,6 +2240,81 @@ fn admit_request<W, LS, SS>(
             },
         ),
     }
+}
+
+/// Execute a point read after the Ready owner has drained all committed work
+/// that was already pending at the start of the host turn.
+fn admit_read_request(
+    request: TabletReadRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+    deadline: Instant,
+) {
+    if deadline <= Instant::now() {
+        let _ = reply.send(Err(Error::ProposalUnavailable {
+            reason: "tablet read deadline elapsed before admission".to_string(),
+        }));
+        return;
+    }
+    if !serving_leader {
+        let _ = reply.send(Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        }));
+        return;
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet read request targets a different Raft group".to_string(),
+        )));
+        return;
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet read request targets a different tablet".to_string(),
+        )));
+        return;
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet read request targets a stale tablet epoch".to_string(),
+        )));
+        return;
+    }
+    if request.read_timestamp.0 == 0
+        || request.request_id.client_id == 0
+        || request.request_id.sequence == 0
+    {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet read request contains a reserved zero value".to_string(),
+        )));
+        return;
+    }
+
+    let row_key = request.row_key;
+    let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
+    let transaction = match ragnordb_txn::Transaction::new(transaction_id, request.read_timestamp) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return;
+        }
+    };
+    if row_key.table_id != identity.target.table_id {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet read row key targets a different table".to_string(),
+        )));
+        return;
+    }
+
+    let result = tablet
+        .state_machine()
+        .tablet()
+        .get(&transaction, &row_key)
+        .and_then(|row| row.map(|row| encode_row(&row)).transpose());
+    let _ = reply.send(result);
 }
 
 /// Commit an entry in the newly elected leader's term before exposing it to
@@ -2797,7 +2983,9 @@ fn forward_completions(clients: &mut Vec<PendingClient>) {
 
 fn forward_completion(reply: ClientReply, completion: Completion) {
     let error = match completion {
-        ProposalCompletion::Applied { position, .. } => match reply {
+        ProposalCompletion::Applied {
+            position, result, ..
+        } => match reply {
             ClientReply::Commit(sender) => {
                 let _ = sender.send(Ok(DurableWalExtent::from_raw(
                     position.index,
@@ -2814,6 +3002,10 @@ fn forward_completion(reply: ClientReply, completion: Completion) {
                     start_lsn: position.index,
                     end_lsn: position.index.saturating_add(1),
                 }));
+                return;
+            }
+            ClientReply::Command(sender) => {
+                let _ = sender.send(Ok(result));
                 return;
             }
         },
@@ -2843,6 +3035,12 @@ fn reply_error(request: HostRequest, error: Error) {
         HostRequest::Catalog { reply, .. } => {
             let _ = reply.send(Err(error));
         }
+        HostRequest::Command { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        HostRequest::ReadPoint { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
     }
 }
 
@@ -2855,6 +3053,9 @@ fn send_client_error(reply: ClientReply, error: Error) {
             let _ = sender.send(Err(error));
         }
         ClientReply::Catalog(sender) => {
+            let _ = sender.send(Err(error));
+        }
+        ClientReply::Command(sender) => {
             let _ = sender.send(Err(error));
         }
     }
@@ -2913,7 +3114,7 @@ mod tests {
     use ragnordb_common::{
         catalog_codec::TableDefinition,
         command_codec::{CatalogCommand, CatalogOperation, CreateTableOperation},
-        ids::Timestamp,
+        ids::{RowKey, Timestamp},
     };
     use ragnordb_multiraft::{proposal::ProposalPosition, tablet_apply::AppliedTabletCommand};
     use ragnordb_tablet::command::TabletCommandApplyResult;
@@ -2923,6 +3124,52 @@ mod tests {
         local_snapshot_pending: bool,
     ) -> bool {
         local_snapshot_pending || incoming_phase == Some(IncomingSnapshotPhase::ReadyPending)
+    }
+
+    #[test]
+    fn point_read_rejects_stale_tablet_generation_before_storage_access() {
+        let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+            cluster_id: "cluster".to_string(),
+            raft_group_id: RaftGroupId(9),
+            tablet_id: TabletId(3),
+            table_id: TableId(3),
+            tablet_epoch: 7,
+        });
+        let tablet = ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap();
+        let state_machine =
+            ragnordb_tablet::command::TabletStateMachine::new(tablet, 7, RaftGroupId(9)).unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+        let request = TabletReadRequest {
+            request_id: RequestId {
+                client_id: 1,
+                sequence: 1,
+                raft_group_id: RaftGroupId(9),
+            },
+            tablet_id: TabletId(3),
+            tablet_epoch: 6,
+            row_key: RowKey {
+                table_id: TableId(3),
+                primary_key_bytes: b"pk".to_vec(),
+            },
+            read_timestamp: Timestamp(10),
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        admit_read_request(
+            request,
+            &applier,
+            true,
+            Some(1),
+            &identity,
+            sender,
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Err(Error::InvalidArgument(message))
+                if message.contains("stale tablet epoch")
+        ));
     }
 
     /// Realistic bug caught: a queued tick could enter the generic Ready path

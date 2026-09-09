@@ -9,6 +9,7 @@ pub mod multiraft_runtime;
 pub mod protocol;
 pub mod replica_registry;
 pub mod replicated_tablet;
+pub mod rpc;
 pub mod session;
 mod snapshot_transport;
 
