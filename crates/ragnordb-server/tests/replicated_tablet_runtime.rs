@@ -115,12 +115,14 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     for startup in startup_handles {
         let node = startup.await.unwrap();
         let handle = node.runtime.handle();
+        let tablet_gateway = Arc::new(node.runtime.tablet_rpc_client());
 
-        node.database
-            .lock()
-            .await
-            .replace_commit_log(handle.clone());
-        node.database.lock().await.replace_catalog_log(handle);
+        {
+            let mut database = node.database.lock().await;
+            database.replace_commit_log(handle.clone());
+            database.replace_catalog_log(handle);
+            database.replace_tablet_gateway(tablet_gateway);
+        }
 
         nodes.push(node);
     }
@@ -145,12 +147,20 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     // new Raft group through its authoritative host status.
     let request = CreateTableRequest {
         table_name: "metadata_users".to_string(),
-        columns: vec![ColumnDefinition {
-            column_id: ColumnId(1),
-            name: "id".to_string(),
-            ty: DataType::Int,
-            nullable: false,
-        }],
+        columns: vec![
+            ColumnDefinition {
+                column_id: ColumnId(1),
+                name: "id".to_string(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnDefinition {
+                column_id: ColumnId(2),
+                name: "name".to_string(),
+                ty: DataType::Text,
+                nullable: false,
+            },
+        ],
         primary_key_column_ids: vec![ColumnId(1)],
     };
     let request_id = RequestId {
@@ -281,6 +291,154 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     })
     .await
     .expect("a follower SQL mirror must observe the applied Raft commit");
+
+    for node in &nodes {
+        let creator = node.runtime.metadata_table_creator();
+        node.database
+            .lock()
+            .await
+            .replace_metadata_table_creator(creator);
+    }
+
+    let routed_group_id = topology.tablets[0].raft_group_id;
+    let routed_leader_replica = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let leaders = nodes
+                .iter()
+                .filter_map(|node| {
+                    node.runtime
+                        .host_status()
+                        .groups
+                        .iter()
+                        .find(|group| group.identity.raft_group_id == routed_group_id)
+                        .and_then(|group| group.leader_replica_id)
+                })
+                .collect::<Vec<_>>();
+            if leaders.len() == nodes.len() && leaders.windows(2).all(|pair| pair[0] == pair[1]) {
+                break leaders[0];
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the routed tablet must publish a stable leader before SQL forwarding");
+    let routed_leader_node = nodes
+        .iter()
+        .position(|node| {
+            node.runtime
+                .host_status()
+                .groups
+                .iter()
+                .find(|group| group.identity.raft_group_id == routed_group_id)
+                .is_some_and(|group| group.identity.replica_id == routed_leader_replica)
+        })
+        .expect("the routed leader must have a hosted replica on one test node");
+
+    // Exercise the production gateway from a non-leader SQL owner. The
+    // metadata tablet is authoritative in Raft and deliberately has no local
+    // SQL mirror, so this insert must be forwarded to the assigned tablet
+    // leader and completed through the request-identity path.
+    let routed_gateway = (0..nodes.len())
+        .find(|index| *index != routed_leader_node)
+        .expect("a three-node runtime must provide a non-leader gateway");
+    let routed_database = nodes[routed_gateway].database.clone();
+    let (insert_result, update_result, updated_select, delete_result) =
+        tokio::task::spawn_blocking(move || {
+            let mut session = SqlSession::with_client_id(7001);
+            let mut database = routed_database.blocking_lock();
+            let insert_result = database.execute_sql(
+                &mut session,
+                "INSERT INTO metadata_users (id, name) VALUES (7, 'alice')",
+            )?;
+            let update_result = database.execute_sql(
+                &mut session,
+                "UPDATE metadata_users SET name = 'bob' WHERE id = 7",
+            )?;
+            let updated_select = database.execute_sql(
+                &mut session,
+                "SELECT id, name FROM metadata_users WHERE id = 7",
+            )?;
+            let delete_result =
+                database.execute_sql(&mut session, "DELETE FROM metadata_users WHERE id = 7")?;
+            Ok::<_, Error>((insert_result, update_result, updated_select, delete_result))
+        })
+        .await
+        .unwrap()
+        .expect("metadata-routed DML must be forwarded and durably applied");
+    assert!(matches!(
+        insert_result,
+        ExecutionResult::Mutation {
+            affected_rows: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        update_result,
+        ExecutionResult::Mutation {
+            affected_rows: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        updated_select,
+        ExecutionResult::Query(ragnordb_exec::ResultSet {
+            columns: vec![
+                ragnordb_exec::ResultColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                ragnordb_exec::ResultColumn {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            rows: vec![ragnordb_common::codec::Row {
+                values: vec![Value::Int(7), Value::Text("bob".to_string())],
+            }],
+        })
+    );
+    assert!(matches!(
+        delete_result,
+        ExecutionResult::Mutation {
+            affected_rows: 1,
+            ..
+        }
+    ));
+
+    let routed_reader = nodes[(routed_gateway + 1) % nodes.len()].database.clone();
+    let routed_select_deadline = Instant::now() + Duration::from_secs(5);
+    let routed_select = loop {
+        let database = routed_reader.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            database.blocking_lock().execute_sql(
+                &mut SqlSession::new(),
+                "SELECT id, name FROM metadata_users WHERE id = 7",
+            )
+        })
+        .await
+        .unwrap();
+        match result {
+            Ok(ExecutionResult::Query(rows)) if rows.rows.is_empty() => {
+                break ExecutionResult::Query(rows);
+            }
+            Ok(_) if Instant::now() < routed_select_deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(Error::NotLeader { .. } | Error::ProposalUnavailable { .. })
+                if Instant::now() < routed_select_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("metadata-routed point SELECT failed permanently: {error}"),
+            Ok(result) => break result,
+        }
+    };
+    let ExecutionResult::Query(routed_rows) = routed_select else {
+        panic!("metadata-routed point SELECT must return a query result");
+    };
+    assert_eq!(routed_rows.rows, Vec::<ragnordb_common::codec::Row>::new());
 
     // Keep all lifecycle guards alive until assertions complete. Runtime Drop
     // performs an orderly Ready-owner shutdown.

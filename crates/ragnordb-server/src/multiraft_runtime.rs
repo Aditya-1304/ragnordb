@@ -1373,6 +1373,7 @@ impl MultiRaftRuntime {
             transport.clone(),
             tablet_handles,
             metadata_handle.clone(),
+            database.clone(),
             shutdown.clone(),
         );
 

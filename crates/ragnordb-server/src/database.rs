@@ -483,6 +483,20 @@ impl LocalDatabase {
         result
     }
 
+    /// Advance transaction and timestamp allocation floors for a replicated
+    /// commit whose tablet is authoritative outside the local SQL mirror.
+    /// Metadata-owned tablets still contribute durable MVCC timestamps that a
+    /// follower must observe before it starts a routed read or becomes leader.
+    pub(crate) fn observe_replicated_commit_high_water(
+        &mut self,
+        command: &SingleShardCommitCommand,
+    ) -> Result<()> {
+        self.durability_gate.ensure_healthy()?;
+        self.transaction_manager
+            .observe_replicated_high_water(command.txn_id, command.commit_timestamp);
+        Ok(())
+    }
+
     /// Install the authoritative tablet image reconstructed by Raft startup.
     pub(crate) fn install_replicated_storage(
         &mut self,

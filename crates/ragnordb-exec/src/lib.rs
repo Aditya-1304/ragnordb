@@ -166,14 +166,15 @@ pub type SharedTabletGateway = Arc<dyn TabletGateway>;
 /// Per-connection request identity used for tablet RPCs.
 ///
 /// Request sequences are scoped to one client identity and carried into the
-/// destination Raft group. A single context is retained by `SqlSession`, so
-/// every remote read or commit issued by that connection receives a distinct,
-/// non-zero identity while reconnect/retry plumbing can later reuse the same
-/// identity explicitly.
+/// destination Raft group. Reads and commands use independent sequence
+/// counters because only commands populate the tablet's contiguous
+/// deduplication state; consuming a command sequence for a read would make the
+/// first subsequent commit look like a gap to the Raft state machine.
 #[derive(Debug, Clone)]
 pub struct TabletRequestContext {
     client_id: u128,
-    next_sequence: u64,
+    next_read_sequence: u64,
+    next_command_sequence: u64,
     timeout: Duration,
 }
 
@@ -187,7 +188,8 @@ impl TabletRequestContext {
 
         Ok(Self {
             client_id,
-            next_sequence: 1,
+            next_read_sequence: 1,
+            next_command_sequence: 1,
             timeout: Duration::from_secs(30),
         })
     }
@@ -206,23 +208,41 @@ impl TabletRequestContext {
         self.timeout
     }
 
-    fn next_request_id(&mut self, raft_group_id: RaftGroupId) -> Result<RequestId> {
+    fn next_request_id(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        sequence: &mut u64,
+    ) -> Result<RequestId> {
         if raft_group_id.0 == 0 {
             return Err(Error::InvalidArgument(
                 "tablet request Raft group ID 0 is reserved".to_string(),
             ));
         }
 
-        let sequence = self.next_sequence;
-        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+        let current_sequence = *sequence;
+        *sequence = current_sequence.checked_add(1).ok_or_else(|| {
             Error::Configuration("tablet request sequence space is exhausted".to_string())
         })?;
 
         Ok(RequestId {
             client_id: self.client_id,
-            sequence,
+            sequence: current_sequence,
             raft_group_id,
         })
+    }
+
+    fn next_read_request_id(&mut self, raft_group_id: RaftGroupId) -> Result<RequestId> {
+        let mut sequence = self.next_read_sequence;
+        let request_id = self.next_request_id(raft_group_id, &mut sequence)?;
+        self.next_read_sequence = sequence;
+        Ok(request_id)
+    }
+
+    fn next_command_request_id(&mut self, raft_group_id: RaftGroupId) -> Result<RequestId> {
+        let mut sequence = self.next_command_sequence;
+        let request_id = self.next_request_id(raft_group_id, &mut sequence)?;
+        self.next_command_sequence = sequence;
+        Ok(request_id)
     }
 }
 
@@ -403,10 +423,9 @@ impl LocalExecutor {
 
     /// Refresh the local SQL catalog cache from committed metadata state.
     ///
-    /// Metadata-owned tables do not receive a local MVCC tablet until the
-    /// later tablet-lifecycle phase. They are therefore visible to SQL schema
-    /// analysis and `SHOW TABLES`, while DML correctly remains unavailable until
-    /// a routed tablet is installed.
+    /// Metadata-owned tables do not receive a local MVCC mirror. They remain
+    /// visible to SQL schema analysis and `SHOW TABLES`, while point DML is
+    /// routed to the assigned tablet through the installed gateway.
     pub fn refresh_metadata_catalog(&mut self) -> Result<()> {
         let Some(creator) = self.metadata_table_creator.clone() else {
             return Ok(());
@@ -566,15 +585,20 @@ impl LocalExecutor {
 
     /// Apply a Raft-authoritative single-tablet commit to the SQL read mirror.
     ///
-    /// The replicated tablet state machine has already validated and applied
-    /// this command. This second materialization keeps follower SQL planning and
-    /// reads current without creating another durability record.
+    /// Metadata-owned tablets are read through the tablet gateway and therefore
+    /// intentionally have no local SQL mirror. Their follower-side publication
+    /// is a successful no-op; legacy replicated tables still require their
+    /// local coordinator so a missing mirror remains fail-closed.
     pub fn apply_replicated_commit(&mut self, command: &SingleShardCommitCommand) -> Result<usize> {
         let first_key = command.writes.first().ok_or_else(|| {
             Error::InvalidArgument("replicated commit contains no writes".to_string())
         })?;
         let first_row_key = decode_row_key(&first_key.key)?;
         let table_id = first_row_key.table_id;
+        if self.metadata_table_ids.contains(&table_id) {
+            return Ok(0);
+        }
+
         let tablet_id = self.route_row_key(&first_row_key)?;
         let mut transaction = Transaction::new(command.txn_id, command.start_timestamp)?;
 
@@ -1042,7 +1066,7 @@ impl LocalExecutor {
             commit_timestamp,
             writes,
         });
-        let request_id = request_context.next_request_id(route.raft_group_id)?;
+        let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let outcome =
             gateway.submit_command(&route, request_id, command, request_context.timeout())?;
         if !matches!(
@@ -1725,7 +1749,7 @@ impl LocalExecutor {
                 ));
             }
         };
-        let request_id = request_context.next_request_id(route.raft_group_id)?;
+        let request_id = request_context.next_read_request_id(route.raft_group_id)?;
         gateway
             .read_point(
                 &route,
@@ -2533,14 +2557,37 @@ mod tests {
         assert_eq!(gateway.commands.lock().unwrap().len(), 1);
         let (request_id, command) = &gateway.commands.lock().unwrap()[0];
         assert_eq!(request_id.client_id, 88);
-        assert_eq!(request_id.sequence, 2);
+        assert_eq!(request_id.sequence, 1);
         assert_eq!(request_id.raft_group_id, RaftGroupId(242));
         assert!(matches!(command, TabletCommand::SingleShardCommit(_)));
     }
 
-    /// Realistic bug caught: implicit autocommit could use a fresh default
-    /// request context for its commit after the statement used the connection
-    /// context for duplicate checking, producing a colliding identity.
+    /// Realistic bug caught: a metadata-owned tablet has no local SQL mirror,
+    /// so follower-side derived-state publication must not reject a committed
+    /// Raft command merely because there is no local coordinator to update.
+    #[test]
+    fn metadata_replicated_commit_does_not_require_a_local_sql_mirror() {
+        let (mut executor, _, row_key) = remote_executor();
+        let encoded_key = ragnordb_storage::key::encode_row_key(&row_key).unwrap();
+        let command = SingleShardCommitCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(1),
+            commit_timestamp: Timestamp(2),
+            writes: vec![WriteEntry {
+                key: encoded_key,
+                row: Some(Row {
+                    values: vec![Value::Int(7), Value::Text("alice".to_string())],
+                }),
+                op: WriteKind::Put,
+            }],
+        };
+
+        assert_eq!(executor.apply_replicated_commit(&command).unwrap(), 0);
+    }
+
+    /// Realistic bug caught: a point-read sequence was previously counted as a
+    /// command sequence, so implicit autocommit sent its first commit with
+    /// sequence two and the tablet rejected it as a gap.
     #[test]
     fn implicit_remote_commit_reuses_connection_request_identity() {
         let (mut executor, gateway, _) = remote_executor();
@@ -2568,6 +2615,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(reads[0].client_id, 99);
         assert_eq!(commands[0].0.client_id, 99);
-        assert_eq!(commands[0].0.sequence, reads[0].sequence + 1);
+        assert_eq!(reads[0].sequence, 1);
+        assert_eq!(commands[0].0.sequence, 1);
     }
 }

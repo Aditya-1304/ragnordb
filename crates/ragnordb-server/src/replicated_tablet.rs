@@ -99,11 +99,26 @@ const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 #[derive(Debug, Clone)]
 struct TabletRuntimeIdentity {
     target: TabletSnapshotInstallTarget,
+    /// Whether follower apply must materialize a derived SQL mirror. Metadata
+    /// tablets are authoritative in their Raft state machine and are read via
+    /// the gateway, so they deliberately set this to false.
+    sql_mirror_enabled: bool,
 }
 
 impl TabletRuntimeIdentity {
+    #[cfg(test)]
     fn new(target: TabletSnapshotInstallTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            sql_mirror_enabled: true,
+        }
+    }
+
+    fn with_sql_mirror(target: TabletSnapshotInstallTarget, sql_mirror_enabled: bool) -> Self {
+        Self {
+            target,
+            sql_mirror_enabled,
+        }
     }
 }
 
@@ -878,7 +893,7 @@ impl ReplicatedTabletRuntime {
         let raft_identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
             .map_err(|source| Error::Configuration(source.to_string()))?;
 
-        let runtime_identity = TabletRuntimeIdentity::new(target);
+        let runtime_identity = TabletRuntimeIdentity::with_sql_mirror(target, install_sql_mirror);
 
         let mut bootstrap_store = FileBootstrapStore::open(config.data_dir.join("raft-bootstrap"))
             .map_err(|source| Error::RecoveryFailed {
@@ -1725,13 +1740,15 @@ where
                     let installed = prepared.into_installed();
                     // Finalize: install tablet, apply suffix, advance frontier, publish
                     tablet = TabletCommandApplier::new(installed.state_machine);
-                    database
-                        .blocking_lock()
-                        .install_replicated_storage(
-                            identity.target.table_id,
-                            tablet.state_machine().tablet().storage().clone(),
-                        )
-                        .map_err(|e| e.to_string())?;
+                    if identity.sql_mirror_enabled {
+                        database
+                            .blocking_lock()
+                            .install_replicated_storage(
+                                identity.target.table_id,
+                                tablet.state_machine().tablet().storage().clone(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
                     let mut frontier = AppliedRaftFrontier::new(
                         image.metadata.last_included_index,
                         image.metadata.last_included_term,
@@ -1761,7 +1778,7 @@ where
                             &mut registry,
                             &database,
                             catalog_cache.as_ref(),
-                            identity.target.table_id,
+                            &identity,
                         )
                         .map_err(|e| e.to_string())?;
                     }
@@ -2611,13 +2628,15 @@ where
         .ok_or_else(|| "completed snapshot install produced no Ready generation".to_string())?;
 
     *tablet = TabletCommandApplier::new(durable.installed.state_machine);
-    database
-        .blocking_lock()
-        .install_replicated_storage(
-            identity.target.table_id,
-            tablet.state_machine().tablet().storage().clone(),
-        )
-        .map_err(|error| error.to_string())?;
+    if identity.sql_mirror_enabled {
+        database
+            .blocking_lock()
+            .install_replicated_storage(
+                identity.target.table_id,
+                tablet.state_machine().tablet().storage().clone(),
+            )
+            .map_err(|error| error.to_string())?;
+    }
 
     let mut frontier = AppliedRaftFrontier::new(
         image.metadata.last_included_index,
@@ -2647,7 +2666,7 @@ where
             registry,
             database,
             catalog_cache,
-            identity.target.table_id,
+            identity,
         )?;
     }
     ready_loop
@@ -2802,16 +2821,25 @@ fn publish_committed_command(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     catalog_cache: &dyn CatalogCacheWriter,
-    table_id: TableId,
+    identity: &TabletRuntimeIdentity,
 ) -> std::result::Result<(), String> {
     if matches!(disposition, CommittedTabletCommandDisposition::Applied(_)) {
         if let TabletCommand::SingleShardCommit(command) = &envelope.command
             && !locally_proposed
         {
-            database
-                .blocking_lock()
-                .apply_replicated_commit(command)
-                .map_err(|error| error.to_string())?;
+            let mut database = database.blocking_lock();
+            if identity.sql_mirror_enabled {
+                database
+                    .apply_replicated_commit(command)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                // A metadata tablet has no SQL mirror, but every follower
+                // still needs the committed timestamp floor before it
+                // serves a routed read or becomes leader.
+                database
+                    .observe_replicated_commit_high_water(command)
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
         if let TabletCommand::Catalog(command) = &envelope.command {
@@ -2819,7 +2847,7 @@ fn publish_committed_command(
                 ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64);
             catalog_cache
                 .append_catalog_update(&CatalogLogRecord {
-                    table_id,
+                    table_id: identity.target.table_id,
                     update_timestamp,
                     command: command.clone(),
                 })
@@ -2895,7 +2923,7 @@ where
             registry,
             database,
             catalog_cache,
-            identity.target.table_id,
+            identity,
         )
         .map_err(HostedGroupError::Group)?;
     }
@@ -3365,7 +3393,13 @@ mod tests {
             &mut registry,
             &crate::database::LocalDatabase::shared(),
             &OutcomeUnknownCatalogCache,
-            TABLE_ID,
+            &TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+                cluster_id: String::new(),
+                raft_group_id: TABLET_RAFT_GROUP_ID,
+                tablet_id: TABLET_ID,
+                table_id: TABLE_ID,
+                tablet_epoch: TABLET_EPOCH,
+            }),
         )
         .expect_err("uncertain catalog persistence must stop Ready publication");
 

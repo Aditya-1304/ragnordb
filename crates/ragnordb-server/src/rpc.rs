@@ -35,6 +35,7 @@ use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRpcInbound};
 use ragnordb_tablet::TabletRouter;
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
 
+use crate::database::SharedLocalDatabase;
 use crate::replicated_tablet::ReplicatedTabletHandle;
 
 /// Group-qualified handles published by the lifecycle owner after a tablet
@@ -107,13 +108,32 @@ impl TabletRpcClient {
                 node_id: replica.node_id,
             })
             .collect::<Vec<_>>();
-        let leader_replica_id = placement
+        let placement_leader_replica_id = placement
             .replicas
             .iter()
             .find(|replica| replica.role == DesiredReplicaRole::Voter)
             .or_else(|| placement.replicas.first())
             .map(|replica| replica.replica_id)
             .ok_or_else(|| Error::CorruptData("tablet placement has no replicas".to_string()))?;
+        // Metadata records desired membership, not the current Raft leader.
+        // Prefer the local Ready owner's published leader whenever this node
+        // hosts the group; fall back to the canonical first voter only while
+        // that point-in-time status is still unknown during election/startup.
+        let published_leader_replica_id = self
+            .handles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&descriptor.raft_group_id)
+            .and_then(|handle| handle.status().leader_replica_id)
+            .map(ReplicaId);
+        let leader_replica_id = published_leader_replica_id
+            .filter(|leader| {
+                placement
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.replica_id == *leader)
+            })
+            .unwrap_or(placement_leader_replica_id);
         let route = TabletRoute {
             raft_group_id: descriptor.raft_group_id,
             tablet_id: descriptor.tablet_id,
@@ -341,6 +361,7 @@ pub(crate) fn spawn_dispatcher(
     transport: NodeRaftTransport,
     handles: SharedTabletHandleRegistry,
     metadata: MetadataRuntimeHandle,
+    database: SharedLocalDatabase,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
@@ -361,6 +382,7 @@ pub(crate) fn spawn_dispatcher(
                     &transport,
                     &handles,
                     &pending,
+                    &database,
                     message.source_node_id,
                     message.frame,
                 );
@@ -374,6 +396,7 @@ fn dispatch_message(
     transport: &NodeRaftTransport,
     handles: &SharedTabletHandleRegistry,
     pending: &PendingResponses,
+    database: &SharedLocalDatabase,
     source: NodeId,
     frame: RpcFrame,
 ) {
@@ -386,6 +409,10 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
+            let remote_commit = match &request.command {
+                TabletCommand::SingleShardCommit(command) => Some(command.clone()),
+                _ => None,
+            };
             let response = match handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -393,15 +420,22 @@ fn dispatch_message(
                 .cloned()
             {
                 Some(handle) => match handle.submit_command(request, Duration::from_secs(30)) {
-                    Ok(outcome) => TabletCommandResponse {
-                        request_id,
-                        success: true,
-                        error_message: String::new(),
-                        error_code: String::new(),
-                        retryable: false,
-                        result_data: encode_command_outcome(outcome),
-                        found: false,
-                        leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                    Ok(outcome) => match remote_commit.as_ref().map(|command| {
+                        database
+                            .blocking_lock()
+                            .observe_replicated_commit_high_water(command)
+                    }) {
+                        Some(Err(error)) => error_response(request_id, error),
+                        _ => TabletCommandResponse {
+                            request_id,
+                            success: true,
+                            error_message: String::new(),
+                            error_code: String::new(),
+                            retryable: false,
+                            result_data: encode_command_outcome(outcome),
+                            found: false,
+                            leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                        },
                     },
                     Err(error) => error_response(request_id, error),
                 },

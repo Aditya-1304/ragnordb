@@ -173,8 +173,8 @@ fn create_metadata_table(nodes: &[ProcessNode], statement: &str) {
 /// public SQL and admin sockets of three OS processes, creates a metadata-owned
 /// table, stops a process, and verifies that the committed metadata projection
 /// survives both process restart and full-cluster restart. DML is intentionally
-/// not asserted here: distributed SQL routing remains a later Phase 5.6
-/// boundary even though Phase 5.5 now materializes the local tablet groups.
+/// not asserted here because this test focuses on process/recovery lifecycle;
+/// routed DML has dedicated Phase 5.6 coverage.
 #[test]
 fn metadata_table_creation_survives_process_restart() {
     let root = tempfile::tempdir().unwrap();
