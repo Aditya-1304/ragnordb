@@ -237,6 +237,7 @@ fn snapshot_pointer() -> RaftSnapshotPointerRecord {
         last_included_term: 7,
         applied_index: 19,
         conf_state: conf_state(),
+        last_removed_replica: None,
         size_bytes: 4096,
         checksum: [9; 32],
         file_name: "raft-51-61-19.snapshot".to_string(),
@@ -260,6 +261,20 @@ fn stable_state_codecs_preserve_replica_lifetime_and_core_state() {
     assert_eq!(decoded_hard.identity, identity);
     assert_eq!(decoded_hard.to_core().unwrap(), hard_state);
     assert_eq!(decoded_snapshot, snapshot);
+}
+
+/// Catches losing removal evidence at the WAL snapshot-pointer boundary. The
+/// pointer is the durable source used to reconstruct a node after the removal
+/// entry itself has been compacted away.
+#[test]
+fn snapshot_pointer_codec_preserves_replica_removal_proof() {
+    let mut snapshot = snapshot_pointer();
+    snapshot.conf_state = ConfState::new(3, [CoreReplicaId::must(61)], []).unwrap();
+    snapshot.last_removed_replica = Some((CoreReplicaId::must(62), 11, 7, 2));
+
+    let decoded = RaftSnapshotPointerRecord::decode(&snapshot.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded.last_removed_replica, snapshot.last_removed_replica);
 }
 
 /// Realistic bug caught: recovery trusts a pointer that either escapes the

@@ -215,6 +215,51 @@ pub struct MetadataProposalResponse {
     #[prost(uint64, tag = "7")]
     pub leader_replica_id: u64,
 }
+/// Control-plane admission for a post-bootstrap replica lifetime. The target
+/// persists this witness before registering its Raft and snapshot routes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaJoinRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "4")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "5")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "6")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(message, optional, tag = "7")]
+    pub physical_node_id: ::core::option::Option<super::ids::NodeId>,
+    #[prost(uint64, tag = "8")]
+    pub expected_current_conf_state_version: u64,
+    #[prost(uint64, tag = "9")]
+    pub committed_membership_version: u64,
+    #[prost(message, repeated, tag = "10")]
+    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "11")]
+    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "12")]
+    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    /// Non-zero only for a promotion-readiness probe. The target must have
+    /// crossed this leader's committed frontier locally before it replies
+    /// success; zero is the route/materialization probe used before AddLearner.
+    #[prost(uint64, tag = "13")]
+    pub leader_commit_index: u64,
+    #[prost(bool, tag = "14")]
+    pub require_caught_up: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaJoinResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    #[prost(string, tag = "3")]
+    pub error_message: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataProposalOutcome {
     #[prost(enumeration = "metadata_proposal_outcome::Kind", tag = "1")]
@@ -330,6 +375,8 @@ pub enum MessageType {
     TabletReadRequest = 6,
     TabletOutcomeQueryRequest = 7,
     TabletScanRequest = 8,
+    ReplicaJoinRequest = 9,
+    ReplicaJoinResponse = 10,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -349,6 +396,8 @@ impl MessageType {
                 "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST"
             }
             Self::TabletScanRequest => "MESSAGE_TYPE_TABLET_SCAN_REQUEST",
+            Self::ReplicaJoinRequest => "MESSAGE_TYPE_REPLICA_JOIN_REQUEST",
+            Self::ReplicaJoinResponse => "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -365,6 +414,8 @@ impl MessageType {
                 Some(Self::TabletOutcomeQueryRequest)
             }
             "MESSAGE_TYPE_TABLET_SCAN_REQUEST" => Some(Self::TabletScanRequest),
+            "MESSAGE_TYPE_REPLICA_JOIN_REQUEST" => Some(Self::ReplicaJoinRequest),
+            "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE" => Some(Self::ReplicaJoinResponse),
             _ => None,
         }
     }

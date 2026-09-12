@@ -103,6 +103,15 @@ pub struct TabletSnapshotMetadata {
     pub total_length: u64,
     #[prost(bytes = "vec", tag = "16")]
     pub checksum: ::prost::alloc::vec::Vec<u8>,
+    /// Exact removal evidence retained when the log entry is compacted.
+    #[prost(uint64, tag = "17")]
+    pub last_removed_replica_id: u64,
+    #[prost(uint64, tag = "18")]
+    pub last_removed_replica_index: u64,
+    #[prost(uint64, tag = "19")]
+    pub last_removed_replica_term: u64,
+    #[prost(uint64, tag = "20")]
+    pub last_removed_conf_state_version: u64,
 }
 /// the on-disk artifact contains metadata and the immutable state payload
 #[derive(Clone, PartialEq, ::prost::Message)]

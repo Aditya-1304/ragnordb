@@ -119,6 +119,8 @@ async fn admin_status_returns_json() {
                 outgoing_voters: Vec::new(),
                 replica_match_indices: Vec::new(),
                 pending_conf_change_index: None,
+                last_conf_change: None,
+                last_removed_replica: None,
             },
             MultiRaftGroupStatus {
                 identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity::new(
@@ -146,6 +148,8 @@ async fn admin_status_returns_json() {
                 outgoing_voters: Vec::new(),
                 replica_match_indices: Vec::new(),
                 pending_conf_change_index: None,
+                last_conf_change: None,
+                last_removed_replica: None,
             },
         ],
     }));

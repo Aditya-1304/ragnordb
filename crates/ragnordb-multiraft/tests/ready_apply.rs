@@ -118,6 +118,7 @@ impl RaftSnapshotStore for MemorySnapshotStore {
             last_included_term: snapshot.last_included_term,
             applied_index: snapshot.last_included_index,
             conf_state: snapshot.conf_state.clone(),
+            last_removed_replica: snapshot.last_removed_replica,
             size_bytes: snapshot.size_bytes,
             checksum: snapshot.checksum,
             file_name: format!(
@@ -170,6 +171,7 @@ fn snapshot() -> Snapshot<Vec<u8>> {
         last_included_index: 5,
         last_included_term: 2,
         conf_state: ConfState::new(1, [raft::types::ReplicaId::must(1)], []).unwrap(),
+        last_removed_replica: None,
         size_bytes: data.len() as u64,
         checksum: *blake3::hash(&data).as_bytes(),
         data,

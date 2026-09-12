@@ -7,6 +7,7 @@ pub mod database;
 pub mod metrics;
 pub mod multiraft_runtime;
 pub mod protocol;
+pub(crate) mod replica_join;
 pub mod replica_registry;
 pub mod replicated_tablet;
 pub mod rpc;

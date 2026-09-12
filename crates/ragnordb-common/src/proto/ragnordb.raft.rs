@@ -117,6 +117,15 @@ pub struct RaftSnapshotPointerRecord {
     /// it to equal last_included_index so replay always resumes at index + 1.
     #[prost(uint64, tag = "14")]
     pub applied_index: u64,
+    /// Exact committed removal proof retained across log compaction.
+    #[prost(uint64, tag = "15")]
+    pub last_removed_replica_id: u64,
+    #[prost(uint64, tag = "16")]
+    pub last_removed_replica_index: u64,
+    #[prost(uint64, tag = "17")]
+    pub last_removed_replica_term: u64,
+    #[prost(uint64, tag = "18")]
+    pub last_removed_conf_state_version: u64,
 }
 /// Group-tagged transport envelope. The Raft core remains independent of
 /// RagnorDB protobufs, so its versioned message bytes are carried as an opaque

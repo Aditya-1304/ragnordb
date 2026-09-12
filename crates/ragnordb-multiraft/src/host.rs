@@ -19,11 +19,13 @@ use raft::{
     },
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{ConfChange, LogIndex, Role, Term},
+    types::{ConfChange, ConfState, LogIndex, Role, Term},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 
 use crate::{
+    membership::conf_change_for_action,
+    meta::{MetadataReconcileAction, MetadataReconcileActionKind},
     runtime::{
         RaftReadyLoop, RaftReadyStateMachine, RaftSnapshotStore, ReadyApplyError, ReadyLoopError,
     },
@@ -197,6 +199,12 @@ pub struct MultiRaftGroupStatus {
     pub replica_match_indices: Vec<(ReplicaId, u64)>,
     /// First unapplied configuration entry, if one is outstanding.
     pub pending_conf_change_index: Option<u64>,
+    /// Exact latest committed configuration entry `(index, term)`, when the
+    /// core has retained that proof for post-removal metadata retirement.
+    pub last_conf_change: Option<(u64, u64)>,
+    /// Exact `(replica, index, term, resulting_conf_state_version)` proof for
+    /// the latest committed removal, if one is known.
+    pub last_removed_replica: Option<(ReplicaId, u64, u64, u64)>,
 }
 
 /// Lifecycle state of the physical MultiRaft host.
@@ -500,6 +508,8 @@ pub trait HostedRaftGroup: Send {
             outgoing_voters: Vec::new(),
             replica_match_indices: Vec::new(),
             pending_conf_change_index: None,
+            last_conf_change: None,
+            last_removed_replica: None,
         }
     }
 
@@ -881,6 +891,12 @@ where
                 .map(|(replica_id, index)| (ReplicaId::from_raft(replica_id), index))
                 .collect(),
             pending_conf_change_index: raft.pending_conf_change_index(),
+            last_conf_change: raft.last_applied_conf_change(),
+            last_removed_replica: raft.last_removed_replica().map(
+                |(replica_id, index, term, version)| {
+                    (ReplicaId::from_raft(replica_id), index, term, version)
+                },
+            ),
         }
     }
 
@@ -2382,6 +2398,84 @@ where
         self.finish_group_proposal(raft_group_id, result)
     }
 
+    /// Propose one planner-produced membership action only if the group still
+    /// exposes the exact ConfState version that was observed by reconciliation.
+    /// The check is repeated immediately before Raft admission; a stale
+    /// scheduler action therefore becomes a replan outcome instead of mutating
+    /// a newer membership lifetime.
+    pub fn propose_reconcile_action(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        action: MetadataReconcileAction,
+    ) -> Result<HostedProposal, MultiRaftHostError> {
+        self.ensure_active()?;
+
+        let status = self
+            .groups
+            .get(&raft_group_id)
+            .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?
+            .status();
+        let observed_version =
+            status
+                .conf_state_version
+                .ok_or_else(|| MultiRaftHostError::GroupRetryable {
+                    raft_group_id,
+                    reason: "membership ConfState is not published yet".to_string(),
+                })?;
+        if observed_version != action.expected_conf_state_version {
+            return Err(MultiRaftHostError::StaleMembershipObservation {
+                raft_group_id,
+                expected: action.expected_conf_state_version,
+                observed: observed_version,
+            });
+        }
+        if let MetadataReconcileActionKind::RemoveReplica { replica_id } = action.kind
+            && status.leader_replica_id == Some(replica_id)
+        {
+            return Err(MultiRaftHostError::LeaderTransferRequired {
+                raft_group_id,
+                replica_id,
+            });
+        }
+
+        let voters = status
+            .voters
+            .iter()
+            .map(|replica_id| {
+                replica_id
+                    .to_raft()
+                    .map_err(|reason| MultiRaftHostError::InvalidMessage(reason.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let learners = status
+            .learners
+            .iter()
+            .map(|replica_id| {
+                replica_id
+                    .to_raft()
+                    .map_err(|reason| MultiRaftHostError::InvalidMessage(reason.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut observed = ConfState::new(observed_version, voters, learners)
+            .map_err(|error| MultiRaftHostError::InvalidMessage(format!("{error:?}")))?;
+        observed.outgoing_voters = status
+            .outgoing_voters
+            .iter()
+            .map(|replica_id| {
+                replica_id
+                    .to_raft()
+                    .map_err(|reason| MultiRaftHostError::InvalidMessage(reason.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        let change = conf_change_for_action(&action, &observed).map_err(|error| {
+            MultiRaftHostError::StaleMembershipAction {
+                raft_group_id,
+                reason: error.to_string(),
+            }
+        })?;
+        self.propose_conf_change(raft_group_id, change)
+    }
+
     fn finish_group_proposal(
         &mut self,
         raft_group_id: RaftGroupId,
@@ -2603,6 +2697,26 @@ pub enum MultiRaftHostError {
 
     #[error("Raft group {raft_group_id:?} rejected operation without failing: {reason}")]
     GroupRejected {
+        raft_group_id: RaftGroupId,
+        reason: String,
+    },
+    #[error(
+        "membership observation for Raft group {raft_group_id:?} is stale: expected {expected}, observed {observed}"
+    )]
+    StaleMembershipObservation {
+        raft_group_id: RaftGroupId,
+        expected: u64,
+        observed: u64,
+    },
+    #[error(
+        "membership action for Raft group {raft_group_id:?} requires leadership transfer before removing replica {replica_id:?}"
+    )]
+    LeaderTransferRequired {
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+    },
+    #[error("membership action for Raft group {raft_group_id:?} is stale or invalid: {reason}")]
+    StaleMembershipAction {
         raft_group_id: RaftGroupId,
         reason: String,
     },
@@ -3541,6 +3655,7 @@ mod tests {
                     last_included_term: 1,
                     conf_state: raft::types::ConfState::new(1, [RaftReplicaId::must(101)], [])
                         .unwrap(),
+                    last_removed_replica: None,
                     size_bytes: 0,
                     checksum: [0; 32],
                 },

@@ -58,9 +58,26 @@ pub struct BootstrappedTabletReplica<W: RaftWal> {
     pub initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
 }
 
+/// New dynamic replica whose initial ConfState is only a committed membership
+/// witness. The local identity is deliberately absent until AddLearner is
+/// applied by Raft.
+pub struct BootstrappedJoiningTabletReplica<W: RaftWal> {
+    pub ready_loop: BootstrappedTabletReadyLoop<W>,
+    pub tablet: TabletCommandApplier,
+    pub initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
+}
+
 /// existing tablet replica reconstructed entirely from durable authorities
 pub struct RecoveredTabletReplica<W: RaftWal> {
     pub bootstrap: RaftGroupBootstrap,
+    pub ready_loop: RecoveredTabletReadyLoop<W>,
+    pub tablet: TabletCommandApplier,
+}
+
+/// Existing dynamic replica reconstructed from its joining witness and shared
+/// WAL. Unlike [`RecoveredTabletReplica`], this type intentionally carries no
+/// mutable or synthetic bootstrap authority.
+pub struct RecoveredJoiningTabletReplica<W: RaftWal> {
     pub ready_loop: RecoveredTabletReadyLoop<W>,
     pub tablet: TabletCommandApplier,
 }
@@ -127,6 +144,59 @@ where
         bootstrap,
         ready_loop,
         tablet: TabletCommandApplier::new(tablet),
+        initial_ready,
+    })
+}
+
+/// Bootstrap a passive dynamic joiner without rewriting immutable group
+/// bootstrap authority. The witness is persisted by the caller's lifecycle
+/// registry before this function is invoked.
+pub fn bootstrap_joining_tablet_replica<W>(
+    local_replica_id: ReplicaId,
+    conf_state: raft::types::ConfState,
+    wal: W,
+    target: &TabletSnapshotInstallTarget,
+    election_timeout: u64,
+    heartbeat_interval: u64,
+) -> Result<BootstrappedJoiningTabletReplica<W>, TabletReplicaStartupError>
+where
+    W: RaftWal,
+{
+    if conf_state.contains(
+        local_replica_id
+            .to_raft()
+            .map_err(|reason| TabletReplicaStartupError::Identity(reason.to_string()))?,
+    ) {
+        return Err(TabletReplicaStartupError::RaftInitialization(
+            "joining replica is already in the membership witness".to_string(),
+        ));
+    }
+    let raft = RaftNode::bootstrap_joining(
+        local_replica_id
+            .to_raft()
+            .map_err(|reason| TabletReplicaStartupError::Identity(reason.to_string()))?,
+        conf_state,
+        MemStorage::new(),
+        MemStorage::new(),
+        election_timeout,
+        heartbeat_interval,
+    )
+    .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
+    let tablet = Tablet::new(target.tablet_id, target.table_id)
+        .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+    let state_machine = TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+    let mut ready_loop = RaftReadyLoop::new(
+        raft,
+        RaftWalStorage::new(
+            wal,
+            RaftReplicaIdentity::new(target.raft_group_id, local_replica_id)
+                .map_err(|error| TabletReplicaStartupError::Identity(error.to_string()))?,
+        ),
+    );
+    let initial_ready = ready_loop.persist_next_ready(None)?;
+    Ok(BootstrappedJoiningTabletReplica {
+        ready_loop,
+        tablet: TabletCommandApplier::new(state_machine),
         initial_ready,
     })
 }
@@ -234,7 +304,7 @@ pub fn recover_tablet_replica<W: RaftWal>(
 
     let adapters = RaftStorageAdapters::from_recovered(recovered)
         .map_err(|error| TabletReplicaStartupError::RaftAdapter(error.to_string()))?;
-    let raft = RaftNode::restart(
+    let raft = RaftNode::restart_with_last_removed_replica(
         local_replica_id
             .to_raft()
             .map_err(|reason| TabletReplicaStartupError::Identity(reason.to_string()))?,
@@ -242,6 +312,9 @@ pub fn recover_tablet_replica<W: RaftWal>(
         adapters.stable,
         election_timeout,
         heartbeat_interval,
+        recovered
+            .snapshot()
+            .and_then(|pointer| pointer.last_removed_replica),
     )
     .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
     let persistence = RaftWalStorage::from_recovered(wal, recovered, durable_end_lsn)?;
@@ -256,6 +329,161 @@ pub fn recover_tablet_replica<W: RaftWal>(
         ready_loop,
         tablet,
     })
+}
+
+/// Recover a dynamic replica whose initial membership authority is the
+/// durable joining witness rather than an immutable group bootstrap.
+///
+/// The same WAL replay and snapshot checks are used for both phases of the
+/// lifetime. Before `AddLearner` commits, the Raft core restarts in joining
+/// mode; after that entry is part of the committed ConfState, ordinary restart
+/// is required so a removed identity cannot be revived through the passive
+/// constructor.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_joining_tablet_replica<W: RaftWal>(
+    local_replica_id: ReplicaId,
+    wal: W,
+    durable_end_lsn: Lsn,
+    recovered: &RecoveredRaftReplica,
+    snapshot_store: &FileTabletSnapshotStore,
+    target: &TabletSnapshotInstallTarget,
+    election_timeout: u64,
+    heartbeat_interval: u64,
+) -> Result<RecoveredJoiningTabletReplica<W>, TabletReplicaStartupError> {
+    let identity = RaftReplicaIdentity::new(target.raft_group_id, local_replica_id)
+        .map_err(|error| TabletReplicaStartupError::Identity(error.to_string()))?;
+    if recovered.identity() != identity {
+        return Err(TabletReplicaStartupError::RecoveredIdentityMismatch);
+    }
+    if target.cluster_id.is_empty()
+        || target.raft_group_id.0 == 0
+        || target.tablet_id.0 == 0
+        || target.table_id.0 == 0
+        || target.tablet_epoch == 0
+        || local_replica_id.0 == 0
+    {
+        return Err(TabletReplicaStartupError::Identity(
+            "dynamic replica recovery target contains a reserved identity".to_string(),
+        ));
+    }
+
+    let (mut tablet, mut applied_frontier) = match recovered.snapshot() {
+        Some(raft_pointer) => {
+            let image = snapshot_store.load_verified_by_name(&raft_pointer.file_name)?;
+            let tablet_pointer = TabletSnapshotPointer {
+                metadata: image.metadata.clone(),
+                file_name: raft_pointer.file_name.clone(),
+            };
+            let expected_raft_pointer = raft_pointer_for_tablet(identity, &tablet_pointer)?;
+            if &expected_raft_pointer != raft_pointer {
+                return Err(TabletReplicaStartupError::SnapshotPointerMismatch);
+            }
+            let restored = restore_verified_snapshot(&image, target)?;
+            (
+                TabletCommandApplier::new(restored.state_machine),
+                Some(AppliedRaftFrontier::new(
+                    restored.frontier.index,
+                    restored.frontier.term,
+                )),
+            )
+        }
+        None => {
+            if recovered.progress().truncated_through_index != 0 {
+                return Err(TabletReplicaStartupError::MissingSnapshotForCompactedLog {
+                    truncated_through: recovered.progress().truncated_through_index,
+                });
+            }
+            let tablet = Tablet::new(target.tablet_id, target.table_id)
+                .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+            let state_machine =
+                TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+            (TabletCommandApplier::new(state_machine), None)
+        }
+    };
+
+    let commit = recovered
+        .hard_state()
+        .map(|state| state.commit)
+        .unwrap_or(0);
+    let mut applied_index = applied_frontier.map(|frontier| frontier.index).unwrap_or(0);
+    for entry in recovered.log_view().entries() {
+        if entry.record.index <= applied_index {
+            continue;
+        }
+        if entry.record.index > commit {
+            break;
+        }
+        let expected_index = applied_index.saturating_add(1);
+        if entry.record.index != expected_index {
+            return Err(TabletReplicaStartupError::CommittedSuffixGap {
+                expected: expected_index,
+                received: entry.record.index,
+            });
+        }
+        if let DurableRaftEntryPayload::Normal(command) = &entry.record.payload {
+            tablet.apply_committed(
+                crate::proposal::ProposalPosition {
+                    term: entry.record.term,
+                    index: entry.record.index,
+                },
+                command,
+            )?;
+        }
+        applied_index = entry.record.index;
+        applied_frontier = Some(AppliedRaftFrontier::new(
+            entry.record.index,
+            entry.record.term,
+        ));
+    }
+    if applied_index != commit {
+        return Err(TabletReplicaStartupError::CommitNotReconstructed {
+            commit,
+            applied: applied_index,
+        });
+    }
+
+    let adapters = RaftStorageAdapters::from_recovered(recovered)
+        .map_err(|error| TabletReplicaStartupError::RaftAdapter(error.to_string()))?;
+    let raft =
+        match recovered.conf_state() {
+            Some(conf_state)
+                if conf_state.contains(local_replica_id.to_raft().map_err(|reason| {
+                    TabletReplicaStartupError::Identity(reason.to_string())
+                })?) =>
+            {
+                RaftNode::restart_with_last_removed_replica(
+                    local_replica_id.to_raft().map_err(|reason| {
+                        TabletReplicaStartupError::Identity(reason.to_string())
+                    })?,
+                    adapters.log,
+                    adapters.stable,
+                    election_timeout,
+                    heartbeat_interval,
+                    recovered
+                        .snapshot()
+                        .and_then(|pointer| pointer.last_removed_replica),
+                )
+            }
+            Some(_) | None => RaftNode::restart_joining_with_last_removed_replica(
+                local_replica_id
+                    .to_raft()
+                    .map_err(|reason| TabletReplicaStartupError::Identity(reason.to_string()))?,
+                adapters.log,
+                adapters.stable,
+                election_timeout,
+                heartbeat_interval,
+                recovered
+                    .snapshot()
+                    .and_then(|pointer| pointer.last_removed_replica),
+            ),
+        }
+        .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
+    let persistence = RaftWalStorage::from_recovered(wal, recovered, durable_end_lsn)?;
+    let mut ready_loop = RaftReadyLoop::new(raft, persistence);
+    if let Some(frontier) = applied_frontier {
+        ready_loop.advance_applied_frontier(frontier)?;
+    }
+    Ok(RecoveredJoiningTabletReplica { ready_loop, tablet })
 }
 
 fn validate_target(

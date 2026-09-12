@@ -9,7 +9,7 @@
 //! committed Raft ConfState, never from the current seed voter list.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -22,10 +22,12 @@ use std::{
 use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
 use ragnordb_common::{
     Error, Result,
-    ids::{ClientRequestId, CommandKind, LogicalCommandId, NodeId, ReplicaId, RequestId, TabletId},
+    ids::{
+        ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
+    },
     metadata_codec::{
         CreateTableRequest, DesiredReplicaRole, MetadataCommand, MetadataCommandEnvelope,
-        NodeDescriptor, TabletDescriptor,
+        NodeDescriptor, NodeLifecycle, TabletDescriptor,
     },
     raft_bootstrap::RaftGroupBootstrap,
 };
@@ -33,10 +35,14 @@ use ragnordb_common::{
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
     host::{
-        MultiRaftHost, MultiRaftHostConfig, MultiRaftHostError, MultiRaftHostStatus,
-        MultiRaftTurnBudget, RoutedRaftMessage, SharedMultiRaftHostStatus,
+        MultiRaftGroupStatus, MultiRaftHost, MultiRaftHostConfig, MultiRaftHostError,
+        MultiRaftHostStatus, MultiRaftTurnBudget, RoutedRaftMessage, SharedMultiRaftHostStatus,
     },
-    meta::{MetadataRuntimeHandle, bootstrap_metadata_group, recover_metadata_group},
+    membership::{MembershipDecision, MembershipObservation, plan_membership_reconciliation},
+    meta::{
+        MetadataReconcileActionKind, MetadataRuntimeHandle, bootstrap_metadata_group,
+        recover_metadata_group,
+    },
     snapshot::SnapshotWorkController,
     storage::{
         codec::RaftReplicaIdentity,
@@ -57,13 +63,18 @@ use crate::{
     config::NodeConfig,
     data_directory_lock::DataDirectoryLock,
     database::SharedLocalDatabase,
+    replica_join::{
+        JoiningMembershipWitness, JoiningReplicaLifecycle, JoiningReplicaRecord,
+        JoiningReplicaRegistry,
+    },
     replica_registry::{
         DurableFrontier, InitialReplicaConfiguration, LocalReplicaKey, LocalReplicaRecord,
         LocalReplicaRegistry, ReplicaLifecycle,
     },
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
     rpc::{
-        MetadataRpcClient, RpcState, SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher,
+        MetadataRpcClient, ReplicaJoinAdmission, ReplicaJoinAdmissionResult, ReplicaJoinRpcClient,
+        RpcState, SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher,
     },
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
 };
@@ -87,6 +98,8 @@ const METADATA_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
 const METADATA_REQUEST_BUDGET: usize = 64;
+
+const REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY: usize = 128;
 
 pub(crate) enum MetadataHostRequest {
     Command {
@@ -121,6 +134,7 @@ struct TabletLifecycleManager {
     snapshot_work: SnapshotWorkController,
     snapshot_transport: NodeSnapshotTransport,
     registry: LocalReplicaRegistry,
+    joins: JoiningReplicaRegistry,
     recovered: RecoveredRaftStorage,
     start_gate: Arc<AtomicBool>,
     runtimes: BTreeMap<RaftReplicaIdentity, ReplicatedTabletRuntime>,
@@ -129,6 +143,7 @@ struct TabletLifecycleManager {
     /// restartable without reopening a second writer for the same identity.
     writers: BTreeMap<RaftReplicaIdentity, NodeRaftWalHandle<LocalWal>>,
     tablet_handles: SharedTabletHandleRegistry,
+    pending_retirements: BTreeSet<(RaftGroupId, ReplicaId)>,
 }
 
 impl TabletLifecycleManager {
@@ -142,6 +157,7 @@ impl TabletLifecycleManager {
         snapshot_work: SnapshotWorkController,
         snapshot_transport: NodeSnapshotTransport,
         registry: LocalReplicaRegistry,
+        joins: JoiningReplicaRegistry,
         recovered: RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
         tablet_handles: SharedTabletHandleRegistry,
@@ -155,11 +171,13 @@ impl TabletLifecycleManager {
             snapshot_work,
             snapshot_transport,
             registry,
+            joins,
             recovered,
             start_gate,
             runtimes: BTreeMap::new(),
             writers: BTreeMap::new(),
             tablet_handles,
+            pending_retirements: BTreeSet::new(),
         }
     }
 
@@ -210,6 +228,61 @@ impl TabletLifecycleManager {
             if status.last_log_index > 0 || status.applied_index > 0 {
                 self.registry.mark_active(key)?;
             }
+            if let Some(join) = self
+                .joins
+                .record(identity.raft_group_id, identity.replica_id)?
+            {
+                match (join.lifecycle, status.replica_in_conf_state) {
+                    (
+                        JoiningReplicaLifecycle::Creating
+                        | JoiningReplicaLifecycle::RouteRegistered
+                        | JoiningReplicaLifecycle::AddLearnerCommitted
+                        | JoiningReplicaLifecycle::CatchingUp
+                        | JoiningReplicaLifecycle::ReadyToPromote,
+                        Some(false),
+                    ) => {
+                        // A committed removal is the only transition that can
+                        // move a live join lifetime to Removed. Retain the
+                        // record until metadata records the exact removal
+                        // proof and the tombstone cleanup completes.
+                        self.joins.advance(
+                            join.raft_group_id,
+                            join.replica_id,
+                            JoiningReplicaLifecycle::Removed,
+                        )?;
+                    }
+                    (_, Some(true)) => {
+                        if status.learners.contains(&identity.replica_id.0) {
+                            self.joins.advance(
+                                join.raft_group_id,
+                                join.replica_id,
+                                JoiningReplicaLifecycle::AddLearnerCommitted,
+                            )?;
+                            if status.applied_index < status.commit_index
+                                || status.snapshot_install_pending
+                                || status.runtime_error.is_some()
+                            {
+                                self.joins.advance(
+                                    join.raft_group_id,
+                                    join.replica_id,
+                                    JoiningReplicaLifecycle::CatchingUp,
+                                )?;
+                            }
+                        }
+                        if status.applied_index >= status.commit_index
+                            && !status.snapshot_install_pending
+                            && status.runtime_error.is_none()
+                        {
+                            self.joins.advance(
+                                join.raft_group_id,
+                                join.replica_id,
+                                JoiningReplicaLifecycle::ReadyToPromote,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
 
         let state = metadata.state_snapshot();
@@ -219,6 +292,40 @@ impl TabletLifecycleManager {
 
         self.reconcile_retired(host, &state, active)?;
 
+        // A placement edit can remove a local dynamic replica before the
+        // committed RemoveReplica entry reaches it. If its recovered WAL
+        // still contains that lifetime, materialize it from the durable join
+        // witness so it can apply the removal and expose the exact proof.
+        for record in self.joins.records()? {
+            if record.physical_node_id != self.config.node_id
+                || matches!(
+                    record.lifecycle,
+                    JoiningReplicaLifecycle::Removed | JoiningReplicaLifecycle::Retired
+                )
+            {
+                continue;
+            }
+            let identity = RaftReplicaIdentity::new(record.raft_group_id, record.replica_id)
+                .map_err(|source| Error::Configuration(source.to_string()))?;
+            if self.recovered.replica(identity).is_none() {
+                continue;
+            }
+            let desired_contains_lifetime =
+                state
+                    .desired_placement(record.tablet_id)
+                    .is_some_and(|placement| {
+                        placement.replicas.iter().any(|replica| {
+                            replica.replica_id == record.replica_id
+                                && replica.node_id == record.physical_node_id
+                        })
+                    });
+            if desired_contains_lifetime {
+                continue;
+            }
+            let request = join_request_from_record(&record);
+            self.admit_replica_join(host, metadata, self.config.node_id, &request, active, true)?;
+        }
+
         let descriptors = state.tablets().cloned().collect::<Vec<_>>();
         for descriptor in descriptors {
             let Some(placement) = state.desired_placement(descriptor.tablet_id).cloned() else {
@@ -227,14 +334,6 @@ impl TabletLifecycleManager {
                     descriptor.tablet_id.0
                 )));
             };
-            let Some(desired_local) = placement
-                .replicas
-                .iter()
-                .find(|replica| replica.node_id == self.config.node_id)
-            else {
-                continue;
-            };
-
             let requested_bootstrap = metadata_tablet_bootstrap(
                 self.config.cluster_id.as_deref().unwrap_or_default(),
                 &descriptor,
@@ -252,11 +351,70 @@ impl TabletLifecycleManager {
                         reason: source.to_string(),
                     },
                 )?;
-            let bootstrap = resolve_metadata_tablet_bootstrap(
-                requested_bootstrap,
-                bootstrap,
-                descriptor.tablet_id,
-            )?;
+
+            let desired_local = placement
+                .replicas
+                .iter()
+                .find(|replica| replica.node_id == self.config.node_id);
+            let durable_local_replica = bootstrap
+                .as_ref()
+                .and_then(|bootstrap| bootstrap.replica_on_node(self.config.node_id));
+
+            // A later placement epoch may assign this physical node a new
+            // replica lifetime. Such a lifetime is admitted only through the
+            // durable join registry; it must never be represented by editing
+            // the immutable initial bootstrap.
+            if let Some(desired_local) = desired_local {
+                let dynamic_join = self
+                    .joins
+                    .record(descriptor.raft_group_id, desired_local.replica_id)?;
+                if durable_local_replica != Some(desired_local.replica_id) {
+                    let mut dynamic_join_admitted = false;
+                    if let Some(record) = dynamic_join {
+                        let request = join_request_from_record(&record);
+                        self.admit_replica_join(
+                            host,
+                            metadata,
+                            self.config.node_id,
+                            &request,
+                            active,
+                            false,
+                        )?;
+                        dynamic_join_admitted = true;
+                    }
+                    if durable_local_replica.is_some() || dynamic_join_admitted {
+                        continue;
+                    }
+                }
+            } else if let Some(local_replica_id) = durable_local_replica {
+                let identity = RaftReplicaIdentity::new(descriptor.raft_group_id, local_replica_id)
+                    .map_err(|source| Error::Configuration(source.to_string()))?;
+                let still_committed = self.runtimes.contains_key(&identity)
+                    || self
+                        .recovered
+                        .replica(identity)
+                        .and_then(|replica| replica.conf_state())
+                        .is_some_and(|conf_state| {
+                            conf_state.contains(
+                                local_replica_id
+                                    .to_raft()
+                                    .expect("validated bootstrap replica IDs are non-zero"),
+                            )
+                        });
+                if !still_committed {
+                    // The committed removal proof may already be visible in
+                    // recovered ConfState while metadata retirement is still
+                    // propagating. The later retirement pass owns cleanup.
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            // Once written, the initial bootstrap is immutable historical
+            // authority. New desired members are handled by the join record
+            // above and by committed ConfState transitions; they must not make
+            // this original file appear to have changed.
+            let bootstrap = bootstrap.unwrap_or(requested_bootstrap);
 
             let local_replica_id =
                 bootstrap
@@ -267,7 +425,7 @@ impl TabletLifecycleManager {
                             descriptor.raft_group_id.0
                         ))
                     })?;
-            if desired_local.replica_id != local_replica_id {
+            if desired_local.is_some_and(|desired| desired.replica_id != local_replica_id) {
                 return Err(Error::RecoveryFailed {
                     reason: format!(
                         "metadata placement for tablet {} disagrees with durable local replica {}",
@@ -391,6 +549,635 @@ impl TabletLifecycleManager {
         Ok(())
     }
 
+    /// Execute at most one fresh metadata-to-Raft membership transition for
+    /// each local leader. The target-preparation RPC is repeated from the
+    /// current observation on every pass, so route loss, leadership changes,
+    /// and desired-placement edits naturally produce a retry/replan rather
+    /// than applying a stale action.
+    fn reconcile_membership(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+        replica_join_rpc: &ReplicaJoinRpcClient,
+    ) -> Result<()> {
+        let state = metadata.state_snapshot();
+        if state.cluster_id() != Some(self.config.cluster_id.as_deref().unwrap_or_default()) {
+            return Ok(());
+        }
+        let host_status = host.status();
+        for group_status in host_status.groups {
+            if group_status.role != Some(ragnordb_multiraft::host::MultiRaftRole::Leader) {
+                continue;
+            }
+            let Some(descriptor) = state.tablet_for_raft_group(group_status.identity.raft_group_id)
+            else {
+                continue;
+            };
+            let Some(desired) = state.desired_placement(descriptor.tablet_id).cloned() else {
+                continue;
+            };
+            if let Some((removed_replica, _, _, _)) = group_status.last_removed_replica
+                && !state.is_replica_retired(group_status.identity.raft_group_id, removed_replica)
+            {
+                // Keep one removal proof outstanding per group. The Raft
+                // core exposes the latest exact removal tuple; proposing a
+                // second removal before metadata durably records this one
+                // could overwrite the only proof needed to retire the first
+                // local lifetime after a crash.
+                continue;
+            }
+            let observed = status_conf_state(&group_status)?;
+            let action = match ragnordb_multiraft::meta::next_reconcile_action(&desired, &observed)
+            {
+                Ok(Some(action)) => action,
+                Ok(None)
+                | Err(ragnordb_multiraft::meta::MetadataReconcileError::JointConsensusInProgress) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(Error::Configuration(error.to_string())),
+            };
+            let mut target_prepared = BTreeMap::new();
+            let mut target_snapshot_pending = BTreeMap::new();
+            let mut target_quarantined = BTreeMap::new();
+            let mut target_apply_indices = BTreeMap::new();
+
+            let target = match &action.kind {
+                MetadataReconcileActionKind::AddLearner {
+                    replica_id,
+                    node_id,
+                }
+                | MetadataReconcileActionKind::PromoteLearner {
+                    replica_id,
+                    node_id,
+                } => Some((*replica_id, *node_id)),
+                MetadataReconcileActionKind::RemoveReplica { .. } => None,
+            };
+            if let Some((target_replica, target_node)) = target {
+                let require_caught_up = matches!(
+                    &action.kind,
+                    MetadataReconcileActionKind::PromoteLearner { .. }
+                );
+                let request = join_request_from_status(
+                    self.config.cluster_id.as_deref().unwrap_or_default(),
+                    descriptor,
+                    &group_status,
+                    target_replica,
+                    target_node,
+                    require_caught_up,
+                );
+                let mut prepared = true;
+                for node in state
+                    .nodes()
+                    .filter(|node| node.lifecycle == NodeLifecycle::Active)
+                {
+                    let result = if node.node_id == self.config.node_id {
+                        self.admit_replica_join(
+                            host,
+                            metadata,
+                            self.config.node_id,
+                            &request,
+                            true,
+                            false,
+                        )
+                    } else {
+                        replica_join_rpc.prepare(
+                            node.node_id,
+                            request.clone(),
+                            Duration::from_millis(250),
+                        )
+                    };
+                    if result.is_err() {
+                        prepared = false;
+                        break;
+                    }
+                }
+                target_prepared.insert(target_replica, prepared);
+                target_snapshot_pending.insert(target_replica, false);
+                target_quarantined.insert(target_replica, !prepared);
+                if prepared && require_caught_up {
+                    target_apply_indices.insert(target_replica, group_status.commit_index);
+                }
+            }
+
+            let observation = MembershipObservation {
+                desired,
+                observed,
+                local_replica_id: group_status.identity.replica_id,
+                leader_replica_id: group_status.leader_replica_id,
+                commit_index: group_status.commit_index,
+                replica_match_indices: group_status.replica_match_indices.iter().copied().collect(),
+                target_apply_indices,
+                target_prepared,
+                target_snapshot_pending,
+                target_quarantined,
+                same_replica_lifetime: group_status
+                    .voters
+                    .iter()
+                    .chain(group_status.learners.iter())
+                    .copied()
+                    .map(|replica_id| {
+                        (
+                            replica_id,
+                            !state.is_replica_retired(
+                                group_status.identity.raft_group_id,
+                                replica_id,
+                            ),
+                        )
+                    })
+                    .collect(),
+            };
+            // Remote preparation can take long enough for metadata placement
+            // or node lifecycle to change. Re-read both authorities before
+            // proposing; the host performs the final ConfState-version check.
+            let latest_state = metadata.state_snapshot();
+            if latest_state.tablet(descriptor.tablet_id) != Some(descriptor)
+                || latest_state.desired_placement(descriptor.tablet_id)
+                    != Some(&observation.desired)
+                || target.is_some_and(|(_, node_id)| {
+                    latest_state
+                        .node(node_id)
+                        .is_none_or(|node| node.lifecycle != NodeLifecycle::Active)
+                })
+            {
+                continue;
+            }
+            match plan_membership_reconciliation(&observation)
+                .map_err(|error| Error::Configuration(error.to_string()))?
+            {
+                MembershipDecision::Action(action) => {
+                    match host.propose_reconcile_action(group_status.identity.raft_group_id, action)
+                    {
+                        Ok(proposal) => send_outbound(&self.transport, proposal.outbound),
+                        Err(MultiRaftHostError::GroupRejected { .. })
+                        | Err(MultiRaftHostError::GroupRetryable { .. })
+                        | Err(MultiRaftHostError::StaleMembershipObservation { .. })
+                        | Err(MultiRaftHostError::StaleMembershipAction { .. }) => {}
+                        Err(MultiRaftHostError::LeaderTransferRequired { .. }) => {
+                            tracing::info!(
+                                raft_group_id = group_status.identity.raft_group_id.0,
+                                "membership removal deferred until leadership transfer is available",
+                            );
+                        }
+                        Err(error) => return Err(host_error(error)),
+                    }
+                }
+                MembershipDecision::WaitForCatchUp { .. }
+                | MembershipDecision::LeaderTransferRequired { .. }
+                | MembershipDecision::PausedJointConsensus
+                | MembershipDecision::Noop => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish the second, metadata-owned half of a removal proof. This is
+    /// intentionally separate from the Raft configuration proposal: a crash
+    /// between the two commits simply causes this idempotent command to be
+    /// proposed again after restart.
+    fn reconcile_retirement_records(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+    ) -> Result<()> {
+        let state = metadata.state_snapshot();
+        self.pending_retirements
+            .retain(|key| !state.is_replica_retired(key.0, key.1));
+        for record in self.registry.records()? {
+            let key = record.key();
+            if state.is_replica_retired(key.raft_group_id, key.replica_id)
+                || self
+                    .pending_retirements
+                    .contains(&(key.raft_group_id, key.replica_id))
+            {
+                continue;
+            }
+            let Some(descriptor) = state.tablet_for_raft_group(key.raft_group_id) else {
+                continue;
+            };
+            let Some(placement) = state.desired_placement(descriptor.tablet_id) else {
+                continue;
+            };
+            if placement
+                .replicas
+                .iter()
+                .any(|replica| replica.replica_id == key.replica_id)
+            {
+                // A desired-placement edit back to this lifetime wins over a
+                // stale removal observation until the removal is committed.
+                continue;
+            }
+            let Some(status) = host
+                .status()
+                .groups
+                .into_iter()
+                .find(|status| status.identity.raft_group_id == key.raft_group_id)
+            else {
+                continue;
+            };
+            let Some((removed_replica, removal_index, removal_term, removed_version)) =
+                status.last_removed_replica
+            else {
+                continue;
+            };
+            if removed_replica != key.replica_id {
+                continue;
+            }
+            let observed = status_conf_state(&status)?;
+            if !conf_state_excludes_replica(&observed, key.replica_id) {
+                continue;
+            }
+            let command = MetadataCommand::RecordReplicaRetirement {
+                raft_group_id: key.raft_group_id,
+                replica_id: key.replica_id,
+                desired_configuration_epoch: placement.configuration_epoch,
+                removed_conf_state_version: removed_version,
+                removal_index,
+                removal_term,
+            };
+            let encoded = command
+                .encode()
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            match host.propose(METADATA_RAFT_GROUP_ID, encoded.clone(), encoded.len()) {
+                Ok(proposal) => {
+                    send_outbound(&self.transport, proposal.outbound);
+                    self.pending_retirements
+                        .insert((key.raft_group_id, key.replica_id));
+                }
+                Err(MultiRaftHostError::GroupRejected { .. })
+                | Err(MultiRaftHostError::GroupRetryable { .. }) => {}
+                Err(MultiRaftHostError::RecoveryRequired) => {
+                    return Err(Error::RecoveryRequired {
+                        reason: "metadata Raft entered recovery-required state while recording replica retirement".to_string(),
+                    });
+                }
+                Err(error) => tracing::debug!(
+                    error = %error,
+                    "replica retirement proposal will be retried",
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit one post-bootstrap replica request on the host owner thread.
+    ///
+    /// Every node that receives the control-plane request installs the target
+    /// route, while the target node additionally persists its joining lifetime
+    /// and constructs the passive Ready owner. Consequently a leader cannot
+    /// emit `AppendEntries` or a snapshot for a new replica until the target
+    /// has a durable identity, route, WAL writer, and runtime.
+    fn admit_replica_join(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+        source_node_id: NodeId,
+        request: &ragnordb_common::proto::rpc::ReplicaJoinRequest,
+        active: bool,
+        allow_obsolete_recovery: bool,
+    ) -> Result<()> {
+        let cluster_id = request.cluster_id.as_str();
+        let group_id = request
+            .raft_group_id
+            .map(ragnordb_common::ids::RaftGroupId::from_proto)
+            .ok_or_else(|| Error::InvalidArgument("join request has no Raft group".into()))?;
+        let tablet_id = request
+            .tablet_id
+            .map(ragnordb_common::ids::TabletId::from_proto)
+            .ok_or_else(|| Error::InvalidArgument("join request has no tablet".into()))?;
+        let replica_id = request
+            .replica_id
+            .map(ragnordb_common::ids::ReplicaId::from_proto)
+            .ok_or_else(|| Error::InvalidArgument("join request has no replica".into()))?;
+        let node_id = request
+            .physical_node_id
+            .map(ragnordb_common::ids::NodeId::from_proto)
+            .ok_or_else(|| Error::InvalidArgument("join request has no physical node".into()))?;
+        if cluster_id != self.config.cluster_id.as_deref().unwrap_or_default() {
+            return Err(Error::Configuration(
+                "joining request belongs to another cluster".to_string(),
+            ));
+        }
+        let state = metadata.state_snapshot();
+        if state.cluster_id() != Some(cluster_id) {
+            return Err(Error::Configuration(
+                "joining request does not match committed metadata cluster".to_string(),
+            ));
+        }
+        if state
+            .node(node_id)
+            .is_none_or(|node| node.lifecycle != NodeLifecycle::Active)
+        {
+            return Err(Error::ProposalUnavailable {
+                reason: format!(
+                    "joining target node {} is not an active metadata node",
+                    node_id.0
+                ),
+            });
+        }
+        if source_node_id.0 == 0
+            || state
+                .node(source_node_id)
+                .is_none_or(|node| node.lifecycle != NodeLifecycle::Active)
+        {
+            return Err(Error::ProposalUnavailable {
+                reason: format!(
+                    "joining request source node {} is not an active metadata node",
+                    source_node_id.0
+                ),
+            });
+        }
+        if state.is_replica_retired(group_id, replica_id) {
+            return Err(Error::InvalidArgument(format!(
+                "replica {} of group {} is permanently retired",
+                replica_id.0, group_id.0
+            )));
+        }
+        let descriptor = state.tablet(tablet_id).ok_or_else(|| {
+            Error::CorruptData(format!(
+                "join request references unknown tablet {}",
+                tablet_id.0
+            ))
+        })?;
+        if descriptor.raft_group_id != group_id || descriptor.tablet_epoch != request.tablet_epoch {
+            return Err(Error::StaleTabletEpoch {
+                current_epoch: descriptor.tablet_epoch,
+                expected_epoch: request.tablet_epoch,
+            });
+        }
+        let placement = state.desired_placement(tablet_id).ok_or_else(|| {
+            Error::CorruptData(format!("tablet {} has no desired placement", tablet_id.0))
+        })?;
+        let desired = placement
+            .replicas
+            .iter()
+            .find(|replica| replica.replica_id == replica_id && replica.node_id == node_id);
+        if desired.is_none() && !allow_obsolete_recovery {
+            return Err(Error::ProposalUnavailable {
+                reason: format!(
+                    "replica {} on node {} is not in current desired placement",
+                    replica_id.0, node_id.0
+                ),
+            });
+        }
+        if request.expected_current_conf_state_version == 0
+            || request.committed_membership_version != request.expected_current_conf_state_version
+        {
+            return Err(Error::InvalidArgument(
+                "join request has inconsistent membership witness version".to_string(),
+            ));
+        }
+        let voters = request
+            .voters
+            .iter()
+            .cloned()
+            .map(ragnordb_common::ids::ReplicaId::from_proto)
+            .collect::<std::collections::BTreeSet<_>>();
+        let learners = request
+            .learners
+            .iter()
+            .cloned()
+            .map(ragnordb_common::ids::ReplicaId::from_proto)
+            .collect::<std::collections::BTreeSet<_>>();
+        let outgoing_voters = request
+            .outgoing_voters
+            .iter()
+            .cloned()
+            .map(ragnordb_common::ids::ReplicaId::from_proto)
+            .collect::<std::collections::BTreeSet<_>>();
+        if voters.len() != request.voters.len()
+            || learners.len() != request.learners.len()
+            || outgoing_voters.len() != request.outgoing_voters.len()
+        {
+            return Err(Error::InvalidArgument(
+                "join request membership witness contains duplicate identities".to_string(),
+            ));
+        }
+        let witness = JoiningMembershipWitness {
+            version: request.committed_membership_version,
+            voters,
+            learners,
+            outgoing_voters,
+        };
+        let witness_conf_state = witness.to_core()?;
+        let witness = JoiningMembershipWitness::from_core(&witness_conf_state)?;
+
+        if node_id != self.config.node_id {
+            // Non-target nodes only install the route. The target persists its
+            // Creating record first so a crash cannot leave an addressable
+            // replica identity with no durable lifetime fence.
+            self.transport
+                .register_dynamic_route(group_id, replica_id, node_id)
+                .map_err(|error| {
+                    Error::Configuration(format!("register joining route: {error}"))
+                })?;
+            return Ok(());
+        }
+
+        if let Some(existing_group) = host
+            .status()
+            .groups
+            .into_iter()
+            .find(|status| status.identity.raft_group_id == group_id)
+        {
+            let existing_conf_state = status_conf_state(&existing_group)?;
+            if existing_conf_state != witness_conf_state {
+                return Err(Error::ProposalUnavailable {
+                    reason: format!(
+                        "joining membership witness for group {} is stale on target",
+                        group_id.0
+                    ),
+                });
+            }
+        }
+
+        if self
+            .joins
+            .record(group_id, replica_id)?
+            .is_some_and(|record| {
+                matches!(
+                    record.lifecycle,
+                    JoiningReplicaLifecycle::Removed | JoiningReplicaLifecycle::Retired
+                )
+            })
+        {
+            return Err(Error::InvalidArgument(format!(
+                "replica {} of group {} has a terminal joining lifetime",
+                replica_id.0, group_id.0
+            )));
+        }
+
+        let record = JoiningReplicaRecord {
+            cluster_id: cluster_id.to_string(),
+            raft_group_id: group_id,
+            tablet_id,
+            tablet_epoch: descriptor.tablet_epoch,
+            replica_id,
+            physical_node_id: node_id,
+            expected_current_conf_state_version: request.expected_current_conf_state_version,
+            committed_membership_witness: witness,
+            lifecycle: JoiningReplicaLifecycle::Creating,
+        };
+        self.joins.ensure(record)?;
+
+        let local_record = LocalReplicaRecord::new(
+            group_id,
+            replica_id,
+            tablet_id,
+            descriptor.table_id,
+            descriptor.tablet_epoch,
+            ReplicaLifecycle::Creating,
+        );
+        self.registry.ensure_replica(local_record)?;
+        let identity = RaftReplicaIdentity::new(group_id, replica_id)
+            .map_err(|error| Error::Configuration(error.to_string()))?;
+
+        // All configured voters learn the dynamic route. This is deliberately
+        // separate from target materialization: a later leader must still be
+        // able to send to the learner after leadership changes.
+        self.transport
+            .register_dynamic_route(group_id, replica_id, node_id)
+            .map_err(|error| Error::Configuration(format!("register joining route: {error}")))?;
+
+        if self.runtimes.contains_key(&identity) {
+            self.joins.advance(
+                group_id,
+                replica_id,
+                JoiningReplicaLifecycle::RouteRegistered,
+            )?;
+            if request.require_caught_up {
+                self.verify_join_caught_up(identity, request.leader_commit_index)?;
+                self.joins.advance(
+                    group_id,
+                    replica_id,
+                    JoiningReplicaLifecycle::ReadyToPromote,
+                )?;
+            }
+            return Ok(());
+        }
+        if self
+            .runtimes
+            .keys()
+            .any(|existing| existing.raft_group_id == group_id)
+        {
+            return Err(Error::Configuration(format!(
+                "node {} already hosts another lifetime of group {}",
+                self.config.node_id.0, group_id.0
+            )));
+        }
+
+        let durability_gate = self
+            .database
+            .try_lock()
+            .map_err(|_| Error::Configuration("database is busy during replica join".into()))?
+            .durability_gate();
+        let group_wal = if active {
+            host.issue_group_writer_after_activation(identity)
+                .map_err(host_error)?
+        } else {
+            host.issue_group_writer(identity).map_err(host_error)?
+        };
+        let retention_writer = group_wal.clone();
+        let group_transport = self
+            .transport
+            .register_dynamic_group(group_id, replica_id, node_id)
+            .map_err(|error| {
+                Error::Configuration(format!("register joining group route: {error}"))
+            })?;
+        let snapshot_endpoint = self
+            .snapshot_transport
+            .register_dynamic_group(group_id, replica_id, self.snapshot_store.clone())
+            .map_err(|error| {
+                Error::Configuration(format!("register joining snapshot route: {error}"))
+            })?;
+        let target = TabletSnapshotInstallTarget {
+            cluster_id: self.config.cluster_id.clone().unwrap_or_default(),
+            raft_group_id: group_id,
+            tablet_id,
+            table_id: descriptor.table_id,
+            tablet_epoch: descriptor.tablet_epoch,
+        };
+        let runtime = ReplicatedTabletRuntime::start_hosted_joining_tablet_from_shared_recovery(
+            &self.config,
+            self.wal.clone(),
+            self.database.clone(),
+            replica_id,
+            witness_conf_state,
+            target,
+            group_wal,
+            group_transport,
+            self.snapshot_store.clone(),
+            self.snapshot_work.clone(),
+            snapshot_endpoint,
+            &self.recovered,
+            self.start_gate.clone(),
+            Some(durability_gate),
+        )?;
+        let recovered = self.recovered.replica(identity).is_some();
+        if active {
+            host.register_active_group(Box::new(runtime.hosted_group()))
+                .map_err(host_error)?;
+        } else if recovered {
+            host.register_recovered_group(Box::new(runtime.hosted_group()))
+                .map_err(host_error)?;
+        } else {
+            host.register_new_group(Box::new(runtime.hosted_group()))
+                .map_err(host_error)?;
+        }
+        self.runtimes.insert(identity, runtime);
+        self.tablet_handles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group_id, self.runtimes[&identity].handle());
+        self.writers.insert(identity, retention_writer);
+        self.joins.advance(
+            group_id,
+            replica_id,
+            JoiningReplicaLifecycle::RouteRegistered,
+        )?;
+        if request.require_caught_up {
+            self.verify_join_caught_up(identity, request.leader_commit_index)?;
+            self.joins.advance(
+                group_id,
+                replica_id,
+                JoiningReplicaLifecycle::ReadyToPromote,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_join_caught_up(
+        &self,
+        identity: RaftReplicaIdentity,
+        leader_commit: u64,
+    ) -> Result<()> {
+        let status = self
+            .runtimes
+            .get(&identity)
+            .ok_or_else(|| Error::ProposalUnavailable {
+                reason: "joining runtime is not materialized".to_string(),
+            })?
+            .handle()
+            .status();
+        if status.runtime_error.is_some()
+            || status.snapshot_install_pending
+            || status.replica_in_conf_state != Some(true)
+            || status.applied_index < leader_commit
+        {
+            return Err(Error::ProposalUnavailable {
+                reason: format!(
+                    "joining replica {} is not locally caught up: applied={}, commit={}, snapshot_pending={}, in_conf_state={:?}",
+                    identity.replica_id.0,
+                    status.applied_index,
+                    leader_commit,
+                    status.snapshot_install_pending,
+                    status.replica_in_conf_state,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Reconcile local lifetimes whose removal has been durably authorized by
     /// metadata and by the recovered/current Raft ConfState.
     ///
@@ -452,8 +1239,21 @@ impl TabletLifecycleManager {
             }
 
             if active {
-                host.tombstone_group(identity).map_err(host_error)?;
+                // This helper also covers the restart case where cleanup had
+                // already removed the in-memory worker and WAL handle.
+                self.ensure_tombstone_writer(host, identity, true)?;
                 self.cleanup_retired_replica(record, identity)?;
+                if self
+                    .joins
+                    .record(identity.raft_group_id, identity.replica_id)?
+                    .is_some()
+                {
+                    self.joins.advance(
+                        identity.raft_group_id,
+                        identity.replica_id,
+                        JoiningReplicaLifecycle::Retired,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -503,6 +1303,20 @@ impl TabletLifecycleManager {
                 .unregister_group(&bootstrap)
                 .map_err(|source| Error::RecoveryFailed {
                     reason: format!("unregister tablet Raft transport: {source}"),
+                })?;
+        }
+        if let Some(join) = self
+            .joins
+            .record(identity.raft_group_id, identity.replica_id)?
+        {
+            self.transport
+                .unregister_dynamic_route(
+                    identity.raft_group_id,
+                    identity.replica_id,
+                    join.physical_node_id,
+                )
+                .map_err(|source| Error::RecoveryFailed {
+                    reason: format!("unregister dynamic tablet Raft route: {source}"),
                 })?;
         }
         self.snapshot_transport
@@ -652,6 +1466,16 @@ impl TabletLifecycleManager {
                 raft_group_id: identity.raft_group_id,
                 replica_id: identity.replica_id,
             };
+            if self.registry.record(key)?.is_some()
+                && !metadata_state.is_replica_retired(key.raft_group_id, key.replica_id)
+                && self.conf_state_proves_removed(identity)
+            {
+                // Removal may already be committed locally while the
+                // metadata retirement command is still outstanding. Keep the
+                // durable recovery image until another active metadata
+                // replica publishes that exact proof.
+                continue;
+            }
             if let Some(record) = self.registry.record(key)?
                 && matches!(
                     record.lifecycle,
@@ -699,6 +1523,120 @@ fn conf_state_excludes_replica(conf_state: &raft::types::ConfState, replica_id: 
         && !conf_state.outgoing_voters.contains(&replica_id)
 }
 
+fn status_conf_state(status: &MultiRaftGroupStatus) -> Result<raft::types::ConfState> {
+    let voters = status
+        .voters
+        .iter()
+        .map(|replica_id| {
+            replica_id
+                .to_raft()
+                .map_err(|reason| Error::CorruptData(reason.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let learners = status
+        .learners
+        .iter()
+        .map(|replica_id| {
+            replica_id
+                .to_raft()
+                .map_err(|reason| Error::CorruptData(reason.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut state = raft::types::ConfState::new(
+        status
+            .conf_state_version
+            .ok_or_else(|| Error::RecoveryFailed {
+                reason: "group status has no ConfState version".to_string(),
+            })?,
+        voters,
+        learners,
+    )
+    .map_err(|error| Error::CorruptData(format!("invalid group ConfState: {error:?}")))?;
+    state.outgoing_voters = status
+        .outgoing_voters
+        .iter()
+        .map(|replica_id| {
+            replica_id
+                .to_raft()
+                .map_err(|reason| Error::CorruptData(reason.to_string()))
+        })
+        .collect::<Result<_>>()?;
+    state
+        .validate()
+        .map_err(|error| Error::CorruptData(format!("invalid group ConfState: {error:?}")))?;
+    Ok(state)
+}
+
+fn join_request_from_status(
+    cluster_id: &str,
+    descriptor: &TabletDescriptor,
+    status: &MultiRaftGroupStatus,
+    target_replica_id: ReplicaId,
+    target_node_id: NodeId,
+    require_caught_up: bool,
+) -> ragnordb_common::proto::rpc::ReplicaJoinRequest {
+    ragnordb_common::proto::rpc::ReplicaJoinRequest {
+        rpc_attempt_id: None,
+        cluster_id: cluster_id.to_string(),
+        raft_group_id: Some(status.identity.raft_group_id.to_proto()),
+        tablet_id: Some(descriptor.tablet_id.to_proto()),
+        tablet_epoch: descriptor.tablet_epoch,
+        replica_id: Some(target_replica_id.to_proto()),
+        physical_node_id: Some(target_node_id.to_proto()),
+        expected_current_conf_state_version: status.conf_state_version.unwrap_or_default(),
+        committed_membership_version: status.conf_state_version.unwrap_or_default(),
+        voters: status.voters.iter().map(ReplicaId::to_proto).collect(),
+        learners: status.learners.iter().map(ReplicaId::to_proto).collect(),
+        outgoing_voters: status
+            .outgoing_voters
+            .iter()
+            .map(ReplicaId::to_proto)
+            .collect(),
+        leader_commit_index: if require_caught_up {
+            status.commit_index
+        } else {
+            0
+        },
+        require_caught_up,
+    }
+}
+
+fn join_request_from_record(
+    record: &JoiningReplicaRecord,
+) -> ragnordb_common::proto::rpc::ReplicaJoinRequest {
+    ragnordb_common::proto::rpc::ReplicaJoinRequest {
+        rpc_attempt_id: None,
+        cluster_id: record.cluster_id.clone(),
+        raft_group_id: Some(record.raft_group_id.to_proto()),
+        tablet_id: Some(record.tablet_id.to_proto()),
+        tablet_epoch: record.tablet_epoch,
+        replica_id: Some(record.replica_id.to_proto()),
+        physical_node_id: Some(record.physical_node_id.to_proto()),
+        expected_current_conf_state_version: record.expected_current_conf_state_version,
+        committed_membership_version: record.committed_membership_witness.version,
+        voters: record
+            .committed_membership_witness
+            .voters
+            .iter()
+            .map(ReplicaId::to_proto)
+            .collect(),
+        learners: record
+            .committed_membership_witness
+            .learners
+            .iter()
+            .map(ReplicaId::to_proto)
+            .collect(),
+        outgoing_voters: record
+            .committed_membership_witness
+            .outgoing_voters
+            .iter()
+            .map(ReplicaId::to_proto)
+            .collect(),
+        leader_commit_index: 0,
+        require_caught_up: false,
+    }
+}
+
 fn metadata_tablet_bootstrap(
     cluster_id: &str,
     descriptor: &TabletDescriptor,
@@ -741,27 +1679,6 @@ fn metadata_tablet_bootstrap(
         learners,
     )
     .map_err(|source| Error::Configuration(source.to_string()))
-}
-
-/// Resolve one tablet's bootstrap without allowing a stale local file to
-/// override committed metadata placement. Membership transitions are not part
-/// of Slice 2, so any mismatch is a recovery error rather than a best-effort
-/// reconciliation.
-fn resolve_metadata_tablet_bootstrap(
-    requested: RaftGroupBootstrap,
-    durable: Option<RaftGroupBootstrap>,
-    tablet_id: TabletId,
-) -> Result<RaftGroupBootstrap> {
-    match durable {
-        Some(durable) if durable != requested => Err(Error::RecoveryFailed {
-            reason: format!(
-                "durable bootstrap for tablet {} conflicts with committed metadata placement",
-                tablet_id.0
-            ),
-        }),
-        Some(durable) => Ok(durable),
-        None => Ok(requested),
-    }
 }
 
 /// Client-side proposal boundary for metadata-owned SQL schema operations.
@@ -1355,6 +2272,35 @@ impl MultiRaftRuntime {
             }
         }
 
+        // Dynamic joiners do not have an immutable bootstrap file on the
+        // target node. Their durable membership witness is the only safe
+        // initial configuration for reconstructing any WAL written before a
+        // crash during catch-up.
+        if let Some(cluster_id) = config.cluster_id.as_deref() {
+            let joins = JoiningReplicaRegistry::open(
+                config.data_dir.join("replica-join-registry.json"),
+                cluster_id,
+            )?;
+            for record in joins.records()? {
+                let identity = RaftReplicaIdentity::new(record.raft_group_id, record.replica_id)
+                    .map_err(|source| Error::RecoveryFailed {
+                        reason: source.to_string(),
+                    })?;
+                let conf_state = record.committed_membership_witness.to_core()?;
+                if let Some(existing) = configurations.get(&identity)
+                    && existing != &conf_state
+                {
+                    return Err(Error::RecoveryFailed {
+                        reason: format!(
+                            "joining membership witness for {:?} conflicts with another recovery authority",
+                            identity
+                        ),
+                    });
+                }
+                configurations.insert(identity, conf_state);
+            }
+        }
+
         Ok(configurations)
     }
 
@@ -1370,6 +2316,10 @@ impl MultiRaftRuntime {
 
         let registry =
             LocalReplicaRegistry::open(config.data_dir.join("replica-registry.json"), &cluster_id)?;
+        let joins = JoiningReplicaRegistry::open(
+            config.data_dir.join("replica-join-registry.json"),
+            &cluster_id,
+        )?;
         registry.validate_recovered_lifetimes(recovered.replicas().map(|(identity, _)| {
             LocalReplicaKey {
                 raft_group_id: identity.raft_group_id,
@@ -1595,6 +2545,7 @@ impl MultiRaftRuntime {
             snapshot_work,
             snapshot_transport.clone(),
             registry,
+            joins,
             recovered,
             Arc::clone(&start_gate),
             tablet_handles.clone(),
@@ -1644,6 +2595,10 @@ impl MultiRaftRuntime {
 
         let worker_shutdown = Arc::clone(&shutdown);
 
+        let (join_request_tx, join_request_rx) =
+            mpsc::sync_channel(REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY);
+        let replica_join_rpc = ReplicaJoinRpcClient::new(transport.clone(), rpc_state.clone());
+
         let (tablet_rpc, rpc_worker) = spawn_dispatcher(
             rpc_inbound,
             transport.clone(),
@@ -1652,6 +2607,7 @@ impl MultiRaftRuntime {
             metadata_handle.clone(),
             metadata_request_tx,
             database.clone(),
+            join_request_tx,
             shutdown.clone(),
         );
 
@@ -1675,6 +2631,8 @@ impl MultiRaftRuntime {
                     metadata_nodes,
                     metadata_ready_tx,
                     tablet_lifecycle,
+                    join_request_rx,
+                    replica_join_rpc,
                 )
             })
             .map_err(|source| Error::Configuration(format!("spawn MultiRaft host: {source}")))?;
@@ -1803,6 +2761,8 @@ fn run_host(
     metadata_nodes: Vec<NodeDescriptor>,
     metadata_ready: mpsc::SyncSender<std::result::Result<(), String>>,
     mut tablet_lifecycle: TabletLifecycleManager,
+    join_requests: mpsc::Receiver<ReplicaJoinAdmission>,
+    replica_join_rpc: ReplicaJoinRpcClient,
 ) {
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
@@ -1818,6 +2778,33 @@ fn run_host(
     let mut startup_sender = Some(metadata_ready);
 
     while !shutdown.load(Ordering::Acquire) {
+        let mut admitted_joins = 0;
+        while admitted_joins < REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY {
+            let Ok(admission) = join_requests.try_recv() else {
+                break;
+            };
+            admitted_joins += 1;
+            let result = tablet_lifecycle.admit_replica_join(
+                &mut host,
+                &metadata,
+                admission.source_node_id,
+                &admission.request,
+                true,
+                false,
+            );
+            let response = match result {
+                Ok(()) => ReplicaJoinAdmissionResult {
+                    success: true,
+                    error_message: String::new(),
+                },
+                Err(error) => ReplicaJoinAdmissionResult {
+                    success: false,
+                    error_message: error.to_string(),
+                },
+            };
+            let _ = admission.reply.send(response);
+        }
+
         if !service_metadata_requests(
             &mut host,
             &transport,
@@ -1987,6 +2974,14 @@ fn run_host(
             );
             tracing::error!("metadata tablet lifecycle reconciliation failed");
             return;
+        }
+        if let Err(error) =
+            tablet_lifecycle.reconcile_membership(&mut host, &metadata, &replica_join_rpc)
+        {
+            tracing::warn!(error = %error, "membership reconciliation pass failed; retrying");
+        }
+        if let Err(error) = tablet_lifecycle.reconcile_retirement_records(&mut host, &metadata) {
+            tracing::warn!(error = %error, "replica retirement publication pass failed; retrying");
         }
         expire_metadata_proposals(&mut pending_metadata, &mut pending_metadata_by_request, now);
 
@@ -2412,44 +3407,6 @@ mod tests {
             bootstrap.initial_learners,
             [ReplicaId(2)].into_iter().collect()
         );
-    }
-
-    /// Realistic bug caught: a stale bootstrap file could retain the same
-    /// local replica while changing a peer, role, or configuration epoch.
-    /// Starting that file would split Raft membership under one group ID.
-    #[test]
-    fn metadata_tablet_bootstrap_rejects_durable_placement_divergence() {
-        let descriptor = TabletDescriptor {
-            tablet_id: TabletId(8),
-            table_id: TableId(9),
-            raft_group_id: RaftGroupId(10),
-            tablet_epoch: 1,
-            partition: PartitionSpec::Hash {
-                bucket: 0,
-                bucket_count: 1,
-            },
-        };
-        let requested_placement = DesiredReplicaPlacement {
-            tablet_id: descriptor.tablet_id,
-            configuration_epoch: 4,
-            placement_policy: PlacementPolicy::for_replica_count(1),
-            replicas: vec![DesiredReplica {
-                replica_id: ReplicaId(1),
-                node_id: NodeId(3),
-                role: DesiredReplicaRole::Voter,
-            }],
-        };
-        let stale_placement = DesiredReplicaPlacement {
-            configuration_epoch: 5,
-            ..requested_placement.clone()
-        };
-        let requested =
-            metadata_tablet_bootstrap("cluster-a", &descriptor, &requested_placement).unwrap();
-        let stale = metadata_tablet_bootstrap("cluster-a", &descriptor, &stale_placement).unwrap();
-
-        let error = resolve_metadata_tablet_bootstrap(requested, Some(stale), descriptor.tablet_id)
-            .expect_err("stale durable placement must fail closed");
-        assert!(matches!(error, Error::RecoveryFailed { .. }));
     }
 
     /// Realistic bug caught: a replica in the outgoing voter set is still

@@ -696,4 +696,18 @@ pub enum MetadataReconcileError {
         .0.0
     )]
     DesiredLearnerIsCommittedVoter(ReplicaId),
+
+    #[error(
+        "reconciliation observed ConfState version {observed}, expected {expected}; replan required"
+    )]
+    StaleConfState { expected: u64, observed: u64 },
+
+    #[error("reconciliation would remove the final committed voter")]
+    WouldRemoveLastVoter,
+
+    #[error("replacement voter is not fully committed in the observed ConfState")]
+    ReplacementNotCommitted,
+
+    #[error("replica {0:?} no longer matches its recorded lifetime")]
+    ReplicaLifetimeMismatch(ReplicaId),
 }

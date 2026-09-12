@@ -51,6 +51,7 @@ pub type SharedTabletHandleRegistry =
 enum PendingResponseMessage {
     Tablet(TabletCommandResponse),
     Metadata(MetadataResponse),
+    ReplicaJoin(rpc::ReplicaJoinResponse),
 }
 
 struct PendingResponse {
@@ -68,6 +69,90 @@ pub(crate) struct RpcState {
 pub(crate) struct MetadataRpcClient {
     transport: NodeRaftTransport,
     rpc_state: RpcState,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReplicaJoinRpcClient {
+    transport: NodeRaftTransport,
+    rpc_state: RpcState,
+}
+
+pub(crate) struct ReplicaJoinAdmission {
+    pub source_node_id: NodeId,
+    pub request: rpc::ReplicaJoinRequest,
+    pub reply: mpsc::Sender<ReplicaJoinAdmissionResult>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplicaJoinAdmissionResult {
+    pub success: bool,
+    pub error_message: String,
+}
+
+impl ReplicaJoinRpcClient {
+    pub(crate) fn new(transport: NodeRaftTransport, rpc_state: RpcState) -> Self {
+        Self {
+            transport,
+            rpc_state,
+        }
+    }
+
+    /// Ask the target node to durably prepare a joining lifetime. The leader
+    /// must receive a successful response before it can propose AddLearner;
+    /// otherwise Raft may emit replication traffic to an unmaterialized route.
+    pub(crate) fn prepare(
+        &self,
+        target: NodeId,
+        mut request: rpc::ReplicaJoinRequest,
+        timeout: Duration,
+    ) -> Result<()> {
+        let attempt_id = self.rpc_state.next_attempt_id()?;
+        request.rpc_attempt_id = Some(attempt_id);
+        let frame = RpcFrame {
+            msg_type: MessageType::ReplicaJoinRequest,
+            raft_group_id: ragnordb_common::ids::RaftGroupId::from_proto(
+                request
+                    .raft_group_id
+                    .ok_or_else(|| Error::Configuration("join request has no group".into()))?,
+            ),
+            payload: request.encode_to_vec(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.rpc_state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(attempt_id, PendingResponse { target, sender });
+        if let Err(error) = self.transport.try_send_rpc(target, frame) {
+            self.rpc_state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&attempt_id);
+            return Err(Error::ProposalUnavailable {
+                reason: format!("replica join request could not be queued: {error}"),
+            });
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(PendingResponseMessage::ReplicaJoin(response)) if response.success => Ok(()),
+            Ok(PendingResponseMessage::ReplicaJoin(response)) => Err(Error::ProposalUnavailable {
+                reason: response.error_message,
+            }),
+            Ok(_) => Err(Error::CorruptData(
+                "replica join waiter received an unrelated response".to_string(),
+            )),
+            Err(_) => {
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&attempt_id);
+                Err(Error::ProposalUnavailable {
+                    reason: "replica join preparation deadline elapsed".to_string(),
+                })
+            }
+        }
+    }
 }
 
 impl MetadataRpcClient {
@@ -127,6 +212,9 @@ impl MetadataRpcClient {
             Ok(PendingResponseMessage::Metadata(response)) => Ok(response),
             Ok(PendingResponseMessage::Tablet(_)) => Err(Error::CorruptData(
                 "metadata RPC waiter received a tablet response".to_string(),
+            )),
+            Ok(PendingResponseMessage::ReplicaJoin(_)) => Err(Error::CorruptData(
+                "metadata RPC waiter received a replica-join response".to_string(),
             )),
             Err(_) => {
                 self.rpc_state
@@ -1153,6 +1241,9 @@ impl TabletRpcClient {
             Ok(PendingResponseMessage::Metadata(_)) => Err(Error::CorruptData(
                 "tablet RPC waiter received a metadata response".to_string(),
             )),
+            Ok(PendingResponseMessage::ReplicaJoin(_)) => Err(Error::CorruptData(
+                "tablet RPC waiter received a replica-join response".to_string(),
+            )),
             Err(_) => {
                 self.rpc_state
                     .pending
@@ -1302,6 +1393,7 @@ pub(crate) fn spawn_dispatcher(
     metadata: MetadataRuntimeHandle,
     metadata_requests: mpsc::SyncSender<MetadataHostRequest>,
     database: SharedLocalDatabase,
+    join_requests: mpsc::SyncSender<ReplicaJoinAdmission>,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
     let client = TabletRpcClient::new(
@@ -1323,6 +1415,7 @@ pub(crate) fn spawn_dispatcher(
                     &rpc_state,
                     &database,
                     &metadata_requests,
+                    &join_requests,
                     message.source_node_id,
                     message.frame,
                 );
@@ -1332,16 +1425,67 @@ pub(crate) fn spawn_dispatcher(
     (client, worker)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_message(
     transport: &NodeRaftTransport,
     handles: &SharedTabletHandleRegistry,
     rpc_state: &RpcState,
     database: &SharedLocalDatabase,
     metadata_requests: &mpsc::SyncSender<MetadataHostRequest>,
+    join_requests: &mpsc::SyncSender<ReplicaJoinAdmission>,
     source: NodeId,
     frame: RpcFrame,
 ) {
     match frame.msg_type {
+        MessageType::ReplicaJoinRequest => {
+            let Ok(request) = rpc::ReplicaJoinRequest::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let Some(attempt_id) = request.rpc_attempt_id else {
+                return;
+            };
+            let (reply, response) = mpsc::channel();
+            if join_requests
+                .try_send(ReplicaJoinAdmission {
+                    source_node_id: source,
+                    request,
+                    reply,
+                })
+                .is_err()
+            {
+                send_replica_join_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    false,
+                    "replica join lifecycle owner is unavailable".to_string(),
+                );
+                return;
+            }
+            // The lifecycle owner may wait on WAL/database ownership and must
+            // not block this dispatcher: doing so would let one slow join
+            // starve unrelated tablet and metadata RPCs. The admission queue
+            // is bounded; a full queue is rejected synchronously above.
+            let transport = transport.clone();
+            let group_id = frame.raft_group_id;
+            thread::spawn(move || {
+                let result = response.recv_timeout(Duration::from_secs(30)).unwrap_or(
+                    ReplicaJoinAdmissionResult {
+                        success: false,
+                        error_message: "replica join admission deadline elapsed".to_string(),
+                    },
+                );
+                send_replica_join_response(
+                    &transport,
+                    source,
+                    group_id,
+                    attempt_id,
+                    result.success,
+                    result.error_message,
+                );
+            });
+        }
         MessageType::TabletCommandRequest => {
             let Ok(proto) = rpc::TabletCommandRequest::decode(frame.payload.as_slice()) else {
                 return;
@@ -1692,6 +1836,33 @@ fn dispatch_message(
                     .send(PendingResponseMessage::Metadata(response));
             }
         }
+        MessageType::ReplicaJoinResponse => {
+            let Ok(response) = rpc::ReplicaJoinResponse::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let Some(attempt_id) = response.rpc_attempt_id else {
+                return;
+            };
+            let pending_response = rpc_state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&attempt_id)
+                .is_some_and(|pending| pending.target == source)
+                .then(|| {
+                    rpc_state
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&attempt_id)
+                })
+                .flatten();
+            if let Some(pending_response) = pending_response {
+                let _ = pending_response
+                    .sender
+                    .send(PendingResponseMessage::ReplicaJoin(response));
+            }
+        }
         MessageType::RaftConsensus => {}
     }
 }
@@ -1836,10 +2007,40 @@ fn attach_rpc_attempt_id(
             }
             Ok(proto.encode_to_vec())
         }
+        MessageType::ReplicaJoinRequest => {
+            let mut proto = rpc::ReplicaJoinRequest::decode(payload).map_err(|error| {
+                Error::InvalidArgument(format!("invalid replica join request: {error}"))
+            })?;
+            proto.rpc_attempt_id = Some(attempt_id);
+            Ok(proto.encode_to_vec())
+        }
         _ => Err(Error::InvalidArgument(
             "RPC attempts are only valid for request messages".to_string(),
         )),
     }
+}
+
+fn send_replica_join_response(
+    transport: &NodeRaftTransport,
+    target: NodeId,
+    group_id: RaftGroupId,
+    attempt_id: u64,
+    success: bool,
+    error_message: String,
+) {
+    let response = rpc::ReplicaJoinResponse {
+        rpc_attempt_id: Some(attempt_id),
+        success,
+        error_message,
+    };
+    let _ = transport.try_send_rpc(
+        target,
+        RpcFrame {
+            msg_type: MessageType::ReplicaJoinResponse,
+            raft_group_id: group_id,
+            payload: response.encode_to_vec(),
+        },
+    );
 }
 
 fn send_response(

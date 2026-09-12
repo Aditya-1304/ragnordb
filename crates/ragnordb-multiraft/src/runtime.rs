@@ -321,6 +321,7 @@ impl RaftSnapshotStore for FileRaftSnapshotStore {
             last_included_term: snapshot.last_included_term,
             applied_index: snapshot.last_included_index,
             conf_state: snapshot.conf_state.clone(),
+            last_removed_replica: snapshot.last_removed_replica,
             size_bytes: snapshot.size_bytes,
             checksum: snapshot.checksum,
             file_name: Self::file_name(identity, snapshot.snapshot_id),
@@ -413,6 +414,7 @@ impl RaftSnapshotStore for FileRaftSnapshotStore {
             last_included_index: pointer.last_included_index,
             last_included_term: pointer.last_included_term,
             conf_state: pointer.conf_state.clone(),
+            last_removed_replica: pointer.last_removed_replica,
             size_bytes: pointer.size_bytes,
             checksum: pointer.checksum,
             data,
@@ -1429,6 +1431,7 @@ fn validate_snapshot_pointer(
         last_included_index: pointer.last_included_index,
         last_included_term: pointer.last_included_term,
         conf_state: pointer.conf_state.clone(),
+        last_removed_replica: pointer.last_removed_replica,
         size_bytes: pointer.size_bytes,
         checksum: pointer.checksum,
     };

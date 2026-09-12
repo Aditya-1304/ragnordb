@@ -255,6 +255,74 @@ fn unregister_group_removes_all_replica_routes() {
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
+#[test]
+fn dynamic_routes_are_group_scoped_and_conflicts_are_rejected() {
+    let node_2_addr = unused_address();
+    let node_3_addr = unused_address();
+    let endpoint = NodeRaftTransport::bind(
+        NodeId(1),
+        unused_address(),
+        BTreeMap::from([(NodeId(2), node_2_addr), (NodeId(3), node_3_addr)]),
+    )
+    .unwrap();
+
+    endpoint
+        .transport
+        .register_dynamic_route(RaftGroupId(41), ReplicaId(7), NodeId(2))
+        .unwrap();
+    endpoint
+        .transport
+        .register_dynamic_route(RaftGroupId(42), ReplicaId(7), NodeId(3))
+        .unwrap();
+    endpoint
+        .transport
+        .register_dynamic_route(RaftGroupId(41), ReplicaId(7), NodeId(2))
+        .unwrap();
+
+    let conflict = endpoint
+        .transport
+        .register_dynamic_route(RaftGroupId(41), ReplicaId(7), NodeId(3))
+        .unwrap_err();
+    assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
+    let unconfigured = endpoint
+        .transport
+        .register_dynamic_route(RaftGroupId(43), ReplicaId(7), NodeId(99))
+        .unwrap_err();
+    assert_eq!(unconfigured.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        endpoint
+            .transport
+            .target_node(RaftGroupId(41), ReplicaId(7))
+            .unwrap(),
+        NodeId(2)
+    );
+    assert_eq!(
+        endpoint
+            .transport
+            .target_node(RaftGroupId(42), ReplicaId(7))
+            .unwrap(),
+        NodeId(3)
+    );
+
+    endpoint
+        .transport
+        .unregister_dynamic_route(RaftGroupId(41), ReplicaId(7), NodeId(2))
+        .unwrap();
+    assert!(
+        endpoint
+            .transport
+            .target_node(RaftGroupId(41), ReplicaId(7))
+            .is_err()
+    );
+    assert_eq!(
+        endpoint
+            .transport
+            .target_node(RaftGroupId(42), ReplicaId(7))
+            .unwrap(),
+        NodeId(3)
+    );
+}
+
 /// Realistic bug caught: the physical listener must demultiplex gateway RPC
 /// traffic without feeding it to the Raft scheduler, while retaining the
 /// authenticated source node identity for authorization and diagnostics.

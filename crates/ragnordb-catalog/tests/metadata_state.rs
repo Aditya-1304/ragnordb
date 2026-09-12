@@ -795,6 +795,78 @@ fn desired_placement_can_revert_before_replica_removal_is_committed() {
 }
 
 #[test]
+fn replica_retirement_requires_the_second_proof_and_is_idempotent() {
+    let mut state = bootstrap_state();
+
+    state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+        DesiredReplicaPlacement {
+            tablet_id: TabletId(17),
+            configuration_epoch: 1,
+            placement_policy: PlacementPolicy::for_replica_count(1),
+            replicas: vec![DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(11),
+                role: DesiredReplicaRole::Voter,
+            }],
+        },
+    ));
+
+    let replacement = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 2,
+        placement_policy: PlacementPolicy::for_replica_count(1),
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(32),
+            node_id: NodeId(12),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(replacement)),
+        MetadataApplyOutcome::Applied
+    );
+
+    let retirement = MetadataCommand::RecordReplicaRetirement {
+        raft_group_id: RaftGroupId(23),
+        replica_id: ReplicaId(31),
+        desired_configuration_epoch: 2,
+        removed_conf_state_version: 3,
+        removal_index: 41,
+        removal_term: 7,
+    };
+
+    assert_eq!(
+        state.apply(retirement.clone()),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        state.apply(retirement),
+        MetadataApplyOutcome::AlreadyApplied
+    );
+    assert!(state.is_replica_retired(RaftGroupId(23), ReplicaId(31)));
+    assert_eq!(
+        state
+            .retired_replica(RaftGroupId(23), ReplicaId(31))
+            .unwrap()
+            .removal_index,
+        41
+    );
+
+    let conflict = MetadataCommand::RecordReplicaRetirement {
+        raft_group_id: RaftGroupId(23),
+        replica_id: ReplicaId(31),
+        desired_configuration_epoch: 2,
+        removed_conf_state_version: 4,
+        removal_index: 42,
+        removal_term: 8,
+    };
+    assert!(matches!(
+        state.apply(conflict),
+        MetadataApplyOutcome::Rejected(MetadataRejection::RetirementProofConflict { .. })
+    ));
+}
+
+#[test]
 fn draining_node_cannot_be_retained_as_a_preferred_leader() {
     let mut state = bootstrap_state();
     let mut draining = node(11, 7001);

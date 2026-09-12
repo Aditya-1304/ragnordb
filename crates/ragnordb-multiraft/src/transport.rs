@@ -837,45 +837,129 @@ impl NodeRaftTransport {
     /// Register the durable replica-to-node mapping for one Raft group.
     ///
     /// Exact replay is harmless. Conflicting routing authority is rejected;
-    /// Slice 3 removes mappings only after the local lifecycle tombstone is
+    /// lifecycle cleanup removes mappings only after the local tombstone is
     /// durable.
     pub fn register_group(&self, bootstrap: &RaftGroupBootstrap) -> io::Result<GroupRaftTransport> {
         bootstrap
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
 
-        let mut routes = self
-            .routes
-            .write()
-            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?;
-
         for (replica_id, node_id) in &bootstrap.replica_to_node {
-            let key = (bootstrap.raft_group_id, *replica_id);
-
-            match routes.get(&key) {
-                Some(existing) if existing != node_id => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "conflicting route for Raft group {} replica {}: \
-                             node {} vs node {}",
-                            bootstrap.raft_group_id.0, replica_id.0, existing.0, node_id.0,
-                        ),
-                    ));
-                }
-
-                Some(_) => {}
-
-                None => {
-                    routes.insert(key, *node_id);
-                }
-            }
+            self.register_route(bootstrap.raft_group_id, *replica_id, *node_id, false)?;
         }
 
         Ok(GroupRaftTransport {
             raft_group_id: bootstrap.raft_group_id,
             transport: self.clone(),
         })
+    }
+
+    /// Register only the route for a post-bootstrap replica lifetime and
+    /// return its group-scoped transport view. The immutable bootstrap remains
+    /// untouched because it is historical recovery authority, not live
+    /// placement state.
+    pub fn register_dynamic_group(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        node_id: NodeId,
+    ) -> io::Result<GroupRaftTransport> {
+        self.register_dynamic_route(raft_group_id, replica_id, node_id)?;
+        Ok(GroupRaftTransport {
+            raft_group_id,
+            transport: self.clone(),
+        })
+    }
+
+    /// Register one post-bootstrap replica route.
+    ///
+    /// The physical node must already be present in the configured node
+    /// directory, which is the Phase 5.10 boundary for physical discovery.
+    /// The `(group, replica)` key is the lifetime identity; a conflicting
+    /// owner is never silently overwritten.
+    pub fn register_dynamic_route(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        node_id: NodeId,
+    ) -> io::Result<()> {
+        self.register_route(raft_group_id, replica_id, node_id, true)
+    }
+
+    fn register_route(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        node_id: NodeId,
+        require_configured_node: bool,
+    ) -> io::Result<()> {
+        if raft_group_id.0 == 0 || replica_id.0 == 0 || node_id.0 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dynamic Raft routes require non-zero group, replica, and node IDs",
+            ));
+        }
+        if require_configured_node
+            && node_id != self.local_node_id
+            && !self.node_addresses.contains_key(&node_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "dynamic Raft route targets physical node {} without a configured address",
+                    node_id.0
+                ),
+            ));
+        }
+
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?;
+        let key = (raft_group_id, replica_id);
+        match routes.get(&key) {
+            Some(existing) if *existing != node_id => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "conflicting route for Raft group {} replica {}: node {} vs node {}",
+                    raft_group_id.0, replica_id.0, existing.0, node_id.0
+                ),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                routes.insert(key, node_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove one exact dynamic route after its local lifecycle tombstone is
+    /// durable. Repeated removal is safe and does not affect another group
+    /// that happens to use the same replica number.
+    pub fn unregister_dynamic_route(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        expected_node_id: NodeId,
+    ) -> io::Result<()> {
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?;
+        let key = (raft_group_id, replica_id);
+        if let Some(existing) = routes.get(&key) {
+            if *existing != expected_node_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "route for Raft group {} replica {} belongs to node {}, not {}",
+                        raft_group_id.0, replica_id.0, existing.0, expected_node_id.0
+                    ),
+                ));
+            }
+            routes.remove(&key);
+        }
+        Ok(())
     }
 
     /// Remove every route owned by one durable group bootstrap.

@@ -205,6 +205,18 @@ impl NodeSnapshotTransport {
         })
     }
 
+    /// Register a dynamically joined local replica. Snapshot routing is
+    /// group-qualified and the local replica identity is checked on every
+    /// receive, so a new lifetime cannot inherit another group's route.
+    pub fn register_dynamic_group(
+        &self,
+        raft_group_id: RaftGroupId,
+        local_replica_id: ReplicaId,
+        store: Arc<FileTabletSnapshotStore>,
+    ) -> io::Result<GroupSnapshotEndpoint> {
+        self.register_group(raft_group_id, local_replica_id, store)
+    }
+
     /// Remove the local receive route for one exact replica lifetime.
     ///
     /// Route removal closes the admission path for new snapshot transfers;

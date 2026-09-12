@@ -24,7 +24,7 @@ use raft::{
     entry::EntryPayload,
     message::{Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{ConfChange, HardState, LogIndex, SnapshotMetadata},
+    types::{ConfChange, ConfState, HardState, LogIndex, SnapshotMetadata},
 };
 
 use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog};
@@ -51,7 +51,10 @@ use ragnordb_multiraft::{
         MultiRaftTurnBudget, RaftMessageEnvelope, classify_ready_error,
     },
     proposal::{ProposalCompletion, ProposalRegistry, ProposalTicket},
-    replica_startup::{bootstrap_tablet_replica, recover_tablet_replica},
+    replica_startup::{
+        bootstrap_joining_tablet_replica, bootstrap_tablet_replica, recover_joining_tablet_replica,
+        recover_tablet_replica,
+    },
     runtime::{AppliedRaftFrontier, RaftReadyLoop, ReadyLoopError},
     snapshot::{
         PreparedIncomingTabletSnapshotInstall, SnapshotWorkController, SnapshotWorkError,
@@ -165,6 +168,11 @@ pub struct ReplicatedTabletStatus {
     pub outgoing_voters: Vec<u64>,
     pub replica_match_indices: Vec<(u64, u64)>,
     pub pending_conf_change_index: Option<u64>,
+    pub last_conf_change: Option<(u64, u64)>,
+    pub last_removed_replica: Option<(u64, u64, u64, u64)>,
+    /// True while an incoming or locally generated snapshot still owns a
+    /// persistence boundary. Promotion must wait for this to clear.
+    pub snapshot_install_pending: bool,
 }
 
 enum HostRequest {
@@ -508,6 +516,10 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
                 .map(|(replica_id, index)| (ReplicaId(replica_id), index))
                 .collect(),
             pending_conf_change_index: status.pending_conf_change_index,
+            last_conf_change: status.last_conf_change,
+            last_removed_replica: status.last_removed_replica.map(
+                |(replica_id, index, term, version)| (ReplicaId(replica_id), index, term, version),
+            ),
         }
     }
 
@@ -1267,6 +1279,156 @@ impl ReplicatedTabletRuntime {
 
     pub fn handle(&self) -> Arc<ReplicatedTabletHandle> {
         self.handle.clone()
+    }
+
+    /// Start a post-bootstrap replica from a committed membership witness.
+    ///
+    /// This path never opens or rewrites `RaftGroupBootstrap`: the witness is
+    /// lifecycle authority for this new replica only. A fresh target starts in
+    /// passive joining mode; a target with recovered WAL selects joining or
+    /// ordinary restart from its recovered committed ConfState.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_hosted_joining_tablet_from_shared_recovery(
+        config: &NodeConfig,
+        wal: LocalWal,
+        database: SharedLocalDatabase,
+        local_replica_id: ReplicaId,
+        witness: ConfState,
+        target: TabletSnapshotInstallTarget,
+        group_wal: NodeRaftWalHandle<LocalWal>,
+        transport: GroupRaftTransport,
+        snapshot_store: Arc<FileTabletSnapshotStore>,
+        snapshot_work: SnapshotWorkController,
+        snapshot_endpoint: GroupSnapshotEndpoint,
+        recovered: &RecoveredRaftStorage,
+        start_gate: Arc<AtomicBool>,
+        provided_durability_gate: Option<DurabilityGate>,
+    ) -> Result<Self> {
+        let cluster_id = config.cluster_id.clone().ok_or_else(|| {
+            Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
+        })?;
+        if target.cluster_id != cluster_id {
+            return Err(Error::RecoveryFailed {
+                reason: "dynamic tablet target belongs to another cluster".to_string(),
+            });
+        }
+        witness.validate().map_err(|error| Error::RecoveryFailed {
+            reason: format!("invalid dynamic membership witness: {error:?}"),
+        })?;
+        let identity = RaftReplicaIdentity::new(target.raft_group_id, local_replica_id)
+            .map_err(|source| Error::Configuration(source.to_string()))?;
+        if witness.contains(
+            local_replica_id
+                .to_raft()
+                .map_err(|reason| Error::Configuration(reason.to_string()))?,
+        ) {
+            return Err(Error::RecoveryFailed {
+                reason: format!(
+                    "joining witness already contains local replica {}",
+                    local_replica_id.0
+                ),
+            });
+        }
+
+        let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (host_control_tx, host_control_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let snapshot_policy = SnapshotPolicy {
+            interval_entries: config.snapshot_interval_entries,
+            interval_bytes: config.snapshot_interval_bytes,
+            min_elapsed: Duration::from_millis(config.snapshot_min_elapsed_ms),
+            applied_bytes: Arc::new(AtomicU64::new(0)),
+        };
+        let handle = Arc::new(ReplicatedTabletHandle {
+            requests: request_tx,
+            status: status.clone(),
+        });
+        let durability_gate = match provided_durability_gate {
+            Some(gate) => gate,
+            None => database
+                .try_lock()
+                .map_err(|_| Error::Configuration("database is busy during tablet startup".into()))?
+                .durability_gate(),
+        };
+        let catalog_cache: Arc<dyn CatalogCacheWriter> = Arc::new(FencedCatalogCache {
+            adapter: RagnorDbWalAdapter::new(wal.clone()),
+            durability_gate,
+        });
+        let worker_shutdown = shutdown.clone();
+        let runtime_identity = TabletRuntimeIdentity::with_sql_mirror(target, false);
+        let worker = if let Some(recovered_replica) = recovered.replica(identity) {
+            let recovered = recover_joining_tablet_replica(
+                local_replica_id,
+                group_wal,
+                wal.durable_lsn(),
+                recovered_replica,
+                &snapshot_store,
+                &runtime_identity.target,
+                ELECTION_TIMEOUT_TICKS,
+                HEARTBEAT_INTERVAL_TICKS,
+            )
+            .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?;
+            spawn_ready_owner(
+                recovered.ready_loop,
+                recovered.tablet,
+                None,
+                transport,
+                host_control_rx,
+                request_rx,
+                database,
+                status,
+                worker_shutdown,
+                start_gate,
+                snapshot_store,
+                snapshot_work,
+                snapshot_endpoint,
+                cluster_id,
+                runtime_identity,
+                catalog_cache,
+                snapshot_policy,
+            )
+        } else {
+            let bootstrapped = bootstrap_joining_tablet_replica(
+                local_replica_id,
+                witness,
+                group_wal,
+                &runtime_identity.target,
+                ELECTION_TIMEOUT_TICKS,
+                HEARTBEAT_INTERVAL_TICKS,
+            )
+            .map_err(|source| Error::RecoveryFailed {
+                reason: source.to_string(),
+            })?;
+            spawn_ready_owner(
+                bootstrapped.ready_loop,
+                bootstrapped.tablet,
+                bootstrapped.initial_ready,
+                transport,
+                host_control_rx,
+                request_rx,
+                database,
+                status,
+                worker_shutdown,
+                start_gate,
+                snapshot_store,
+                snapshot_work,
+                snapshot_endpoint,
+                cluster_id,
+                runtime_identity,
+                catalog_cache,
+                snapshot_policy,
+            )
+        };
+        Ok(Self {
+            handle,
+            identity,
+            host_control: host_control_tx,
+            shutdown,
+            worker: Some(worker),
+        })
     }
 }
 
@@ -2364,6 +2526,7 @@ where
                     )
                 })
                 .unwrap_or((0, 0)),
+            pending_snapshot_install.is_some() || pending_local_snapshot.is_some(),
             &status,
         );
         thread::sleep(Duration::from_millis(2));
@@ -3956,6 +4119,7 @@ fn publish_status<W, LS, SS>(
     ready_loop: &RaftReadyLoop<W, LS, SS>,
     serving_leader: bool,
     snapshot: (u64, u64),
+    snapshot_install_pending: bool,
     status: &RwLock<ReplicatedTabletStatus>,
 ) where
     W: RaftWal,
@@ -4017,6 +4181,12 @@ fn publish_status<W, LS, SS>(
         .map(|(replica_id, index)| (replica_id.get(), index))
         .collect();
     published.pending_conf_change_index = ready_loop.raft().pending_conf_change_index();
+    published.last_conf_change = ready_loop.raft().last_applied_conf_change();
+    published.last_removed_replica = ready_loop
+        .raft()
+        .last_removed_replica()
+        .map(|(replica_id, index, term, version)| (replica_id.get(), index, term, version));
+    published.snapshot_install_pending = snapshot_install_pending;
     let local_replica = ready_loop.raft().id();
     published.replica_in_conf_state = ready_loop
         .raft()

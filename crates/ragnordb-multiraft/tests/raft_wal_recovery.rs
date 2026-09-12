@@ -49,6 +49,7 @@ fn snapshot_pointer(
         last_included_term: term,
         applied_index: 10,
         conf_state,
+        last_removed_replica: None,
         size_bytes: 4096,
         checksum,
         file_name: "raft-80-181-10.snapshot".to_owned(),

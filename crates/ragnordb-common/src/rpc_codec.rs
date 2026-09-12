@@ -40,6 +40,8 @@ pub enum MessageType {
     TabletReadRequest,
     TabletOutcomeQueryRequest,
     TabletScanRequest,
+    ReplicaJoinRequest,
+    ReplicaJoinResponse,
 }
 
 impl MessageType {
@@ -57,6 +59,8 @@ impl MessageType {
             Self::TabletReadRequest => 0x06,
             Self::TabletOutcomeQueryRequest => 0x07,
             Self::TabletScanRequest => 0x08,
+            Self::ReplicaJoinRequest => 0x09,
+            Self::ReplicaJoinResponse => 0x0A,
         }
     }
 
@@ -70,6 +74,8 @@ impl MessageType {
             0x06 => Ok(Self::TabletReadRequest),
             0x07 => Ok(Self::TabletOutcomeQueryRequest),
             0x08 => Ok(Self::TabletScanRequest),
+            0x09 => Ok(Self::ReplicaJoinRequest),
+            0x0A => Ok(Self::ReplicaJoinResponse),
             _ => Err("unknown RPC message type"),
         }
     }
@@ -84,6 +90,8 @@ impl MessageType {
             MessageType::TabletReadRequest => rpc::MessageType::TabletReadRequest,
             MessageType::TabletOutcomeQueryRequest => rpc::MessageType::TabletOutcomeQueryRequest,
             MessageType::TabletScanRequest => rpc::MessageType::TabletScanRequest,
+            MessageType::ReplicaJoinRequest => rpc::MessageType::ReplicaJoinRequest,
+            MessageType::ReplicaJoinResponse => rpc::MessageType::ReplicaJoinResponse,
         }
     }
 
@@ -99,6 +107,8 @@ impl MessageType {
                 Ok(MessageType::TabletOutcomeQueryRequest)
             }
             rpc::MessageType::TabletScanRequest => Ok(MessageType::TabletScanRequest),
+            rpc::MessageType::ReplicaJoinRequest => Ok(MessageType::ReplicaJoinRequest),
+            rpc::MessageType::ReplicaJoinResponse => Ok(MessageType::ReplicaJoinResponse),
             rpc::MessageType::Unspecified => Err("unspecified message type"),
         }
     }

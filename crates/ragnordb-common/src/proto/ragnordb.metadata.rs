@@ -24,7 +24,10 @@ pub struct MetadataCommand {
     /// epoch across reconnects.
     #[prost(message, optional, tag = "13")]
     pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
-    #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8, 11, 12")]
+    #[prost(
+        oneof = "metadata_command::Command",
+        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14"
+    )]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
 /// Nested message and enum types in `MetadataCommand`.
@@ -54,6 +57,9 @@ pub mod metadata_command {
         RegisterClient(super::RegisterClient),
         #[prost(message, tag = "12")]
         RenewClient(super::RenewClient),
+        /// Independent metadata proof that a committed Raft removal completed.
+        #[prost(message, tag = "14")]
+        RecordReplicaRetirement(super::RecordReplicaRetirement),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -247,6 +253,29 @@ pub struct RetiredReplicaLifetime {
     pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
     #[prost(message, optional, tag = "2")]
     pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "3")]
+    pub desired_configuration_epoch: u64,
+    #[prost(uint64, tag = "4")]
+    pub removed_conf_state_version: u64,
+    #[prost(uint64, tag = "5")]
+    pub removal_index: u64,
+    #[prost(uint64, tag = "6")]
+    pub removal_term: u64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RecordReplicaRetirement {
+    #[prost(message, optional, tag = "1")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "2")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(uint64, tag = "3")]
+    pub desired_configuration_epoch: u64,
+    #[prost(uint64, tag = "4")]
+    pub removed_conf_state_version: u64,
+    #[prost(uint64, tag = "5")]
+    pub removal_index: u64,
+    #[prost(uint64, tag = "6")]
+    pub removal_term: u64,
 }
 /// Monotonic identity high-water marks owned by metadata.
 ///

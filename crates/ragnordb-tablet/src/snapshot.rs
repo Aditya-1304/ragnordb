@@ -88,6 +88,30 @@ pub fn generate_local_snapshot(
     conf_state: TabletSnapshotConfState,
     applied_frontier: AppliedTabletFrontier,
 ) -> Result<TabletSnapshotImage, TabletSnapshotGenerationError> {
+    generate_local_snapshot_with_removal_proof(
+        state_machine,
+        cluster_id,
+        replica_id,
+        snapshot_id,
+        conf_state,
+        applied_frontier,
+        None,
+    )
+}
+
+/// Generate a tablet snapshot while retaining the exact latest committed
+/// replica-removal proof needed after the corresponding log entry is
+/// compacted. The proof is metadata, not tablet payload, so it is transferred
+/// and checksummed with the immutable snapshot envelope.
+pub fn generate_local_snapshot_with_removal_proof(
+    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    cluster_id: impl Into<String>,
+    replica_id: ReplicaId,
+    snapshot_id: u64,
+    conf_state: TabletSnapshotConfState,
+    applied_frontier: AppliedTabletFrontier,
+    last_removed_replica: Option<(ReplicaId, u64, u64, u64)>,
+) -> Result<TabletSnapshotImage, TabletSnapshotGenerationError> {
     if applied_frontier.index == 0 {
         return Err(TabletSnapshotGenerationError::ZeroAppliedIndex);
     }
@@ -116,7 +140,7 @@ pub fn generate_local_snapshot(
     }
     .encode_to_vec();
 
-    let metadata = TabletSnapshotMetadata::for_payload(
+    let mut metadata = TabletSnapshotMetadata::for_payload(
         TabletSnapshotMetadataInput {
             cluster_id: cluster_id.into(),
             raft_group_id: state_machine.raft_group_id(),
@@ -129,6 +153,8 @@ pub fn generate_local_snapshot(
         },
         &payload,
     )?;
+    metadata.last_removed_replica = last_removed_replica;
+    metadata.validate()?;
 
     TabletSnapshotImage::new(metadata, payload).map_err(TabletSnapshotGenerationError::Metadata)
 }
@@ -277,6 +303,21 @@ fn decode_replica_set(
     Ok(decoded)
 }
 
+fn decode_optional_removal_proof(
+    replica_id: u64,
+    index: u64,
+    term: u64,
+    version: u64,
+) -> Result<Option<(ReplicaId, u64, u64, u64)>, TabletSnapshotMetadataError> {
+    if replica_id == 0 && index == 0 && term == 0 && version == 0 {
+        return Ok(None);
+    }
+    if replica_id == 0 || index == 0 || term == 0 || version == 0 {
+        return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+    }
+    Ok(Some((ReplicaId(replica_id), index, term, version)))
+}
+
 /// Versioned database-specific metadata for an immutable tablet snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletSnapshotMetadata {
@@ -293,6 +334,7 @@ pub struct TabletSnapshotMetadata {
     pub storage_format_version: u32,
     pub total_length: u64,
     pub checksum: [u8; 32],
+    pub last_removed_replica: Option<(ReplicaId, u64, u64, u64)>,
 }
 
 impl TabletSnapshotMetadata {
@@ -329,6 +371,7 @@ impl TabletSnapshotMetadata {
             storage_format_version: TABLET_SNAPSHOT_STORAGE_FORMAT_VERSION,
             total_length,
             checksum: *blake3::hash(payload).as_bytes(),
+            last_removed_replica: None,
         };
 
         metadata.validate()?;
@@ -384,6 +427,24 @@ impl TabletSnapshotMetadata {
 
         if self.total_length == 0 {
             return Err(TabletSnapshotMetadataError::ZeroTotalLength);
+        }
+
+        if let Some((replica_id, index, term, version)) = self.last_removed_replica {
+            if replica_id.0 == 0
+                || index == 0
+                || index > self.last_included_index
+                || term == 0
+                || version == 0
+                || version > self.conf_state.configuration_version
+            {
+                return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+            }
+            if self.conf_state.voters.contains(&replica_id)
+                || self.conf_state.learners.contains(&replica_id)
+                || self.conf_state.outgoing_voters.contains(&replica_id)
+            {
+                return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+            }
         }
 
         self.conf_state.validate()
@@ -456,6 +517,12 @@ impl TabletSnapshotMetadata {
             storage_format_version: proto.storage_format_version,
             total_length: proto.total_length,
             checksum,
+            last_removed_replica: decode_optional_removal_proof(
+                proto.last_removed_replica_id,
+                proto.last_removed_replica_index,
+                proto.last_removed_replica_term,
+                proto.last_removed_conf_state_version,
+            )?,
         };
 
         metadata.validate()?;
@@ -495,6 +562,16 @@ impl TabletSnapshotMetadata {
             storage_format_version: self.storage_format_version,
             total_length: self.total_length,
             checksum: self.checksum.to_vec(),
+            last_removed_replica_id: self
+                .last_removed_replica
+                .map(|proof| proof.0.0)
+                .unwrap_or(0),
+            last_removed_replica_index: self.last_removed_replica.map(|proof| proof.1).unwrap_or(0),
+            last_removed_replica_term: self.last_removed_replica.map(|proof| proof.2).unwrap_or(0),
+            last_removed_conf_state_version: self
+                .last_removed_replica
+                .map(|proof| proof.3)
+                .unwrap_or(0),
         }
     }
 }
@@ -1054,6 +1131,9 @@ pub enum TabletSnapshotMetadataError {
 
     #[error("tablet snapshot payload length is zero")]
     ZeroTotalLength,
+
+    #[error("tablet snapshot contains an invalid replica-removal proof")]
+    InvalidRemovalProof,
 
     #[error("tablet snapshot payload length overflows u64")]
     PayloadLengthOverflow,

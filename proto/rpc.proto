@@ -15,6 +15,8 @@ enum MessageType {
     MESSAGE_TYPE_TABLET_READ_REQUEST = 6;
     MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST = 7;
     MESSAGE_TYPE_TABLET_SCAN_REQUEST = 8;
+    MESSAGE_TYPE_REPLICA_JOIN_REQUEST = 9;
+    MESSAGE_TYPE_REPLICA_JOIN_RESPONSE = 10;
 }
 
 message RpcFrame {
@@ -149,6 +151,34 @@ message MetadataProposalResponse {
     string error_message = 5;
     bytes outcome = 6;
     uint64 leader_replica_id = 7;
+}
+
+// Control-plane admission for a post-bootstrap replica lifetime. The target
+// persists this witness before registering its Raft and snapshot routes.
+message ReplicaJoinRequest {
+    optional uint64 rpc_attempt_id = 1;
+    string cluster_id = 2;
+    ragnordb.ids.RaftGroupId raft_group_id = 3;
+    ragnordb.ids.TabletId tablet_id = 4;
+    uint64 tablet_epoch = 5;
+    ragnordb.ids.ReplicaId replica_id = 6;
+    ragnordb.ids.NodeId physical_node_id = 7;
+    uint64 expected_current_conf_state_version = 8;
+    uint64 committed_membership_version = 9;
+    repeated ragnordb.ids.ReplicaId voters = 10;
+    repeated ragnordb.ids.ReplicaId learners = 11;
+    repeated ragnordb.ids.ReplicaId outgoing_voters = 12;
+    // Non-zero only for a promotion-readiness probe. The target must have
+    // crossed this leader's committed frontier locally before it replies
+    // success; zero is the route/materialization probe used before AddLearner.
+    uint64 leader_commit_index = 13;
+    bool require_caught_up = 14;
+}
+
+message ReplicaJoinResponse {
+    optional uint64 rpc_attempt_id = 1;
+    bool success = 2;
+    string error_message = 3;
 }
 
 message MetadataProposalOutcome {

@@ -86,6 +86,18 @@ pub enum MetadataCommand {
 
     SetDesiredReplicaPlacement(DesiredReplicaPlacement),
 
+    /// Durable metadata proof that a Raft replica lifetime was removed from
+    /// its group. This never replaces the Raft configuration entry; it is the
+    /// second independent proof required before local destruction.
+    RecordReplicaRetirement {
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        desired_configuration_epoch: u64,
+        removed_conf_state_version: u64,
+        removal_index: u64,
+        removal_term: u64,
+    },
+
     UpdateTableSchema {
         expected_schema_version: u64,
         table: TableDefinition,
@@ -455,6 +467,10 @@ pub struct DesiredReplicaPlacement {
 pub struct RetiredReplicaLifetime {
     pub raft_group_id: RaftGroupId,
     pub replica_id: ReplicaId,
+    pub desired_configuration_epoch: u64,
+    pub removed_conf_state_version: u64,
+    pub removal_index: u64,
+    pub removal_term: u64,
 }
 
 /// Canonical state-machine snapshot.
@@ -591,6 +607,22 @@ impl MetadataCommand {
 
             Self::SetDesiredReplicaPlacement(placement) => placement.validate(),
 
+            Self::RecordReplicaRetirement {
+                raft_group_id,
+                replica_id,
+                desired_configuration_epoch,
+                removed_conf_state_version,
+                removal_index,
+                removal_term,
+            } => validate_replica_retirement(
+                *raft_group_id,
+                *replica_id,
+                *desired_configuration_epoch,
+                *removed_conf_state_version,
+                *removal_index,
+                *removal_term,
+            ),
+
             Self::UpdateTableSchema {
                 expected_schema_version,
                 table,
@@ -649,6 +681,22 @@ impl MetadataCommand {
             Self::SetDesiredReplicaPlacement(placement) => {
                 Command::SetDesiredReplicaPlacement(placement.to_proto())
             }
+
+            Self::RecordReplicaRetirement {
+                raft_group_id,
+                replica_id,
+                desired_configuration_epoch,
+                removed_conf_state_version,
+                removal_index,
+                removal_term,
+            } => Command::RecordReplicaRetirement(metadata::RecordReplicaRetirement {
+                raft_group_id: Some(raft_group_id.to_proto()),
+                replica_id: Some(replica_id.to_proto()),
+                desired_configuration_epoch: *desired_configuration_epoch,
+                removed_conf_state_version: *removed_conf_state_version,
+                removal_index: *removal_index,
+                removal_term: *removal_term,
+            }),
 
             Self::UpdateTableSchema {
                 expected_schema_version,
@@ -719,6 +767,21 @@ impl MetadataCommand {
             Some(Command::SetDesiredReplicaPlacement(command)) => {
                 Self::SetDesiredReplicaPlacement(DesiredReplicaPlacement::from_proto(command)?)
             }
+
+            Some(Command::RecordReplicaRetirement(command)) => Self::RecordReplicaRetirement {
+                raft_group_id: RaftGroupId::from_proto(command.raft_group_id.ok_or(
+                    MetadataCommandCodecError::MissingField(
+                        "record_replica_retirement.raft_group_id",
+                    ),
+                )?),
+                replica_id: ReplicaId::from_proto(command.replica_id.ok_or(
+                    MetadataCommandCodecError::MissingField("record_replica_retirement.replica_id"),
+                )?),
+                desired_configuration_epoch: command.desired_configuration_epoch,
+                removed_conf_state_version: command.removed_conf_state_version,
+                removal_index: command.removal_index,
+                removal_term: command.removal_term,
+            },
 
             Some(Command::UpdateTableSchema(command)) => Self::UpdateTableSchema {
                 expected_schema_version: command.expected_schema_version,
@@ -1286,6 +1349,13 @@ impl RetiredReplicaLifetime {
             return Err(MetadataCommandCodecError::ZeroReplicaId);
         }
 
+        validate_replica_retirement_fields(
+            self.desired_configuration_epoch,
+            self.removed_conf_state_version,
+            self.removal_index,
+            self.removal_term,
+        )?;
+
         Ok(())
     }
 
@@ -1293,6 +1363,10 @@ impl RetiredReplicaLifetime {
         metadata::RetiredReplicaLifetime {
             raft_group_id: Some(self.raft_group_id.to_proto()),
             replica_id: Some(self.replica_id.to_proto()),
+            desired_configuration_epoch: self.desired_configuration_epoch,
+            removed_conf_state_version: self.removed_conf_state_version,
+            removal_index: self.removal_index,
+            removal_term: self.removal_term,
         }
     }
 
@@ -1307,12 +1381,59 @@ impl RetiredReplicaLifetime {
             replica_id: ReplicaId::from_proto(proto.replica_id.ok_or(
                 MetadataCommandCodecError::MissingField("retired_replica.replica_id"),
             )?),
+            desired_configuration_epoch: proto.desired_configuration_epoch,
+            removed_conf_state_version: proto.removed_conf_state_version,
+            removal_index: proto.removal_index,
+            removal_term: proto.removal_term,
         };
 
         value.validate()?;
 
         Ok(value)
     }
+}
+
+fn validate_replica_retirement(
+    raft_group_id: RaftGroupId,
+    replica_id: ReplicaId,
+    desired_configuration_epoch: u64,
+    removed_conf_state_version: u64,
+    removal_index: u64,
+    removal_term: u64,
+) -> Result<(), MetadataCommandCodecError> {
+    if raft_group_id.0 == 0 {
+        return Err(MetadataCommandCodecError::ZeroRaftGroupId);
+    }
+    if replica_id.0 == 0 {
+        return Err(MetadataCommandCodecError::ZeroReplicaId);
+    }
+    validate_replica_retirement_fields(
+        desired_configuration_epoch,
+        removed_conf_state_version,
+        removal_index,
+        removal_term,
+    )
+}
+
+fn validate_replica_retirement_fields(
+    desired_configuration_epoch: u64,
+    removed_conf_state_version: u64,
+    removal_index: u64,
+    removal_term: u64,
+) -> Result<(), MetadataCommandCodecError> {
+    if desired_configuration_epoch == 0 {
+        return Err(MetadataCommandCodecError::ZeroConfigurationEpoch);
+    }
+    if removed_conf_state_version == 0 {
+        return Err(MetadataCommandCodecError::ZeroConfStateVersion);
+    }
+    if removal_index == 0 {
+        return Err(MetadataCommandCodecError::ZeroRemovalIndex);
+    }
+    if removal_term == 0 {
+        return Err(MetadataCommandCodecError::ZeroRemovalTerm);
+    }
+    Ok(())
 }
 
 impl MetadataAllocatorState {
@@ -2081,6 +2202,15 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata node ID must be non-zero")]
     ZeroNodeId,
+
+    #[error("metadata retirement ConfState version must be non-zero")]
+    ZeroConfStateVersion,
+
+    #[error("metadata retirement removal index must be non-zero")]
+    ZeroRemovalIndex,
+
+    #[error("metadata retirement removal term must be non-zero")]
+    ZeroRemovalTerm,
 
     #[error("metadata endpoint {0} cannot be empty")]
     EmptyNodeEndpoint(&'static str),

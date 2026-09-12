@@ -113,6 +113,14 @@ fn metadata_v2_commands_roundtrip_every_authoritative_field() {
             primary_key_column_ids: vec![ColumnId(1)],
         }),
         MetadataCommand::SetDesiredReplicaPlacement(placement()),
+        MetadataCommand::RecordReplicaRetirement {
+            raft_group_id: RaftGroupId(23),
+            replica_id: ReplicaId(30),
+            desired_configuration_epoch: 2,
+            removed_conf_state_version: 3,
+            removal_index: 41,
+            removal_term: 7,
+        },
         MetadataCommand::UpdateTableSchema {
             expected_schema_version: 1,
 
@@ -271,6 +279,10 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
         retired_replicas: vec![RetiredReplicaLifetime {
             raft_group_id: RaftGroupId(23),
             replica_id: ReplicaId(30),
+            desired_configuration_epoch: 2,
+            removed_conf_state_version: 3,
+            removal_index: 41,
+            removal_term: 7,
         }],
 
         allocator: MetadataAllocatorState {

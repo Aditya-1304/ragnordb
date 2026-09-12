@@ -266,6 +266,29 @@ pub enum MetadataRejection {
         replica_id: ReplicaId,
     },
 
+    #[error("metadata references unknown Raft group {0:?}")]
+    UnknownRaftGroup(RaftGroupId),
+
+    #[error(
+        "replica {} of Raft group {} is still present in desired placement",
+        .replica_id.0,
+        .raft_group_id.0
+    )]
+    RetirementStillDesired {
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+    },
+
+    #[error(
+        "retirement proof for replica {} of Raft group {} conflicts with the existing proof",
+        .replica_id.0,
+        .raft_group_id.0
+    )]
+    RetirementProofConflict {
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+    },
+
     #[error(
         "replica {} cannot move from node {} to node {}; allocate a new ReplicaId",
         .replica_id.0,
@@ -376,7 +399,7 @@ pub struct MetadataState {
     ///
     /// Phase 5.10 will connect committed membership removal to this durable
     /// retirement history so removed ReplicaIds can never be reused.
-    retired_replicas: BTreeSet<(RaftGroupId, ReplicaId)>,
+    retired_replicas: BTreeMap<(RaftGroupId, ReplicaId), RetiredReplicaLifetime>,
 
     /// Durable result cache for request identities accepted by metadata Raft.
     ///
@@ -402,7 +425,7 @@ impl Default for MetadataState {
             tablet_ids_by_raft_group: BTreeMap::new(),
             tablet_ids_by_partition: BTreeMap::new(),
             desired_placements: BTreeMap::new(),
-            retired_replicas: BTreeSet::new(),
+            retired_replicas: BTreeMap::new(),
             request_deduplication: BTreeMap::new(),
             client_sessions: BTreeMap::new(),
         }
@@ -476,7 +499,17 @@ impl MetadataState {
     }
 
     pub fn is_replica_retired(&self, raft_group_id: RaftGroupId, replica_id: ReplicaId) -> bool {
-        self.retired_replicas.contains(&(raft_group_id, replica_id))
+        self.retired_replicas
+            .contains_key(&(raft_group_id, replica_id))
+    }
+
+    /// Return the committed retirement proof for one replica lifetime.
+    pub fn retired_replica(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+    ) -> Option<&RetiredReplicaLifetime> {
+        self.retired_replicas.get(&(raft_group_id, replica_id))
     }
 
     /// Apply one command that has already committed in metadata Raft.
@@ -561,6 +594,22 @@ impl MetadataState {
                 self.apply_desired_placement(placement)
             }
 
+            MetadataCommand::RecordReplicaRetirement {
+                raft_group_id,
+                replica_id,
+                desired_configuration_epoch,
+                removed_conf_state_version,
+                removal_index,
+                removal_term,
+            } => self.apply_replica_retirement(RetiredReplicaLifetime {
+                raft_group_id,
+                replica_id,
+                desired_configuration_epoch,
+                removed_conf_state_version,
+                removal_index,
+                removal_term,
+            }),
+
             MetadataCommand::UpdateTableSchema {
                 expected_schema_version,
                 table,
@@ -585,14 +634,7 @@ impl MetadataState {
 
             desired_placements: self.desired_placements.values().cloned().collect(),
 
-            retired_replicas: self
-                .retired_replicas
-                .iter()
-                .map(|(raft_group_id, replica_id)| RetiredReplicaLifetime {
-                    raft_group_id: *raft_group_id,
-                    replica_id: *replica_id,
-                })
-                .collect(),
+            retired_replicas: self.retired_replicas.values().copied().collect(),
 
             allocator: self.allocator,
 
@@ -683,7 +725,7 @@ impl MetadataState {
                 // Retired-replica reuse is also checked below for the retired
                 // set, but a snapshot that directly reuses a retired replica
                 // in its desired placement is already corrupt.
-                if state.retired_replicas.contains(&(
+                if state.retired_replicas.contains_key(&(
                     state.tablets[&placement.tablet_id].raft_group_id,
                     replica.replica_id,
                 )) {
@@ -731,7 +773,7 @@ impl MetadataState {
 
             state
                 .retired_replicas
-                .insert((retired.raft_group_id, retired.replica_id));
+                .insert((retired.raft_group_id, retired.replica_id), retired);
         }
 
         // Snapshot validation proved that these high-water marks dominate all
@@ -1262,6 +1304,74 @@ impl MetadataState {
         MetadataApplyOutcome::Applied
     }
 
+    /// Commit the metadata half of the two-proof retirement protocol.
+    ///
+    /// The group-local ConfState removal is intentionally not represented by
+    /// this state machine. The caller must first observe that independent
+    /// Raft fact, then commit this record. Replaying the exact record is
+    /// idempotent; a different proof for the same identity is corruption of
+    /// the lifecycle protocol and is rejected deterministically.
+    fn apply_replica_retirement(
+        &mut self,
+        retirement: RetiredReplicaLifetime,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        let Some(tablet_id) = self
+            .tablet_ids_by_raft_group
+            .get(&retirement.raft_group_id)
+            .copied()
+        else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownRaftGroup(
+                retirement.raft_group_id,
+            ));
+        };
+
+        if self
+            .desired_placements
+            .get(&tablet_id)
+            .is_some_and(|placement| {
+                placement
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.replica_id == retirement.replica_id)
+            })
+        {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::RetirementStillDesired {
+                raft_group_id: retirement.raft_group_id,
+                replica_id: retirement.replica_id,
+            });
+        }
+
+        let key = (retirement.raft_group_id, retirement.replica_id);
+        if let Some(existing) = self.retired_replicas.get(&key) {
+            return if existing == &retirement {
+                MetadataApplyOutcome::AlreadyApplied
+            } else {
+                MetadataApplyOutcome::Rejected(MetadataRejection::RetirementProofConflict {
+                    raft_group_id: retirement.raft_group_id,
+                    replica_id: retirement.replica_id,
+                })
+            };
+        }
+
+        let Some(placement) = self.desired_placements.get(&tablet_id) else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownTablet(tablet_id));
+        };
+        if placement.configuration_epoch != retirement.desired_configuration_epoch {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::PlacementEpochMismatch {
+                tablet_id,
+                expected: placement.configuration_epoch,
+                received: retirement.desired_configuration_epoch,
+            });
+        }
+
+        self.retired_replicas.insert(key, retirement);
+        MetadataApplyOutcome::Applied
+    }
+
     fn apply_desired_placement(
         &mut self,
         placement: DesiredReplicaPlacement,
@@ -1308,7 +1418,7 @@ impl MetadataState {
 
             if self
                 .retired_replicas
-                .contains(&(tablet.raft_group_id, replica.replica_id))
+                .contains_key(&(tablet.raft_group_id, replica.replica_id))
             {
                 return MetadataApplyOutcome::Rejected(MetadataRejection::RetiredReplicaReuse {
                     raft_group_id: tablet.raft_group_id,
