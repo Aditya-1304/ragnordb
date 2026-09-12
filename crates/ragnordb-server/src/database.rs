@@ -26,8 +26,8 @@ use ragnordb_common::{
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
-    ExecutionResult, LocalExecutor, SharedCatalogLog, SharedCommitLog, SharedMetadataTableCreator,
-    SharedTabletGateway, SqlSession,
+    ExecutionResult, LocalExecutor, QueryResultSink, QueryStreamSummary, SharedCatalogLog,
+    SharedCommitLog, SharedMetadataTableCreator, SharedTabletGateway, SqlSession,
 };
 use ragnordb_multiraft::storage::persistence::NodeRaftWal;
 use ragnordb_multiraft::storage::{
@@ -730,6 +730,33 @@ impl LocalDatabase {
             self.durability_gate.observe_error(error);
         }
 
+        result
+    }
+
+    /// Execute one SELECT through the bounded streaming executor. The caller
+    /// keeps the database guard while the sink applies backpressure, so tablet
+    /// pages stop advancing when the client stops consuming output.
+    pub fn execute_sql_streaming(
+        &mut self,
+        session: &mut SqlSession,
+        sql: &str,
+        sink: &mut dyn QueryResultSink,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<QueryStreamSummary> {
+        self.durability_gate.ensure_healthy()?;
+        self.executor.refresh_metadata_catalog()?;
+        let result = session.execute_sql_streaming(
+            sql,
+            &mut self.executor,
+            &mut self.transaction_manager,
+            sink,
+            max_rows,
+            max_bytes,
+        );
+        if let Err(error) = &result {
+            self.durability_gate.observe_error(error);
+        }
         result
     }
 

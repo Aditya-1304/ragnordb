@@ -6,6 +6,36 @@
 //!  Additional errors will be introduced later alongside
 //! the transaction, routing, and Raft milestones
 
+use serde::{Deserialize, Serialize};
+
+use crate::ids::TabletId;
+
+/// Serializable client-facing frames for the opt-in bounded result stream.
+/// `ResultEnd` is deliberately a distinct enum variant from `ResultError`, so
+/// a consumer cannot mistake batches received before a failed tablet read for
+/// a successfully completed distributed scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum StreamingResultFrame {
+    #[serde(rename = "result_start")]
+    ResultStart { columns: Vec<String>, read_ts: u64 },
+    #[serde(rename = "row_batch")]
+    RowBatch {
+        rows: Vec<Vec<u8>>,
+        row_count: u32,
+        byte_count: u32,
+    },
+    #[serde(rename = "result_end")]
+    ResultEnd { row_count: u64 },
+    #[serde(rename = "result_error")]
+    ResultError {
+        code: String,
+        message: String,
+        retryable: bool,
+        rows_emitted: u64,
+    },
+}
+
 /// Canonical error type shared across RagnorDB crates.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -90,6 +120,17 @@ pub enum Error {
     /// A proposal lost leadership or exceeded its deadline before apply.
     #[error("replicated proposal did not reach a known apply result: {reason}")]
     ProposalUnavailable { reason: String },
+
+    /// One required tablet in an all-or-nothing distributed scan could not
+    /// provide its assigned logical span. `retryable` is part of the semantic
+    /// error contract because the gateway must not retry a permanent failure
+    /// as though it were a stale leader or transient outage.
+    #[error("distributed scan failed on tablet {tablet_id:?} (retryable={retryable}): {reason}")]
+    DistributedScanFailed {
+        tablet_id: TabletId,
+        retryable: bool,
+        reason: String,
+    },
 
     /// A-WAL rejected the database record before assigning it a logical extent
     ///
@@ -214,6 +255,9 @@ impl Error {
             | Self::TabletUnavailable { .. }
             | Self::ProposalUnavailable { .. }
             | Self::StatementTimeout { .. } => RetryAction::RetrySameRequest,
+            Self::DistributedScanFailed {
+                retryable: true, ..
+            } => RetryAction::RetrySameRequest,
             Self::RequestOutcomeUnknown { .. }
             | Self::CommitOutcomeUnknown { .. }
             | Self::CatalogOutcomeUnknown { .. }
@@ -229,6 +273,9 @@ impl Error {
             | Self::UnsupportedSql(_)
             | Self::SchemaMismatch(_)
             | Self::Configuration(_)
+            | Self::DistributedScanFailed {
+                retryable: false, ..
+            }
             | Self::WalAppendNotStaged { .. }
             | Self::RecoveryRequired { .. }
             | Self::RecoveryFailed { .. }
@@ -256,6 +303,28 @@ mod tests {
         assert_eq!(
             Error::NotLeader { leader_id: None }.retry_action(),
             RetryAction::RetrySameRequest
+        );
+    }
+
+    #[test]
+    fn distributed_scan_failure_preserves_tablet_and_retry_policy() {
+        assert_eq!(
+            Error::DistributedScanFailed {
+                tablet_id: crate::ids::TabletId(12),
+                retryable: true,
+                reason: "leader election in progress".to_string(),
+            }
+            .retry_action(),
+            RetryAction::RetrySameRequest
+        );
+        assert_eq!(
+            Error::DistributedScanFailed {
+                tablet_id: crate::ids::TabletId(12),
+                retryable: false,
+                reason: "corrupt scan response".to_string(),
+            }
+            .retry_action(),
+            RetryAction::None
         );
     }
 }

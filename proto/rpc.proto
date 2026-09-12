@@ -14,6 +14,7 @@ enum MessageType {
     MESSAGE_TYPE_METADATA_RESPONSE = 5;
     MESSAGE_TYPE_TABLET_READ_REQUEST = 6;
     MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST = 7;
+    MESSAGE_TYPE_TABLET_SCAN_REQUEST = 8;
 }
 
 message RpcFrame {
@@ -51,6 +52,34 @@ message TabletReadRequest {
         ragnordb.ids.Timestamp read_timestamp = 5;
         ragnordb.ids.LogicalCommandId logical_command_id = 6;
         optional uint64 rpc_attempt_id = 7;
+}
+
+// A bounded, resumable read over one logical half-open tablet span. The
+// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
+// response so scan failures retain the established retry and attempt-correlation
+// fields without introducing a second response envelope.
+message TabletScanRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.TabletId tablet_id = 2;
+        uint64 tablet_epoch = 3;
+        optional bytes start_key = 4;
+        optional bytes end_key = 5;
+        optional bytes resume_after = 6;
+        ragnordb.ids.Timestamp read_timestamp = 7;
+        uint32 max_rows = 8;
+        uint32 max_bytes = 9;
+        optional uint64 rpc_attempt_id = 10;
+}
+
+message TabletScanRow {
+        bytes key = 1;
+        bytes row = 2;
+}
+
+message TabletScanBatch {
+        repeated TabletScanRow rows = 1;
+        optional bytes next_resume_after = 2;
+        bool exhausted = 3;
 }
 
 message TabletCommandResponse {

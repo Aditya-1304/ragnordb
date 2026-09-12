@@ -156,6 +156,7 @@ impl DurabilityGate {
             | Error::StaleTabletEpoch { .. }
             | Error::LeaderUnknown
             | Error::TabletUnavailable { .. }
+            | Error::DistributedScanFailed { .. }
             | Error::RequestOutcomeUnknown { .. }
             | Error::RequestIdExpired { .. }
             | Error::ClientSessionExpired { .. }

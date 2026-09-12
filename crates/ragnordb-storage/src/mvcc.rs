@@ -94,6 +94,16 @@ pub struct MvccStats {
     pub write_records: usize,
 }
 
+/// One bounded, ordered MVCC scan response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccScanPage {
+    /// Rows visible at the requested snapshot, ordered by encoded row key.
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+
+    /// Whether another visible row remains after the final returned key.
+    pub has_more: bool,
+}
+
 /// Storage contract required by the transaction-aware tablet layer.
 ///
 /// All keys passed to this trait must be complete canonical row-key encodings
@@ -111,6 +121,24 @@ pub trait MvccStorage {
         end: Option<&[u8]>,
         read_ts: Timestamp,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// Scan one bounded page using an exclusive continuation key.
+    ///
+    /// `max_bytes` counts encoded key bytes plus encoded row bytes. A backend
+    /// with an ordered native iterator should override this method so it does
+    /// not materialize the complete scan before applying the page boundary.
+    fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        let rows = self.scan(start, end, read_ts)?;
+        page_ordered_rows(rows, start, end, resume_after, max_rows, max_bytes)
+    }
 
     /// Atomically install one distributed transaction intent.
     ///
@@ -797,29 +825,99 @@ impl MvccStorage for InMemoryMvcc {
         end: Option<&[u8]>,
         read_ts: Timestamp,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let (lower, upper) = encoded_scan_bounds(start, end)?;
+        Ok(self
+            .scan_page(start, end, None, read_ts, usize::MAX, usize::MAX)?
+            .rows)
+    }
 
-        // Locks must participate even when their key has no committed history.
-        // Otherwise a scan could silently pass a locked insertion.
-        let mut candidates = BTreeSet::new();
+    fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        validate_scan_page_limits(max_rows, max_bytes)?;
+        let (_, upper) = encoded_scan_bounds(start, end)?;
 
-        for (key, _) in self.writes.range((lower.clone(), upper.clone())) {
-            candidates.insert(key.clone());
-        }
-
-        for (key, _) in self.locks.range((lower, upper)) {
-            candidates.insert(key.clone());
-        }
-
-        let mut rows = Vec::new();
-
-        for key in candidates {
-            if let Some(row) = self.read_visible_version(&key, read_ts)? {
-                rows.push((key, row));
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "scan resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(MvccScanPage {
+                    rows: Vec::new(),
+                    has_more: false,
+                });
             }
         }
 
-        Ok(rows)
+        let lower = scan_lower_bound(start, resume_after);
+        let mut writes = self.writes.range((lower.clone(), upper.clone())).peekable();
+        let mut locks = self.locks.range((lower, upper)).peekable();
+        let mut next_write = writes.next();
+        let mut next_lock = locks.next();
+        let mut rows = Vec::new();
+        let mut encoded_bytes = 0_usize;
+
+        loop {
+            let (key, take_write, take_lock) = match (&next_write, &next_lock) {
+                (None, None) => break,
+                (Some((write_key, _)), None) => ((*write_key).clone(), true, false),
+                (None, Some((lock_key, _))) => ((*lock_key).clone(), false, true),
+                (Some((write_key, _)), Some((lock_key, _))) => match write_key.cmp(lock_key) {
+                    std::cmp::Ordering::Less => ((*write_key).clone(), true, false),
+                    std::cmp::Ordering::Equal => ((*write_key).clone(), true, true),
+                    std::cmp::Ordering::Greater => ((*lock_key).clone(), false, true),
+                },
+            };
+
+            if take_write {
+                next_write = writes.next();
+            }
+            if take_lock {
+                next_lock = locks.next();
+            }
+
+            // Locks must participate even when they have no committed history;
+            // otherwise a scan could silently pass a locked insertion.
+            let Some(row) = self.read_visible_version(&key, read_ts)? else {
+                continue;
+            };
+
+            if rows.len() >= max_rows {
+                return Ok(MvccScanPage {
+                    rows,
+                    has_more: true,
+                });
+            }
+
+            let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
+                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+            })?;
+            let next_bytes = encoded_bytes.checked_add(row_bytes).ok_or_else(|| {
+                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+            })?;
+            if next_bytes > max_bytes {
+                if rows.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "scan page byte budget is smaller than the first encoded row".to_string(),
+                    ));
+                }
+                return Ok(MvccScanPage {
+                    rows,
+                    has_more: true,
+                });
+            }
+
+            encoded_bytes = next_bytes;
+            rows.push((key, row));
+        }
+
+        Ok(MvccScanPage {
+            rows,
+            has_more: false,
+        })
     }
 
     fn validate_commit_batch(
@@ -1476,6 +1574,84 @@ fn encoded_scan_bounds(start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Encod
     ))
 }
 
+fn validate_scan_page_limits(max_rows: usize, max_bytes: usize) -> Result<()> {
+    if max_rows == 0 {
+        return Err(Error::InvalidArgument(
+            "scan page max_rows must be greater than zero".to_string(),
+        ));
+    }
+    if max_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "scan page max_bytes must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn scan_lower_bound(start: Option<&[u8]>, resume_after: Option<&[u8]>) -> Bound<Vec<u8>> {
+    match (start, resume_after) {
+        (None, None) => Unbounded,
+        (Some(start), None) => Included(start.to_vec()),
+        (None, Some(resume_after)) => Excluded(resume_after.to_vec()),
+        (Some(start), Some(resume_after)) if resume_after < start => Included(start.to_vec()),
+        (Some(_), Some(resume_after)) => Excluded(resume_after.to_vec()),
+    }
+}
+
+fn page_ordered_rows(
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<MvccScanPage> {
+    validate_scan_page_limits(max_rows, max_bytes)?;
+    encoded_scan_bounds(start, end)?;
+    if let Some(resume_after) = resume_after {
+        validate_encoded_key_argument(resume_after, "scan resume key")?;
+    }
+
+    let mut page = Vec::new();
+    let mut encoded_bytes = 0_usize;
+
+    for (key, row) in rows {
+        if start.is_some_and(|start| key.as_slice() < start)
+            || end.is_some_and(|end| key.as_slice() >= end)
+            || resume_after.is_some_and(|resume_after| key.as_slice() <= resume_after)
+        {
+            continue;
+        }
+
+        let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
+            Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+        })?;
+        if page.len() >= max_rows
+            || encoded_bytes
+                .checked_add(row_bytes)
+                .is_none_or(|bytes| bytes > max_bytes)
+        {
+            if page.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "scan page byte budget is smaller than the first encoded row".to_string(),
+                ));
+            }
+            return Ok(MvccScanPage {
+                rows: page,
+                has_more: true,
+            });
+        }
+
+        encoded_bytes += row_bytes;
+        page.push((key, row));
+    }
+
+    Ok(MvccScanPage {
+        rows: page,
+        has_more: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1795,6 +1971,71 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn scan_page_is_ordered_bounded_and_resume_after_is_exclusive() {
+        // Regression: page implementations that materialize or resume from an
+        // inclusive key duplicate the boundary row and can exceed the caller's
+        // row or encoded-byte budget.
+        let keys = [
+            encoded_key(1),
+            encoded_key(2),
+            encoded_key(3),
+            encoded_key(4),
+        ];
+        let rows = [
+            encoded_row(1, "a"),
+            encoded_row(2, "bb"),
+            encoded_row(3, "ccc"),
+            encoded_row(4, "dddd"),
+        ];
+        let mutations = keys
+            .iter()
+            .cloned()
+            .zip(rows.iter().cloned())
+            .map(|(key, row)| (key, Mutation::Put(row)))
+            .collect::<BTreeMap<_, _>>();
+        let mut engine = InMemoryMvcc::new();
+        engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap();
+
+        let first = engine
+            .scan_page(None, None, None, Timestamp(2), 2, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            first.rows.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![&keys[0], &keys[1]]
+        );
+        assert!(first.has_more);
+
+        let second = engine
+            .scan_page(
+                None,
+                None,
+                Some(&first.rows.last().unwrap().0),
+                Timestamp(2),
+                2,
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(
+            second.rows.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![&keys[2], &keys[3]]
+        );
+        assert!(!second.has_more);
+
+        let byte_budget = keys[0].len() + rows[0].len();
+        let byte_page = engine
+            .scan_page(None, None, None, Timestamp(2), 10, byte_budget)
+            .unwrap();
+        assert_eq!(byte_page.rows.len(), 1);
+        assert_eq!(
+            byte_page.rows[0].0.len() + byte_page.rows[0].1.len(),
+            byte_budget
+        );
+        assert!(byte_page.has_more);
     }
 
     #[test]

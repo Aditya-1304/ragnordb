@@ -203,6 +203,10 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
             error_response("TABLET_UNAVAILABLE", &error.to_string(), true)
         }
 
+        Error::DistributedScanFailed { retryable, .. } => {
+            error_response("DISTRIBUTED_SCAN_FAILED", &error.to_string(), *retryable)
+        }
+
         Error::RequestOutcomeUnknown { .. } => {
             error_response("REQUEST_OUTCOME_UNKNOWN", &error.to_string(), false)
         }

@@ -18,26 +18,26 @@ use std::{
 };
 
 use prost::Message;
-use ragnordb_catalog::MetadataApplyOutcome;
+use ragnordb_catalog::{MetadataApplyOutcome, MetadataState};
 use ragnordb_common::{
     Error, Result,
     command_codec::{CachedTabletCommandOutcome, TabletCommand},
     ids::{
         LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp,
     },
-    metadata_codec::DesiredReplicaRole,
+    metadata_codec::{DesiredReplicaRole, TabletDescriptor},
     proto::rpc,
     rpc_codec::{
         MessageType, MetadataProposalRequest, MetadataRequest, MetadataResponse, ReplicaRoute,
         RpcFrame, TabletCommandRequest, TabletCommandResponse, TabletOutcomeQueryRequest,
-        TabletReadRequest, TabletRoute, TabletRouteCache,
+        TabletReadRequest, TabletRoute, TabletRouteCache, TabletScanBatch, TabletScanRequest,
     },
 };
-use ragnordb_exec::TabletGateway;
+use ragnordb_exec::{TabletGateway, TabletScanRoute};
 use ragnordb_multiraft::meta::MetadataRuntimeHandle;
 use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRpcInbound};
-use ragnordb_tablet::TabletRouter;
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
+use ragnordb_tablet::{ScanSpan, TabletRouter};
 
 use crate::database::SharedLocalDatabase;
 use crate::multiraft_runtime::MetadataHostRequest;
@@ -252,6 +252,105 @@ impl TabletRpcClient {
             tablet_id: descriptor.tablet_id,
             tablet_epoch: descriptor.tablet_epoch,
             leader_replica_id,
+            replicas,
+        };
+        if let Some(cached_leader) = self.cached_leader_for(&route) {
+            route.leader_replica_id = cached_leader;
+        }
+        route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        self.cache_authoritative_route(&route);
+        Ok(route)
+    }
+
+    /// Resolve one logical span against a single committed metadata snapshot.
+    /// The returned physical routes are deliberately paired with clipped
+    /// logical fragments so a stale epoch can be re-resolved without treating
+    /// the original tablet-ID list as progress.
+    pub fn lookup_scan_routes(
+        &self,
+        table_id: TableId,
+        span: &ScanSpan,
+    ) -> Result<Vec<TabletScanRoute>> {
+        span.validate()?;
+        let state = self.metadata.state_snapshot();
+        state.table(table_id).ok_or_else(|| {
+            Error::SchemaMismatch(format!("metadata has no table {}", table_id.0))
+        })?;
+        let descriptors = state.tablets_for_table(table_id);
+        let router = TabletRouter::new(table_id, &descriptors).map_err(|error| {
+            Error::CorruptData(format!(
+                "metadata scan route for table {} is invalid: {error}",
+                table_id.0
+            ))
+        })?;
+        router
+            .route_scan_fragments(span)?
+            .into_iter()
+            .map(|fragment| {
+                let descriptor = descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.tablet_id == fragment.tablet_id)
+                    .ok_or_else(|| {
+                        Error::CorruptData(
+                            "metadata scan route selected an unknown tablet".to_string(),
+                        )
+                    })?;
+                Ok(TabletScanRoute {
+                    route: self.tablet_route_from_metadata(&state, descriptor)?,
+                    span: fragment.span,
+                })
+            })
+            .collect()
+    }
+
+    fn tablet_route_from_metadata(
+        &self,
+        state: &MetadataState,
+        descriptor: &TabletDescriptor,
+    ) -> Result<TabletRoute> {
+        let placement = state
+            .desired_placement(descriptor.tablet_id)
+            .ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "tablet {} has no desired placement",
+                    descriptor.tablet_id.0
+                ))
+            })?;
+        let replicas = placement
+            .replicas
+            .iter()
+            .map(|replica| ReplicaRoute {
+                replica_id: replica.replica_id,
+                node_id: replica.node_id,
+            })
+            .collect::<Vec<_>>();
+        let placement_leader = placement
+            .replicas
+            .iter()
+            .find(|replica| replica.role == DesiredReplicaRole::Voter)
+            .or_else(|| placement.replicas.first())
+            .map(|replica| replica.replica_id)
+            .ok_or_else(|| Error::CorruptData("tablet placement has no replicas".to_string()))?;
+        let published_leader = self
+            .handles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&descriptor.raft_group_id)
+            .and_then(|handle| handle.status().leader_replica_id)
+            .map(ReplicaId)
+            .filter(|leader| {
+                placement
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.replica_id == *leader)
+            });
+        let mut route = TabletRoute {
+            raft_group_id: descriptor.raft_group_id,
+            tablet_id: descriptor.tablet_id,
+            tablet_epoch: descriptor.tablet_epoch,
+            leader_replica_id: published_leader.unwrap_or(placement_leader),
             replicas,
         };
         if let Some(cached_leader) = self.cached_leader_for(&route) {
@@ -646,6 +745,104 @@ impl TabletRpcClient {
         }))
     }
 
+    /// Read one bounded scan page, retrying leader and transport failures on
+    /// the same logical fragment. A stale epoch is returned to the executor so
+    /// it can re-resolve the unfinished logical span; selecting one replacement
+    /// tablet here would be incorrect after a split.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_page(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        span: &ScanSpan,
+        resume_after: Option<&[u8]>,
+        read_timestamp: Timestamp,
+        max_rows: u32,
+        max_bytes: u32,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        route
+            .validate()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let mut request = TabletScanRequest {
+            request_id,
+            tablet_id: route.tablet_id,
+            tablet_epoch: route.tablet_epoch,
+            start_key: span.start_key.clone(),
+            end_key: span.end_key.clone(),
+            resume_after: resume_after.map(ToOwned::to_owned),
+            read_timestamp,
+            max_rows,
+            max_bytes,
+            rpc_attempt_id: None,
+        };
+        request
+            .validate()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                Error::InvalidArgument("tablet scan retry deadline overflowed".into())
+            })?;
+        let mut current_route = route.clone();
+        let mut last_error = None;
+        let mut attempted_replicas = BTreeSet::new();
+
+        for attempt in 0..MAX_TABLET_RETRY_ATTEMPTS {
+            let (target_replica, target) =
+                match next_unattempted_replica(&current_route, &attempted_replicas) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        last_error = Some(Error::LeaderUnknown);
+                        continue;
+                    }
+                };
+            attempted_replicas.insert((current_route.raft_group_id, target_replica));
+            let attempt_timeout = retry_attempt_timeout(deadline, attempt);
+            if attempt_timeout.is_zero() {
+                break;
+            }
+
+            request.tablet_id = current_route.tablet_id;
+            request.tablet_epoch = current_route.tablet_epoch;
+            request.request_id.raft_group_id = current_route.raft_group_id;
+            match self.scan_page_to(
+                target,
+                current_route.raft_group_id,
+                request.clone(),
+                attempt_timeout,
+            ) {
+                Ok(batch) => {
+                    batch
+                        .validate_for(&request)
+                        .map_err(|error| Error::CorruptData(error.to_string()))?;
+                    self.record_successful_leader(&current_route, target_replica);
+                    return Ok(batch);
+                }
+                Err(error @ Error::StaleTabletEpoch { .. }) => return Err(error),
+                Err(error)
+                    if is_retryable_tablet_error(&error)
+                        && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
+                {
+                    self.update_route_after_error(&mut current_route, target_replica, &error);
+                    last_error = Some(error);
+                    let backoff = retry_backoff(
+                        attempt,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if !backoff.is_zero() {
+                        thread::sleep(backoff);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::TabletUnavailable {
+            reason: "tablet scan retry deadline elapsed".to_string(),
+        }))
+    }
+
     fn cached_leader_for(&self, route: &TabletRoute) -> Option<ReplicaId> {
         let cache = self
             .route_cache
@@ -856,6 +1053,42 @@ impl TabletRpcClient {
         Ok(response.found.then_some(response.result_data))
     }
 
+    fn scan_page_to(
+        &self,
+        target: NodeId,
+        group_id: RaftGroupId,
+        request: TabletScanRequest,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        if target == self.transport.local_node_id() {
+            let handle = self.local_handle(group_id)?;
+            handle.read_barrier(timeout)?;
+            return handle.scan_page(request, timeout);
+        }
+
+        let request_id = request.request_id.clone();
+        let response = self.send_remote(
+            target,
+            RpcFrame {
+                msg_type: MessageType::TabletScanRequest,
+                raft_group_id: group_id,
+                payload: request.to_proto().encode_to_vec(),
+            },
+            request_id,
+            timeout,
+            false,
+        )?;
+        if !response.success {
+            return Err(response_error(response));
+        }
+        TabletScanBatch::from_proto(
+            rpc::TabletScanBatch::decode(response.result_data.as_slice()).map_err(|error| {
+                Error::CorruptData(format!("invalid tablet scan batch: {error}"))
+            })?,
+        )
+        .map_err(|error| Error::CorruptData(error.to_string()))
+    }
+
     fn local_handle(&self, group_id: RaftGroupId) -> Result<Arc<ReplicatedTabletHandle>> {
         self.handles
             .read()
@@ -949,6 +1182,38 @@ impl TabletGateway for TabletRpcClient {
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
         TabletRpcClient::read_point(self, route, request_id, row_key, read_timestamp, timeout)
+    }
+
+    fn lookup_scan_routes(
+        &self,
+        table_id: TableId,
+        span: &ScanSpan,
+    ) -> Result<Vec<TabletScanRoute>> {
+        TabletRpcClient::lookup_scan_routes(self, table_id, span)
+    }
+
+    fn scan_page(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        span: &ScanSpan,
+        resume_after: Option<&[u8]>,
+        read_timestamp: Timestamp,
+        max_rows: u32,
+        max_bytes: u32,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        TabletRpcClient::scan_page(
+            self,
+            route,
+            request_id,
+            span,
+            resume_after,
+            read_timestamp,
+            max_rows,
+            max_bytes,
+            timeout,
+        )
     }
 
     fn submit_command(
@@ -1146,6 +1411,48 @@ fn dispatch_message(
                         retryable: false,
                         found: row.is_some(),
                         result_data: row.unwrap_or_default(),
+                        leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                        current_tablet_epoch: None,
+                        expected_tablet_epoch: None,
+                    },
+                    Err(error) => error_response(request_id, error),
+                },
+                None => error_response(
+                    request_id,
+                    Error::ProposalUnavailable {
+                        reason: "tablet Raft group is not hosted on this node".to_string(),
+                    },
+                ),
+            };
+            send_response(transport, source, frame.raft_group_id, attempt_id, response);
+        }
+        MessageType::TabletScanRequest => {
+            let Ok(proto) = rpc::TabletScanRequest::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let attempt_id = proto.rpc_attempt_id;
+            let Ok(request) = TabletScanRequest::from_proto(proto) else {
+                return;
+            };
+            let request_id = request.request_id.clone();
+            let response = match handles
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&frame.raft_group_id)
+                .cloned()
+            {
+                Some(handle) => match handle
+                    .read_barrier(Duration::from_secs(30))
+                    .and_then(|()| handle.scan_page(request, Duration::from_secs(30)))
+                {
+                    Ok(batch) => TabletCommandResponse {
+                        request_id,
+                        success: true,
+                        error_message: String::new(),
+                        error_code: String::new(),
+                        retryable: false,
+                        found: !batch.rows.is_empty(),
+                        result_data: batch.to_proto().encode_to_vec(),
                         leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
                         current_tablet_epoch: None,
                         expected_tablet_epoch: None,
@@ -1468,6 +1775,12 @@ fn attach_rpc_attempt_id(
         MessageType::TabletReadRequest => {
             let mut proto = rpc::TabletReadRequest::decode(payload)
                 .map_err(|error| Error::InvalidArgument(format!("invalid tablet read: {error}")))?;
+            proto.rpc_attempt_id = Some(attempt_id);
+            Ok(proto.encode_to_vec())
+        }
+        MessageType::TabletScanRequest => {
+            let mut proto = rpc::TabletScanRequest::decode(payload)
+                .map_err(|error| Error::InvalidArgument(format!("invalid tablet scan: {error}")))?;
             proto.rpc_attempt_id = Some(attempt_id);
             Ok(proto.encode_to_vec())
         }

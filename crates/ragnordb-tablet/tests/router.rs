@@ -1,3 +1,4 @@
+use ragnordb_common::ids::Timestamp;
 use ragnordb_common::{
     Error,
     codec::Value,
@@ -5,7 +6,7 @@ use ragnordb_common::{
     metadata_codec::{PartitionSpec, TabletDescriptor},
 };
 use ragnordb_storage::key::encode_primary_key;
-use ragnordb_tablet::{HashTabletPartitioner, TabletRouter};
+use ragnordb_tablet::{HashTabletPartitioner, ScanProgress, ScanSpan, TabletRouter};
 
 const ROUTING_DOMAIN: &[u8] = b"ragnordb/tablet-hash";
 const ROUTING_VERSION: u8 = 1;
@@ -303,4 +304,126 @@ fn ordered_ranges_route_only_the_tablets_intersecting_a_logical_span() {
         router.route_scan_span(Some(&[0x80]), Some(&[0x40])),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+#[test]
+fn ordered_scan_fragments_are_clipped_and_hash_scan_fragments_preserve_the_span() {
+    // Regression: routing only tablet IDs would make a range tablet receive
+    // the full logical span, causing duplicate reads or rows outside ownership.
+    let table_id = TableId(17);
+    let descriptor = |tablet_id, raft_group_id, start_key, end_key| TabletDescriptor {
+        tablet_id: TabletId(tablet_id),
+        table_id,
+        raft_group_id: RaftGroupId(raft_group_id),
+        tablet_epoch: 1,
+        partition: PartitionSpec::Range { start_key, end_key },
+    };
+    let router = TabletRouter::new(
+        table_id,
+        &[
+            descriptor(1, 11, Vec::new(), vec![0x40]),
+            descriptor(2, 12, vec![0x40], vec![0x80]),
+            descriptor(3, 13, vec![0x80], Vec::new()),
+        ],
+    )
+    .unwrap();
+    let logical_span = ScanSpan::new(Some(vec![0x20]), Some(vec![0x90])).unwrap();
+
+    assert_eq!(
+        router.route_scan_fragments(&logical_span).unwrap(),
+        vec![
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(1),
+                span: ScanSpan::new(Some(vec![0x20]), Some(vec![0x40])).unwrap(),
+            },
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(2),
+                span: ScanSpan::new(Some(vec![0x40]), Some(vec![0x80])).unwrap(),
+            },
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(3),
+                span: ScanSpan::new(Some(vec![0x80]), Some(vec![0x90])).unwrap(),
+            },
+        ]
+    );
+
+    assert_eq!(
+        router.route_scan_fragments(&ScanSpan::unbounded()).unwrap(),
+        vec![
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(1),
+                span: ScanSpan::new(None, Some(vec![0x40])).unwrap(),
+            },
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(2),
+                span: ScanSpan::new(Some(vec![0x40]), Some(vec![0x80])).unwrap(),
+            },
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(3),
+                span: ScanSpan::new(Some(vec![0x80]), None).unwrap(),
+            },
+        ]
+    );
+
+    let hash_router = TabletRouter::new(
+        table_id,
+        &[
+            descriptor_hash(table_id, 10, 20, 0, 2),
+            descriptor_hash(table_id, 11, 21, 1, 2),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        hash_router.route_scan_fragments(&logical_span).unwrap(),
+        vec![
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(10),
+                span: logical_span.clone(),
+            },
+            ragnordb_tablet::TabletScanFragment {
+                tablet_id: TabletId(11),
+                span: logical_span,
+            },
+        ]
+    );
+}
+
+fn descriptor_hash(
+    table_id: TableId,
+    tablet_id: u64,
+    raft_group_id: u64,
+    bucket: u32,
+    bucket_count: u32,
+) -> TabletDescriptor {
+    TabletDescriptor {
+        tablet_id: TabletId(tablet_id),
+        table_id,
+        raft_group_id: RaftGroupId(raft_group_id),
+        tablet_epoch: 1,
+        partition: PartitionSpec::Hash {
+            bucket,
+            bucket_count,
+        },
+    }
+}
+
+#[test]
+fn scan_progress_marks_only_successfully_completed_subspans() {
+    // Regression: marking a clipped fragment complete must retain the exact
+    // unfinished suffix so a retry cannot duplicate or skip logical keys.
+    let initial = ScanSpan::new(Some(vec![0x20]), Some(vec![0x90])).unwrap();
+    let mut progress = ScanProgress::new(Timestamp(7), initial);
+    let completed = ScanSpan::new(Some(vec![0x20]), Some(vec![0x40])).unwrap();
+
+    progress.mark_completed(completed.clone()).unwrap();
+
+    assert_eq!(progress.read_ts, Timestamp(7));
+    assert_eq!(
+        progress.completed.into_iter().collect::<Vec<_>>(),
+        vec![completed]
+    );
+    assert_eq!(
+        progress.remaining.into_iter().collect::<Vec<_>>(),
+        vec![ScanSpan::new(Some(vec![0x40]), Some(vec![0x90])).unwrap()]
+    );
 }

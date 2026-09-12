@@ -23,7 +23,7 @@ mod result;
 mod session;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -49,7 +49,7 @@ use ragnordb_common::{
     },
     metadata_codec::{CreateTableRequest, MetadataCommandCodecError, TabletDescriptor},
     proto::snapshot as snapshot_proto,
-    rpc_codec::TabletRoute,
+    rpc_codec::{TabletRoute, TabletScanBatch},
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
@@ -64,13 +64,15 @@ use ragnordb_storage::{
 };
 
 use ragnordb_tablet::command::TabletCommandApplyOutcome;
-use ragnordb_tablet::{RowMutation, Tablet, TabletRouter};
+use ragnordb_tablet::{RowMutation, ScanProgress, ScanSpan, Tablet, TabletRouter};
 use ragnordb_txn::{
     CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
     TransactionManager,
 };
 
-pub use result::{DmlOperation, ExecutionResult, ResultColumn, ResultSet};
+pub use result::{
+    DmlOperation, ExecutionResult, QueryResultSink, QueryStreamSummary, ResultColumn, ResultSet,
+};
 pub use session::SqlSession;
 
 /// Process-wide semantic commit boundary used by every local tablet.
@@ -209,6 +211,39 @@ pub trait TabletGateway: Send + Sync {
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>>;
 
+    /// Resolve the current owners of one logical scan span.
+    ///
+    /// Implementations must return a complete ordered range cover. The
+    /// executor intentionally asks again after a stale epoch instead of
+    /// retaining tablet IDs as scan progress.
+    fn lookup_scan_routes(
+        &self,
+        _table_id: TableId,
+        _span: &ScanSpan,
+    ) -> Result<Vec<TabletScanRoute>> {
+        Err(Error::NotImplemented(
+            "distributed tablet scan routing is unavailable",
+        ))
+    }
+
+    /// Read one bounded page from a previously resolved tablet fragment.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_page(
+        &self,
+        _route: &TabletRoute,
+        _request_id: RequestId,
+        _span: &ScanSpan,
+        _resume_after: Option<&[u8]>,
+        _read_timestamp: Timestamp,
+        _max_rows: u32,
+        _max_bytes: u32,
+        _timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        Err(Error::NotImplemented(
+            "distributed tablet scan execution is unavailable",
+        ))
+    }
+
     fn submit_command(
         &self,
         route: &TabletRoute,
@@ -262,6 +297,13 @@ pub trait TabletGateway: Send + Sync {
             "tablet logical outcome lookup is unavailable",
         ))
     }
+}
+
+/// One current physical route for a logical scan fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanRoute {
+    pub route: TabletRoute,
+    pub span: ScanSpan,
 }
 
 /// Shared server-provided gateway used by metadata-backed SQL tables.
@@ -441,6 +483,16 @@ type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
 /// Temporary materialized-result boundary until the client protocol streams.
 pub const MAX_MATERIALIZED_RESULT_ROWS: usize = 100_000;
+const TABLET_SCAN_PAGE_ROWS: u32 = 1_024;
+const TABLET_SCAN_PAGE_BYTES: u32 = 256 * 1_024;
+const MAX_SCAN_TOPOLOGY_REFRESHES: u32 = 3;
+
+#[derive(Debug, Clone)]
+struct PendingScanFragment {
+    route: TabletScanRoute,
+    resume_after: Option<Vec<u8>>,
+    topology_refreshes: u32,
+}
 
 #[derive(Default)]
 struct InMemoryCatalogLog {
@@ -613,15 +665,6 @@ impl LocalExecutor {
             let descriptors = creator.table_descriptors(table_id)?;
             let router = self.build_metadata_router(&definition, &descriptors)?;
 
-            if let Some(existing_router) = self.tablet_routers.get(&table_id)
-                && existing_router != &router
-            {
-                return Err(Error::CorruptData(format!(
-                    "metadata routing map for table {} changed in the local SQL cache",
-                    table_id.0
-                )));
-            }
-
             let schema = self.catalog.catalog().table_by_id(table_id);
 
             if let Some(existing) = schema {
@@ -636,7 +679,11 @@ impl LocalExecutor {
                     .install_replicated_definition(definition.clone())?;
             }
 
-            self.tablet_routers.entry(table_id).or_insert(router);
+            // The router is built from one complete, validated metadata
+            // snapshot before replacing the cached view. Readers therefore
+            // observe either the previous topology or the new gap-free cover;
+            // they never observe a partially installed split or merge.
+            self.tablet_routers.insert(table_id, router);
             self.metadata_table_ids.insert(table_id);
         }
 
@@ -1031,6 +1078,138 @@ impl LocalExecutor {
         request_context: &mut TabletRequestContext,
     ) -> Result<ExecutionResult> {
         self.execute_inner(plan, transaction, Some(request_context))
+    }
+
+    /// Execute a SELECT through bounded row batches.
+    ///
+    /// The sink is called only after a row has passed SQL filtering and
+    /// projection. A sink supplied by the server is responsible for bounded
+    /// transport backpressure; when it reports cancellation this method stops
+    /// requesting further tablet pages and returns without publishing a
+    /// successful end marker.
+    pub fn execute_select_streaming(
+        &self,
+        plan: Plan,
+        transaction: &mut Transaction,
+        request_context: &mut TabletRequestContext,
+        sink: &mut dyn QueryResultSink,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<QueryStreamSummary> {
+        let Plan::Select(plan) = plan else {
+            return Err(Error::UnsupportedSql(
+                "streaming result mode currently supports SELECT only".to_string(),
+            ));
+        };
+        if max_rows == 0 || max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "streaming result batch limits must be greater than zero".to_string(),
+            ));
+        }
+
+        let SelectPlan {
+            table,
+            projection,
+            filter,
+        } = plan;
+        let schema = self.resolve_table(&table)?;
+        if projection.is_empty() {
+            return Err(Error::SchemaMismatch(
+                "SELECT plan contains an empty projection".to_string(),
+            ));
+        }
+        for column in &projection {
+            validate_bound_column(schema.as_ref(), column)?;
+        }
+        if let Some(filter) = &filter {
+            validate_filter(schema.as_ref(), filter)?;
+        }
+        let columns = projection
+            .iter()
+            .map(|column| ResultColumn {
+                name: column.name.clone(),
+                data_type: column.data_type,
+                nullable: column.nullable,
+            })
+            .collect();
+        sink.start(columns, transaction.start_ts())?;
+
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_usize;
+        let mut rows_read = 0_u64;
+        let mut emit = |key: RowKey, row: Row| -> Result<()> {
+            if sink.cancelled() {
+                return Err(Error::StatementTimeout { timeout_ms: 0 });
+            }
+            validate_stored_keyed_row(
+                schema.as_ref(),
+                &KeyedRow {
+                    key: key.clone(),
+                    row: row.clone(),
+                },
+            )?;
+            if let Some(filter) = filter.as_ref()
+                && !expression::evaluate_filter(filter, &row)?
+            {
+                return Ok(());
+            }
+            let projected = project_row(&row, &projection)?;
+            let encoded_size = encode_row(&projected)?.len();
+            if encoded_size > max_bytes {
+                return Err(Error::InvalidArgument(
+                    "one projected row exceeds the streaming byte budget".to_string(),
+                ));
+            }
+            if !batch.is_empty()
+                && (batch.len() >= max_rows || batch_bytes + encoded_size > max_bytes)
+            {
+                let rows = std::mem::take(&mut batch);
+                sink.push_batch(rows)?;
+                batch_bytes = 0;
+            }
+            batch_bytes += encoded_size;
+            batch.push(projected);
+            rows_read = rows_read.saturating_add(1);
+            Ok(())
+        };
+
+        match choose_access_path(schema.as_ref(), filter.as_ref())? {
+            AccessPath::Empty => {}
+            AccessPath::Point(key) => {
+                let mut request_context = Some(request_context);
+                if let Some(row) = self.point_row(transaction, &key, &mut request_context)? {
+                    emit(key, row)?;
+                }
+            }
+            AccessPath::Scan if self.tablets.contains_key(&schema.id) => {
+                self.local_scan_each_row(transaction, schema.id, &mut emit)?;
+            }
+            AccessPath::Scan => {
+                if transaction.is_empty() {
+                    self.distributed_scan_each_row(
+                        transaction,
+                        schema.id,
+                        request_context,
+                        &mut emit,
+                    )?;
+                } else {
+                    for (key, row) in self.distributed_scan_rows(
+                        transaction,
+                        schema.id,
+                        &mut Some(request_context),
+                    )? {
+                        emit(key, row)?;
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            sink.push_batch(batch)?;
+        }
+        Ok(QueryStreamSummary {
+            read_ts: transaction.start_ts(),
+            rows_read,
+        })
     }
 
     fn execute_inner(
@@ -1874,30 +2053,11 @@ impl LocalExecutor {
                 .unwrap_or_default(),
 
             AccessPath::Scan => {
-                if !self.tablets.contains_key(&schema.id) {
-                    return Err(Error::UnsupportedSql(
-                        "distributed scans are not available in this routing slice".to_string(),
-                    ));
+                if self.tablets.contains_key(&schema.id) {
+                    self.local_scan_rows(transaction, schema.id)?
+                } else {
+                    self.distributed_scan_rows(transaction, schema.id, &mut request_context)?
                 }
-                let tablet_ids = self.router_for(schema.id)?.route_scan();
-                let mut rows = Vec::new();
-
-                for tablet_id in tablet_ids {
-                    let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-
-                    for (key, row) in tablet.scan(transaction, None, None)? {
-                        if self.route_row_key(&key)? != tablet_id {
-                            return Err(Error::CorruptData(format!(
-                                "tablet {} returned row key routed to another tablet for table {}",
-                                tablet_id.0, schema.id.0
-                            )));
-                        }
-
-                        rows.push((key, row));
-                    }
-                }
-
-                rows
             }
         };
 
@@ -1917,6 +2077,394 @@ impl LocalExecutor {
         }
 
         Ok(rows)
+    }
+
+    fn local_scan_rows(
+        &self,
+        transaction: &Transaction,
+        table_id: TableId,
+    ) -> Result<Vec<(RowKey, Row)>> {
+        let tablet_ids = self.router_for(table_id)?.route_scan();
+        let mut rows = Vec::new();
+
+        for tablet_id in tablet_ids {
+            let tablet = self.local_tablet_for_route(table_id, tablet_id)?;
+            let mut resume_after = None;
+            loop {
+                let page = tablet.scan_page(
+                    transaction,
+                    None,
+                    None,
+                    resume_after.as_ref(),
+                    TABLET_SCAN_PAGE_ROWS as usize,
+                    TABLET_SCAN_PAGE_BYTES as usize,
+                )?;
+                if page.rows.is_empty() && page.has_more {
+                    return Err(Error::CorruptData(format!(
+                        "tablet {} returned a non-progressing scan page",
+                        tablet_id.0
+                    )));
+                }
+                for (key, row) in page.rows {
+                    if self.route_row_key(&key)? != tablet_id {
+                        return Err(Error::CorruptData(format!(
+                            "tablet {} returned row key routed to another tablet for table {}",
+                            tablet_id.0, table_id.0
+                        )));
+                    }
+                    resume_after = Some(key.clone());
+                    rows.push((key, row));
+                }
+                if !page.has_more {
+                    break;
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn local_scan_each_row(
+        &self,
+        transaction: &Transaction,
+        table_id: TableId,
+        emit: &mut dyn FnMut(RowKey, Row) -> Result<()>,
+    ) -> Result<()> {
+        for tablet_id in self.router_for(table_id)?.route_scan() {
+            let tablet = self.local_tablet_for_route(table_id, tablet_id)?;
+            let mut resume_after = None;
+            loop {
+                let page = tablet.scan_page(
+                    transaction,
+                    None,
+                    None,
+                    resume_after.as_ref(),
+                    TABLET_SCAN_PAGE_ROWS as usize,
+                    TABLET_SCAN_PAGE_BYTES as usize,
+                )?;
+                if page.rows.is_empty() && page.has_more {
+                    return Err(Error::CorruptData(format!(
+                        "tablet {} returned a non-progressing scan page",
+                        tablet_id.0
+                    )));
+                }
+                for (key, row) in page.rows {
+                    if self.route_row_key(&key)? != tablet_id {
+                        return Err(Error::CorruptData(format!(
+                            "tablet {} returned row key routed to another tablet for table {}",
+                            tablet_id.0, table_id.0
+                        )));
+                    }
+                    resume_after = Some(key.clone());
+                    emit(key, row)?;
+                }
+                if !page.has_more {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn distributed_scan_rows(
+        &self,
+        transaction: &Transaction,
+        table_id: TableId,
+        request_context: &mut Option<&mut TabletRequestContext>,
+    ) -> Result<Vec<(RowKey, Row)>> {
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql(format!(
+                "metadata table {} has no installed tablet gateway",
+                table_id.0
+            ))
+        })?;
+        let context = match request_context {
+            Some(context) => &mut **context,
+            None => {
+                return Err(Error::InvalidArgument(
+                    "distributed scans require a tablet request context".to_string(),
+                ));
+            }
+        };
+        let logical_span = ScanSpan::unbounded();
+        let initial_routes = gateway.lookup_scan_routes(table_id, &logical_span)?;
+        validate_scan_route_cover(&logical_span, &initial_routes)?;
+        let identical_hash_spans = initial_routes.len() > 1
+            && initial_routes
+                .iter()
+                .all(|route| route.span == logical_span);
+        let mut work = initial_routes
+            .into_iter()
+            .map(|route| PendingScanFragment {
+                route,
+                resume_after: None,
+                topology_refreshes: 0,
+            })
+            .collect::<VecDeque<_>>();
+        let mut progress = ScanProgress::new(transaction.start_ts(), logical_span.clone());
+        let mut committed_rows = BTreeMap::<Vec<u8>, Row>::new();
+
+        while let Some(mut pending) = work.pop_front() {
+            let request_id = context.next_read_request_id(pending.route.route.raft_group_id)?;
+            let response = gateway.scan_page(
+                &pending.route.route,
+                request_id.clone(),
+                &pending.route.span,
+                pending.resume_after.as_deref(),
+                progress.read_ts,
+                TABLET_SCAN_PAGE_ROWS,
+                TABLET_SCAN_PAGE_BYTES,
+                context.timeout(),
+            );
+
+            let batch = match response {
+                Ok(batch) => batch,
+                Err(Error::StaleTabletEpoch { .. })
+                    if pending.topology_refreshes < MAX_SCAN_TOPOLOGY_REFRESHES =>
+                {
+                    let refreshed = gateway
+                        .lookup_scan_routes(table_id, &pending.route.span)
+                        .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    validate_scan_route_cover(&pending.route.span, &refreshed)
+                        .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    let refreshed = resume_scan_routes(
+                        refreshed,
+                        pending.resume_after.as_deref(),
+                        pending.topology_refreshes + 1,
+                    );
+                    for route in refreshed.into_iter().rev() {
+                        work.push_front(route);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(scan_failure(pending.route.route.tablet_id, error));
+                }
+            };
+
+            let validation_request = ragnordb_common::rpc_codec::TabletScanRequest {
+                request_id,
+                tablet_id: pending.route.route.tablet_id,
+                tablet_epoch: pending.route.route.tablet_epoch,
+                start_key: pending.route.span.start_key.clone(),
+                end_key: pending.route.span.end_key.clone(),
+                resume_after: pending.resume_after.clone(),
+                read_timestamp: progress.read_ts,
+                max_rows: TABLET_SCAN_PAGE_ROWS,
+                max_bytes: TABLET_SCAN_PAGE_BYTES,
+                rpc_attempt_id: None,
+            };
+            batch.validate_for(&validation_request).map_err(|error| {
+                scan_failure(
+                    pending.route.route.tablet_id,
+                    Error::CorruptData(error.to_string()),
+                )
+            })?;
+            if batch.rows.is_empty() && !batch.exhausted {
+                return Err(scan_failure(
+                    pending.route.route.tablet_id,
+                    Error::CorruptData(
+                        "tablet returned a non-progressing distributed scan page".to_string(),
+                    ),
+                ));
+            }
+
+            for scan_row in batch.rows {
+                let row_key = RowKey {
+                    table_id,
+                    primary_key_bytes: scan_row.key,
+                };
+                let encoded_key = ragnordb_storage::key::encode_row_key(&row_key)?;
+                let row = decode_row(&scan_row.row)?;
+                if committed_rows.insert(encoded_key, row).is_some() {
+                    return Err(scan_failure(
+                        pending.route.route.tablet_id,
+                        Error::CorruptData(
+                            "distributed scan returned the same logical row more than once"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            }
+
+            if batch.exhausted && !identical_hash_spans {
+                progress.mark_completed(pending.route.span)?;
+            } else {
+                if !batch.exhausted {
+                    pending.resume_after = batch.next_resume_after;
+                    work.push_front(pending);
+                }
+            }
+        }
+
+        if identical_hash_spans {
+            progress.mark_completed(logical_span.clone())?;
+        }
+
+        if !progress.remaining.is_empty() {
+            return Err(Error::CorruptData(
+                "distributed scan exhausted its route work with logical spans remaining"
+                    .to_string(),
+            ));
+        }
+
+        // Remote tablet reads contain committed state only. Overlay the
+        // transaction's deterministic write set after every required span has
+        // succeeded so V1 still publishes an all-or-nothing result while
+        // preserving read-your-writes for inserts, updates, and deletes.
+        for (encoded_key, mutation) in transaction.write_set() {
+            let row_key = decode_row_key(encoded_key)?;
+            if row_key.table_id != table_id {
+                continue;
+            }
+            match mutation {
+                Mutation::Put(encoded_row) => {
+                    committed_rows.insert(encoded_key.clone(), decode_row(encoded_row)?);
+                }
+                Mutation::Delete => {
+                    committed_rows.remove(encoded_key);
+                }
+            }
+        }
+
+        committed_rows
+            .into_iter()
+            .map(|(encoded_key, row)| decode_row_key(&encoded_key).map(|key| (key, row)))
+            .collect()
+    }
+
+    fn distributed_scan_each_row(
+        &self,
+        transaction: &Transaction,
+        table_id: TableId,
+        request_context: &mut TabletRequestContext,
+        emit: &mut dyn FnMut(RowKey, Row) -> Result<()>,
+    ) -> Result<()> {
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql(format!(
+                "metadata table {} has no installed tablet gateway",
+                table_id.0
+            ))
+        })?;
+        let logical_span = ScanSpan::unbounded();
+        let initial_routes = gateway.lookup_scan_routes(table_id, &logical_span)?;
+        validate_scan_route_cover(&logical_span, &initial_routes)?;
+        if initial_routes.len() > 1
+            && initial_routes
+                .iter()
+                .all(|route| route.span == logical_span)
+        {
+            return Err(Error::UnsupportedSql(
+                "streaming scans require ordered range metadata".to_string(),
+            ));
+        }
+        let mut work = initial_routes
+            .into_iter()
+            .map(|route| PendingScanFragment {
+                route,
+                resume_after: None,
+                topology_refreshes: 0,
+            })
+            .collect::<VecDeque<_>>();
+        let mut progress = ScanProgress::new(transaction.start_ts(), logical_span);
+        let mut last_key = None::<Vec<u8>>;
+
+        while let Some(mut pending) = work.pop_front() {
+            let request_id =
+                request_context.next_read_request_id(pending.route.route.raft_group_id)?;
+            let batch = match gateway.scan_page(
+                &pending.route.route,
+                request_id.clone(),
+                &pending.route.span,
+                pending.resume_after.as_deref(),
+                progress.read_ts,
+                TABLET_SCAN_PAGE_ROWS,
+                TABLET_SCAN_PAGE_BYTES,
+                request_context.timeout(),
+            ) {
+                Ok(batch) => batch,
+                Err(Error::StaleTabletEpoch { .. })
+                    if pending.topology_refreshes < MAX_SCAN_TOPOLOGY_REFRESHES =>
+                {
+                    let refreshed = gateway
+                        .lookup_scan_routes(table_id, &pending.route.span)
+                        .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    validate_scan_route_cover(&pending.route.span, &refreshed)
+                        .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    for route in resume_scan_routes(
+                        refreshed,
+                        pending.resume_after.as_deref(),
+                        pending.topology_refreshes + 1,
+                    )
+                    .into_iter()
+                    .rev()
+                    {
+                        work.push_front(route);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(scan_failure(pending.route.route.tablet_id, error)),
+            };
+            let validation_request = ragnordb_common::rpc_codec::TabletScanRequest {
+                request_id,
+                tablet_id: pending.route.route.tablet_id,
+                tablet_epoch: pending.route.route.tablet_epoch,
+                start_key: pending.route.span.start_key.clone(),
+                end_key: pending.route.span.end_key.clone(),
+                resume_after: pending.resume_after.clone(),
+                read_timestamp: progress.read_ts,
+                max_rows: TABLET_SCAN_PAGE_ROWS,
+                max_bytes: TABLET_SCAN_PAGE_BYTES,
+                rpc_attempt_id: None,
+            };
+            batch.validate_for(&validation_request).map_err(|error| {
+                scan_failure(
+                    pending.route.route.tablet_id,
+                    Error::CorruptData(error.to_string()),
+                )
+            })?;
+            if batch.rows.is_empty() && !batch.exhausted {
+                return Err(scan_failure(
+                    pending.route.route.tablet_id,
+                    Error::CorruptData(
+                        "tablet returned a non-progressing distributed scan page".to_string(),
+                    ),
+                ));
+            }
+            for scan_row in &batch.rows {
+                if last_key
+                    .as_deref()
+                    .is_some_and(|last_key| scan_row.key.as_slice() <= last_key)
+                {
+                    return Err(scan_failure(
+                        pending.route.route.tablet_id,
+                        Error::CorruptData(
+                            "ordered distributed scan returned a duplicate or regressing key"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                let row_key = RowKey {
+                    table_id,
+                    primary_key_bytes: scan_row.key.clone(),
+                };
+                let row = decode_row(&scan_row.row)?;
+                last_key = Some(scan_row.key.clone());
+                emit(row_key, row)?;
+            }
+            if batch.exhausted {
+                progress.mark_completed(pending.route.span)?;
+            } else {
+                pending.resume_after = batch.next_resume_after;
+                work.push_front(pending);
+            }
+        }
+        if !progress.remaining.is_empty() {
+            return Err(Error::CorruptData(
+                "streaming distributed scan left logical spans unfinished".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Read one row from the local compatibility tablet or the server gateway,
@@ -1979,6 +2527,106 @@ impl LocalExecutor {
             )?
             .map(|encoded_row| decode_row(&encoded_row))
             .transpose()
+    }
+}
+
+fn validate_scan_route_cover(span: &ScanSpan, routes: &[TabletScanRoute]) -> Result<()> {
+    if routes.is_empty() {
+        return Err(Error::CorruptData(
+            "metadata returned no owners for a non-empty logical scan span".to_string(),
+        ));
+    }
+
+    let mut tablet_ids = BTreeSet::new();
+    for route in routes {
+        route
+            .route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        route.span.validate()?;
+        if !tablet_ids.insert(route.route.tablet_id) {
+            return Err(Error::CorruptData(format!(
+                "metadata returned tablet {} more than once for one scan span",
+                route.route.tablet_id.0
+            )));
+        }
+    }
+
+    // Legacy hash metadata cannot express ordered ownership intervals. Every
+    // bucket therefore receives the complete logical span and the executor
+    // performs a final ordered merge. Authoritative range metadata instead
+    // must form one exact adjacent cover.
+    if routes.iter().all(|route| route.span == *span) {
+        return Ok(());
+    }
+
+    let mut next_start = span.start_key.clone();
+    for (index, route) in routes.iter().enumerate() {
+        if route.span.start_key != next_start {
+            return Err(Error::CorruptData(
+                "metadata scan routes contain a gap, overlap, or are out of order".to_string(),
+            ));
+        }
+        if route.span.end_key.is_none() && index + 1 != routes.len() {
+            return Err(Error::CorruptData(
+                "an unbounded scan fragment was followed by another route".to_string(),
+            ));
+        }
+        next_start = route.span.end_key.clone();
+    }
+    if next_start != span.end_key {
+        return Err(Error::CorruptData(
+            "metadata scan routes do not cover the complete requested span".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resume_scan_routes(
+    routes: Vec<TabletScanRoute>,
+    resume_after: Option<&[u8]>,
+    topology_refreshes: u32,
+) -> Vec<PendingScanFragment> {
+    routes
+        .into_iter()
+        .filter_map(|route| {
+            let route_is_finished = resume_after.is_some_and(|resume_after| {
+                route
+                    .span
+                    .end_key
+                    .as_deref()
+                    .is_some_and(|end_key| end_key <= resume_after)
+            });
+            if route_is_finished {
+                return None;
+            }
+            let resume_for_route = resume_after
+                .filter(|resume_after| {
+                    route
+                        .span
+                        .start_key
+                        .as_deref()
+                        .is_none_or(|start_key| start_key <= *resume_after)
+                })
+                .map(ToOwned::to_owned);
+            Some(PendingScanFragment {
+                route,
+                resume_after: resume_for_route,
+                topology_refreshes,
+            })
+        })
+        .collect()
+}
+
+fn scan_failure(tablet_id: TabletId, error: Error) -> Error {
+    if matches!(error, Error::DistributedScanFailed { .. }) {
+        return error;
+    }
+    let retryable = error.retry_action() == ragnordb_common::RetryAction::RetrySameRequest;
+    Error::DistributedScanFailed {
+        tablet_id,
+        retryable,
+        reason: error.to_string(),
     }
 }
 
@@ -2509,7 +3157,7 @@ mod tests {
         command_codec::{CachedTabletCommandResult, TabletCommand},
         ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TxnId},
         metadata_codec::PartitionSpec,
-        rpc_codec::{ReplicaRoute, TabletRoute},
+        rpc_codec::{ReplicaRoute, TabletRoute, TabletScanRow},
     };
     use ragnordb_sql::{analyze, parse_one, plan};
     use ragnordb_tablet::command::TabletCommandApplyResult;
@@ -2518,6 +3166,11 @@ mod tests {
     struct StaticMetadata {
         definition: TableDefinition,
         descriptor: TabletDescriptor,
+    }
+
+    struct RefreshingMetadata {
+        definition: TableDefinition,
+        descriptors: Mutex<Vec<TabletDescriptor>>,
     }
 
     impl MetadataTableCreator for StaticMetadata {
@@ -2542,6 +3195,30 @@ mod tests {
         }
     }
 
+    impl MetadataTableCreator for RefreshingMetadata {
+        fn create_table(
+            &self,
+            _request: CreateTableRequest,
+            _request_id: RequestId,
+            _timeout: Duration,
+        ) -> Result<TableDefinition> {
+            Err(Error::NotImplemented(
+                "refreshing test metadata is read-only",
+            ))
+        }
+
+        fn table_descriptors(&self, table_id: TableId) -> Result<Vec<TabletDescriptor>> {
+            if table_id != TableId(self.definition.table_id) {
+                return Err(Error::SchemaMismatch("unknown test table".to_string()));
+            }
+            Ok(self.descriptors.lock().unwrap().clone())
+        }
+
+        fn list_tables(&self) -> Vec<TableDefinition> {
+            vec![self.definition.clone()]
+        }
+    }
+
     struct RecordingGateway {
         route: TabletRoute,
         row_key: Vec<u8>,
@@ -2550,6 +3227,130 @@ mod tests {
         commands: Mutex<Vec<(RequestId, TabletCommand)>>,
         unknown_outcome_once: Mutex<bool>,
         outcome_queries: Mutex<Vec<LogicalCommandId>>,
+    }
+
+    struct RecordingScanGateway {
+        routes: Vec<TabletScanRoute>,
+        rows: BTreeMap<TabletId, TabletScanRow>,
+        failed_tablet: Option<TabletId>,
+        stale_tablet_once: Mutex<Option<TabletId>>,
+        replacement_routes: Mutex<Option<Vec<TabletScanRoute>>>,
+        read_timestamps: Mutex<Vec<Timestamp>>,
+        scan_tablets: Mutex<Vec<TabletId>>,
+    }
+
+    impl TabletGateway for RecordingScanGateway {
+        fn lookup_tablet_route(&self, _table_id: TableId, _key: &[u8]) -> Result<TabletRoute> {
+            Err(Error::NotImplemented(
+                "point reads are unused by this scan test",
+            ))
+        }
+
+        fn read_point(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            _row_key: RowKey,
+            _read_timestamp: Timestamp,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            Err(Error::NotImplemented(
+                "point reads are unused by this scan test",
+            ))
+        }
+
+        fn lookup_scan_routes(
+            &self,
+            _table_id: TableId,
+            span: &ScanSpan,
+        ) -> Result<Vec<TabletScanRoute>> {
+            let replacement_active = self.stale_tablet_once.lock().unwrap().is_none();
+            let routes = replacement_active
+                .then(|| self.replacement_routes.lock().unwrap().clone())
+                .flatten()
+                .unwrap_or_else(|| self.routes.clone());
+            Ok(routes
+                .into_iter()
+                .filter(|route| {
+                    span.end_key.as_ref().is_none_or(|end| {
+                        route
+                            .span
+                            .start_key
+                            .as_ref()
+                            .is_none_or(|start| start < end)
+                    }) && span.start_key.as_ref().is_none_or(|start| {
+                        route.span.end_key.as_ref().is_none_or(|end| end > start)
+                    })
+                })
+                .collect())
+        }
+
+        fn scan_page(
+            &self,
+            route: &TabletRoute,
+            _request_id: RequestId,
+            _span: &ScanSpan,
+            resume_after: Option<&[u8]>,
+            read_timestamp: Timestamp,
+            _max_rows: u32,
+            _max_bytes: u32,
+            _timeout: Duration,
+        ) -> Result<TabletScanBatch> {
+            self.read_timestamps.lock().unwrap().push(read_timestamp);
+            self.scan_tablets.lock().unwrap().push(route.tablet_id);
+            if self.failed_tablet == Some(route.tablet_id) {
+                return Err(Error::TabletUnavailable {
+                    reason: "test tablet remains unavailable".to_string(),
+                });
+            }
+            let stale_once = self
+                .stale_tablet_once
+                .lock()
+                .unwrap()
+                .is_some_and(|tablet| tablet == route.tablet_id);
+            if stale_once && resume_after.is_some() {
+                self.stale_tablet_once.lock().unwrap().take();
+                return Err(Error::StaleTabletEpoch {
+                    current_epoch: route.tablet_epoch + 1,
+                    expected_epoch: route.tablet_epoch,
+                });
+            }
+            let rows = if resume_after.is_none() {
+                self.rows
+                    .get(&route.tablet_id)
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(if stale_once {
+                let next_resume_after = rows.last().map(|row| row.key.clone());
+                TabletScanBatch {
+                    rows,
+                    next_resume_after,
+                    exhausted: false,
+                }
+            } else {
+                TabletScanBatch {
+                    rows,
+                    next_resume_after: None,
+                    exhausted: true,
+                }
+            })
+        }
+
+        fn submit_command(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            _command: TabletCommand,
+            _timeout: Duration,
+        ) -> Result<TabletCommandApplyOutcome> {
+            Err(Error::NotImplemented(
+                "commands are unused by this scan test",
+            ))
+        }
     }
 
     impl TabletGateway for RecordingGateway {
@@ -2691,6 +3492,277 @@ mod tests {
         executor.refresh_metadata_catalog().unwrap();
         executor.replace_tablet_gateway(gateway.clone());
         (executor, gateway, row_key)
+    }
+
+    fn remote_scan_executor(
+        failed_tablet: Option<TabletId>,
+    ) -> (LocalExecutor, Arc<RecordingScanGateway>) {
+        let table_id = TableId(52);
+        let first_key = make_row_key(table_id, &[Value::Int(1)]).unwrap();
+        let second_key = make_row_key(table_id, &[Value::Int(2)]).unwrap();
+        let boundary = second_key.primary_key_bytes.clone();
+        let descriptors = vec![
+            TabletDescriptor {
+                tablet_id: TabletId(152),
+                table_id,
+                raft_group_id: RaftGroupId(252),
+                tablet_epoch: 1,
+                partition: PartitionSpec::Range {
+                    start_key: Vec::new(),
+                    end_key: boundary.clone(),
+                },
+            },
+            TabletDescriptor {
+                tablet_id: TabletId(153),
+                table_id,
+                raft_group_id: RaftGroupId(253),
+                tablet_epoch: 1,
+                partition: PartitionSpec::Range {
+                    start_key: boundary.clone(),
+                    end_key: Vec::new(),
+                },
+            },
+        ];
+        let definition = TableDefinition {
+            table_id: table_id.0,
+            name: "remote_scan".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    column_id: ColumnId(1),
+                    name: "id".to_string(),
+                    ty: DataType::Int,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    column_id: ColumnId(2),
+                    name: "name".to_string(),
+                    ty: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            primary_key_column_ids: vec![ColumnId(1)],
+            schema_version: 1,
+            tablet_count: 1,
+        };
+        let routes = descriptors
+            .iter()
+            .map(|descriptor| TabletScanRoute {
+                route: TabletRoute {
+                    raft_group_id: descriptor.raft_group_id,
+                    tablet_id: descriptor.tablet_id,
+                    tablet_epoch: descriptor.tablet_epoch,
+                    leader_replica_id: ReplicaId(1),
+                    replicas: vec![ReplicaRoute {
+                        replica_id: ReplicaId(1),
+                        node_id: NodeId(9),
+                    }],
+                },
+                span: match &descriptor.partition {
+                    PartitionSpec::Range { start_key, end_key } => ScanSpan::new(
+                        (!start_key.is_empty()).then(|| start_key.clone()),
+                        (!end_key.is_empty()).then(|| end_key.clone()),
+                    )
+                    .unwrap(),
+                    PartitionSpec::Hash { .. } => unreachable!(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let rows = BTreeMap::from([
+            (
+                TabletId(152),
+                TabletScanRow {
+                    key: first_key.primary_key_bytes,
+                    row: encode_row(&Row {
+                        values: vec![Value::Int(1), Value::Text("first".to_string())],
+                    })
+                    .unwrap(),
+                },
+            ),
+            (
+                TabletId(153),
+                TabletScanRow {
+                    key: second_key.primary_key_bytes,
+                    row: encode_row(&Row {
+                        values: vec![Value::Int(2), Value::Text("second".to_string())],
+                    })
+                    .unwrap(),
+                },
+            ),
+            (
+                TabletId(154),
+                TabletScanRow {
+                    key: make_row_key(table_id, &[Value::Int(1)])
+                        .unwrap()
+                        .primary_key_bytes,
+                    row: encode_row(&Row {
+                        values: vec![Value::Int(1), Value::Text("first".to_string())],
+                    })
+                    .unwrap(),
+                },
+            ),
+        ]);
+        let gateway = Arc::new(RecordingScanGateway {
+            routes,
+            rows,
+            failed_tablet,
+            stale_tablet_once: Mutex::new(None),
+            replacement_routes: Mutex::new(None),
+            read_timestamps: Mutex::new(Vec::new()),
+            scan_tablets: Mutex::new(Vec::new()),
+        });
+        let mut executor = LocalExecutor::new();
+        executor.replace_metadata_table_creator(Arc::new(RefreshingMetadata {
+            definition,
+            descriptors: Mutex::new(descriptors),
+        }));
+        executor.refresh_metadata_catalog().unwrap();
+        executor.replace_tablet_gateway(gateway.clone());
+        (executor, gateway)
+    }
+
+    /// Realistic bug caught: metadata tables previously rejected every scan,
+    /// so rows owned by multiple range tablets could never be returned through
+    /// an arbitrary SQL gateway at one snapshot timestamp.
+    #[test]
+    fn metadata_scan_fans_out_in_key_order_at_one_read_timestamp() {
+        let (mut executor, gateway) = remote_scan_executor(None);
+        let plan = build(&executor, "SELECT id, name FROM remote_scan");
+        let mut transaction = Transaction::new(TxnId(1), Timestamp(77)).unwrap();
+        let mut context = TabletRequestContext::new(900).unwrap();
+
+        let result = executor
+            .execute_with_request_context(plan, Some(&mut transaction), &mut context)
+            .unwrap();
+        let ExecutionResult::Query(result) = result else {
+            panic!("expected query result");
+        };
+        assert_eq!(
+            result.rows,
+            vec![
+                Row {
+                    values: vec![Value::Int(1), Value::Text("first".to_string())]
+                },
+                Row {
+                    values: vec![Value::Int(2), Value::Text("second".to_string())]
+                },
+            ]
+        );
+        assert_eq!(
+            gateway.read_timestamps.lock().unwrap().as_slice(),
+            &[Timestamp(77), Timestamp(77)]
+        );
+    }
+
+    /// Realistic bug caught: a stale epoch during a partially consumed tablet
+    /// range could restart the whole scan or keep the stale tablet ID, causing
+    /// duplicate rows or an omitted split successor.
+    #[test]
+    fn metadata_scan_reroutes_only_the_unfinished_span_after_stale_epoch() {
+        let (mut executor, gateway) = remote_scan_executor(None);
+        *gateway.stale_tablet_once.lock().unwrap() = Some(TabletId(152));
+        let mut replacement = gateway.routes[0].clone();
+        replacement.route.tablet_id = TabletId(154);
+        replacement.route.raft_group_id = RaftGroupId(254);
+        *gateway.replacement_routes.lock().unwrap() =
+            Some(vec![replacement, gateway.routes[1].clone()]);
+
+        let plan = build(&executor, "SELECT id, name FROM remote_scan");
+        let mut transaction = Transaction::new(TxnId(1), Timestamp(77)).unwrap();
+        let mut context = TabletRequestContext::new(902).unwrap();
+        let result = executor
+            .execute_with_request_context(plan, Some(&mut transaction), &mut context)
+            .unwrap();
+        let ExecutionResult::Query(result) = result else {
+            panic!("expected query result");
+        };
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            gateway.scan_tablets.lock().unwrap().as_slice(),
+            &[TabletId(152), TabletId(152), TabletId(154), TabletId(153)]
+        );
+    }
+
+    /// Realistic bug caught: returning rows from healthy tablets before a
+    /// failed tablet was discovered would turn an incomplete distributed scan
+    /// into an apparently successful V1 result.
+    #[test]
+    fn metadata_scan_fails_whole_result_and_identifies_unavailable_tablet() {
+        let (mut executor, _) = remote_scan_executor(Some(TabletId(153)));
+        let plan = build(&executor, "SELECT id, name FROM remote_scan");
+        let mut transaction = Transaction::new(TxnId(1), Timestamp(77)).unwrap();
+        let mut context = TabletRequestContext::new(901).unwrap();
+
+        assert!(matches!(
+            executor.execute_with_request_context(plan, Some(&mut transaction), &mut context),
+            Err(Error::DistributedScanFailed {
+                tablet_id: TabletId(153),
+                retryable: true,
+                ..
+            })
+        ));
+    }
+
+    /// Realistic bug caught: a committed tablet epoch change previously made
+    /// every later metadata refresh fail as corruption, permanently pinning
+    /// the SQL gateway to a stale route after a split, merge, or reassignment.
+    #[test]
+    fn metadata_refresh_replaces_a_complete_changed_route() {
+        let table_id = TableId(42);
+        let metadata = Arc::new(RefreshingMetadata {
+            definition: TableDefinition {
+                table_id: table_id.0,
+                name: "refreshable".to_string(),
+                columns: vec![ColumnDefinition {
+                    column_id: ColumnId(1),
+                    name: "id".to_string(),
+                    ty: DataType::Int,
+                    nullable: false,
+                }],
+                primary_key_column_ids: vec![ColumnId(1)],
+                schema_version: 1,
+                tablet_count: 1,
+            },
+            descriptors: Mutex::new(vec![TabletDescriptor {
+                tablet_id: TabletId(142),
+                table_id,
+                raft_group_id: RaftGroupId(242),
+                tablet_epoch: 1,
+                partition: PartitionSpec::Range {
+                    start_key: Vec::new(),
+                    end_key: Vec::new(),
+                },
+            }]),
+        });
+        let mut executor = LocalExecutor::new();
+        executor.replace_metadata_table_creator(metadata.clone());
+        executor.refresh_metadata_catalog().unwrap();
+
+        *metadata.descriptors.lock().unwrap() = vec![
+            TabletDescriptor {
+                tablet_id: TabletId(143),
+                table_id,
+                raft_group_id: RaftGroupId(243),
+                tablet_epoch: 2,
+                partition: PartitionSpec::Range {
+                    start_key: Vec::new(),
+                    end_key: vec![0x80],
+                },
+            },
+            TabletDescriptor {
+                tablet_id: TabletId(144),
+                table_id,
+                raft_group_id: RaftGroupId(244),
+                tablet_epoch: 2,
+                partition: PartitionSpec::Range {
+                    start_key: vec![0x80],
+                    end_key: Vec::new(),
+                },
+            },
+        ];
+        executor.refresh_metadata_catalog().unwrap();
+
+        let route = executor.tablet_routers.get(&table_id).unwrap();
+        assert_eq!(route.route_scan(), vec![TabletId(143), TabletId(144)]);
     }
 
     fn build(executor: &LocalExecutor, sql: &str) -> Plan {

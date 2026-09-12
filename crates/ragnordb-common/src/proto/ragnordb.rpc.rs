@@ -58,6 +58,49 @@ pub struct TabletReadRequest {
     #[prost(uint64, optional, tag = "7")]
     pub rpc_attempt_id: ::core::option::Option<u64>,
 }
+/// A bounded, resumable read over one logical half-open tablet span. The
+/// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
+/// response so scan failures retain the established retry and attempt-correlation
+/// fields without introducing a second response envelope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub start_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub end_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub resume_after: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, optional, tag = "7")]
+    pub read_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(uint32, tag = "8")]
+    pub max_rows: u32,
+    #[prost(uint32, tag = "9")]
+    pub max_bytes: u32,
+    #[prost(uint64, optional, tag = "10")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanRow {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub row: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<TabletScanRow>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub next_resume_after: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bool, tag = "3")]
+    pub exhausted: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommandResponse {
     #[prost(message, optional, tag = "1")]
@@ -278,6 +321,7 @@ pub enum MessageType {
     MetadataResponse = 5,
     TabletReadRequest = 6,
     TabletOutcomeQueryRequest = 7,
+    TabletScanRequest = 8,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -296,6 +340,7 @@ impl MessageType {
             Self::TabletOutcomeQueryRequest => {
                 "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST"
             }
+            Self::TabletScanRequest => "MESSAGE_TYPE_TABLET_SCAN_REQUEST",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -311,6 +356,7 @@ impl MessageType {
             "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST" => {
                 Some(Self::TabletOutcomeQueryRequest)
             }
+            "MESSAGE_TYPE_TABLET_SCAN_REQUEST" => Some(Self::TabletScanRequest),
             _ => None,
         }
     }

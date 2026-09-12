@@ -36,7 +36,10 @@ use ragnordb_common::{
     encoding::{decode_row, encode_row},
     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, TxnId},
     raft_bootstrap::RaftGroupBootstrap,
-    rpc_codec::{TabletCommandRequest, TabletOutcomeQueryRequest, TabletReadRequest},
+    rpc_codec::{
+        TabletCommandRequest, TabletOutcomeQueryRequest, TabletReadRequest, TabletScanBatch,
+        TabletScanRequest, TabletScanRow,
+    },
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
@@ -172,6 +175,11 @@ enum HostRequest {
     ReadPoint {
         request: TabletReadRequest,
         reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+        deadline: Instant,
+    },
+    Scan {
+        request: TabletScanRequest,
+        reply: mpsc::Sender<Result<TabletScanBatch>>,
         deadline: Instant,
     },
     OutcomeQuery {
@@ -681,6 +689,35 @@ impl ReplicatedTabletHandle {
             .recv_timeout(timeout)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet read deadline elapsed before execution".to_string(),
+            })?
+    }
+
+    /// Read one bounded, ordered page at a caller-supplied MVCC timestamp.
+    ///
+    /// Like point reads, the Ready owner executes this on the state-machine
+    /// thread after the caller has crossed the current-term read barrier.
+    pub fn scan_page(
+        &self,
+        request: TabletScanRequest,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("tablet scan deadline overflowed".into()))?;
+        let (reply, response) = mpsc::channel();
+        self.requests
+            .send(HostRequest::Scan {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "replicated tablet runtime has stopped".to_string(),
+            })?;
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "tablet scan deadline elapsed before execution".to_string(),
             })?
     }
 
@@ -1954,6 +1991,19 @@ where
                     reply,
                     deadline,
                 ),
+                HostRequest::Scan {
+                    request,
+                    reply,
+                    deadline,
+                } => admit_scan_request(
+                    request,
+                    &tablet,
+                    serving_leader,
+                    ready_loop.raft().leader_id().map(|id| id.get()),
+                    &identity,
+                    reply,
+                    deadline,
+                ),
                 HostRequest::OutcomeQuery {
                     request,
                     reply,
@@ -2295,6 +2345,12 @@ fn admit_request<W, LS, SS>(
             )));
             return;
         }
+        HostRequest::Scan { reply, .. } => {
+            let _ = reply.send(Err(Error::InvalidArgument(
+                "tablet scans must use the scan admission path".to_string(),
+            )));
+            return;
+        }
         HostRequest::OutcomeQuery { reply, .. } => {
             let _ = reply.send(Err(Error::InvalidArgument(
                 "tablet outcome queries must use the outcome admission path".to_string(),
@@ -2431,6 +2487,125 @@ fn admit_read_request(
         .tablet()
         .get(&transaction, &row_key)
         .and_then(|row| row.map(|row| encode_row(&row)).transpose());
+    let _ = reply.send(result);
+}
+
+/// Execute a bounded range page after the same Ready-owner admission checks
+/// used by point reads. No scan request can bypass leader activation, target
+/// identity, tablet epoch, or the caller's fixed MVCC timestamp.
+fn admit_scan_request(
+    request: TabletScanRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    reply: mpsc::Sender<Result<TabletScanBatch>>,
+    deadline: Instant,
+) {
+    if deadline <= Instant::now() {
+        let _ = reply.send(Err(Error::ProposalUnavailable {
+            reason: "tablet scan deadline elapsed before admission".to_string(),
+        }));
+        return;
+    }
+    if !serving_leader {
+        let _ = reply.send(Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        }));
+        return;
+    }
+    if let Err(error) = request.validate() {
+        let _ = reply.send(Err(Error::InvalidArgument(error.to_string())));
+        return;
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet scan request targets a different Raft group".to_string(),
+        )));
+        return;
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        let _ = reply.send(Err(Error::InvalidArgument(
+            "tablet scan request targets a different tablet".to_string(),
+        )));
+        return;
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        let _ = reply.send(Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        }));
+        return;
+    }
+
+    let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
+    let transaction = match ragnordb_txn::Transaction::new(transaction_id, request.read_timestamp) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return;
+        }
+    };
+    let table_id = identity.target.table_id;
+    let start = request
+        .start_key
+        .as_ref()
+        .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+            table_id,
+            primary_key_bytes: primary_key_bytes.clone(),
+        });
+    let end = request
+        .end_key
+        .as_ref()
+        .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+            table_id,
+            primary_key_bytes: primary_key_bytes.clone(),
+        });
+    let resume_after =
+        request
+            .resume_after
+            .as_ref()
+            .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+                table_id,
+                primary_key_bytes: primary_key_bytes.clone(),
+            });
+
+    let result = tablet
+        .state_machine()
+        .tablet()
+        .scan_page(
+            &transaction,
+            start.as_ref(),
+            end.as_ref(),
+            resume_after.as_ref(),
+            request.max_rows as usize,
+            request.max_bytes as usize,
+        )
+        .and_then(|page| {
+            let rows = page
+                .rows
+                .into_iter()
+                .map(|(key, row)| {
+                    Ok(TabletScanRow {
+                        key: key.primary_key_bytes,
+                        row: encode_row(&row)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let next_resume_after = page
+                .has_more
+                .then(|| rows.last().map(|row| row.key.clone()))
+                .flatten();
+            let batch = TabletScanBatch {
+                rows,
+                next_resume_after,
+                exhausted: !page.has_more,
+            };
+            batch
+                .validate_for(&request)
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            Ok(batch)
+        });
     let _ = reply.send(result);
 }
 
@@ -3182,6 +3357,9 @@ fn reply_error(request: HostRequest, error: Error) {
             let _ = reply.send(Err(error));
         }
         HostRequest::ReadPoint { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        HostRequest::Scan { reply, .. } => {
             let _ = reply.send(Err(error));
         }
         HostRequest::OutcomeQuery { reply, .. } => {

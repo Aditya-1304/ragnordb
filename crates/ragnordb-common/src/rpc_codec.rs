@@ -22,6 +22,7 @@ use prost::Message;
 ///   0x05 — MetadataResponse
 ///   0x06 — TabletReadRequest
 ///   0x07 — TabletOutcomeQueryRequest
+///   0x08 — TabletScanRequest
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
@@ -38,6 +39,7 @@ pub enum MessageType {
     MetadataResponse,
     TabletReadRequest,
     TabletOutcomeQueryRequest,
+    TabletScanRequest,
 }
 
 impl MessageType {
@@ -54,6 +56,7 @@ impl MessageType {
             Self::MetadataResponse => 0x05,
             Self::TabletReadRequest => 0x06,
             Self::TabletOutcomeQueryRequest => 0x07,
+            Self::TabletScanRequest => 0x08,
         }
     }
 
@@ -66,6 +69,7 @@ impl MessageType {
             0x05 => Ok(Self::MetadataResponse),
             0x06 => Ok(Self::TabletReadRequest),
             0x07 => Ok(Self::TabletOutcomeQueryRequest),
+            0x08 => Ok(Self::TabletScanRequest),
             _ => Err("unknown RPC message type"),
         }
     }
@@ -79,6 +83,7 @@ impl MessageType {
             MessageType::MetadataResponse => rpc::MessageType::MetadataResponse,
             MessageType::TabletReadRequest => rpc::MessageType::TabletReadRequest,
             MessageType::TabletOutcomeQueryRequest => rpc::MessageType::TabletOutcomeQueryRequest,
+            MessageType::TabletScanRequest => rpc::MessageType::TabletScanRequest,
         }
     }
 
@@ -93,6 +98,7 @@ impl MessageType {
             rpc::MessageType::TabletOutcomeQueryRequest => {
                 Ok(MessageType::TabletOutcomeQueryRequest)
             }
+            rpc::MessageType::TabletScanRequest => Ok(MessageType::TabletScanRequest),
             rpc::MessageType::Unspecified => Err("unspecified message type"),
         }
     }
@@ -291,6 +297,247 @@ impl TabletReadRequest {
             row_key,
             read_timestamp,
         })
+    }
+}
+
+/// Maximum number of rows admitted into one tablet scan batch. The request
+/// carries a caller-selected lower cap, but never a value above this protocol
+/// bound; this keeps one malformed or malicious request from forcing an
+/// unbounded response allocation at a tablet.
+pub const MAX_TABLET_SCAN_ROWS: u32 = 65_536;
+
+/// Maximum raw key-plus-row bytes admitted into one tablet scan batch.
+pub const MAX_TABLET_SCAN_BYTES: u32 = 8 * 1024 * 1024;
+
+/// A bounded read over one logical half-open tablet span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanRequest {
+    pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    /// Inclusive lower logical bound. `None` means unbounded below.
+    pub start_key: Option<Vec<u8>>,
+    /// Exclusive upper logical bound. `None` means unbounded above.
+    pub end_key: Option<Vec<u8>>,
+    /// The last key already delivered. The next row must compare greater than
+    /// this key, which makes retries and topology refreshes resumable without
+    /// replaying a completed logical row.
+    pub resume_after: Option<Vec<u8>>,
+    pub read_timestamp: Timestamp,
+    pub max_rows: u32,
+    pub max_bytes: u32,
+    /// Physical transport-attempt correlation. It is not part of logical scan
+    /// identity and may change when the same scan request is retried.
+    pub rpc_attempt_id: Option<u64>,
+}
+
+impl TabletScanRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.request_id.client_id == 0
+            || self.request_id.sequence == 0
+            || self.request_id.raft_group_id.0 == 0
+            || self.tablet_id.0 == 0
+            || self.tablet_epoch == 0
+        {
+            return Err("tablet scan request contains a reserved zero identity");
+        }
+        if self.read_timestamp.0 == 0 {
+            return Err("tablet scan read timestamp must be non-zero");
+        }
+        if self.max_rows == 0 || self.max_rows > MAX_TABLET_SCAN_ROWS {
+            return Err("tablet scan max_rows is outside the allowed range");
+        }
+        if self.max_bytes == 0 || self.max_bytes > MAX_TABLET_SCAN_BYTES {
+            return Err("tablet scan max_bytes is outside the allowed range");
+        }
+        if let (Some(start_key), Some(end_key)) = (&self.start_key, &self.end_key)
+            && start_key >= end_key
+        {
+            return Err("tablet scan logical bounds must be ordered");
+        }
+        if let Some(resume_after) = &self.resume_after {
+            if self
+                .start_key
+                .as_ref()
+                .is_some_and(|start_key| resume_after < start_key)
+            {
+                return Err("scan resume_after must not precede start_key");
+            }
+            if self
+                .end_key
+                .as_ref()
+                .is_some_and(|end_key| resume_after >= end_key)
+            {
+                return Err("scan resume_after must be strictly before end_key");
+            }
+        }
+        if self
+            .rpc_attempt_id
+            .is_some_and(|attempt_id| attempt_id == 0)
+        {
+            return Err("tablet scan RPC attempt ID must be non-zero");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> rpc::TabletScanRequest {
+        rpc::TabletScanRequest {
+            request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+            start_key: self.start_key.clone(),
+            end_key: self.end_key.clone(),
+            resume_after: self.resume_after.clone(),
+            read_timestamp: Some(self.read_timestamp.to_proto()),
+            max_rows: self.max_rows,
+            max_bytes: self.max_bytes,
+            rpc_attempt_id: self.rpc_attempt_id,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletScanRequest) -> Result<Self, &'static str> {
+        let request = Self {
+            request_id: RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?,
+            tablet_id: TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?),
+            tablet_epoch: proto.tablet_epoch,
+            start_key: proto.start_key,
+            end_key: proto.end_key,
+            resume_after: proto.resume_after,
+            read_timestamp: Timestamp::from_proto(
+                proto.read_timestamp.ok_or("missing read_timestamp")?,
+            ),
+            max_rows: proto.max_rows,
+            max_bytes: proto.max_bytes,
+            rpc_attempt_id: proto.rpc_attempt_id,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+/// One logically ordered row returned by a tablet scan. `key` is the logical
+/// ordering key used for resume progress; `row` is the canonical encoded row
+/// payload consumed by the executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanRow {
+    pub key: Vec<u8>,
+    pub row: Vec<u8>,
+}
+
+impl TabletScanRow {
+    pub fn to_proto(&self) -> rpc::TabletScanRow {
+        rpc::TabletScanRow {
+            key: self.key.clone(),
+            row: self.row.clone(),
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletScanRow) -> Self {
+        Self {
+            key: proto.key,
+            row: proto.row,
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.key.len().saturating_add(self.row.len())
+    }
+}
+
+/// One bounded tablet response batch. A non-exhausted batch must publish the
+/// last delivered key as `next_resume_after`; the next request can then use it
+/// as an exclusive cursor after a timeout, leader retry, or range refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanBatch {
+    pub rows: Vec<TabletScanRow>,
+    pub next_resume_after: Option<Vec<u8>>,
+    pub exhausted: bool,
+}
+
+impl TabletScanBatch {
+    pub fn to_proto(&self) -> rpc::TabletScanBatch {
+        rpc::TabletScanBatch {
+            rows: self.rows.iter().map(TabletScanRow::to_proto).collect(),
+            next_resume_after: self.next_resume_after.clone(),
+            exhausted: self.exhausted,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletScanBatch) -> Result<Self, &'static str> {
+        let batch = Self {
+            rows: proto
+                .rows
+                .into_iter()
+                .map(TabletScanRow::from_proto)
+                .collect(),
+            next_resume_after: proto.next_resume_after,
+            exhausted: proto.exhausted,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rows.windows(2).any(|rows| rows[0].key >= rows[1].key) {
+            return Err("tablet scan rows must be strictly ordered by key");
+        }
+        match (&self.rows.last(), &self.next_resume_after) {
+            (Some(last_row), Some(next_resume_after)) if last_row.key != *next_resume_after => {
+                Err("tablet scan resume cursor must equal the last row key")
+            }
+            (None, Some(_)) => Err("empty tablet scan batch cannot publish a resume cursor"),
+            (Some(_), None) if !self.exhausted => {
+                Err("non-exhausted tablet scan batch must publish a resume cursor")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn validate_for(&self, request: &TabletScanRequest) -> Result<(), &'static str> {
+        request.validate()?;
+        self.validate()?;
+        if self.rows.len() > request.max_rows as usize {
+            return Err("tablet scan batch exceeds max_rows");
+        }
+        if self.byte_len() > request.max_bytes as usize {
+            return Err("tablet scan batch exceeds max_bytes");
+        }
+        for row in &self.rows {
+            if request
+                .start_key
+                .as_ref()
+                .is_some_and(|start_key| row.key < *start_key)
+            {
+                return Err("tablet scan row is before start_key");
+            }
+            if request
+                .end_key
+                .as_ref()
+                .is_some_and(|end_key| row.key >= *end_key)
+            {
+                return Err("tablet scan row is at or beyond end_key");
+            }
+            if request
+                .resume_after
+                .as_ref()
+                .is_some_and(|resume_after| row.key <= *resume_after)
+            {
+                return Err("tablet scan row is not after resume_after");
+            }
+        }
+        if let Some(next_resume_after) = &self.next_resume_after
+            && request
+                .end_key
+                .as_ref()
+                .is_some_and(|end_key| next_resume_after >= end_key)
+        {
+            return Err("tablet scan resume cursor must be before end_key");
+        }
+        Ok(())
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.rows.iter().map(TabletScanRow::byte_len).sum()
     }
 }
 
@@ -1488,11 +1735,81 @@ mod tests {
     #[test]
     fn message_type_wire_values_are_stable_and_unknown_values_rejected() {
         assert_eq!(MessageType::MetadataRequest.wire_value(), 0x04);
+        assert_eq!(MessageType::TabletScanRequest.wire_value(), 0x08);
         assert_eq!(
             MessageType::from_wire_value(0x05),
             Ok(MessageType::MetadataResponse)
         );
         assert!(MessageType::from_wire_value(0xff).is_err());
+    }
+
+    #[test]
+    fn tablet_scan_request_and_batch_roundtrip_preserves_snapshot_progress_and_caps() {
+        let request = TabletScanRequest {
+            request_id: RequestId {
+                client_id: 77,
+                sequence: 12,
+                raft_group_id: RaftGroupId(8),
+            },
+            tablet_id: TabletId(12),
+            tablet_epoch: 9,
+            start_key: Some(b"a".to_vec()),
+            end_key: Some(b"z".to_vec()),
+            resume_after: Some(b"m".to_vec()),
+            read_timestamp: Timestamp(100),
+            max_rows: 2,
+            max_bytes: 64,
+            rpc_attempt_id: Some(41),
+        };
+        let batch = TabletScanBatch {
+            rows: vec![
+                TabletScanRow {
+                    key: b"n".to_vec(),
+                    row: b"row-n".to_vec(),
+                },
+                TabletScanRow {
+                    key: b"o".to_vec(),
+                    row: b"row-o".to_vec(),
+                },
+            ],
+            next_resume_after: Some(b"o".to_vec()),
+            exhausted: false,
+        };
+
+        let decoded_request = TabletScanRequest::from_proto(request.to_proto()).unwrap();
+        let decoded_batch = TabletScanBatch::from_proto(batch.to_proto()).unwrap();
+
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_batch, batch);
+        assert!(decoded_batch.validate_for(&decoded_request).is_ok());
+    }
+
+    #[test]
+    fn tablet_scan_request_rejects_non_exclusive_or_unbounded_progress() {
+        let request = rpc::TabletScanRequest {
+            request_id: Some(
+                RequestId {
+                    client_id: 1,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(8),
+                }
+                .to_proto(),
+            ),
+            tablet_id: Some(TabletId(12).to_proto()),
+            tablet_epoch: 1,
+            start_key: Some(b"a".to_vec()),
+            end_key: Some(b"z".to_vec()),
+            resume_after: Some(b"z".to_vec()),
+            read_timestamp: Some(Timestamp(10).to_proto()),
+            max_rows: 1,
+            max_bytes: 32,
+            rpc_attempt_id: Some(1),
+        };
+
+        assert_eq!(
+            TabletScanRequest::from_proto(request),
+            Err("scan resume_after must be strictly before end_key")
+        );
     }
 
     #[test]

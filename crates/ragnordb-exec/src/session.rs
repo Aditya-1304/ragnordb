@@ -14,7 +14,9 @@ use ragnordb_common::{Error, Result, ids::ClientRequestId, ids::RequestId, ids::
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_txn::{Transaction, TransactionManager};
 
-use crate::{ExecutionResult, LocalExecutor, TabletRequestContext};
+use crate::{
+    ExecutionResult, LocalExecutor, QueryResultSink, QueryStreamSummary, TabletRequestContext,
+};
 
 /// SQL transaction policy and state for one client connection.
 ///
@@ -118,6 +120,62 @@ impl SqlSession {
             None,
             Duration::ZERO,
         )
+    }
+
+    /// Execute an opt-in streaming SELECT while preserving the same
+    /// transaction and metadata-refresh boundaries as the materialized path.
+    /// The successful stream summary is returned only after an implicit
+    /// transaction has crossed its commit boundary.
+    pub fn execute_sql_streaming<M: TransactionManager>(
+        &mut self,
+        sql: &str,
+        executor: &mut LocalExecutor,
+        transaction_manager: &mut M,
+        sink: &mut dyn QueryResultSink,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<QueryStreamSummary> {
+        let parsed = parse_one(sql)?;
+        let bound = analyze(&parsed, executor.catalog())?;
+        let plan = plan(bound);
+        let Plan::Select(_) = plan else {
+            return Err(Error::UnsupportedSql(
+                "streaming result mode currently supports SELECT only".to_string(),
+            ));
+        };
+
+        if let Some(transaction) = self.current_transaction.as_mut() {
+            return executor.execute_select_streaming(
+                plan,
+                transaction,
+                &mut self.tablet_request_context,
+                sink,
+                max_rows,
+                max_bytes,
+            );
+        }
+
+        let mut transaction = transaction_manager.begin_transaction()?;
+        let summary = match executor.execute_select_streaming(
+            plan,
+            &mut transaction,
+            &mut self.tablet_request_context,
+            sink,
+            max_rows,
+            max_bytes,
+        ) {
+            Ok(summary) => summary,
+            Err(error) => {
+                executor.rollback_transaction(transaction);
+                return Err(error);
+            }
+        };
+        let _ = executor.commit_transaction_outcome_with_request_context(
+            transaction,
+            transaction_manager,
+            &mut self.tablet_request_context,
+        )?;
+        Ok(summary)
     }
 
     /// Parse, analyze, and execute one SQL statement with an optional

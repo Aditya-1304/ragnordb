@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error, Result,
-    ids::{TableId, TabletId},
+    ids::{TableId, TabletId, Timestamp},
     metadata_codec::{PartitionSpec, TabletDescriptor},
 };
 use ragnordb_storage::key::decode_primary_key;
@@ -21,6 +21,183 @@ const HASH_ROUTING_DOMAIN: &[u8] = b"ragnordb/tablet-hash";
 /// This is part of the routing contract. A future incompatible hash-input
 /// change must use a new version instead of silently moving existing keys.
 pub const HASH_ROUTING_VERSION: u8 = 1;
+
+/// A logical half-open key span used as the stable unit of scan progress.
+///
+/// `None` represents an unbounded side. This is intentionally different from
+/// the empty byte vector used by the metadata wire format as its unbounded
+/// sentinel, so a caller cannot accidentally turn an actual key into an
+/// unbounded boundary while refreshing routing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScanSpan {
+    /// Inclusive lower key boundary, or `None` for the beginning of the table.
+    pub start_key: Option<Vec<u8>>,
+
+    /// Exclusive upper key boundary, or `None` for the end of the table.
+    pub end_key: Option<Vec<u8>>,
+}
+
+impl ScanSpan {
+    /// Construct a non-empty logical half-open span.
+    pub fn new(start_key: Option<Vec<u8>>, end_key: Option<Vec<u8>>) -> Result<Self> {
+        let span = Self { start_key, end_key };
+        span.validate()?;
+        Ok(span)
+    }
+
+    /// Construct an unbounded span covering the complete logical key space.
+    pub const fn unbounded() -> Self {
+        Self {
+            start_key: None,
+            end_key: None,
+        }
+    }
+
+    /// Validate the half-open interval invariant.
+    pub fn validate(&self) -> Result<()> {
+        if let (Some(start_key), Some(end_key)) = (&self.start_key, &self.end_key)
+            && start_key >= end_key
+        {
+            return Err(Error::InvalidArgument(
+                "logical scan span must be a non-empty half-open interval".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ordered set of logical spans used by [`ScanProgress`].
+pub type SpanSet = BTreeSet<ScanSpan>;
+
+/// The portion of one logical scan span owned by one tablet at route time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanFragment {
+    /// Tablet that currently owns `span` according to the routing snapshot.
+    pub tablet_id: TabletId,
+
+    /// Intersection of the requested logical span and the tablet's range.
+    pub span: ScanSpan,
+}
+
+/// Stable progress for a distributed scan.
+///
+/// The read timestamp is immutable for the lifetime of the scan. A caller may
+/// move a logical subspan from `remaining` to `completed` only after its page
+/// or range read succeeds, which keeps retries from acknowledging work that
+/// was only partially observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// Snapshot timestamp shared by every tablet fragment in this scan.
+    pub read_ts: Timestamp,
+
+    /// Logical spans whose reads have completed successfully.
+    pub completed: SpanSet,
+
+    /// Logical spans still requiring a successful read.
+    pub remaining: SpanSet,
+}
+
+impl ScanProgress {
+    /// Start progress with one logical span still outstanding.
+    pub fn new(read_ts: Timestamp, span: ScanSpan) -> Self {
+        Self {
+            read_ts,
+            completed: SpanSet::new(),
+            remaining: SpanSet::from([span]),
+        }
+    }
+
+    /// Mark one wholly successful subspan as complete.
+    ///
+    /// The completed span may be a clipped fragment of a larger remaining
+    /// span. Any left or right remainder stays in `remaining`; attempting to
+    /// complete a span that is not still outstanding is rejected so duplicate
+    /// acknowledgements cannot silently corrupt retry state.
+    pub fn mark_completed(&mut self, completed: ScanSpan) -> Result<()> {
+        completed.validate()?;
+
+        let existing = self.remaining.iter().cloned().collect::<Vec<_>>();
+        let mut uncovered = vec![completed.clone()];
+        for span in &existing {
+            uncovered = uncovered
+                .into_iter()
+                .flat_map(|piece| subtract_span(piece, span))
+                .collect();
+            if uncovered.is_empty() {
+                break;
+            }
+        }
+
+        if !uncovered.is_empty() {
+            return Err(Error::InvalidArgument(
+                "scan progress can complete only an outstanding logical span".to_string(),
+            ));
+        }
+
+        for span in existing {
+            if spans_intersect(&span, &completed) {
+                self.remaining.remove(&span);
+                for remainder in subtract_span(span, &completed) {
+                    self.remaining.insert(remainder);
+                }
+            }
+        }
+        self.completed.insert(completed);
+        Ok(())
+    }
+
+    /// Alias for callers that model successful range completion as an action.
+    pub fn complete(&mut self, completed: ScanSpan) -> Result<()> {
+        self.mark_completed(completed)
+    }
+}
+
+fn spans_intersect(left: &ScanSpan, right: &ScanSpan) -> bool {
+    let left_starts_before_right_end = right.end_key.as_ref().is_none_or(|right_end| {
+        left.start_key
+            .as_ref()
+            .is_none_or(|left_start| left_start < right_end)
+    });
+    let left_ends_after_right_start = right.start_key.as_ref().is_none_or(|right_start| {
+        left.end_key
+            .as_ref()
+            .is_none_or(|left_end| left_end > right_start)
+    });
+    left_starts_before_right_end && left_ends_after_right_start
+}
+
+fn subtract_span(span: ScanSpan, covered: &ScanSpan) -> Vec<ScanSpan> {
+    if !spans_intersect(&span, covered) {
+        return vec![span];
+    }
+
+    let mut remainders = Vec::with_capacity(2);
+    if let Some(covered_start) = &covered.start_key
+        && span
+            .start_key
+            .as_ref()
+            .is_none_or(|span_start| span_start < covered_start)
+    {
+        remainders.push(
+            ScanSpan::new(span.start_key.clone(), Some(covered_start.clone()))
+                .expect("subtracting a valid span preserves a non-empty left remainder"),
+        );
+    }
+
+    if let Some(covered_end) = &covered.end_key
+        && span
+            .end_key
+            .as_ref()
+            .is_none_or(|span_end| covered_end < span_end)
+    {
+        remainders.push(
+            ScanSpan::new(Some(covered_end.clone()), span.end_key.clone())
+                .expect("subtracting a valid span preserves a non-empty right remainder"),
+        );
+    }
+
+    remainders
+}
 
 /// Stateless hash partitioner for table primary keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -374,34 +551,72 @@ impl TabletRouter {
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
     ) -> Result<Vec<TabletId>> {
-        if let (Some(start_key), Some(end_key)) = (start_key, end_key)
-            && start_key >= end_key
-        {
-            return Err(Error::InvalidArgument(
-                "logical scan span must be a non-empty half-open interval".to_string(),
-            ));
-        }
+        let span = ScanSpan::new(
+            start_key.map(ToOwned::to_owned),
+            end_key.map(ToOwned::to_owned),
+        )?;
+        Ok(self
+            .route_scan_fragments(&span)?
+            .into_iter()
+            .map(|fragment| fragment.tablet_id)
+            .collect())
+    }
+
+    /// Route a logical span into ordered, clipped tablet fragments.
+    ///
+    /// Hash metadata has no ordered ownership boundaries, so every tablet gets
+    /// the same logical span. Ordered range metadata produces only the
+    /// intersections with the requested span, in metadata range order.
+    pub fn route_scan_fragments(&self, span: &ScanSpan) -> Result<Vec<TabletScanFragment>> {
+        span.validate()?;
 
         if self.ranges.is_empty() {
-            // Legacy hash metadata has no ordered key ownership. Preserve its
-            // compatibility behavior by conservatively fanning out to every
-            // bucket rather than pretending a byte span has ordered meaning.
-            return Ok(self.route_scan());
+            return Ok(self
+                .route_scan()
+                .into_iter()
+                .map(|tablet_id| TabletScanFragment {
+                    tablet_id,
+                    span: span.clone(),
+                })
+                .collect());
         }
 
-        Ok(self
-            .ranges
+        self.ranges
             .iter()
             .filter(|range| {
-                let starts_before_end = end_key.is_none_or(|end_key| {
-                    range.start_key.is_empty() || range.start_key.as_slice() < end_key
+                let starts_before_end = span.end_key.as_ref().is_none_or(|end_key| {
+                    range.start_key.is_empty() || range.start_key.as_slice() < end_key.as_slice()
                 });
-                let ends_after_start = start_key.is_none_or(|start_key| {
-                    range.end_key.is_empty() || range.end_key.as_slice() > start_key
+                let ends_after_start = span.start_key.as_ref().is_none_or(|start_key| {
+                    range.end_key.is_empty() || range.end_key.as_slice() > start_key.as_slice()
                 });
                 starts_before_end && ends_after_start
             })
-            .map(|range| range.tablet_id)
-            .collect())
+            .map(|range| {
+                let start_key = match (span.start_key.as_ref(), range.start_key.as_slice()) {
+                    (None, _) | (_, []) => span
+                        .start_key
+                        .clone()
+                        .or_else(|| (!range.start_key.is_empty()).then(|| range.start_key.clone())),
+                    (Some(span_start), range_start) => {
+                        Some(span_start.as_slice().max(range_start).to_vec())
+                    }
+                };
+                let end_key = match (span.end_key.as_ref(), range.end_key.as_slice()) {
+                    (None, _) | (_, []) => span
+                        .end_key
+                        .clone()
+                        .or_else(|| (!range.end_key.is_empty()).then(|| range.end_key.clone())),
+                    (Some(span_end), range_end) => {
+                        Some(span_end.as_slice().min(range_end).to_vec())
+                    }
+                };
+
+                ScanSpan::new(start_key, end_key).map(|span| TabletScanFragment {
+                    tablet_id: range.tablet_id,
+                    span,
+                })
+            })
+            .collect()
     }
 }
