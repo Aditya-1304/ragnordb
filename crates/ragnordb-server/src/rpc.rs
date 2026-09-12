@@ -335,8 +335,8 @@ impl TabletRpcClient {
                     }
                 };
             attempted_replicas.insert((current_route.raft_group_id, target_replica));
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+            let attempt_timeout = retry_attempt_timeout(deadline, attempt);
+            if attempt_timeout.is_zero() {
                 break;
             }
 
@@ -357,7 +357,7 @@ impl TabletRpcClient {
                 target,
                 current_route.raft_group_id,
                 attempt_request,
-                remaining,
+                attempt_timeout,
             ) {
                 Ok(outcome) => {
                     self.record_successful_leader(&current_route, target_replica);
@@ -411,40 +411,107 @@ impl TabletRpcClient {
             ));
         }
 
-        let request = TabletOutcomeQueryRequest {
+        let mut request = TabletOutcomeQueryRequest {
             request_id,
             logical_command_id,
             tablet_id: route.tablet_id,
             tablet_epoch: route.tablet_epoch,
         };
-        let target = route.leader_node().map_err(|_| Error::LeaderUnknown)?;
-        let response = if target == self.transport.local_node_id() {
-            let handle = self.local_handle(route.raft_group_id)?;
-            let outcome = handle.query_original_outcome(request, timeout)?;
-            return Ok(outcome);
-        } else {
-            self.send_remote(
-                target,
-                RpcFrame {
-                    msg_type: MessageType::TabletOutcomeQueryRequest,
-                    raft_group_id: route.raft_group_id,
-                    payload: request.to_proto().encode_to_vec(),
-                },
-                request.request_id.clone(),
-                timeout,
-                false,
-            )?
-        };
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                Error::InvalidArgument("tablet outcome retry deadline overflowed".into())
+            })?;
+        let mut current_route = route.clone();
+        let mut attempted_replicas = BTreeSet::new();
+        let mut last_error = None;
 
-        if !response.success {
-            return Err(response_error(response));
+        for attempt in 0..MAX_TABLET_RETRY_ATTEMPTS {
+            let (target_replica, target) =
+                match next_unattempted_replica(&current_route, &attempted_replicas) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        last_error = Some(Error::LeaderUnknown);
+                        continue;
+                    }
+                };
+            attempted_replicas.insert((current_route.raft_group_id, target_replica));
+            let attempt_timeout = retry_attempt_timeout(deadline, attempt);
+            if attempt_timeout.is_zero() {
+                break;
+            }
+
+            request.tablet_id = current_route.tablet_id;
+            request.tablet_epoch = current_route.tablet_epoch;
+            request.request_id.raft_group_id = current_route.raft_group_id;
+            let result = if target == self.transport.local_node_id() {
+                match self.local_handle(current_route.raft_group_id) {
+                    Ok(handle) => handle
+                        .query_original_outcome(request.clone(), attempt_timeout)
+                        .and_then(|outcome| match outcome {
+                            Some(outcome) => outcome
+                                .encode_for_outcome_query()
+                                .map(|result_data| Some((result_data, true)))
+                                .map_err(|error| Error::CorruptData(error.to_string())),
+                            None => Ok(Some((Vec::new(), false))),
+                        }),
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.send_remote(
+                    target,
+                    RpcFrame {
+                        msg_type: MessageType::TabletOutcomeQueryRequest,
+                        raft_group_id: current_route.raft_group_id,
+                        payload: request.to_proto().encode_to_vec(),
+                    },
+                    request.request_id.clone(),
+                    attempt_timeout,
+                    false,
+                )
+                .and_then(|response| {
+                    if !response.success {
+                        return Err(response_error(response));
+                    }
+                    Ok(Some((response.result_data, response.found)))
+                })
+            };
+
+            match result {
+                Ok(Some((result_data, true))) => {
+                    return CachedTabletCommandOutcome::decode_from_outcome_query(&result_data)
+                        .map(Some)
+                        .map_err(|error| Error::CorruptData(error.to_string()));
+                }
+                Ok(Some((_, false))) => return Ok(None),
+                Ok(None) => return Ok(None),
+                Err(error)
+                    if is_retryable_tablet_error(&error)
+                        && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
+                {
+                    if let Error::StaleTabletEpoch { current_epoch, .. } = error
+                        && current_epoch != 0
+                    {
+                        current_route.tablet_epoch = current_epoch;
+                        request.tablet_epoch = current_epoch;
+                    }
+                    self.update_route_after_error(&mut current_route, target_replica, &error);
+                    last_error = Some(error);
+                    let backoff = retry_backoff(
+                        attempt,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if !backoff.is_zero() {
+                        thread::sleep(backoff);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-        if !response.found {
-            return Ok(None);
-        }
-        CachedTabletCommandOutcome::decode_from_outcome_query(&response.result_data)
-            .map(Some)
-            .map_err(|error| Error::CorruptData(error.to_string()))
+
+        Err(last_error.unwrap_or_else(|| Error::TabletUnavailable {
+            reason: "tablet outcome query retry deadline elapsed".to_string(),
+        }))
     }
 
     /// Read one row from a metadata-selected tablet route.
@@ -491,8 +558,8 @@ impl TabletRpcClient {
                     }
                 };
             attempted_replicas.insert((current_route.raft_group_id, target_replica));
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+            let attempt_timeout = retry_attempt_timeout(deadline, attempt);
+            if attempt_timeout.is_zero() {
                 break;
             }
 
@@ -503,7 +570,7 @@ impl TabletRpcClient {
                 target,
                 current_route.raft_group_id,
                 request.clone(),
-                remaining,
+                attempt_timeout,
             ) {
                 Ok(row) => {
                     self.record_successful_leader(&current_route, target_replica);
@@ -612,6 +679,14 @@ impl TabletRpcClient {
                 }
             }
             Error::NotLeader { leader_id: None } | Error::LeaderUnknown => {
+                let _ = cache.invalidate_leader(route.tablet_id, rejected_leader);
+            }
+            Error::ProposalUnavailable { .. } | Error::TabletUnavailable { .. } => {
+                // A transport timeout can leave the destination's outcome
+                // unknown, but it still proves that this gateway must not
+                // keep selecting the failed replica as its cached leader.
+                // Mutation callers resolve the original identity separately;
+                // read callers can immediately use the remaining placement.
                 let _ = cache.invalidate_leader(route.tablet_id, rejected_leader);
             }
             _ => {}
@@ -1519,6 +1594,22 @@ fn retry_backoff(attempt: u32, remaining: Duration) -> Duration {
         .saturating_mul(multiplier)
         .min(TABLET_RETRY_BACKOFF_MAX_MS);
     Duration::from_millis(delay_ms).min(remaining)
+}
+
+/// Reserve part of the caller's deadline for each remaining replica attempt.
+///
+/// A stopped peer can accept an outbound frame and then provide no response
+/// until the transport timeout. Giving the first attempt the entire statement
+/// deadline would prevent the gateway from trying a healthy replica, even
+/// though the route still contains enough placement information to fail over.
+fn retry_attempt_timeout(deadline: std::time::Instant, attempt: u32) -> Duration {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let attempts_left = MAX_TABLET_RETRY_ATTEMPTS.saturating_sub(attempt).max(1);
+    if attempts_left == 1 {
+        remaining
+    } else {
+        remaining / attempts_left
+    }
 }
 
 fn next_unattempted_replica(

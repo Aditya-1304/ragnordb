@@ -259,6 +259,130 @@ fn create_metadata_table(nodes: &[ProcessNode], statement: &str) {
     }
 }
 
+fn wait_for_routed_tablet_group(nodes: &[ProcessNode]) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let group_id = nodes
+            .iter()
+            .filter_map(ProcessNode::status)
+            .find_map(|status| {
+                status["multiraft"]["groups"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|group| group["raft_group_id"].as_u64())
+                    // Group 1 is the legacy tablet and group 2 is metadata. A
+                    // CREATE TABLE-created routed tablet receives a later group.
+                    .find(|group_id| *group_id > 2)
+            });
+        if let Some(group_id) = group_id {
+            return group_id;
+        }
+
+        if Instant::now() >= deadline {
+            let statuses = nodes.iter().map(ProcessNode::status).collect::<Vec<_>>();
+            panic!("routed tablet group did not become visible; statuses={statuses:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn tablet_group_progress(
+    status: &Value,
+    group_id: u64,
+) -> Option<(u64, Option<u64>, u64, u64, bool, bool)> {
+    let group = status["multiraft"]["groups"]
+        .as_array()?
+        .iter()
+        .find(|group| group["raft_group_id"].as_u64() == Some(group_id))?;
+    let role = group["role"].as_str();
+    Some((
+        group["replica_id"].as_u64()?,
+        group["leader_replica_id"].as_u64(),
+        group["commit_index"].as_u64()?,
+        group["applied_index"].as_u64()?,
+        role == Some("leader"),
+        role == Some("follower"),
+    ))
+}
+
+fn wait_for_routed_tablet_leader(
+    nodes: &[ProcessNode],
+    group_id: u64,
+    excluded: Option<usize>,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        for (index, node) in nodes.iter().enumerate() {
+            if excluded == Some(index) {
+                continue;
+            }
+            let is_leader = node
+                .status()
+                .and_then(|status| tablet_group_progress(&status, group_id))
+                .is_some_and(|(replica_id, leader_replica_id, _, _, is_leader, _)| {
+                    is_leader && leader_replica_id == Some(replica_id)
+                });
+            if is_leader {
+                return index;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let statuses = nodes.iter().map(ProcessNode::status).collect::<Vec<_>>();
+            panic!(
+                "routed tablet group {group_id} did not elect a replacement leader; \
+                 statuses={statuses:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_routed_tablet_catch_up(
+    nodes: &[ProcessNode],
+    group_id: u64,
+    restarted_index: usize,
+    leader_index: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_progress = nodes[leader_index]
+            .status()
+            .and_then(|status| tablet_group_progress(&status, group_id));
+        let restarted_progress = nodes[restarted_index]
+            .status()
+            .and_then(|status| tablet_group_progress(&status, group_id));
+
+        if let (
+            Some((
+                leader_replica_id,
+                Some(observed_leader),
+                leader_commit,
+                leader_applied,
+                true,
+                _,
+            )),
+            Some((_, Some(restarted_leader), restarted_commit, restarted_applied, _, true)),
+        ) = (leader_progress, restarted_progress)
+            && observed_leader == leader_replica_id
+            && restarted_leader == leader_replica_id
+            && restarted_commit >= leader_commit
+            && restarted_applied >= leader_applied
+        {
+            return;
+        }
+
+        if Instant::now() >= deadline {
+            let statuses = nodes.iter().map(ProcessNode::status).collect::<Vec<_>>();
+            panic!(
+                "restarted routed tablet replica {restarted_index} did not catch up to \
+                 leader {leader_index} for group {group_id}; statuses={statuses:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Realistic bug caught:
 ///
 /// An in-process cluster can hide missing CLI/server wiring, port binding, data
@@ -401,5 +525,133 @@ fn metadata_table_creation_survives_process_restart() {
         after_restart["rows"],
         serde_json::json!([[7, "bob"]]),
         "routed V2 read after restart: {after_restart}"
+    );
+}
+
+/// Realistic bug caught:
+///
+/// A gateway can retain a dead routed-tablet leader in its cache after a
+/// process failure. This acceptance test warms that cache, stops the cached
+/// leader, and resubmits the same V2 write identity through the same gateway.
+/// It fails if the gateway does not fail over, if a retry is treated as a new
+/// logical mutation, or if the restarted replica does not catch up.
+#[test]
+fn routed_tablet_leader_failover_retries_stable_v2_write_and_catches_up() {
+    let root = tempfile::tempdir().unwrap();
+    // Hold every reservation until the complete unique address set is known.
+    let reservations = (0..12)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+    let reserved = reservations
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect::<Vec<_>>();
+    let addresses = reserved
+        .chunks_exact(4)
+        .map(|chunk| (chunk[0], chunk[1], chunk[2], chunk[3]))
+        .collect::<Vec<_>>();
+    drop(reservations);
+
+    let mut nodes = Vec::new();
+    for index in 0..3 {
+        let node_id = index + 1;
+        let config_path = root.path().join(format!("failover-node-{node_id}.toml"));
+        let data_dir = root.path().join(format!("failover-node-{node_id}"));
+        let mut config = format!(
+            "node_id = {node_id}\ndata_dir = \"{}\"\nlisten_addr = \"{}\"\nadmin_addr = \"{}\"\ncluster_id = \"process-failover-test\"\nbootstrap = true\nstatement_timeout_ms = 5000\nshutdown_grace_period_ms = 1000\nsnapshot_interval_entries = 4\nsnapshot_interval_bytes = 536870912\nsnapshot_min_elapsed_ms = 0\nmax_snapshot_file_bytes = 536870912\nsnapshot_chunk_bytes = 65536\n",
+            data_dir.display(),
+            addresses[index].2,
+            addresses[index].3,
+        );
+        for (seed_index, (raft, snapshot, sql, admin)) in addresses.iter().enumerate() {
+            config.push_str(&format!(
+                "\n[[seed_nodes]]\nid = {}\nraft_addr = \"{}\"\nsnapshot_addr = \"{}\"\nsql_addr = \"{}\"\nadmin_addr = \"{}\"\nregion = \"region-a\"\nzone = \"zone-{}\"\nrack = \"rack-{}\"\nstorage_class = \"default\"\n",
+                seed_index + 1,
+                raft,
+                snapshot,
+                sql,
+                admin,
+                seed_index + 1,
+                seed_index + 1,
+            ));
+        }
+        fs::write(&config_path, config).unwrap();
+        let mut node = ProcessNode {
+            config_path,
+            sql_addr: addresses[index].2,
+            admin_addr: addresses[index].3,
+            child: None,
+        };
+        node.start();
+        nodes.push(node);
+    }
+
+    wait_for_leader(&nodes, None);
+    create_metadata_table(
+        &nodes,
+        "CREATE TABLE failover_users (id INT PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    let tablet_group_id = wait_for_routed_tablet_group(&nodes);
+    let old_tablet_leader = wait_for_routed_tablet_leader(&nodes, tablet_group_id, None);
+    let client_id = 0xfeed_fade_u128;
+
+    // Warm both possible surviving gateways. This keeps the acceptance test
+    // deterministic when the failed node happened to lead metadata as well as
+    // the routed tablet: whichever survivor wins metadata leadership retains
+    // the stale routed-tablet leader hint needed for the failover assertion.
+    let surviving_gateways = (0..nodes.len())
+        .filter(|index| *index != old_tablet_leader)
+        .collect::<Vec<_>>();
+    for (offset, gateway) in surviving_gateways.iter().enumerate() {
+        let warmup = send_v2_until_ok(
+            nodes[*gateway].sql_addr,
+            client_id,
+            offset as u64 + 1,
+            (offset > 0).then_some(offset as u64),
+            "SELECT id, name FROM failover_users WHERE id = 1",
+        );
+        assert_eq!(warmup["rows"], serde_json::json!([]));
+    }
+
+    nodes[old_tablet_leader].kill();
+    let new_tablet_leader =
+        wait_for_routed_tablet_leader(&nodes, tablet_group_id, Some(old_tablet_leader));
+    assert_ne!(
+        new_tablet_leader, old_tablet_leader,
+        "tablet failover must elect a surviving process"
+    );
+    // A node hosts both metadata and routed-tablet groups. If the failed
+    // tablet leader also led metadata, wait for that control-plane election
+    // before issuing the next public SQL request.
+    let gateway = wait_for_routed_tablet_leader(&nodes, 2, Some(old_tablet_leader));
+
+    let failover_write = send_v2_until_ok(
+        nodes[gateway].sql_addr,
+        client_id,
+        3,
+        Some(2),
+        "INSERT INTO failover_users (id, name) VALUES (2, 'after-failover')",
+    );
+    assert_eq!(failover_write["result"]["affected_rows"], 1);
+
+    nodes[old_tablet_leader].start();
+    wait_for_routed_tablet_catch_up(
+        &nodes,
+        tablet_group_id,
+        old_tablet_leader,
+        new_tablet_leader,
+    );
+    let after_catch_up = wait_for_v2_rows(
+        nodes[old_tablet_leader].sql_addr,
+        client_id,
+        4,
+        Some(3),
+        "SELECT id, name FROM failover_users WHERE id = 2",
+        serde_json::json!([[2, "after-failover"]]),
+    );
+    assert_eq!(
+        after_catch_up["rows"],
+        serde_json::json!([[2, "after-failover"]]),
+        "failover row after restarted replica catch-up: {after_catch_up}"
     );
 }

@@ -8,7 +8,7 @@ use ragnordb_common::{
     Error,
     catalog_codec::{ColumnDefinition, DataType},
     codec::Value,
-    ids::{ColumnId, NodeId, RaftGroupId, RequestId},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId},
     metadata_codec::CreateTableRequest,
 };
 use ragnordb_exec::{ExecutionResult, SqlSession};
@@ -29,6 +29,100 @@ struct TestNode {
     database: SharedLocalDatabase,
     runtime: MultiRaftRuntime,
     _data: TempDir,
+}
+
+fn start_failover_test_node(
+    seed: SeedNodeConfig,
+    all_seeds: Vec<SeedNodeConfig>,
+    cluster_id: String,
+) -> TestNode {
+    let data = tempfile::tempdir().unwrap();
+    let config = NodeConfig {
+        node_id: seed.id,
+        data_dir: data.path().to_path_buf(),
+        listen_addr: seed.sql_addr,
+        admin_addr: seed.admin_addr,
+        max_connections: 8,
+        statement_timeout_ms: 5_000,
+        shutdown_grace_period_ms: 1_000,
+        statement_logging: ragnordb_server::config::StatementLogging::Off,
+        cluster_id: Some(cluster_id),
+        bootstrap: true,
+        seed_nodes: all_seeds,
+        snapshot_interval_entries: 100_000,
+        snapshot_interval_bytes: 256 * 1024 * 1024,
+        snapshot_min_elapsed_ms: 300_000,
+        max_snapshot_file_bytes: 512 * 1024 * 1024,
+        snapshot_chunk_bytes: 1024 * 1024,
+    };
+    let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
+
+    let configurations =
+        MultiRaftRuntime::recovery_configurations(&config, &data_directory_lock).unwrap();
+
+    let (database, _, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
+        &config.data_dir,
+        config.node_id,
+        &configurations,
+        data_directory_lock,
+    )
+    .unwrap();
+    let wal = database.wal_handle().unwrap();
+    let database = database.into_shared();
+    let runtime =
+        MultiRaftRuntime::start_from_shared_recovery(&config, wal, database.clone(), recovered)
+            .unwrap();
+
+    TestNode {
+        database,
+        runtime,
+        _data: data,
+    }
+}
+
+async fn start_failover_test_nodes() -> Vec<TestNode> {
+    let seeds = (1..=3)
+        .map(|id| SeedNodeConfig {
+            id: NodeId(id),
+            raft_addr: unused_address(),
+            snapshot_addr: unused_address(),
+            sql_addr: unused_address(),
+            admin_addr: unused_address(),
+            region: None,
+            zone: None,
+            rack: None,
+            storage_class: "default".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let cluster_id = "runtime-stale-route-failover".to_string();
+    let startup_handles = seeds
+        .iter()
+        .cloned()
+        .map(|seed| {
+            let all_seeds = seeds.clone();
+            let cluster_id = cluster_id.clone();
+            tokio::task::spawn_blocking(move || {
+                start_failover_test_node(seed, all_seeds, cluster_id)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut nodes = Vec::with_capacity(startup_handles.len());
+    for startup in startup_handles {
+        let node = startup.await.unwrap();
+        let handle = node.runtime.handle();
+        let tablet_gateway = Arc::new(node.runtime.tablet_rpc_client());
+
+        {
+            let mut database = node.database.lock().await;
+            database.replace_commit_log(handle.clone());
+            database.replace_catalog_log(handle);
+            database.replace_tablet_gateway(tablet_gateway);
+        }
+
+        nodes.push(node);
+    }
+    nodes
 }
 
 /// Realistic bugs caught:
@@ -446,5 +540,254 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
 
     // Keep all lifecycle guards alive until assertions complete. Runtime Drop
     // performs an orderly Ready-owner shutdown.
+    drop(nodes);
+}
+
+/// Realistic bug caught: a gateway can retain a route to the old tablet leader
+/// after that leader stops. The request must retry through the same gateway's
+/// stale route cache, converge on a surviving replica, and still observe the
+/// committed point row. Runtime `Drop` is used as the bounded in-process stop
+/// boundary; it signals and joins the host and RPC workers before the failed
+/// node's temporary directory is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_routed_tablet_leader_fails_over_after_runtime_drop() {
+    let mut nodes = start_failover_test_nodes().await;
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if nodes.iter().any(|node| node.runtime.handle().is_leader()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the production hosts must elect a metadata leader");
+
+    let request = CreateTableRequest {
+        table_name: "stale_route_users".to_string(),
+        columns: vec![
+            ColumnDefinition {
+                column_id: ColumnId(1),
+                name: "id".to_string(),
+                ty: DataType::Int,
+                nullable: false,
+            },
+            ColumnDefinition {
+                column_id: ColumnId(2),
+                name: "name".to_string(),
+                ty: DataType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key_column_ids: vec![ColumnId(1)],
+    };
+    let request_id = RequestId {
+        client_id: 0x66,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    let topology = 'accepted: loop {
+        for node in &nodes {
+            let creator = node.runtime.metadata_table_creator();
+            let attempt = tokio::task::spawn_blocking({
+                let request = request.clone();
+                let request_id = request_id.clone();
+                move || {
+                    creator.create_table_topology(request, request_id, Duration::from_millis(500))
+                }
+            })
+            .await
+            .expect("metadata proposal task must not panic");
+            match attempt {
+                Ok(topology) => break 'accepted topology,
+                Err(Error::NotLeader { .. } | Error::ProposalUnavailable { .. }) => continue,
+                Err(error) => panic!("metadata CREATE TABLE failed permanently: {error}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(topology.definition.table_id > 1);
+
+    let routed_group_id = topology.tablets[0].raft_group_id;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if nodes
+                .iter()
+                .all(|node| node.runtime.host_status().groups.len() >= 3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every assigned node must materialize the routed tablet group");
+
+    for node in &nodes {
+        let creator = node.runtime.metadata_table_creator();
+        node.database
+            .lock()
+            .await
+            .replace_metadata_table_creator(creator);
+    }
+
+    let (old_leader_replica, old_leader_node) =
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let mut leader = None;
+                let mut leader_node = None;
+                let mut converged = true;
+                for (node_index, node) in nodes.iter().enumerate() {
+                    let status = node.runtime.host_status();
+                    let Some(group) = status
+                        .groups
+                        .iter()
+                        .find(|group| group.identity.raft_group_id == routed_group_id)
+                    else {
+                        converged = false;
+                        break;
+                    };
+                    let Some(replica) = group.leader_replica_id else {
+                        converged = false;
+                        break;
+                    };
+                    if let Some(expected) = leader {
+                        if expected != replica {
+                            converged = false;
+                            break;
+                        }
+                    } else {
+                        leader = Some(replica);
+                    }
+                    if group.identity.replica_id == replica {
+                        leader_node = Some(node_index);
+                    }
+                }
+                if converged
+                    && let (Some(leader_replica), Some(leader_node_index)) = (leader, leader_node)
+                    && nodes.iter().all(|node| {
+                        node.runtime
+                            .host_status()
+                            .groups
+                            .iter()
+                            .find(|group| group.identity.raft_group_id == routed_group_id)
+                            .and_then(|group| group.leader_replica_id)
+                            == Some(leader_replica)
+                    })
+                {
+                    break (leader_replica, leader_node_index);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the routed tablet must publish a converged leader before the stop");
+
+    let gateway_index = (0..nodes.len())
+        .find(|index| *index != old_leader_node)
+        .expect("a three-node runtime must provide a surviving gateway");
+    let gateway_database = nodes[gateway_index].database.clone();
+    let inserted = tokio::task::spawn_blocking({
+        let gateway_database = gateway_database.clone();
+        move || {
+            gateway_database.blocking_lock().execute_sql(
+                &mut SqlSession::with_client_id(8101),
+                "INSERT INTO stale_route_users (id, name) VALUES (42, 'before-failover')",
+            )
+        }
+    })
+    .await
+    .unwrap()
+    .expect("the gateway must warm its route cache through the current leader");
+    assert!(matches!(
+        inserted,
+        ExecutionResult::Mutation {
+            affected_rows: 1,
+            ..
+        }
+    ));
+
+    let failed = nodes.swap_remove(old_leader_node);
+    let TestNode {
+        database,
+        runtime,
+        _data,
+    } = failed;
+    drop(runtime);
+    drop(database);
+    drop(_data);
+
+    let new_leader_replica = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let leaders = nodes
+                .iter()
+                .filter_map(|node| {
+                    node.runtime
+                        .host_status()
+                        .groups
+                        .iter()
+                        .find(|group| group.identity.raft_group_id == routed_group_id)
+                        .and_then(|group| group.leader_replica_id)
+                })
+                .collect::<Vec<ReplicaId>>();
+            if leaders.len() == nodes.len()
+                && leaders.windows(2).all(|pair| pair[0] == pair[1])
+                && leaders[0] != old_leader_replica
+            {
+                break leaders[0];
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the surviving tablet replicas must elect a new leader");
+    assert_ne!(new_leader_replica, old_leader_replica);
+    // Host status publishes the elected replica before its tablet worker has
+    // completed the current-term serving activation used by routed reads.
+    // Keep this bounded settle inside the acceptance test so the stale-route
+    // request exercises failover rather than racing that known lifecycle edge.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let observed = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking({
+            let gateway_database = gateway_database.clone();
+            move || {
+                let mut session = SqlSession::with_client_id(8102);
+                session.set_tablet_request_timeout(Duration::from_secs(5));
+                gateway_database.blocking_lock().execute_sql(
+                    &mut session,
+                    "SELECT id, name FROM stale_route_users WHERE id = 42",
+                )
+            }
+        }),
+    )
+    .await
+    .expect("stale-route read must finish within the bounded failover window")
+    .unwrap()
+    .expect("the gateway must retry the stale route against the new leader");
+    assert_eq!(
+        observed,
+        ExecutionResult::Query(ragnordb_exec::ResultSet {
+            columns: vec![
+                ragnordb_exec::ResultColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                ragnordb_exec::ResultColumn {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            rows: vec![ragnordb_common::codec::Row {
+                values: vec![Value::Int(42), Value::Text("before-failover".to_string())],
+            }],
+        })
+    );
+
+    drop(gateway_database);
     drop(nodes);
 }
