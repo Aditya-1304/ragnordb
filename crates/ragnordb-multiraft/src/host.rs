@@ -14,11 +14,12 @@ use std::{
 use raft::{
     core::{
         node::{ProposeError, RaftError, SnapshotInstallError, StepError},
+        read_index::{ReadIndexError, ReadState},
         ready::AdvanceError,
     },
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, Role},
+    types::{LogIndex, Role, Term},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 
@@ -226,6 +227,10 @@ pub type SharedMultiRaftHostStatus = Arc<RwLock<MultiRaftHostStatus>>;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HostedGroupTurn {
     pub outbound: Vec<RaftMessageEnvelope>,
+    /// ReadIndex results released after this Ready generation's committed
+    /// entries have applied. These states authorize a future read only after
+    /// the consumer independently verifies the local applied frontier.
+    pub read_states: Vec<ReadState>,
     pub ready_generations: usize,
     pub apply_entries: usize,
     pub snapshot_bytes: usize,
@@ -247,6 +252,8 @@ pub struct MultiRaftTurnResult {
     pub apply_entries: usize,
     pub snapshot_bytes: usize,
     pub outbound: Vec<RoutedRaftMessage>,
+    /// Read states released by hosted groups after their local apply boundary.
+    pub read_states: Vec<(RaftGroupId, ReadState)>,
 }
 
 #[derive(Debug, Default)]
@@ -367,6 +374,9 @@ struct PendingPersistenceGroup {
     /// completed. This keeps custom group adapters subject to the same
     /// persistence-before-message invariant as the built-in adapter.
     outbound: Vec<RaftMessageEnvelope>,
+    /// Read states are held with the Ready batch so a custom adapter cannot
+    /// publish a read result before the batch's persistence/apply boundary.
+    read_states: Vec<ReadState>,
 }
 
 impl PendingGroupMessages {
@@ -418,6 +428,8 @@ pub(crate) fn is_control_message(message: &RaftMessageEnvelope) -> bool {
             | raft::message::Message::PreVoteResponse(_)
             | raft::message::Message::RequestVote(_)
             | raft::message::Message::RequestVoteResponse(_)
+            | raft::message::Message::ReadIndex(_)
+            | raft::message::Message::ReadIndexResponse(_)
             | raft::message::Message::AppendEntriesResponse(_)
             | raft::message::Message::InstallSnapshot(_)
             | raft::message::Message::InstallSnapshotResponse(_)
@@ -476,6 +488,34 @@ pub trait HostedRaftGroup: Send {
     /// compatibility default because their operation is host-atomic.
     fn has_pending_work(&self) -> bool {
         false
+    }
+
+    /// Returns whether the only pending work is a compatibility-path
+    /// ReadState that can be safely invalidated by processing an inbound
+    /// control message first. A normal outstanding Ready must continue to
+    /// block message admission because its persistence/apply ordering is
+    /// still owned by the group.
+    fn has_only_deferred_read_states(&self) -> bool {
+        false
+    }
+
+    /// Enables ReadIndex only after the group has crossed its current-term
+    /// persistence and apply boundary. Adapters which still expose their own
+    /// read barrier retain the safe default and must opt into this contract
+    /// explicitly.
+    fn activate_read_index(&mut self, _term: Term) -> Result<(), HostedGroupError> {
+        Err(HostedGroupError::Rejected(
+            "hosted group does not expose Raft ReadIndex admission".to_string(),
+        ))
+    }
+
+    /// Admits one opaque ReadIndex context. Completion remains asynchronous;
+    /// the resulting [`ReadState`] is returned from a later fully completed
+    /// [`HostedGroupTurn`].
+    fn read_index(&mut self, _context: Vec<u8>) -> Result<(), HostedGroupError> {
+        Err(HostedGroupError::Rejected(
+            "hosted group does not expose Raft ReadIndex admission".to_string(),
+        ))
     }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError>;
@@ -583,6 +623,25 @@ where
     ready_loop: RaftReadyLoop<W, LS, SS>,
     state_machine: SM,
     snapshot_store: SF,
+    /// Read states already completed by a direct compatibility operation.
+    /// Those operations predate [`HostedGroupTurn`] and cannot return read
+    /// states themselves, so retain them until the bounded host turn can
+    /// publish the group-tagged completion without dropping it.
+    deferred_read_states: Vec<ReadState>,
+}
+
+/// Remove compatibility-path ReadStates which no longer belong to the exact
+/// local leader term. Direct host operations can finish a Ready generation
+/// before a later bounded host turn publishes the state; a leadership change
+/// in that gap must therefore invalidate the adapter-owned queue as well as
+/// the Raft core's pending ReadIndex state.
+fn retain_current_leader_read_states(
+    states: &mut Vec<ReadState>,
+    local_id: raft::types::NodeId,
+    leader_id: Option<raft::types::NodeId>,
+    current_term: Term,
+) {
+    states.retain(|state| state.term == current_term && leader_id == Some(local_id));
 }
 
 impl<W, LS, SS, SM, SF> ReadyLoopHostedGroup<W, LS, SS, SM, SF>
@@ -602,6 +661,7 @@ where
             ready_loop,
             state_machine,
             snapshot_store,
+            deferred_read_states: Vec::new(),
         }
     }
 
@@ -624,11 +684,16 @@ where
                 .ready
                 .map(|ready| ready.messages)
                 .unwrap_or_default(),
+            read_states: progress.read_states,
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
             snapshot_bytes: progress.snapshot_bytes,
             persistence: None,
         })
+    }
+
+    fn defer_read_states(&mut self, turn: &mut HostedGroupTurn) {
+        self.deferred_read_states.append(&mut turn.read_states);
     }
 
     fn drain_ready_budgeted(
@@ -649,6 +714,7 @@ where
                 .ready
                 .map(|ready| ready.messages)
                 .unwrap_or_default(),
+            read_states: progress.read_states,
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
             snapshot_bytes: progress.snapshot_bytes,
@@ -660,6 +726,23 @@ where
         &mut self,
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
+        if !self.deferred_read_states.is_empty() {
+            let raft = self.ready_loop.raft();
+            retain_current_leader_read_states(
+                &mut self.deferred_read_states,
+                raft.id(),
+                raft.leader_id(),
+                raft.hard_state().current_term,
+            );
+        }
+
+        if !self.deferred_read_states.is_empty() {
+            return Ok(HostedGroupTurn {
+                read_states: std::mem::take(&mut self.deferred_read_states),
+                ..HostedGroupTurn::default()
+            });
+        }
+
         if self.ready_loop.has_pending_persistence() {
             let progress = self
                 .ready_loop
@@ -668,6 +751,7 @@ where
 
             return Ok(HostedGroupTurn {
                 outbound: Vec::new(),
+                read_states: Vec::new(),
                 ready_generations: progress.ready_generations,
                 apply_entries: 0,
                 snapshot_bytes: progress.snapshot_bytes,
@@ -688,6 +772,7 @@ where
 
         Ok(HostedGroupTurn {
             outbound: Vec::new(),
+            read_states: Vec::new(),
             ready_generations: progress.ready_generations,
             apply_entries: 0,
             snapshot_bytes: progress.snapshot_bytes,
@@ -740,7 +825,35 @@ where
     }
 
     fn has_pending_work(&self) -> bool {
-        self.ready_loop.has_pending_work()
+        self.ready_loop.has_pending_work() || !self.deferred_read_states.is_empty()
+    }
+
+    fn has_only_deferred_read_states(&self) -> bool {
+        !self.ready_loop.has_pending_work() && !self.deferred_read_states.is_empty()
+    }
+
+    fn activate_read_index(&mut self, term: Term) -> Result<(), HostedGroupError> {
+        if self.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still pending".to_string(),
+            ));
+        }
+
+        self.ready_loop
+            .activate_read_index(term)
+            .map_err(classify_ready_error)
+    }
+
+    fn read_index(&mut self, context: Vec<u8>) -> Result<(), HostedGroupError> {
+        if self.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still pending".to_string(),
+            ));
+        }
+
+        self.ready_loop
+            .read_index(context)
+            .map_err(classify_ready_error)
     }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
@@ -753,6 +866,7 @@ where
         // A previous retryable persistence operation may have left a Ready
         // generation pending. Finish it before mutating Raft again.
         let mut turn = self.drain_ready()?;
+        self.defer_read_states(&mut turn);
 
         if turn.ready_generations > 0 || self.ready_loop.has_pending_work() {
             return Ok(turn.outbound);
@@ -760,7 +874,8 @@ where
 
         self.ready_loop.tick(ticks).map_err(classify_ready_error)?;
 
-        let after_tick = self.drain_ready()?;
+        let mut after_tick = self.drain_ready()?;
+        self.defer_read_states(&mut after_tick);
         turn.outbound.extend(after_tick.outbound);
 
         Ok(turn.outbound)
@@ -777,6 +892,7 @@ where
         }
 
         let mut turn = self.drain_ready()?;
+        self.defer_read_states(&mut turn);
 
         if self.ready_loop.has_pending_work() {
             return Err(HostedGroupError::Retryable(
@@ -788,7 +904,8 @@ where
             .step(message)
             .map_err(classify_ready_error)?;
 
-        let after_step = self.drain_ready()?;
+        let mut after_step = self.drain_ready()?;
+        self.defer_read_states(&mut after_step);
         turn.outbound.extend(after_step.outbound);
 
         Ok(turn.outbound)
@@ -806,6 +923,7 @@ where
         }
 
         let mut turn = self.drain_ready()?;
+        self.defer_read_states(&mut turn);
 
         if self.ready_loop.has_pending_work() {
             return Err(HostedGroupError::Retryable(
@@ -818,7 +936,8 @@ where
             .propose(command, encoded_len)
             .map_err(classify_ready_error)?;
 
-        let after_proposal = self.drain_ready()?;
+        let mut after_proposal = self.drain_ready()?;
+        self.defer_read_states(&mut after_proposal);
         turn.outbound.extend(after_proposal.outbound);
 
         Ok((index, turn.outbound))
@@ -831,10 +950,15 @@ where
     ) -> Result<HostedGroupTurn, HostedGroupError> {
         let mut turn = self.prepare_ready_budgeted(budget)?;
 
-        if turn.persistence.is_some()
+        if !turn.read_states.is_empty()
+            || turn.persistence.is_some()
             || turn.ready_generations > 0
             || self.ready_loop.has_pending_work()
         {
+            // A deferred ReadState is valid only for the leadership term that
+            // produced it. Do not advance the clock after selecting it: a
+            // same-turn check-quorum transition could otherwise invalidate
+            // the state after it has already been returned to the host.
             return Ok(turn);
         }
 
@@ -843,6 +967,7 @@ where
         match after_tick {
             Ok(after_tick) => {
                 turn.outbound.extend(after_tick.outbound);
+                turn.read_states.extend(after_tick.read_states);
                 turn.ready_generations += after_tick.ready_generations;
                 turn.apply_entries += after_tick.apply_entries;
                 turn.snapshot_bytes += after_tick.snapshot_bytes;
@@ -858,6 +983,18 @@ where
         message: RaftMessageEnvelope,
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
+        // A direct compatibility operation may have completed a ReadIndex and
+        // retained its state for publication by the next bounded host turn.
+        // Process the queued Raft message before exposing that state: a higher
+        // term or a new leader can invalidate it, and publishing it first
+        // would make a same-turn stale-read result observable.
+        if !self.ready_loop.has_pending_work() && !self.deferred_read_states.is_empty() {
+            self.ready_loop
+                .step(message)
+                .map_err(classify_ready_error)?;
+            return self.prepare_ready_budgeted(budget);
+        }
+
         let mut turn = self.prepare_ready_budgeted(budget)?;
 
         if turn.persistence.is_some()
@@ -872,6 +1009,7 @@ where
             .map_err(classify_ready_error)?;
         let after_step = self.prepare_ready_budgeted(budget)?;
         turn.outbound.extend(after_step.outbound);
+        turn.read_states.extend(after_step.read_states);
         turn.ready_generations += after_step.ready_generations;
         turn.apply_entries += after_step.apply_entries;
         turn.snapshot_bytes += after_step.snapshot_bytes;
@@ -894,6 +1032,7 @@ where
                 .ready
                 .map(|ready| ready.messages)
                 .unwrap_or_default(),
+            read_states: progress.read_states,
             ready_generations: 0,
             apply_entries: progress.apply_entries,
             snapshot_bytes: progress.snapshot_bytes,
@@ -913,6 +1052,7 @@ pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
         | ReadyLoopError::Tick(RaftError::RecoveryRequired)
         | ReadyLoopError::Step(StepError::RecoveryRequired)
         | ReadyLoopError::Proposal(ProposeError::RecoveryRequired)
+        | ReadyLoopError::ReadIndex(ReadIndexError::RecoveryRequired)
         | ReadyLoopError::SnapshotInstall(SnapshotInstallError::RecoveryRequired)
         | ReadyLoopError::Advance(AdvanceError::RecoveryRequired) => {
             HostedGroupError::RecoveryRequired
@@ -922,7 +1062,7 @@ pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
             HostedGroupError::Retryable(error.to_string())
         }
 
-        ReadyLoopError::Proposal(_) | ReadyLoopError::Step(_) => {
+        ReadyLoopError::Proposal(_) | ReadyLoopError::ReadIndex(_) | ReadyLoopError::Step(_) => {
             HostedGroupError::Rejected(error.to_string())
         }
 
@@ -1427,6 +1567,54 @@ where
         Ok(())
     }
 
+    /// Enables the Raft core's ReadIndex path for one hosted group after the
+    /// caller has applied that group's current-term activation entry.
+    ///
+    /// The host owns this admission boundary so a caller cannot bypass group
+    /// quarantine, shared-WAL health, or the per-group Ready ordering. The
+    /// operation does not itself create a read result; a later
+    /// [`Self::run_turn`] delivers any completed [`ReadState`] values.
+    pub fn activate_read_index(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        term: Term,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_schedulable_group(raft_group_id)?;
+
+        let result = self
+            .groups
+            .get_mut(&raft_group_id)
+            .expect("schedulable group must be registered")
+            .activate_read_index(term);
+
+        self.finish_group_admission(raft_group_id, result)
+    }
+
+    /// Admits one opaque quorum-confirmed read context for a hosted group.
+    ///
+    /// Admission is asynchronous. The group is scheduled immediately so its
+    /// outbound ReadIndex messages and, after quorum confirmation, its
+    /// persisted/applied Ready read states flow through the ordinary host
+    /// turn. The caller correlates completion using the returned context in
+    /// [`MultiRaftTurnResult::read_states`].
+    pub fn read_index(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        context: Vec<u8>,
+    ) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        self.ensure_schedulable_group(raft_group_id)?;
+
+        let result = self
+            .groups
+            .get_mut(&raft_group_id)
+            .expect("schedulable group must be registered")
+            .read_index(context);
+
+        self.finish_group_admission(raft_group_id, result)
+    }
+
     fn account_pending_addition(&mut self, wire_bytes: usize) {
         self.pending_message_count = self.pending_message_count.saturating_add(1);
         self.pending_message_bytes = self.pending_message_bytes.saturating_add(wire_bytes);
@@ -1545,6 +1733,10 @@ where
                 continue;
             }
 
+            let has_queued_message = self
+                .pending_messages
+                .get(&raft_group_id)
+                .is_some_and(|pending| !pending.is_empty());
             let mut pending_message = if budget.max_messages == 0 {
                 None
             } else {
@@ -1582,7 +1774,32 @@ where
                 .groups
                 .get(&raft_group_id)
                 .is_some_and(|group| group.has_pending_work());
-            let process_message = had_message && !group_has_pending_work;
+            let group_only_deferred_read_states = self
+                .groups
+                .get(&raft_group_id)
+                .is_some_and(|group| group.has_only_deferred_read_states());
+
+            if has_queued_message && group_only_deferred_read_states && !had_message {
+                // A zero message budget leaves the control message queued.
+                // Do not publish a deferred ReadState while that message is
+                // waiting: it may carry a newer term which invalidates the
+                // state. Preserve the queue lane and give other groups a
+                // chance to use this turn's non-message budget.
+                let control = self
+                    .pending_messages
+                    .get(&raft_group_id)
+                    .is_some_and(PendingGroupMessages::has_control);
+                if control {
+                    self.runnable.enqueue_control(raft_group_id);
+                } else {
+                    self.runnable.enqueue(raft_group_id);
+                }
+                result.groups_serviced += 1;
+                continue;
+            }
+
+            let process_message =
+                had_message && (!group_has_pending_work || group_only_deferred_read_states);
             let retry_message = process_message.then(|| {
                 pending_message
                     .as_ref()
@@ -1647,8 +1864,14 @@ where
                             raft_group_id,
                             batch,
                             outbound: turn.outbound,
+                            read_states: turn.read_states,
                         });
                     } else {
+                        result.read_states.extend(
+                            turn.read_states
+                                .into_iter()
+                                .map(|state| (raft_group_id, state)),
+                        );
                         result
                             .outbound
                             .extend(turn.outbound.into_iter().map(|envelope| RoutedRaftMessage {
@@ -1750,6 +1973,7 @@ where
             let mut recovery_required = false;
 
             for pending in persistence_groups {
+                let raft_group_id = pending.raft_group_id;
                 let record_count = pending.batch.records.len();
                 let group_outcome = match &shared_outcome {
                     Ok(batch_result) => {
@@ -1772,7 +1996,7 @@ where
                 let completion = {
                     let group = self
                         .groups
-                        .get_mut(&pending.raft_group_id)
+                        .get_mut(&raft_group_id)
                         .expect("a pending persistence batch belongs to an active group");
                     group.complete_persistence(group_outcome, group_budget_for_completion(budget))
                 };
@@ -1781,13 +2005,20 @@ where
                     Ok(turn) => {
                         result.apply_entries += turn.apply_entries;
                         result.snapshot_bytes += turn.snapshot_bytes;
+                        result.read_states.extend(
+                            pending
+                                .read_states
+                                .into_iter()
+                                .chain(turn.read_states)
+                                .map(|state| (raft_group_id, state)),
+                        );
                         result.outbound.extend(
                             pending
                                 .outbound
                                 .into_iter()
                                 .chain(turn.outbound)
                                 .map(|envelope| RoutedRaftMessage {
-                                    raft_group_id: pending.raft_group_id,
+                                    raft_group_id,
                                     envelope,
                                 }),
                         );
@@ -1795,7 +2026,7 @@ where
                         if self.node_wal.recovery_required() {
                             recovery_required = true;
                         } else {
-                            self.reschedule_after_turn(pending.raft_group_id);
+                            self.reschedule_after_turn(raft_group_id);
                         }
                     }
                     Err(HostedGroupError::RecoveryRequired) => {
@@ -1805,15 +2036,15 @@ where
                         if self.node_wal.recovery_required() {
                             recovery_required = true;
                         } else {
-                            self.quarantined.insert(pending.raft_group_id, reason);
-                            self.remove_pending_group(pending.raft_group_id);
+                            self.quarantined.insert(raft_group_id, reason);
+                            self.remove_pending_group(raft_group_id);
                         }
                     }
                     Err(HostedGroupError::Retryable(_reason)) => {
-                        self.reschedule_after_turn(pending.raft_group_id);
+                        self.reschedule_after_turn(raft_group_id);
                     }
                     Err(HostedGroupError::Rejected(_reason)) => {
-                        self.reschedule_after_turn(pending.raft_group_id);
+                        self.reschedule_after_turn(raft_group_id);
                     }
                 }
             }
@@ -1829,7 +2060,6 @@ where
 
     fn validate_message(&self, message: &RoutedRaftMessage) -> Result<(), MultiRaftHostError> {
         let raft_group_id = message.raft_group_id;
-
         let received = ReplicaId::from_raft(message.envelope.to);
         let tombstone_identity = RaftReplicaIdentity::new(raft_group_id, received)
             .map_err(|error| MultiRaftHostError::InvalidMessage(error.to_string()))?;
@@ -2082,6 +2312,62 @@ where
                 })
                 .collect(),
         })
+    }
+
+    fn finish_group_admission(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        result: Result<(), HostedGroupError>,
+    ) -> Result<(), MultiRaftHostError> {
+        match result {
+            Ok(()) => {
+                self.ensure_shared_wal_healthy()?;
+                self.reschedule_after_turn(raft_group_id);
+                Ok(())
+            }
+
+            Err(HostedGroupError::RecoveryRequired) => {
+                self.state = HostState::RecoveryRequired;
+                Err(MultiRaftHostError::RecoveryRequired)
+            }
+
+            Err(HostedGroupError::Group(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                self.quarantined.insert(raft_group_id, reason.clone());
+                Err(MultiRaftHostError::Group {
+                    raft_group_id,
+                    reason,
+                })
+            }
+
+            Err(HostedGroupError::Retryable(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                Err(MultiRaftHostError::GroupRetryable {
+                    raft_group_id,
+                    reason,
+                })
+            }
+
+            Err(HostedGroupError::Rejected(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                Err(MultiRaftHostError::GroupRejected {
+                    raft_group_id,
+                    reason,
+                })
+            }
+        }
     }
 
     fn ensure_registering(&self) -> Result<(), MultiRaftHostError> {
@@ -3207,5 +3493,29 @@ mod tests {
             host.enqueue_message(message),
             Err(MultiRaftHostError::TombstonedReplica(identity)) if identity == group_identity
         ));
+    }
+
+    #[test]
+    /// Catches publication of a ReadState retained by the compatibility
+    /// adapter after a higher-term message has removed local leadership.
+    fn deferred_read_states_require_the_current_leader_term() {
+        let local = RaftReplicaId::must(101);
+        let former_term = ReadState {
+            request_ctx: b"former-term".to_vec(),
+            index: 10,
+            term: 4,
+        };
+        let current_term = ReadState {
+            request_ctx: b"current-term".to_vec(),
+            index: 11,
+            term: 5,
+        };
+        let mut states = vec![former_term, current_term.clone()];
+
+        retain_current_leader_read_states(&mut states, local, Some(local), 5);
+        assert_eq!(states, vec![current_term]);
+
+        retain_current_leader_read_states(&mut states, local, Some(RaftReplicaId::must(202)), 5);
+        assert!(states.is_empty());
     }
 }

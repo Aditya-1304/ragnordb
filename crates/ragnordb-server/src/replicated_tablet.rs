@@ -17,7 +17,10 @@ use std::{
 };
 
 use raft::{
-    core::ready::Ready,
+    core::{
+        read_index::{ReadIndexError, ReadState},
+        ready::Ready,
+    },
     entry::EntryPayload,
     message::{Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
@@ -49,7 +52,7 @@ use ragnordb_multiraft::{
     },
     proposal::{ProposalCompletion, ProposalRegistry, ProposalTicket},
     replica_startup::{bootstrap_tablet_replica, recover_tablet_replica},
-    runtime::{AppliedRaftFrontier, RaftReadyLoop},
+    runtime::{AppliedRaftFrontier, RaftReadyLoop, ReadyLoopError},
     snapshot::{
         PreparedIncomingTabletSnapshotInstall, SnapshotWorkController, SnapshotWorkError,
         SnapshotWorkKind, TabletSnapshotIntegrationError, TabletSnapshotTransfer,
@@ -95,6 +98,11 @@ const CHANNEL_CAPACITY: usize = 1_024;
 const TABLET_CONTROL_BUDGET: usize = 64;
 const TABLET_REQUEST_BUDGET: usize = 64;
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
+const READ_INDEX_CONTEXT_NAMESPACE: u64 = 0x5241_474e_4944_5801;
+const READ_INDEX_FALLBACK_GRACE: Duration = Duration::from_millis(5);
+/// Bound the number of caller reply channels retained while one coalesced
+/// ReadIndex request waits for quorum or its fallback barrier.
+const MAX_PENDING_READ_BARRIER_WAITERS: usize = 1_024;
 
 /// Identity that must remain consistent across the Raft Ready owner and the
 /// tablet snapshot contract. Keeping these values together prevents a worker
@@ -187,6 +195,18 @@ enum HostRequest {
         reply: mpsc::Sender<Result<Option<CachedTabletCommandOutcome>>>,
         deadline: Instant,
     },
+}
+
+struct PendingReadBarrierWaiter {
+    reply: mpsc::Sender<Result<()>>,
+    deadline: Instant,
+}
+
+struct PendingReadBarrier {
+    context: Vec<u8>,
+    term: u64,
+    fallback_at: Instant,
+    waiters: Vec<PendingReadBarrierWaiter>,
 }
 
 /// Node-level MultiRaft control messages.
@@ -616,15 +636,37 @@ impl ReplicatedTabletHandle {
 
     /// Establish an applied current-term ordering point before a latest read.
     pub fn read_barrier(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("read barrier deadline overflowed".into()))?;
+        self.read_barrier_until(deadline)
+    }
+
+    /// Establish an applied current-term ordering point without resetting the
+    /// caller's deadline. ReadIndex admission and the fallback barrier share
+    /// this exact deadline with the subsequent tablet read.
+    pub(crate) fn read_barrier_until(&self, deadline: Instant) -> Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::ProposalUnavailable {
+                reason: "read barrier deadline elapsed before admission".to_string(),
+            });
+        }
         let (reply, response) = mpsc::channel();
         self.requests
-            .send(HostRequest::Barrier { reply, deadline })
-            .map_err(|_| Error::ProposalUnavailable {
-                reason: "replicated tablet runtime has stopped".to_string(),
+            .try_send(HostRequest::Barrier { reply, deadline })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "read barrier admission queue is full before deadline".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
             })?;
         response
-            .recv_timeout(timeout)
+            .recv_timeout(remaining)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "read barrier deadline elapsed before apply".to_string(),
             })?
@@ -675,18 +717,40 @@ impl ReplicatedTabletHandle {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("tablet read deadline overflowed".into()))?;
+        self.read_point_until(request, deadline)
+    }
+
+    /// Execute a point read using an already-established absolute deadline.
+    pub(crate) fn read_point_until(
+        &self,
+        request: TabletReadRequest,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet read deadline elapsed before execution".to_string(),
+            });
+        }
         let (reply, response) = mpsc::channel();
         self.requests
-            .send(HostRequest::ReadPoint {
+            .try_send(HostRequest::ReadPoint {
                 request,
                 reply,
                 deadline,
             })
-            .map_err(|_| Error::ProposalUnavailable {
-                reason: "replicated tablet runtime has stopped".to_string(),
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet read admission queue is full before deadline".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
             })?;
         response
-            .recv_timeout(timeout)
+            .recv_timeout(remaining)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet read deadline elapsed before execution".to_string(),
             })?
@@ -704,18 +768,40 @@ impl ReplicatedTabletHandle {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("tablet scan deadline overflowed".into()))?;
+        self.scan_page_until(request, deadline)
+    }
+
+    /// Execute one scan page using an already-established absolute deadline.
+    pub(crate) fn scan_page_until(
+        &self,
+        request: TabletScanRequest,
+        deadline: Instant,
+    ) -> Result<TabletScanBatch> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet scan deadline elapsed before execution".to_string(),
+            });
+        }
         let (reply, response) = mpsc::channel();
         self.requests
-            .send(HostRequest::Scan {
+            .try_send(HostRequest::Scan {
                 request,
                 reply,
                 deadline,
             })
-            .map_err(|_| Error::ProposalUnavailable {
-                reason: "replicated tablet runtime has stopped".to_string(),
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet scan admission queue is full before deadline".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
             })?;
         response
-            .recv_timeout(timeout)
+            .recv_timeout(remaining)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet scan deadline elapsed before execution".to_string(),
             })?
@@ -1304,6 +1390,9 @@ where
     let mut internal_barrier_allocator = InternalBarrierAllocator::default();
     let mut was_leader = false;
     let mut leader_activation = None::<ragnordb_multiraft::proposal::ProposalPosition>;
+    let mut pending_read_barriers = Vec::<PendingReadBarrier>::new();
+    let mut pending_read_states = Vec::<ReadState>::new();
+    let mut next_read_index_context = 0_u64;
     let mut latest_snapshot = ready_loop
         .persistence()
         .snapshot()
@@ -1376,6 +1465,7 @@ where
                 &snapshot_policy,
                 &mut last_snapshot_at,
                 &identity,
+                &mut pending_read_states,
             ) {
                 Ok(()) => {
                     debug_assert!(
@@ -1436,6 +1526,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1455,6 +1546,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1484,6 +1576,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1506,6 +1599,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1539,6 +1633,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1563,6 +1658,7 @@ where
                                 catalog_cache.as_ref(),
                                 &snapshot_policy,
                                 &identity,
+                                &mut pending_read_states,
                             )? {
                                 expected_snapshot_install = Some(metadata);
                                 pending_snapshot_install = None;
@@ -1923,6 +2019,7 @@ where
             &mut leader_activation,
             &mut internal_barrier_allocator,
             &identity,
+            &mut pending_read_states,
         ) {
             Ok(()) => {}
             Err(HostedGroupError::Retryable(error)) | Err(HostedGroupError::Rejected(error)) => {
@@ -1933,11 +2030,13 @@ where
             }
             Err(error) => return Err(error.to_string()),
         }
-        let serving_leader = leader_activation.is_some_and(|activation| {
-            ready_loop
-                .applied_frontier()
-                .is_some_and(|frontier| frontier.index >= activation.index)
-        });
+        let serving_leader = ready_loop.raft().leader_id() == Some(ready_loop.raft().id())
+            && leader_activation.is_some_and(|activation| {
+                activation.term == ready_loop.raft().hard_state().current_term
+                    && ready_loop
+                        .applied_frontier()
+                        .is_some_and(|frontier| frontier.index >= activation.index)
+            });
 
         // P1: drain pending Ready before next SQL admission
         match drain_ready(
@@ -1951,6 +2050,7 @@ where
             catalog_cache.as_ref(),
             &snapshot_policy,
             &identity,
+            &mut pending_read_states,
         ) {
             Ok(Some(metadata)) => {
                 expected_snapshot_install = Some(metadata);
@@ -1969,6 +2069,24 @@ where
             }
             Err(error) => return Err(error.to_string()),
         }
+
+        process_pending_read_states(
+            &ready_loop,
+            &mut pending_read_states,
+            &mut pending_read_barriers,
+            Instant::now(),
+        );
+        fallback_pending_read_barriers(
+            &mut ready_loop,
+            &tablet,
+            &mut registry,
+            &mut clients,
+            serving_leader,
+            &mut internal_barrier_allocator,
+            &identity,
+            &mut pending_read_barriers,
+            &mut pending_read_states,
+        );
 
         let mut admitted_requests = 0;
         while admitted_requests < TABLET_REQUEST_BUDGET {
@@ -2016,6 +2134,19 @@ where
                     reply,
                     deadline,
                 ),
+                HostRequest::Barrier { reply, deadline } => admit_read_barrier(
+                    reply,
+                    deadline,
+                    &mut ready_loop,
+                    &tablet,
+                    &mut registry,
+                    &mut clients,
+                    serving_leader,
+                    &mut internal_barrier_allocator,
+                    &identity,
+                    &mut pending_read_barriers,
+                    &mut next_read_index_context,
+                ),
                 request => admit_request(
                     request,
                     &mut ready_loop,
@@ -2038,6 +2169,7 @@ where
                 catalog_cache.as_ref(),
                 &snapshot_policy,
                 &identity,
+                &mut pending_read_states,
             ) {
                 Ok(_) => {}
                 Err(HostedGroupError::Retryable(error))
@@ -2052,6 +2184,13 @@ where
             }
         }
 
+        process_pending_read_states(
+            &ready_loop,
+            &mut pending_read_states,
+            &mut pending_read_barriers,
+            Instant::now(),
+        );
+
         let now = Instant::now();
         registry.expire_deadlines(now);
         let is_leader = ready_loop.raft().leader_id() == Some(ready_loop.raft().id());
@@ -2059,6 +2198,11 @@ where
             registry.mark_leadership_lost(ready_loop.raft().hard_state().current_term);
             leader_activation = None;
             internal_barrier_allocator.clear();
+            reject_pending_read_barriers(
+                &mut pending_read_barriers,
+                &mut pending_read_states,
+                ready_loop.raft().leader_id().map(|id| id.get()),
+            );
         }
         was_leader = is_leader;
         forward_completions(&mut clients);
@@ -2087,6 +2231,7 @@ where
                 &snapshot_policy,
                 &mut last_snapshot_at,
                 &identity,
+                &mut pending_read_states,
             ) {
                 Ok(()) => {}
                 Err(HostedGroupError::Retryable(error))
@@ -2414,6 +2559,286 @@ fn admit_request<W, LS, SS>(
     }
 }
 
+fn read_index_context(group_id: RaftGroupId, term: u64, sequence: u64) -> Vec<u8> {
+    let mut context = Vec::with_capacity(32);
+    context.extend_from_slice(&READ_INDEX_CONTEXT_NAMESPACE.to_le_bytes());
+    context.extend_from_slice(&group_id.0.to_le_bytes());
+    context.extend_from_slice(&term.to_le_bytes());
+    context.extend_from_slice(&sequence.to_le_bytes());
+    context
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_read_barrier<W, LS, SS>(
+    reply: mpsc::Sender<Result<()>>,
+    deadline: Instant,
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
+    tablet: &TabletCommandApplier,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    clients: &mut Vec<PendingClient>,
+    serving_leader: bool,
+    internal_barrier_allocator: &mut InternalBarrierAllocator,
+    identity: &TabletRuntimeIdentity,
+    pending_read_barriers: &mut Vec<PendingReadBarrier>,
+    next_read_index_context: &mut u64,
+) where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    if deadline <= Instant::now() {
+        let _ = reply.send(Err(Error::ProposalUnavailable {
+            reason: "read barrier deadline elapsed before admission".to_string(),
+        }));
+        return;
+    }
+
+    let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
+    if !serving_leader {
+        let _ = reply.send(Err(Error::NotLeader { leader_id }));
+        return;
+    }
+
+    let term = ready_loop.raft().hard_state().current_term;
+    let fallback_at = deadline
+        .checked_sub(READ_INDEX_FALLBACK_GRACE)
+        .unwrap_or(deadline);
+
+    if pending_read_barrier_waiter_count(pending_read_barriers) >= MAX_PENDING_READ_BARRIER_WAITERS
+    {
+        let _ = reply.send(Err(Error::ProposalUnavailable {
+            reason: "latest-read admission limit reached while awaiting quorum".to_string(),
+        }));
+        return;
+    }
+
+    if let Some(pending) = pending_read_barriers
+        .iter_mut()
+        .find(|pending| pending.term == term)
+    {
+        pending.fallback_at = pending.fallback_at.min(fallback_at);
+        pending
+            .waiters
+            .push(PendingReadBarrierWaiter { reply, deadline });
+        return;
+    }
+
+    let sequence = *next_read_index_context;
+    *next_read_index_context = match sequence.checked_add(1) {
+        Some(next) => next,
+        None => {
+            let _ = reply.send(Err(Error::RecoveryRequired {
+                reason: "ReadIndex context sequence exhausted".to_string(),
+            }));
+            return;
+        }
+    };
+    let context = read_index_context(identity.target.raft_group_id, term, sequence);
+
+    match ready_loop.read_index(context.clone()) {
+        Ok(()) => pending_read_barriers.push(PendingReadBarrier {
+            context,
+            term,
+            fallback_at,
+            waiters: vec![PendingReadBarrierWaiter { reply, deadline }],
+        }),
+        Err(ReadyLoopError::ReadIndex(ReadIndexError::NotLeader)) => {
+            let _ = reply.send(Err(Error::NotLeader { leader_id }));
+        }
+        Err(ReadyLoopError::ReadIndex(ReadIndexError::RecoveryRequired)) => {
+            let _ = reply.send(Err(Error::RecoveryRequired {
+                reason: "Raft ReadIndex requires recovery".to_string(),
+            }));
+        }
+        Err(ReadyLoopError::ReadIndex(
+            ReadIndexError::NotActivated { .. }
+            | ReadIndexError::CurrentTermNotCommitted { .. }
+            | ReadIndexError::CurrentTermNotApplied { .. }
+            | ReadIndexError::ActivationTermMismatch { .. },
+        ))
+        | Err(ReadyLoopError::ReadIndex(ReadIndexError::RequestIdExhausted))
+        | Err(ReadyLoopError::ReadIndex(
+            ReadIndexError::PendingReadIndexLimitReached { .. }
+            | ReadIndexError::PendingReadIndexBytesLimitReached { .. },
+        ))
+        | Err(ReadyLoopError::PendingReady) => {
+            // ReadIndex is an optimization. If its activation boundary is not
+            // available, preserve the proven Milestone-4 log-barrier path.
+            admit_request(
+                HostRequest::Barrier { reply, deadline },
+                ready_loop,
+                tablet,
+                registry,
+                clients,
+                serving_leader,
+                internal_barrier_allocator,
+                identity,
+            );
+        }
+        Err(error) => {
+            let _ = reply.send(Err(Error::ProposalUnavailable {
+                reason: error.to_string(),
+            }));
+        }
+    }
+}
+
+fn pending_read_barrier_waiter_count(pending_read_barriers: &[PendingReadBarrier]) -> usize {
+    pending_read_barriers
+        .iter()
+        .map(|pending| pending.waiters.len())
+        .fold(0, usize::saturating_add)
+}
+
+fn process_pending_read_states<W, LS, SS>(
+    ready_loop: &RaftReadyLoop<W, LS, SS>,
+    read_states: &mut Vec<ReadState>,
+    pending_read_barriers: &mut Vec<PendingReadBarrier>,
+    now: Instant,
+) where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let local_id = ready_loop.raft().id();
+    let leader_id = ready_loop.raft().leader_id();
+    let term = ready_loop.raft().hard_state().current_term;
+    let applied_index = ready_loop
+        .applied_frontier()
+        .map(|frontier| frontier.index)
+        .unwrap_or(0);
+    let states = std::mem::take(read_states);
+
+    for state in states {
+        let Some(position) = pending_read_barriers
+            .iter()
+            .position(|pending| pending.term == state.term && pending.context == state.request_ctx)
+        else {
+            // A late or duplicate ReadState is harmless once its waiter has
+            // been completed, timed out, or invalidated by a term change.
+            continue;
+        };
+
+        if leader_id != Some(local_id) || state.term != term || state.index == 0 {
+            let pending = pending_read_barriers.remove(position);
+            for waiter in pending.waiters {
+                let _ = waiter.reply.send(Err(Error::NotLeader {
+                    leader_id: leader_id.map(|id| id.get()),
+                }));
+            }
+            continue;
+        }
+
+        if applied_index < state.index {
+            read_states.push(state);
+            continue;
+        }
+
+        let pending = pending_read_barriers.remove(position);
+        for waiter in pending.waiters {
+            let result = if waiter.deadline <= now {
+                Err(Error::ProposalUnavailable {
+                    reason: "read barrier deadline elapsed before ReadIndex confirmation"
+                        .to_string(),
+                })
+            } else {
+                Ok(())
+            };
+            let _ = waiter.reply.send(result);
+        }
+    }
+}
+
+fn reject_pending_read_barriers(
+    pending_read_barriers: &mut Vec<PendingReadBarrier>,
+    pending_read_states: &mut Vec<ReadState>,
+    leader_id: Option<u64>,
+) {
+    pending_read_states.clear();
+    for pending in pending_read_barriers.drain(..) {
+        for waiter in pending.waiters {
+            let _ = waiter.reply.send(Err(Error::NotLeader { leader_id }));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback_pending_read_barriers<W, LS, SS>(
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
+    tablet: &TabletCommandApplier,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    clients: &mut Vec<PendingClient>,
+    serving_leader: bool,
+    internal_barrier_allocator: &mut InternalBarrierAllocator,
+    identity: &TabletRuntimeIdentity,
+    pending_read_barriers: &mut Vec<PendingReadBarrier>,
+    pending_read_states: &mut Vec<ReadState>,
+) where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let local_id = ready_loop.raft().id();
+    let leader_id = ready_loop.raft().leader_id();
+    let term = ready_loop.raft().hard_state().current_term;
+    if leader_id != Some(local_id)
+        || pending_read_barriers
+            .iter()
+            .any(|pending| pending.term != term)
+    {
+        reject_pending_read_barriers(
+            pending_read_barriers,
+            pending_read_states,
+            leader_id.map(|id| id.get()),
+        );
+        return;
+    }
+
+    let now = Instant::now();
+    let mut position = 0;
+    while position < pending_read_barriers.len() {
+        let pending = &mut pending_read_barriers[position];
+        let mut active_waiters = Vec::with_capacity(pending.waiters.len());
+        for waiter in pending.waiters.drain(..) {
+            if waiter.deadline <= now {
+                let _ = waiter.reply.send(Err(Error::ProposalUnavailable {
+                    reason: "read barrier deadline elapsed before ReadIndex confirmation"
+                        .to_string(),
+                }));
+            } else {
+                active_waiters.push(waiter);
+            }
+        }
+        pending.waiters = active_waiters;
+
+        if pending.waiters.is_empty() {
+            pending_read_barriers.remove(position);
+            continue;
+        }
+        if pending.fallback_at > now {
+            position += 1;
+            continue;
+        }
+
+        let pending = pending_read_barriers.remove(position);
+        for waiter in pending.waiters {
+            admit_request(
+                HostRequest::Barrier {
+                    reply: waiter.reply,
+                    deadline: waiter.deadline,
+                },
+                ready_loop,
+                tablet,
+                registry,
+                clients,
+                serving_leader,
+                internal_barrier_allocator,
+                identity,
+            );
+        }
+    }
+}
+
 /// Execute a point read after the Ready owner has drained all committed work
 /// that was already pending at the start of the host turn.
 fn admit_read_request(
@@ -2627,6 +3052,7 @@ fn refresh_leader_activation<W, LS, SS>(
     activation: &mut Option<ragnordb_multiraft::proposal::ProposalPosition>,
     internal_barrier_allocator: &mut InternalBarrierAllocator,
     identity: &TabletRuntimeIdentity,
+    pending_read_states: &mut Vec<ReadState>,
 ) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
@@ -2640,7 +3066,22 @@ where
     }
 
     let term = ready_loop.raft().hard_state().current_term;
-    if activation.is_some_and(|position| position.term == term) {
+    if let Some(position) = activation
+        .as_ref()
+        .copied()
+        .filter(|position| position.term == term)
+    {
+        if ready_loop.raft().read_index_activation_term() == Some(term) {
+            return Ok(());
+        }
+        if ready_loop
+            .applied_frontier()
+            .is_some_and(|frontier| frontier.index >= position.index)
+        {
+            ready_loop
+                .activate_read_index(term)
+                .map_err(classify_ready_error)?;
+        }
         return Ok(());
     }
 
@@ -2655,6 +3096,7 @@ where
         catalog_cache,
         snapshot_policy,
         identity,
+        pending_read_states,
     )?;
 
     let request_id = internal_barrier_allocator
@@ -2686,7 +3128,16 @@ where
         catalog_cache,
         snapshot_policy,
         identity,
+        pending_read_states,
     )?;
+    if ready_loop
+        .applied_frontier()
+        .is_some_and(|frontier| frontier.index >= index)
+    {
+        ready_loop
+            .activate_read_index(term)
+            .map_err(classify_ready_error)?;
+    }
     Ok(())
 }
 
@@ -2708,6 +3159,7 @@ fn maybe_publish_snapshot<W, LS, SS>(
     snapshot_policy: &SnapshotPolicy,
     last_snapshot_at: &mut Instant,
     identity: &TabletRuntimeIdentity,
+    pending_read_states: &mut Vec<ReadState>,
 ) -> std::result::Result<(), HostedGroupError>
 where
     W: RaftWal,
@@ -2734,6 +3186,7 @@ where
             catalog_cache,
             snapshot_policy,
             identity,
+            pending_read_states,
         )?;
 
         // `drain_ready` may have advanced application state, so snapshot the
@@ -2829,6 +3282,7 @@ where
         catalog_cache,
         snapshot_policy,
         identity,
+        pending_read_states,
     )?;
     release_replica_retention(ready_loop)
         .map_err(|error| HostedGroupError::Group(error.to_string()))?;
@@ -3159,6 +3613,7 @@ fn drain_ready<W, LS, SS>(
     catalog_cache: &dyn CatalogCacheWriter,
     snapshot_policy: &SnapshotPolicy,
     identity: &TabletRuntimeIdentity,
+    pending_read_states: &mut Vec<ReadState>,
 ) -> std::result::Result<Option<SnapshotMetadata>, HostedGroupError>
 where
     W: RaftWal,
@@ -3207,6 +3662,10 @@ where
             .advance_applied_frontier(frontier)
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
     }
+    // Read states are emitted only after the Ready's committed entries have
+    // applied and the applied frontier has advanced. They authorize a read
+    // only; they never mutate or advance that frontier themselves.
+    pending_read_states.extend(ready.read_states);
     let snapshot_install = ready.snapshot_install.clone();
     send_messages(
         transport,
@@ -3477,6 +3936,7 @@ mod tests {
                 primary_key_bytes: b"pk".to_vec(),
             },
             read_timestamp: Timestamp(10),
+            deadline_remaining_ms: None,
         };
         let (sender, receiver) = mpsc::channel();
 
@@ -3496,6 +3956,127 @@ mod tests {
                 current_epoch: 7,
                 expected_epoch: 6,
             })
+        ));
+    }
+
+    #[test]
+    /// Realistic bug caught: a saturated Ready-owner request queue could make
+    /// a latest-read caller wait in `SyncSender::send` after its deadline had
+    /// already elapsed.
+    fn latest_read_admission_does_not_block_on_a_full_request_queue() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (queued_reply, _queued_response) = mpsc::channel();
+        request_tx
+            .send(HostRequest::Barrier {
+                reply: queued_reply,
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .expect("the saturation fixture must fill the request queue");
+
+        let handle = Arc::new(ReplicatedTabletHandle {
+            requests: request_tx,
+            status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
+        });
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let (result_tx, result_rx) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            result_tx
+                .send(handle.read_barrier_until(deadline))
+                .expect("the deadline result must be observable");
+        });
+
+        let early_result = result_rx.recv_timeout(Duration::from_millis(150)).ok();
+        let completed_before_queue_release = early_result.is_some();
+        if early_result.is_none() {
+            // Release the fixture so the pre-fix blocking sender cannot leak
+            // beyond this test after the assertion has been evaluated.
+            let _ = request_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("the saturated request must be releasable");
+        }
+        let result =
+            early_result.or_else(|| result_rx.recv_timeout(Duration::from_millis(200)).ok());
+        caller.join().expect("the read caller must exit");
+
+        assert!(
+            completed_before_queue_release,
+            "latest-read admission must return by its deadline even when the request queue is full; result={result:?}"
+        );
+        assert!(matches!(
+            result,
+            Some(Err(Error::ProposalUnavailable { .. }))
+        ));
+    }
+
+    #[test]
+    /// Realistic bug caught: an already-expired latest read must not enqueue
+    /// work behind a saturated request queue or wait for the Ready owner.
+    fn expired_latest_read_admission_is_rejected_before_queue_access() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (queued_reply, _queued_response) = mpsc::channel();
+        request_tx
+            .send(HostRequest::Barrier {
+                reply: queued_reply,
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .expect("the saturation fixture must fill the request queue");
+        let handle = ReplicatedTabletHandle {
+            requests: request_tx,
+            status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
+        };
+        let deadline = Instant::now();
+
+        let barrier = handle.read_barrier_until(deadline);
+        let point = handle.read_point_until(
+            TabletReadRequest {
+                request_id: RequestId {
+                    client_id: 1,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(9),
+                },
+                logical_command_id: None,
+                tablet_id: TabletId(3),
+                tablet_epoch: 7,
+                row_key: RowKey {
+                    table_id: TableId(3),
+                    primary_key_bytes: b"pk".to_vec(),
+                },
+                read_timestamp: Timestamp(10),
+                deadline_remaining_ms: None,
+            },
+            deadline,
+        );
+        let scan = handle.scan_page_until(
+            TabletScanRequest {
+                request_id: RequestId {
+                    client_id: 1,
+                    sequence: 2,
+                    raft_group_id: RaftGroupId(9),
+                },
+                tablet_id: TabletId(3),
+                tablet_epoch: 7,
+                start_key: Some(vec![0]),
+                end_key: Some(vec![1]),
+                resume_after: None,
+                read_timestamp: Timestamp(10),
+                max_rows: 1,
+                max_bytes: 64,
+                rpc_attempt_id: Some(1),
+                deadline_remaining_ms: None,
+            },
+            deadline,
+        );
+
+        assert!(matches!(barrier, Err(Error::ProposalUnavailable { .. })));
+        assert!(matches!(point, Err(Error::ProposalUnavailable { .. })));
+        assert!(matches!(scan, Err(Error::ProposalUnavailable { .. })));
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(HostRequest::Barrier { .. })
+        ));
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         ));
     }
 
@@ -3943,5 +4524,35 @@ mod tests {
             propose_reply_rx.recv().unwrap(),
             Err(HostedGroupError::Retryable(_)),
         ));
+    }
+
+    #[test]
+    /// Catches unbounded reply-channel retention when a leader cannot obtain a
+    /// ReadIndex quorum and many latest reads coalesce behind one context.
+    fn coalesced_latest_read_waiters_have_a_hard_admission_bound() {
+        let (reply, _receiver) = mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut pending = vec![PendingReadBarrier {
+            context: b"coalesced".to_vec(),
+            term: 7,
+            fallback_at: deadline,
+            waiters: (0..MAX_PENDING_READ_BARRIER_WAITERS)
+                .map(|_| PendingReadBarrierWaiter {
+                    reply: reply.clone(),
+                    deadline,
+                })
+                .collect(),
+        }];
+
+        assert_eq!(
+            pending_read_barrier_waiter_count(&pending),
+            MAX_PENDING_READ_BARRIER_WAITERS
+        );
+        assert!(
+            pending_read_barrier_waiter_count(&pending) >= MAX_PENDING_READ_BARRIER_WAITERS,
+            "the admission path must reject another waiter before pushing it"
+        );
+        pending.clear();
+        assert_eq!(pending_read_barrier_waiter_count(&pending), 0);
     }
 }

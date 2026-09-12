@@ -33,6 +33,7 @@ use std::{
 use raft::{
     core::{
         node::{ProposeError, RaftError, RaftNode, SnapshotInstallError, StepError},
+        read_index::{ReadIndexError, ReadState},
         ready::{AdvanceError, Ready},
     },
     entry::EntryPayload,
@@ -63,6 +64,10 @@ type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
 #[derive(Debug, Default)]
 pub(crate) struct ReadyApplyProgress {
     pub(crate) ready: Option<ReadyGeneration>,
+    /// Read states become visible only after the Ready's committed prefix has
+    /// been applied. They are observations of Raft safety, not state-machine
+    /// progress, and therefore must never advance `applied_frontier`.
+    pub(crate) read_states: Vec<ReadState>,
     pub(crate) ready_generations: usize,
     pub(crate) apply_entries: usize,
     pub(crate) snapshot_bytes: usize,
@@ -157,6 +162,9 @@ pub enum ReadyLoopError {
 
     #[error("Raft proposal failed: {0:?}")]
     Proposal(ProposeError),
+
+    #[error("Raft ReadIndex admission failed: {0:?}")]
+    ReadIndex(ReadIndexError),
 
     #[error("invalid applied Raft frontier: index {index}, term {term}")]
     InvalidAppliedFrontier { index: LogIndex, term: Term },
@@ -519,6 +527,33 @@ where
         self.raft
             .propose_with_size(command, encoded_len)
             .map_err(ReadyLoopError::Proposal)
+    }
+
+    /// Records that the host has applied the current-term activation entry.
+    ///
+    /// The host owns the application-specific no-op, so the Raft core cannot
+    /// identify it directly. This method is intentionally rejected while a
+    /// Ready generation is pending; callers must cross the normal persistence
+    /// and apply boundary before enabling ReadIndex for the term.
+    pub fn activate_read_index(&mut self, term: Term) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+        self.raft
+            .activate_read_index(term)
+            .map_err(ReadyLoopError::ReadIndex)
+    }
+
+    /// Starts one quorum-confirmed read barrier for an opaque host context.
+    ///
+    /// This only admits the protocol request. The resulting [`ReadState`] is
+    /// delivered through the completed Ready path after the local committed
+    /// prefix has applied; this method never advances the applied frontier.
+    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+        self.raft
+            .read_index(context)
+            .map_err(ReadyLoopError::ReadIndex)
     }
 
     /// persists and acknowledges the next exact Ready generation
@@ -1330,8 +1365,10 @@ where
         }
 
         self.applied_frontier = pending.applied_frontier;
+        let read_states = pending.ready.read_states.clone();
         Ok(ReadyApplyProgress {
             ready: Some(pending.ready),
+            read_states,
             ready_generations: 1,
             apply_entries: applied_entries,
             snapshot_bytes,
@@ -1388,4 +1425,167 @@ fn validate_snapshot_pointer(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raft::{core::node::RaftNode, storage::mem::MemStorage};
+    use ragnordb_common::ids::{RaftGroupId, ReplicaId};
+    use wal::{
+        error::BatchAppendFailure,
+        lsn::Lsn,
+        types::RecordType,
+        wal::{AppendResult, BatchAppendResult},
+    };
+
+    type TestNode =
+        RaftNode<Vec<u8>, Vec<u8>, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+    type TestLoop =
+        RaftReadyLoop<TestWal, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+    struct TestWal {
+        next_lsn: Lsn,
+    }
+
+    impl RaftWal for TestWal {
+        fn append_batch_and_sync(
+            &mut self,
+            records: &[(RecordType, &[u8])],
+        ) -> Result<BatchAppendResult, BatchAppendFailure> {
+            let mut extents = Vec::with_capacity(records.len());
+            for (_, payload) in records {
+                let start_lsn = self.next_lsn;
+                let end_lsn = start_lsn
+                    .checked_add_bytes(payload.len() as u64 + 1)
+                    .expect("test WAL LSN must not overflow");
+                self.next_lsn = end_lsn;
+                extents.push(AppendResult { start_lsn, end_lsn });
+            }
+
+            Ok(BatchAppendResult {
+                final_end_lsn: extents
+                    .last()
+                    .map(|extent| extent.end_lsn)
+                    .unwrap_or(Lsn::ZERO),
+                record_extents: extents,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TestStateMachine {
+        applied: Vec<u64>,
+    }
+
+    impl RaftReadyStateMachine for TestStateMachine {
+        type Error = &'static str;
+
+        fn restore_snapshot(&mut self, _snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn apply(&mut self, index: u64, _command: &[u8]) -> Result<(), Self::Error> {
+            self.applied.push(index);
+            Ok(())
+        }
+    }
+
+    struct TestSnapshotStore;
+
+    impl RaftSnapshotStore for TestSnapshotStore {
+        type Error = &'static str;
+
+        fn publish(
+            &mut self,
+            _identity: RaftReplicaIdentity,
+            _snapshot: &Snapshot<Vec<u8>>,
+        ) -> Result<RaftSnapshotPointerRecord, Self::Error> {
+            Err("snapshots are not part of this Ready-order test")
+        }
+
+        fn load_verified(
+            &mut self,
+            _pointer: &RaftSnapshotPointerRecord,
+        ) -> Result<Snapshot<Vec<u8>>, Self::Error> {
+            Err("snapshots are not part of this Ready-order test")
+        }
+    }
+
+    fn new_loop() -> TestLoop {
+        let node: TestNode =
+            RaftNode::new(1, Vec::new(), MemStorage::new(), MemStorage::new(), 5, 2);
+        RaftReadyLoop::new(
+            node,
+            RaftWalStorage::new(
+                TestWal {
+                    next_lsn: Lsn::new(100),
+                },
+                RaftReplicaIdentity::new(RaftGroupId(101), ReplicaId(1)).unwrap(),
+            ),
+        )
+    }
+
+    fn prepare_leader(
+        loop_: &mut TestLoop,
+        store: &mut TestSnapshotStore,
+        state: &mut TestStateMachine,
+    ) {
+        loop_.persist_next_ready(None).unwrap();
+        loop_.tick(loop_.raft().current_election_timeout()).unwrap();
+        loop_.persist_and_apply_next_ready(store, state).unwrap();
+    }
+
+    #[test]
+    /// Catches releasing ReadState from a Ready generation while a bounded
+    /// apply turn still owns an unapplied committed prefix.
+    fn read_state_waits_for_the_complete_ready_apply_prefix() {
+        let mut loop_ = new_loop();
+        let mut store = TestSnapshotStore;
+        let mut state = TestStateMachine::default();
+        prepare_leader(&mut loop_, &mut store, &mut state);
+
+        let activation_index = loop_.propose(b"activation".to_vec(), 10).unwrap();
+        loop_
+            .persist_and_apply_next_ready(&mut store, &mut state)
+            .unwrap();
+        loop_
+            .activate_read_index(loop_.raft().current_term())
+            .unwrap();
+
+        // The runtime API correctly refuses new Raft mutations while a Ready
+        // is outstanding. This test intentionally uses the private core only
+        // to construct one legal Ready containing both committed entries and
+        // a completed ReadState, then exercises the production apply boundary.
+        loop_.raft.propose(b"first".to_vec()).unwrap();
+        loop_.raft.propose(b"second".to_vec()).unwrap();
+        loop_.raft.read_index(b"bounded-read".to_vec()).unwrap();
+
+        let budget = crate::host::MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        };
+        let first = loop_
+            .persist_and_apply_next_ready_budgeted(&mut store, &mut state, budget)
+            .unwrap();
+        assert!(first.read_states.is_empty());
+        assert_eq!(first.apply_entries, 1);
+        assert_eq!(state.applied, vec![activation_index, activation_index + 1]);
+
+        let second = loop_
+            .persist_and_apply_next_ready_budgeted(&mut store, &mut state, budget)
+            .unwrap();
+        assert_eq!(second.read_states.len(), 1);
+        assert_eq!(second.read_states[0].request_ctx, b"bounded-read");
+        assert_eq!(second.read_states[0].index, activation_index + 2);
+        assert_eq!(
+            state.applied,
+            vec![activation_index, activation_index + 1, activation_index + 2]
+        );
+        assert_eq!(loop_.raft.last_applied(), activation_index + 2);
+    }
 }

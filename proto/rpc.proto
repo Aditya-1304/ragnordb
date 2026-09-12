@@ -52,6 +52,9 @@ message TabletReadRequest {
         ragnordb.ids.Timestamp read_timestamp = 5;
         ragnordb.ids.LogicalCommandId logical_command_id = 6;
         optional uint64 rpc_attempt_id = 7;
+        // Conservative remaining caller budget for one forwarded attempt.
+        // The receiver never reconstructs a deadline from its wall clock.
+        optional uint64 deadline_remaining_ms = 8;
 }
 
 // A bounded, resumable read over one logical half-open tablet span. The
@@ -69,6 +72,9 @@ message TabletScanRequest {
         uint32 max_rows = 8;
         uint32 max_bytes = 9;
         optional uint64 rpc_attempt_id = 10;
+        // Conservative remaining caller budget for one forwarded attempt.
+        // The receiver never reconstructs a deadline from its wall clock.
+        optional uint64 deadline_remaining_ms = 11;
 }
 
 message TabletScanRow {

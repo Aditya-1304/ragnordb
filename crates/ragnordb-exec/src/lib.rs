@@ -2253,6 +2253,7 @@ impl LocalExecutor {
                 max_rows: TABLET_SCAN_PAGE_ROWS,
                 max_bytes: TABLET_SCAN_PAGE_BYTES,
                 rpc_attempt_id: None,
+                deadline_remaining_ms: None,
             };
             batch.validate_for(&validation_request).map_err(|error| {
                 scan_failure(
@@ -2416,6 +2417,7 @@ impl LocalExecutor {
                 max_rows: TABLET_SCAN_PAGE_ROWS,
                 max_bytes: TABLET_SCAN_PAGE_BYTES,
                 rpc_attempt_id: None,
+                deadline_remaining_ms: None,
             };
             batch.validate_for(&validation_request).map_err(|error| {
                 scan_failure(

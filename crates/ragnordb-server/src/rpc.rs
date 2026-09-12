@@ -14,7 +14,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use prost::Message;
@@ -658,6 +658,7 @@ impl TabletRpcClient {
             tablet_epoch: route.tablet_epoch,
             row_key,
             read_timestamp,
+            deadline_remaining_ms: None,
         };
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
@@ -691,6 +692,7 @@ impl TabletRpcClient {
                 current_route.raft_group_id,
                 request.clone(),
                 attempt_timeout,
+                deadline,
             ) {
                 Ok(row) => {
                     self.record_successful_leader(&current_route, target_replica);
@@ -775,6 +777,7 @@ impl TabletRpcClient {
             max_rows,
             max_bytes,
             rpc_attempt_id: None,
+            deadline_remaining_ms: None,
         };
         request
             .validate()
@@ -811,6 +814,7 @@ impl TabletRpcClient {
                 current_route.raft_group_id,
                 request.clone(),
                 attempt_timeout,
+                deadline,
             ) {
                 Ok(batch) => {
                     batch
@@ -1026,15 +1030,17 @@ impl TabletRpcClient {
         &self,
         target: NodeId,
         group_id: RaftGroupId,
-        request: TabletReadRequest,
+        mut request: TabletReadRequest,
         timeout: Duration,
+        deadline: Instant,
     ) -> Result<Option<Vec<u8>>> {
         if target == self.transport.local_node_id() {
             let handle = self.local_handle(group_id)?;
-            handle.read_barrier(timeout)?;
-            return handle.read_point(request, timeout);
+            handle.read_barrier_until(deadline)?;
+            return handle.read_point_until(request, deadline);
         }
 
+        request.deadline_remaining_ms = Some(forwarded_read_budget_millis(deadline, timeout)?);
         let request_id = request.request_id.clone();
         let response = self.send_remote(
             target,
@@ -1057,15 +1063,17 @@ impl TabletRpcClient {
         &self,
         target: NodeId,
         group_id: RaftGroupId,
-        request: TabletScanRequest,
+        mut request: TabletScanRequest,
         timeout: Duration,
+        deadline: Instant,
     ) -> Result<TabletScanBatch> {
         if target == self.transport.local_node_id() {
             let handle = self.local_handle(group_id)?;
-            handle.read_barrier(timeout)?;
-            return handle.scan_page(request, timeout);
+            handle.read_barrier_until(deadline)?;
+            return handle.scan_page_until(request, deadline);
         }
 
+        request.deadline_remaining_ms = Some(forwarded_read_budget_millis(deadline, timeout)?);
         let request_id = request.request_id.clone();
         let response = self.send_remote(
             target,
@@ -1393,6 +1401,19 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
+            let deadline = match remote_read_deadline(request.deadline_remaining_ms) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
             let response = match handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1400,8 +1421,8 @@ fn dispatch_message(
                 .cloned()
             {
                 Some(handle) => match handle
-                    .read_barrier(Duration::from_secs(30))
-                    .and_then(|()| handle.read_point(request, Duration::from_secs(30)))
+                    .read_barrier_until(deadline)
+                    .and_then(|()| handle.read_point_until(request, deadline))
                 {
                     Ok(row) => TabletCommandResponse {
                         request_id,
@@ -1435,6 +1456,19 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
+            let deadline = match remote_read_deadline(request.deadline_remaining_ms) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
             let response = match handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1442,8 +1476,8 @@ fn dispatch_message(
                 .cloned()
             {
                 Some(handle) => match handle
-                    .read_barrier(Duration::from_secs(30))
-                    .and_then(|()| handle.scan_page(request, Duration::from_secs(30)))
+                    .read_barrier_until(deadline)
+                    .and_then(|()| handle.scan_page_until(request, deadline))
                 {
                     Ok(batch) => TabletCommandResponse {
                         request_id,
@@ -1928,6 +1962,47 @@ fn error_leader(error: &Error) -> Option<ReplicaId> {
 const MAX_TABLET_RETRY_ATTEMPTS: u32 = 3;
 const TABLET_RETRY_BACKOFF_BASE_MS: u64 = 5;
 const TABLET_RETRY_BACKOFF_MAX_MS: u64 = 100;
+/// Budget reserved for transport queueing and forwarding overhead. A remote
+/// tablet never receives the full sender-side attempt timeout, so the hop
+/// cannot restart or extend that budget.
+const READ_FORWARD_SAFETY_MARGIN: Duration = Duration::from_millis(100);
+
+/// Encode one conservative remaining budget for a remote node. The wire uses
+/// a duration rather than a wall-clock timestamp: independent node clocks
+/// cannot safely reconstruct a monotonic deadline. The sender's absolute
+/// deadline remains authoritative locally, while the receiver gets only the
+/// smaller of the remaining request budget and this attempt's transport
+/// budget, minus a fixed forwarding safety margin.
+fn forwarded_read_budget_millis(deadline: Instant, attempt_timeout: Duration) -> Result<u64> {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(attempt_timeout);
+    let safe_budget = remaining
+        .checked_sub(READ_FORWARD_SAFETY_MARGIN)
+        .ok_or_else(|| Error::ProposalUnavailable {
+            reason: "latest read has no safe forwarding budget remaining".to_string(),
+        })?;
+    let millis = safe_budget.as_millis();
+    if millis == 0 {
+        return Err(Error::ProposalUnavailable {
+            reason: "latest read has no safe forwarding budget remaining".to_string(),
+        });
+    }
+    u64::try_from(millis)
+        .map_err(|_| Error::InvalidArgument("tablet read deadline overflowed".into()))
+}
+
+/// Convert a forwarded remaining budget into the receiving process's
+/// monotonic clock. Missing budgets are rejected so a remote latest read
+/// cannot fall back to an unrelated fixed timeout and outlive its caller.
+fn remote_read_deadline(deadline_remaining_ms: Option<u64>) -> Result<Instant> {
+    let deadline_remaining_ms = deadline_remaining_ms.ok_or_else(|| {
+        Error::InvalidArgument("forwarded latest read is missing its deadline budget".to_string())
+    })?;
+    Instant::now()
+        .checked_add(Duration::from_millis(deadline_remaining_ms))
+        .ok_or_else(|| Error::InvalidArgument("forwarded latest read deadline overflowed".into()))
+}
 
 fn apply_leader_hint(route: &mut TabletRoute, leader: ReplicaId) -> bool {
     if route.node_for_replica(leader).is_none() {
@@ -2181,6 +2256,27 @@ mod tests {
             retry_backoff(1, Duration::from_millis(3)),
             Duration::from_millis(3)
         );
+    }
+
+    #[test]
+    /// Catches restarting the full latest-read timeout after a node-to-node
+    /// forward instead of honoring the original absolute caller deadline.
+    fn forwarded_read_budget_is_required_and_conservative() {
+        assert!(matches!(
+            remote_read_deadline(None),
+            Err(Error::InvalidArgument(reason))
+                if reason.contains("missing its deadline budget")
+        ));
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let encoded = forwarded_read_budget_millis(deadline, Duration::from_millis(500)).unwrap();
+        assert!(encoded <= 400);
+        let remaining = remote_read_deadline(Some(encoded)).unwrap();
+        assert!(remaining > Instant::now());
+        assert!(remaining <= Instant::now() + Duration::from_millis(400));
+
+        let short = forwarded_read_budget_millis(deadline, Duration::from_millis(50));
+        assert!(matches!(short, Err(Error::ProposalUnavailable { .. })));
     }
 
     /// Realistic bug caught: a stale or malicious leader hint can replace the

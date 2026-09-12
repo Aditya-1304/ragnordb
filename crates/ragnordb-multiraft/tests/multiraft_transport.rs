@@ -5,7 +5,10 @@ use std::{
 };
 
 use raft::{
-    message::{AppendEntriesRequest, Envelope, Message, PreVoteResponse, RequestVoteResponse},
+    message::{
+        AppendEntriesRequest, Envelope, Message, PreVoteResponse, ReadIndexRequest,
+        RequestVoteResponse,
+    },
     types::ReplicaId as CoreReplicaId,
 };
 use ragnordb_common::{
@@ -140,6 +143,51 @@ fn local_transport_prioritizes_control_messages_over_bulk_appends() {
         received.envelope.msg,
         Message::RequestVoteResponse(_)
     ));
+}
+
+/// Catches classifying ReadIndex traffic as bulk replication work, which would
+/// let an append burst delay the quorum confirmation needed by a linearizable
+/// read.
+#[test]
+fn local_transport_prioritizes_read_index_control_over_bulk_appends() {
+    let endpoint = NodeRaftTransport::bind(NodeId(1), unused_address(), BTreeMap::new()).unwrap();
+    let sender = endpoint
+        .transport
+        .register_group(&local_bootstrap(33))
+        .unwrap();
+
+    sender
+        .try_send(Envelope {
+            from: CoreReplicaId::must(101),
+            to: CoreReplicaId::must(202),
+            msg: Message::AppendEntries(AppendEntriesRequest {
+                term: 1,
+                leader_id: CoreReplicaId::must(101),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![raft::entry::LogEntry::normal(1, 1, vec![0; 8])],
+                leader_commit: 0,
+            }),
+        })
+        .unwrap();
+    sender
+        .try_send(Envelope {
+            from: CoreReplicaId::must(101),
+            to: CoreReplicaId::must(202),
+            msg: Message::ReadIndex(ReadIndexRequest {
+                term: 1,
+                leader_id: CoreReplicaId::must(101),
+                request_id: 1,
+                context: b"read-control".to_vec(),
+            }),
+        })
+        .unwrap();
+
+    let received = endpoint
+        .inbound
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(received.envelope.msg, Message::ReadIndex(_)));
 }
 
 #[test]

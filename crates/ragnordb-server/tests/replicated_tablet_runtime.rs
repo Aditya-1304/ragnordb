@@ -317,6 +317,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     let start = Arc::new(Barrier::new(3));
     let first = nodes[leader].runtime.handle();
     let second = nodes[leader].runtime.handle();
+    let before_barriers = first.status();
     let first_start = start.clone();
     let first_barrier = tokio::task::spawn_blocking(move || {
         first_start.wait();
@@ -337,6 +338,11 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
         .await
         .unwrap()
         .expect("the second concurrent latest-read barrier must apply");
+    let after_barriers = nodes[leader].runtime.handle().status();
+    assert_eq!(
+        after_barriers.last_log_index, before_barriers.last_log_index,
+        "ReadIndex barriers must not append one no-op per latest-read waiter"
+    );
 
     let leader_catalog = nodes[leader].database.clone();
     tokio::task::spawn_blocking(move || {

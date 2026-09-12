@@ -57,6 +57,10 @@ pub struct TabletReadRequest {
     pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
     #[prost(uint64, optional, tag = "7")]
     pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded attempt.
+    /// The receiver never reconstructs a deadline from its wall clock.
+    #[prost(uint64, optional, tag = "8")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
 }
 /// A bounded, resumable read over one logical half-open tablet span. The
 /// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
@@ -84,6 +88,10 @@ pub struct TabletScanRequest {
     pub max_bytes: u32,
     #[prost(uint64, optional, tag = "10")]
     pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded attempt.
+    /// The receiver never reconstructs a deadline from its wall clock.
+    #[prost(uint64, optional, tag = "11")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletScanRow {

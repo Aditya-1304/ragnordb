@@ -251,6 +251,9 @@ pub struct TabletReadRequest {
     pub tablet_epoch: u64,
     pub row_key: crate::ids::RowKey,
     pub read_timestamp: Timestamp,
+    /// Conservative remaining budget for one node-to-node forward. It is
+    /// transport metadata, not part of logical request identity.
+    pub deadline_remaining_ms: Option<u64>,
 }
 
 impl TabletReadRequest {
@@ -263,6 +266,7 @@ impl TabletReadRequest {
             row_key: Some(self.row_key.to_proto()),
             read_timestamp: Some(self.read_timestamp.to_proto()),
             rpc_attempt_id: None,
+            deadline_remaining_ms: self.deadline_remaining_ms,
         }
     }
 
@@ -285,6 +289,9 @@ impl TabletReadRequest {
         if read_timestamp.0 == 0 {
             return Err("tablet read timestamp must be non-zero");
         }
+        if proto.deadline_remaining_ms == Some(0) {
+            return Err("tablet read deadline must be non-zero");
+        }
 
         Ok(Self {
             request_id,
@@ -296,6 +303,7 @@ impl TabletReadRequest {
             tablet_epoch: proto.tablet_epoch,
             row_key,
             read_timestamp,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
         })
     }
 }
@@ -329,6 +337,9 @@ pub struct TabletScanRequest {
     /// Physical transport-attempt correlation. It is not part of logical scan
     /// identity and may change when the same scan request is retried.
     pub rpc_attempt_id: Option<u64>,
+    /// Conservative remaining budget for one node-to-node forward. It is
+    /// transport metadata, not part of logical scan identity.
+    pub deadline_remaining_ms: Option<u64>,
 }
 
 impl TabletScanRequest {
@@ -377,6 +388,12 @@ impl TabletScanRequest {
         {
             return Err("tablet scan RPC attempt ID must be non-zero");
         }
+        if self
+            .deadline_remaining_ms
+            .is_some_and(|deadline| deadline == 0)
+        {
+            return Err("tablet scan deadline must be non-zero");
+        }
         Ok(())
     }
 
@@ -392,6 +409,7 @@ impl TabletScanRequest {
             max_rows: self.max_rows,
             max_bytes: self.max_bytes,
             rpc_attempt_id: self.rpc_attempt_id,
+            deadline_remaining_ms: self.deadline_remaining_ms,
         }
     }
 
@@ -409,6 +427,7 @@ impl TabletScanRequest {
             max_rows: proto.max_rows,
             max_bytes: proto.max_bytes,
             rpc_attempt_id: proto.rpc_attempt_id,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
         };
         request.validate()?;
         Ok(request)
@@ -1423,6 +1442,7 @@ mod tests {
                 primary_key_bytes: b"pk".to_vec(),
             },
             read_timestamp: Timestamp(100),
+            deadline_remaining_ms: Some(123),
         };
         let decoded = TabletReadRequest::from_proto(request.to_proto()).unwrap();
         assert_eq!(decoded, request);
@@ -1760,6 +1780,7 @@ mod tests {
             max_rows: 2,
             max_bytes: 64,
             rpc_attempt_id: Some(41),
+            deadline_remaining_ms: Some(456),
         };
         let batch = TabletScanBatch {
             rows: vec![
@@ -1804,6 +1825,7 @@ mod tests {
             max_rows: 1,
             max_bytes: 32,
             rpc_attempt_id: Some(1),
+            deadline_remaining_ms: None,
         };
 
         assert_eq!(

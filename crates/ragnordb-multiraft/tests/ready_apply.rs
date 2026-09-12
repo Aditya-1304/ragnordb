@@ -2,13 +2,15 @@ use std::{fs, path::PathBuf, process};
 
 use raft::{
     core::node::RaftNode,
-    message::{Envelope, InstallSnapshotRequest, Message},
+    message::{Envelope, InstallSnapshotRequest, Message, ReadIndexResponse},
     storage::mem::MemStorage,
     types::{ConfState, Snapshot},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
-    host::{MultiRaftHost, MultiRaftTurnBudget, ReadyLoopHostedGroup},
+    host::{
+        MultiRaftHost, MultiRaftRole, MultiRaftTurnBudget, ReadyLoopHostedGroup, RoutedRaftMessage,
+    },
     runtime::{
         AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
         RaftSnapshotStore, ReadyApplyError, ReadyLoopError,
@@ -198,6 +200,280 @@ fn persisted_ready_applies_committed_entries_before_acknowledging_applied_fronti
         loop_.applied_frontier(),
         Some(AppliedRaftFrontier::new(1, ready.committed_entries[0].term))
     );
+}
+
+/// Catches releasing a quorum-confirmed read before the Ready that carries it
+/// has crossed the normal persistence and state-machine apply boundary, and
+/// catches treating the read's safe index as a new applied frontier.
+#[test]
+fn read_state_is_delivered_after_apply_without_moving_the_applied_frontier() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    loop_.propose(b"activation".to_vec(), 10).unwrap();
+
+    let mut store = MemorySnapshotStore::default();
+    let mut state_machine = RecordingStateMachine::default();
+    let activation_ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+    let frontier = loop_
+        .applied_frontier()
+        .expect("the activation entry must establish an applied frontier");
+
+    loop_
+        .activate_read_index(loop_.raft().current_term())
+        .unwrap();
+    loop_.read_index(b"read-after-activation".to_vec()).unwrap();
+
+    let read_ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+
+    assert!(activation_ready.read_states.is_empty());
+    assert_eq!(state_machine.applied.len(), 1);
+    assert!(read_ready.committed_entries.is_empty());
+    assert_eq!(read_ready.read_states.len(), 1);
+    assert_eq!(
+        read_ready.read_states[0].request_ctx,
+        b"read-after-activation"
+    );
+    assert_eq!(read_ready.read_states[0].index, frontier.index);
+    assert_eq!(read_ready.read_states[0].term, frontier.term);
+    assert_eq!(loop_.applied_frontier(), Some(frontier));
+}
+
+/// Catches bypassing the physical-node lifecycle when a caller admits a
+/// ReadIndex request directly against a group instead of through the host.
+#[test]
+fn host_read_index_admission_delivers_the_group_tagged_read_state() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"host-correlated-read".to_vec(),
+    )
+    .unwrap();
+
+    let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+
+    assert_eq!(result.read_states.len(), 1);
+    assert_eq!(result.read_states[0].0, group_identity.raft_group_id);
+    assert_eq!(result.read_states[0].1.request_ctx, b"host-correlated-read");
+}
+
+/// Catches the compatibility proposal path consuming a completed read Ready
+/// without returning its ReadState through a later bounded host turn.
+#[test]
+fn direct_host_operations_do_not_drop_completed_read_states() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"read-before-direct-proposal".to_vec(),
+    )
+    .unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"next-command".to_vec(),
+        b"next-command".len(),
+    )
+    .unwrap();
+
+    let result = host.run_turn(2, MultiRaftTurnBudget::default()).unwrap();
+    assert_eq!(result.read_states.len(), 1);
+    assert_eq!(
+        result.read_states[0].1.request_ctx,
+        b"read-before-direct-proposal"
+    );
+    assert!(
+        result.outbound.is_empty(),
+        "a deferred ReadState must be the only observable work in its host turn"
+    );
+}
+
+/// Catches publishing a deferred ReadState before a later message in the same
+/// host turn demotes its group. The state is safe only if the group is still
+/// the local leader in the state term after the complete turn finishes.
+#[test]
+fn host_turn_discards_deferred_read_state_after_same_turn_higher_term_message() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"stale-after-demotion".to_vec(),
+    )
+    .unwrap();
+
+    // The direct proposal drains the completed ReadState into the adapter's
+    // compatibility queue. It remains unpublished until the next host turn.
+    host.propose(
+        group_identity.raft_group_id,
+        b"next-command".to_vec(),
+        b"next-command".len(),
+    )
+    .unwrap();
+
+    host.enqueue_message(RoutedRaftMessage {
+        raft_group_id: group_identity.raft_group_id,
+        envelope: Envelope {
+            from: raft::types::ReplicaId::must(1),
+            to: raft::types::ReplicaId::must(1),
+            msg: Message::ReadIndexResponse(ReadIndexResponse {
+                term: term + 1,
+                request_id: 1,
+                context: b"stale-after-demotion".to_vec(),
+            }),
+        },
+    })
+    .unwrap();
+
+    let turn = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 2,
+                max_messages: 1,
+                ..MultiRaftTurnBudget::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(turn.messages_processed, 1);
+    assert!(turn.read_states.is_empty());
+    assert_eq!(host.status().groups[0].role, Some(MultiRaftRole::Follower));
+}
+
+/// Catches direct compatibility admission bypassing the adapter-owned
+/// deferred ReadState queue and accumulating completed states without bound.
+#[test]
+fn direct_read_index_rejects_admission_while_a_state_is_deferred() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(group_identity.raft_group_id, b"first-read".to_vec())
+        .unwrap();
+    host.propose(
+        group_identity.raft_group_id,
+        b"drain-first-read".to_vec(),
+        b"drain-first-read".len(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        host.read_index(group_identity.raft_group_id, b"second-read".to_vec()),
+        Err(ragnordb_multiraft::host::MultiRaftHostError::GroupRetryable {
+            raft_group_id,
+            ..
+        }) if raft_group_id == group_identity.raft_group_id
+    ));
 }
 
 /// Catches a host turn acknowledging a Ready after only part of its apply
