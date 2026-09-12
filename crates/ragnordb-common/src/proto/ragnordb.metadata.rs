@@ -18,6 +18,12 @@ pub struct MetadataCommand {
     /// startup entries without an envelope.
     #[prost(uint32, tag = "10")]
     pub envelope_version: u32,
+    /// Topology-independent durable identity. `request_id` remains the
+    /// proposal/RPC correlation identity, while this field is the metadata
+    /// state machine's deduplication key and therefore carries the session
+    /// epoch across reconnects.
+    #[prost(message, optional, tag = "13")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
     #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8, 11, 12")]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
@@ -322,6 +328,11 @@ pub struct MetadataRequestDeduplication {
     pub client_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "8")]
     pub session_epoch: u64,
+    /// New snapshots retain the logical identity independently of the legacy
+    /// group-qualified request correlation ID. Readers of older snapshots may
+    /// derive the compatibility identity from request_id.
+    #[prost(message, optional, tag = "9")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

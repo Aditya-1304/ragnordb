@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::command_codec::TabletCommand;
 use crate::ids::{
-    LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp,
+    LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId, Timestamp,
 };
 use crate::proto::rpc;
+use prost::Message;
 
 /// A logical inter-node message on the multiplexed TCP transport.
 ///
@@ -151,6 +152,7 @@ impl TabletCommandRequest {
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
             command: Some(self.command.to_proto()?),
+            rpc_attempt_id: None,
         })
     }
 
@@ -198,6 +200,7 @@ impl TabletOutcomeQueryRequest {
             logical_command_id: Some(self.logical_command_id.to_proto()),
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
+            rpc_attempt_id: None,
         }
     }
 
@@ -253,6 +256,7 @@ impl TabletReadRequest {
             tablet_epoch: self.tablet_epoch,
             row_key: Some(self.row_key.to_proto()),
             read_timestamp: Some(self.read_timestamp.to_proto()),
+            rpc_attempt_id: None,
         }
     }
 
@@ -325,6 +329,7 @@ impl TabletCommandResponse {
             leader_replica_id: self.leader_replica_id.map(|id| id.0).unwrap_or(0),
             current_tablet_epoch: self.current_tablet_epoch.unwrap_or(0),
             expected_tablet_epoch: self.expected_tablet_epoch.unwrap_or(0),
+            rpc_attempt_id: None,
         }
     }
 
@@ -352,6 +357,140 @@ pub enum MetadataRequest {
     AllocateTimestamp,
     LookupTablet { table_id: u64, key: Vec<u8> },
     LookupSchema { table_id: u64 },
+    ProposeCommand(MetadataProposalRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataProposalRequest {
+    pub request_id: RequestId,
+    pub command_envelope: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataProposalOutcome {
+    Applied,
+    AlreadyApplied,
+    ClientRegistered {
+        session_epoch: u64,
+    },
+    ClientRenewed,
+    TableCreated {
+        table_id: TableId,
+        tablet_id: TabletId,
+        raft_group_id: RaftGroupId,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+impl MetadataProposalOutcome {
+    pub fn to_proto(&self) -> rpc::MetadataProposalOutcome {
+        let (kind, client_id, session_epoch, table_id, tablet_id, raft_group_id, rejection) =
+            match self {
+                Self::Applied => (
+                    rpc::metadata_proposal_outcome::Kind::Applied,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                ),
+                Self::AlreadyApplied => (
+                    rpc::metadata_proposal_outcome::Kind::AlreadyApplied,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                ),
+                Self::ClientRegistered { session_epoch } => (
+                    rpc::metadata_proposal_outcome::Kind::ClientRegistered,
+                    0,
+                    *session_epoch,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                ),
+                Self::ClientRenewed => (
+                    rpc::metadata_proposal_outcome::Kind::ClientRenewed,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                ),
+                Self::TableCreated {
+                    table_id,
+                    tablet_id,
+                    raft_group_id,
+                } => (
+                    rpc::metadata_proposal_outcome::Kind::TableCreated,
+                    0,
+                    0,
+                    table_id.0,
+                    tablet_id.0,
+                    raft_group_id.0,
+                    String::new(),
+                ),
+                Self::Rejected { reason } => (
+                    rpc::metadata_proposal_outcome::Kind::Rejected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    reason.clone(),
+                ),
+            };
+        rpc::MetadataProposalOutcome {
+            kind: kind as i32,
+            client_id,
+            session_epoch,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::MetadataProposalOutcome) -> Result<Self, &'static str> {
+        match rpc::metadata_proposal_outcome::Kind::try_from(proto.kind)
+            .map_err(|_| "invalid metadata proposal outcome kind")?
+        {
+            rpc::metadata_proposal_outcome::Kind::Applied => Ok(Self::Applied),
+            rpc::metadata_proposal_outcome::Kind::AlreadyApplied => Ok(Self::AlreadyApplied),
+            rpc::metadata_proposal_outcome::Kind::ClientRegistered => {
+                if proto.session_epoch == 0 {
+                    return Err("client registration outcome has zero session epoch");
+                }
+                Ok(Self::ClientRegistered {
+                    session_epoch: proto.session_epoch,
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::ClientRenewed => Ok(Self::ClientRenewed),
+            rpc::metadata_proposal_outcome::Kind::TableCreated => {
+                if proto.table_id == 0 || proto.tablet_id == 0 || proto.raft_group_id == 0 {
+                    return Err("table-created outcome contains a zero identity");
+                }
+                Ok(Self::TableCreated {
+                    table_id: TableId(proto.table_id),
+                    tablet_id: TabletId(proto.tablet_id),
+                    raft_group_id: RaftGroupId(proto.raft_group_id),
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::Rejected => Ok(Self::Rejected {
+                reason: proto.rejection,
+            }),
+            rpc::metadata_proposal_outcome::Kind::Unspecified => {
+                Err("unspecified metadata proposal outcome")
+            }
+        }
+    }
 }
 
 impl MetadataRequest {
@@ -369,6 +508,13 @@ impl MetadataRequest {
             MetadataRequest::LookupSchema { table_id } => Some(
                 rpc::metadata_request::Request::LookupSchema(rpc::LookupSchemaRequest {
                     table_id: *table_id,
+                }),
+            ),
+            MetadataRequest::ProposeCommand(request) => Some(
+                rpc::metadata_request::Request::ProposeCommand(rpc::MetadataProposalRequest {
+                    rpc_attempt_id: None,
+                    request_id: Some(request.request_id.to_proto()),
+                    command_envelope: request.command_envelope.clone(),
                 }),
             ),
         };
@@ -390,6 +536,15 @@ impl MetadataRequest {
                 Ok(MetadataRequest::LookupSchema {
                     table_id: req.table_id,
                 })
+            }
+            Some(rpc::metadata_request::Request::ProposeCommand(req)) => {
+                Ok(MetadataRequest::ProposeCommand(MetadataProposalRequest {
+                    request_id: RequestId::from_proto(
+                        req.request_id
+                            .ok_or("missing metadata proposal request_id")?,
+                    )?,
+                    command_envelope: req.command_envelope,
+                }))
             }
             None => Err("missing metadata request"),
         }
@@ -622,6 +777,14 @@ pub enum MetadataResponse {
         schema_bytes: Vec<u8>,
         schema_version: u64,
     },
+    ProposeCommand {
+        request_id: RequestId,
+        success: bool,
+        error_code: String,
+        error_message: String,
+        outcome: Option<MetadataProposalOutcome>,
+        leader_replica_id: Option<ReplicaId>,
+    },
 }
 
 impl MetadataResponse {
@@ -685,6 +848,27 @@ impl MetadataResponse {
                 rpc::LookupSchemaResponse {
                     schema_bytes: schema_bytes.clone(),
                     schema_version: *schema_version,
+                },
+            )),
+            MetadataResponse::ProposeCommand {
+                request_id,
+                success,
+                error_code,
+                error_message,
+                outcome,
+                leader_replica_id,
+            } => Some(rpc::metadata_response::Response::ProposeCommand(
+                rpc::MetadataProposalResponse {
+                    rpc_attempt_id: None,
+                    request_id: Some(request_id.to_proto()),
+                    success: *success,
+                    error_code: error_code.clone(),
+                    error_message: error_message.clone(),
+                    outcome: outcome
+                        .as_ref()
+                        .map(|outcome| outcome.to_proto().encode_to_vec())
+                        .unwrap_or_default(),
+                    leader_replica_id: leader_replica_id.map(|id| id.0).unwrap_or(0),
                 },
             )),
         };
@@ -759,6 +943,28 @@ impl MetadataResponse {
                 Ok(MetadataResponse::LookupSchema {
                     schema_bytes: resp.schema_bytes,
                     schema_version: resp.schema_version,
+                })
+            }
+            Some(rpc::metadata_response::Response::ProposeCommand(resp)) => {
+                let outcome = if resp.outcome.is_empty() {
+                    None
+                } else {
+                    Some(MetadataProposalOutcome::from_proto(
+                        rpc::MetadataProposalOutcome::decode(resp.outcome.as_slice())
+                            .map_err(|_| "invalid metadata proposal outcome")?,
+                    )?)
+                };
+                Ok(MetadataResponse::ProposeCommand {
+                    request_id: RequestId::from_proto(
+                        resp.request_id
+                            .ok_or("missing metadata proposal response request_id")?,
+                    )?,
+                    success: resp.success,
+                    error_code: resp.error_code,
+                    error_message: resp.error_message,
+                    outcome,
+                    leader_replica_id: (resp.leader_replica_id != 0)
+                        .then_some(ReplicaId(resp.leader_replica_id)),
                 })
             }
             None => Err("missing metadata response"),
@@ -904,6 +1110,7 @@ mod tests {
                     .to_proto()
                     .unwrap(),
             ),
+            rpc_attempt_id: None,
         };
         assert!(matches!(
             TabletCommandRequest::from_proto(command),

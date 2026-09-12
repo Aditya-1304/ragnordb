@@ -47,6 +47,10 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
             snapshot_addr: unused_address(),
             sql_addr: unused_address(),
             admin_addr: unused_address(),
+            region: None,
+            zone: None,
+            rack: None,
+            storage_class: "default".to_string(),
         })
         .collect::<Vec<_>>();
     // Replicated startup waits for metadata initialization to commit and apply.

@@ -23,6 +23,12 @@ message MetadataCommand {
     // startup entries without an envelope.
     uint32 envelope_version = 10;
 
+    // Topology-independent durable identity. `request_id` remains the
+    // proposal/RPC correlation identity, while this field is the metadata
+    // state machine's deduplication key and therefore carries the session
+    // epoch across reconnects.
+    ragnordb.ids.LogicalCommandId logical_command_id = 13;
+
     oneof command {
         ClusterInitialized cluster_initialized = 2;
         RegisterNode register_node = 3;
@@ -274,4 +280,9 @@ message MetadataRequestDeduplication {
 
     bytes client_id = 7;
     uint64 session_epoch = 8;
+
+    // New snapshots retain the logical identity independently of the legacy
+    // group-qualified request correlation ID. Readers of older snapshots may
+    // derive the compatibility identity from request_id.
+    ragnordb.ids.LogicalCommandId logical_command_id = 9;
 }

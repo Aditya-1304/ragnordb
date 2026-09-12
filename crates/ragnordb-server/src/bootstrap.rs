@@ -284,10 +284,10 @@ fn node_descriptor(seed: &SeedNodeConfig) -> NodeDescriptor {
         snapshot_addr: seed.snapshot_addr.to_string(),
         sql_addr: seed.sql_addr.to_string(),
         admin_addr: seed.admin_addr.to_string(),
-        region: None,
-        zone: None,
-        rack: None,
-        storage_class: "default".to_string(),
+        region: seed.region.clone(),
+        zone: seed.zone.clone(),
+        rack: seed.rack.clone(),
+        storage_class: seed.storage_class.clone(),
         lifecycle: NodeLifecycle::Active,
     }
 }
@@ -353,6 +353,10 @@ mod tests {
             sql_addr: format!("127.0.0.1:{}", base + 200).parse().unwrap(),
 
             admin_addr: format!("127.0.0.1:{}", base + 300).parse().unwrap(),
+            region: None,
+            zone: None,
+            rack: None,
+            storage_class: "default".to_string(),
         }
     }
 

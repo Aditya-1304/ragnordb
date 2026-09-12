@@ -418,62 +418,71 @@ async fn handle_connection_with_policy(
         let (sql, root_request_sequence) = match request_frame {
             ClientRequestFrame::V1(sql) => (sql, None),
             ClientRequestFrame::V2(request) => {
-                if let Some(creator) = metadata_creator.as_ref()
-                    && let Some(active_epoch) =
-                        creator.active_client_session_epoch(request.client_id)?
-                    && active_epoch != request.client_session_epoch
-                {
-                    return Err(Box::new(ragnordb_common::Error::ClientSessionExpired {
-                        session_epoch: request.client_session_epoch,
-                    }));
-                }
-                if let Some(creator) = metadata_creator.as_ref()
-                    && !session.v2_metadata_registered()
-                {
-                    let registration_request_id = session.metadata_registration_request_id(
-                        request.client_id,
-                        request.client_session_epoch,
-                        request.request_sequence,
-                    )?;
-                    let registered_epoch = creator.register_client(
-                        registration_request_id,
-                        request.client_id,
-                        request.client_session_epoch,
-                        Duration::from_millis(request.statement_timeout_ms),
-                    )?;
-                    if registered_epoch != request.client_session_epoch {
-                        return Err(Box::new(ragnordb_common::Error::ClientSessionExpired {
+                let setup: ragnordb_common::Result<(String, Option<u64>)> = (|| {
+                    if let Some(creator) = metadata_creator.as_ref()
+                        && let Some(active_epoch) =
+                            creator.active_client_session_epoch(request.client_id)?
+                        && request.client_session_epoch < active_epoch
+                    {
+                        return Err(ragnordb_common::Error::ClientSessionExpired {
                             session_epoch: request.client_session_epoch,
-                        }));
+                        });
                     }
-                    session.mark_v2_metadata_registered();
-                }
-                if let Some(creator) = metadata_creator.as_ref()
-                    && let Some(acknowledged_through) = request.acknowledged_through
-                    && acknowledged_through > 0
-                    && session.should_renew_metadata_ack(acknowledged_through)
-                {
-                    creator.renew_client(
-                        session.metadata_renewal_request_id(
+                    if let Some(creator) = metadata_creator.as_ref()
+                        && !session.v2_metadata_registered()
+                    {
+                        let registration_request_id = session.metadata_registration_request_id(
+                            request.client_id,
+                            request.client_session_epoch,
+                            request.request_sequence,
+                        )?;
+                        let registered_epoch = creator.register_client(
+                            registration_request_id,
+                            request.client_id,
+                            request.client_session_epoch,
+                            Duration::from_millis(request.statement_timeout_ms),
+                        )?;
+                        if registered_epoch != request.client_session_epoch {
+                            return Err(ragnordb_common::Error::ClientSessionExpired {
+                                session_epoch: request.client_session_epoch,
+                            });
+                        }
+                        session.mark_v2_metadata_registered();
+                    }
+                    if let Some(creator) = metadata_creator.as_ref()
+                        && let Some(acknowledged_through) = request.acknowledged_through
+                        && acknowledged_through > 0
+                        && session.should_renew_metadata_ack(acknowledged_through)
+                    {
+                        creator.renew_client(
+                            session.metadata_renewal_request_id(
+                                request.client_id,
+                                request.client_session_epoch,
+                                acknowledged_through,
+                            )?,
                             request.client_id,
                             request.client_session_epoch,
                             acknowledged_through,
-                        )?,
+                            Duration::from_millis(request.statement_timeout_ms),
+                        )?;
+                        session.mark_metadata_acknowledged(acknowledged_through);
+                    }
+                    session.accept_v2_request(
                         request.client_id,
                         request.client_session_epoch,
-                        acknowledged_through,
-                        Duration::from_millis(request.statement_timeout_ms),
+                        request.request_sequence,
+                        request.acknowledged_through,
+                        request.statement_timeout_ms,
                     )?;
-                    session.mark_metadata_acknowledged(acknowledged_through);
+                    Ok((request.sql, Some(request.request_sequence)))
+                })();
+                match setup {
+                    Ok(value) => value,
+                    Err(error) => {
+                        write_frame(&mut writer, &internal_error_response(&error)).await?;
+                        continue;
+                    }
                 }
-                session.accept_v2_request(
-                    request.client_id,
-                    request.client_session_epoch,
-                    request.request_sequence,
-                    request.acknowledged_through,
-                    request.statement_timeout_ms,
-                )?;
-                (request.sql, Some(request.request_sequence))
             }
         };
         let statement_timeout_ms = session.statement_timeout_ms;
@@ -492,6 +501,14 @@ async fn handle_connection_with_policy(
         } else {
             None
         };
+        let metadata_logical_request_id =
+            metadata_request_id
+                .as_ref()
+                .map(|request_id| ragnordb_common::ids::ClientRequestId {
+                    client_id: session.client_id(),
+                    session_epoch: session.v2_session_epoch().unwrap_or(1),
+                    request_sequence: request_id.sequence,
+                });
 
         metrics::counter_inc("RagnorDB_requests_received_total");
 
@@ -500,7 +517,7 @@ async fn handle_connection_with_policy(
         // Latest reads are served only after an exact no-op has committed and
         // applied on the current leader. This check happens before database
         // admission so the Ready owner never waits on the SQL state mutex.
-        let read_barrier_error = if is_latest_read(&trimmed) {
+        let read_barrier_error = if metadata_creator.is_none() && is_latest_read(&trimmed) {
             if let Some(replicated) = replicated_tablet.clone() {
                 let timeout = Duration::from_millis(session.statement_timeout_ms);
                 tokio::task::spawn_blocking(move || replicated.read_barrier(timeout))
@@ -546,10 +563,11 @@ async fn handle_connection_with_policy(
                     let (returned_session, result, status) =
                         tokio::task::spawn_blocking(move || {
                             let mut database = database_guard;
-                            let result = database.execute_sql_with_metadata_request(
+                            let result = database.execute_sql_with_metadata_request_and_identity(
                                 &mut sql_session,
                                 &statement,
                                 metadata_request_id,
+                                metadata_logical_request_id,
                                 Duration::from_millis(statement_timeout_ms),
                             );
                             let status = database.status();

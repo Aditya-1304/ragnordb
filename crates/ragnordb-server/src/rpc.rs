@@ -7,10 +7,10 @@
 //! Raft host prevents network retries from bypassing proposal/apply ordering.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -18,6 +18,7 @@ use std::{
 };
 
 use prost::Message;
+use ragnordb_catalog::MetadataApplyOutcome;
 use ragnordb_common::{
     Error, Result,
     command_codec::{CachedTabletCommandOutcome, TabletCommand},
@@ -27,8 +28,9 @@ use ragnordb_common::{
     metadata_codec::DesiredReplicaRole,
     proto::rpc,
     rpc_codec::{
-        MessageType, ReplicaRoute, RpcFrame, TabletCommandRequest, TabletCommandResponse,
-        TabletOutcomeQueryRequest, TabletReadRequest, TabletRoute,
+        MessageType, MetadataProposalRequest, MetadataRequest, MetadataResponse, ReplicaRoute,
+        RpcFrame, TabletCommandRequest, TabletCommandResponse, TabletOutcomeQueryRequest,
+        TabletReadRequest, TabletRoute,
     },
 };
 use ragnordb_exec::TabletGateway;
@@ -38,6 +40,7 @@ use ragnordb_tablet::TabletRouter;
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
 
 use crate::database::SharedLocalDatabase;
+use crate::multiraft_runtime::MetadataHostRequest;
 use crate::replicated_tablet::ReplicatedTabletHandle;
 
 /// Group-qualified handles published by the lifecycle owner after a tablet
@@ -45,19 +48,125 @@ use crate::replicated_tablet::ReplicatedTabletHandle;
 pub type SharedTabletHandleRegistry =
     Arc<RwLock<BTreeMap<RaftGroupId, Arc<ReplicatedTabletHandle>>>>;
 
-struct PendingResponse {
-    target: NodeId,
-    sender: mpsc::Sender<TabletCommandResponse>,
+enum PendingResponseMessage {
+    Tablet(TabletCommandResponse),
+    Metadata(MetadataResponse),
 }
 
-type PendingResponses = Arc<Mutex<BTreeMap<RequestId, PendingResponse>>>;
+struct PendingResponse {
+    target: NodeId,
+    sender: mpsc::Sender<PendingResponseMessage>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RpcState {
+    pending: Arc<Mutex<BTreeMap<u64, PendingResponse>>>,
+    next_attempt: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MetadataRpcClient {
+    transport: NodeRaftTransport,
+    rpc_state: RpcState,
+}
+
+impl MetadataRpcClient {
+    pub(crate) fn new(transport: NodeRaftTransport, rpc_state: RpcState) -> Self {
+        Self {
+            transport,
+            rpc_state,
+        }
+    }
+
+    pub(crate) fn propose(
+        &self,
+        target: NodeId,
+        raft_group_id: RaftGroupId,
+        request: MetadataProposalRequest,
+        timeout: Duration,
+    ) -> Result<MetadataResponse> {
+        let frame = RpcFrame {
+            msg_type: MessageType::MetadataRequest,
+            raft_group_id,
+            payload: MetadataRequest::ProposeCommand(request)
+                .to_proto()
+                .encode_to_vec(),
+        };
+        let attempt_id = self.rpc_state.next_attempt_id()?;
+        let payload = attach_rpc_attempt_id(frame.msg_type, &frame.payload, attempt_id)?;
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending =
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .map_err(|_| Error::ProposalUnavailable {
+                        reason: "metadata RPC pending-response lock is poisoned".to_string(),
+                    })?;
+            pending.insert(attempt_id, PendingResponse { target, sender });
+        }
+        if let Err(error) = self.transport.try_send_rpc(
+            target,
+            RpcFrame {
+                msg_type: frame.msg_type,
+                raft_group_id: frame.raft_group_id,
+                payload,
+            },
+        ) {
+            self.rpc_state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&attempt_id);
+            return Err(Error::ProposalUnavailable {
+                reason: format!("metadata RPC could not be queued: {error}"),
+            });
+        }
+
+        match receiver.recv_timeout(timeout) {
+            Ok(PendingResponseMessage::Metadata(response)) => Ok(response),
+            Ok(PendingResponseMessage::Tablet(_)) => Err(Error::CorruptData(
+                "metadata RPC waiter received a tablet response".to_string(),
+            )),
+            Err(_) => {
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&attempt_id);
+                Err(Error::ProposalUnavailable {
+                    reason: "metadata RPC response deadline elapsed".to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl RpcState {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            next_attempt: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn next_attempt_id(&self) -> Result<u64> {
+        let attempt_id = self.next_attempt.fetch_add(1, Ordering::Relaxed);
+        if attempt_id == 0 {
+            return Err(Error::ProposalUnavailable {
+                reason: "RPC attempt identity exhausted".to_string(),
+            });
+        }
+        Ok(attempt_id)
+    }
+}
 
 /// Client-side gateway for local and remote tablet operations.
 #[derive(Clone)]
 pub struct TabletRpcClient {
     transport: NodeRaftTransport,
     handles: SharedTabletHandleRegistry,
-    pending: PendingResponses,
+    rpc_state: RpcState,
     metadata: MetadataRuntimeHandle,
 }
 
@@ -65,13 +174,13 @@ impl TabletRpcClient {
     fn new(
         transport: NodeRaftTransport,
         handles: SharedTabletHandleRegistry,
-        pending: PendingResponses,
+        rpc_state: RpcState,
         metadata: MetadataRuntimeHandle,
     ) -> Self {
         Self {
             transport,
             handles,
-            pending,
+            rpc_state,
             metadata,
         }
     }
@@ -208,16 +317,18 @@ impl TabletRpcClient {
             .ok_or_else(|| Error::InvalidArgument("tablet retry deadline overflowed".into()))?;
         let mut current_route = route.clone();
         let mut last_error = None;
+        let mut attempted_replicas = BTreeSet::new();
 
         for attempt in 0..=2_u32 {
-            let target = match current_route.leader_node() {
-                Ok(target) => target,
-                Err(_) => {
-                    last_error = Some(Error::LeaderUnknown);
-                    self.rotate_route_leader(&mut current_route, None);
-                    continue;
-                }
-            };
+            let (target_replica, target) =
+                match next_unattempted_replica(&current_route, &attempted_replicas) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        last_error = Some(Error::LeaderUnknown);
+                        continue;
+                    }
+                };
+            attempted_replicas.insert((current_route.raft_group_id, target_replica));
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
@@ -227,8 +338,8 @@ impl TabletRpcClient {
                 request_id: request.request_id.clone(),
                 logical_command_id: request.logical_command_id,
                 acknowledged_through: request.acknowledged_through,
-                tablet_id: request.tablet_id,
-                tablet_epoch: request.tablet_epoch,
+                tablet_id: current_route.tablet_id,
+                tablet_epoch: current_route.tablet_epoch,
                 command: request.command.clone(),
             };
             // RequestId is retained for transport correlation and legacy
@@ -349,21 +460,26 @@ impl TabletRpcClient {
             })?;
         let mut current_route = route.clone();
         let mut last_error = None;
+        let mut attempted_replicas = BTreeSet::new();
 
         for attempt in 0..=2_u32 {
-            let target = match current_route.leader_node() {
-                Ok(target) => target,
-                Err(_) => {
-                    last_error = Some(Error::LeaderUnknown);
-                    self.rotate_route_leader(&mut current_route, None);
-                    continue;
-                }
-            };
+            let (target_replica, target) =
+                match next_unattempted_replica(&current_route, &attempted_replicas) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        last_error = Some(Error::LeaderUnknown);
+                        continue;
+                    }
+                };
+            attempted_replicas.insert((current_route.raft_group_id, target_replica));
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
 
+            request.tablet_id = current_route.tablet_id;
+            request.tablet_epoch = current_route.tablet_epoch;
+            request.request_id.raft_group_id = current_route.raft_group_id;
             match self.read_point_to(
                 target,
                 current_route.raft_group_id,
@@ -378,7 +494,9 @@ impl TabletRpcClient {
                         current_route.tablet_epoch = *current_epoch;
                         request.tablet_epoch = *current_epoch;
                     }
-                    self.rotate_route_leader(&mut current_route, error_leader(&error));
+                    if let Some(leader) = error_leader(&error) {
+                        current_route.leader_replica_id = leader;
+                    }
                     last_error = Some(error);
                     thread::sleep(Duration::from_millis(5 * (u64::from(attempt) + 1)));
                 }
@@ -413,10 +531,7 @@ impl TabletRpcClient {
                 self.refresh_route_for_command(route, command, allow_topology_move)
         {
             *route = refreshed;
-            return;
         }
-
-        self.rotate_route_leader(route, None);
     }
 
     fn refresh_route_for_command(
@@ -439,23 +554,6 @@ impl TabletRpcClient {
             .filter(|refreshed| {
                 allow_topology_move || refreshed.raft_group_id == route.raft_group_id
             })
-    }
-
-    fn rotate_route_leader(&self, route: &mut TabletRoute, preferred: Option<ReplicaId>) {
-        if let Some(preferred) = preferred
-            && route.node_for_replica(preferred).is_some()
-        {
-            route.leader_replica_id = preferred;
-            return;
-        }
-        if let Some(next) = route
-            .replicas
-            .iter()
-            .find(|replica| replica.replica_id != route.leader_replica_id)
-            .map(|replica| replica.replica_id)
-        {
-            route.leader_replica_id = next;
-        }
     }
 
     fn submit_command_to(
@@ -544,57 +642,68 @@ impl TabletRpcClient {
     fn send_remote(
         &self,
         target: NodeId,
-        frame: RpcFrame,
+        mut frame: RpcFrame,
         request_id: RequestId,
         timeout: Duration,
         outcome_uncertain_on_timeout: bool,
     ) -> Result<TabletCommandResponse> {
+        let attempt_id = self.rpc_state.next_attempt_id()?;
+        frame.payload = attach_rpc_attempt_id(frame.msg_type, &frame.payload, attempt_id)?;
         let (sender, receiver) = mpsc::channel();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| Error::ProposalUnavailable {
-                    reason: "tablet RPC pending-response lock is poisoned".to_string(),
-                })?;
+            let mut pending =
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .map_err(|_| Error::ProposalUnavailable {
+                        reason: "tablet RPC pending-response lock is poisoned".to_string(),
+                    })?;
             if pending
-                .insert(request_id.clone(), PendingResponse { target, sender })
+                .insert(attempt_id, PendingResponse { target, sender })
                 .is_some()
             {
                 return Err(Error::ProposalUnavailable {
-                    reason: "tablet RPC request identity is already pending".to_string(),
+                    reason: "RPC attempt identity is already pending".to_string(),
                 });
             }
         }
 
         if let Err(error) = self.transport.try_send_rpc(target, frame) {
-            self.pending
+            self.rpc_state
+                .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&request_id);
+                .remove(&attempt_id);
             return Err(Error::ProposalUnavailable {
                 reason: format!("tablet RPC could not be queued: {error}"),
             });
         }
 
-        receiver.recv_timeout(timeout).map_err(|_| {
-            self.pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&request_id);
-            if outcome_uncertain_on_timeout {
-                Error::RequestOutcomeUnknown {
-                    identity: format!(
-                        "client={:#034x}/group={}/sequence={}",
-                        request_id.client_id, request_id.raft_group_id.0, request_id.sequence
-                    ),
-                }
-            } else {
-                Error::ProposalUnavailable {
-                    reason: "tablet RPC response deadline elapsed".to_string(),
+        match receiver.recv_timeout(timeout) {
+            Ok(PendingResponseMessage::Tablet(response)) => Ok(response),
+            Ok(PendingResponseMessage::Metadata(_)) => Err(Error::CorruptData(
+                "tablet RPC waiter received a metadata response".to_string(),
+            )),
+            Err(_) => {
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&attempt_id);
+                if outcome_uncertain_on_timeout {
+                    Err(Error::RequestOutcomeUnknown {
+                        identity: format!(
+                            "client={:#034x}/group={}/sequence={}",
+                            request_id.client_id, request_id.raft_group_id.0, request_id.sequence
+                        ),
+                    })
+                } else {
+                    Err(Error::ProposalUnavailable {
+                        reason: "tablet RPC response deadline elapsed".to_string(),
+                    })
                 }
             }
-        })
+        }
     }
 }
 
@@ -683,19 +792,21 @@ impl TabletGateway for TabletRpcClient {
 /// frames. It is intentionally independent from the MultiRaft host loop: a
 /// slow SQL request cannot consume the host's Raft turn budget, while the
 /// bounded transport queue still provides admission backpressure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_dispatcher(
     inbound: NodeRpcInbound,
     transport: NodeRaftTransport,
+    rpc_state: RpcState,
     handles: SharedTabletHandleRegistry,
     metadata: MetadataRuntimeHandle,
+    metadata_requests: mpsc::SyncSender<MetadataHostRequest>,
     database: SharedLocalDatabase,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
-    let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let client = TabletRpcClient::new(
         transport.clone(),
         handles.clone(),
-        pending.clone(),
+        rpc_state.clone(),
         metadata,
     );
     let worker = thread::Builder::new()
@@ -708,8 +819,9 @@ pub(crate) fn spawn_dispatcher(
                 dispatch_message(
                     &transport,
                     &handles,
-                    &pending,
+                    &rpc_state,
                     &database,
+                    &metadata_requests,
                     message.source_node_id,
                     message.frame,
                 );
@@ -722,8 +834,9 @@ pub(crate) fn spawn_dispatcher(
 fn dispatch_message(
     transport: &NodeRaftTransport,
     handles: &SharedTabletHandleRegistry,
-    pending: &PendingResponses,
+    rpc_state: &RpcState,
     database: &SharedLocalDatabase,
+    metadata_requests: &mpsc::SyncSender<MetadataHostRequest>,
     source: NodeId,
     frame: RpcFrame,
 ) {
@@ -732,6 +845,7 @@ fn dispatch_message(
             let Ok(proto) = rpc::TabletCommandRequest::decode(frame.payload.as_slice()) else {
                 return;
             };
+            let attempt_id = proto.rpc_attempt_id;
             let Ok(request) = TabletCommandRequest::from_proto(proto) else {
                 return;
             };
@@ -775,12 +889,13 @@ fn dispatch_message(
                     },
                 ),
             };
-            send_response(transport, source, frame.raft_group_id, response);
+            send_response(transport, source, frame.raft_group_id, attempt_id, response);
         }
         MessageType::TabletReadRequest => {
             let Ok(proto) = rpc::TabletReadRequest::decode(frame.payload.as_slice()) else {
                 return;
             };
+            let attempt_id = proto.rpc_attempt_id;
             let Ok(request) = TabletReadRequest::from_proto(proto) else {
                 return;
             };
@@ -816,12 +931,13 @@ fn dispatch_message(
                     },
                 ),
             };
-            send_response(transport, source, frame.raft_group_id, response);
+            send_response(transport, source, frame.raft_group_id, attempt_id, response);
         }
         MessageType::TabletOutcomeQueryRequest => {
             let Ok(proto) = rpc::TabletOutcomeQueryRequest::decode(frame.payload.as_slice()) else {
                 return;
             };
+            let attempt_id = proto.rpc_attempt_id;
             let Ok(request) = TabletOutcomeQueryRequest::from_proto(proto) else {
                 return;
             };
@@ -875,31 +991,279 @@ fn dispatch_message(
                     },
                 ),
             };
-            send_response(transport, source, frame.raft_group_id, response);
+            send_response(transport, source, frame.raft_group_id, attempt_id, response);
         }
         MessageType::TabletCommandResponse => {
             let Ok(proto) = rpc::TabletCommandResponse::decode(frame.payload.as_slice()) else {
                 return;
             };
+            let Some(attempt_id) = proto.rpc_attempt_id else {
+                return;
+            };
             let Ok(response) = TabletCommandResponse::from_proto(proto) else {
                 return;
             };
-            let request_id = response.request_id.clone();
-            let mut pending_guard = pending
+            let mut pending_guard = rpc_state
+                .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let pending_response = pending_guard
-                .get(&request_id)
+                .get(&attempt_id)
                 .is_some_and(|pending| pending.target == source)
-                .then(|| pending_guard.remove(&request_id))
+                .then(|| pending_guard.remove(&attempt_id))
                 .flatten();
             if let Some(pending_response) = pending_response {
-                let _ = pending_response.sender.send(response);
+                let _ = pending_response
+                    .sender
+                    .send(PendingResponseMessage::Tablet(response));
             }
         }
-        MessageType::RaftConsensus
-        | MessageType::MetadataRequest
-        | MessageType::MetadataResponse => {}
+        MessageType::MetadataRequest => {
+            let Ok(proto) = rpc::MetadataRequest::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let Some(rpc::metadata_request::Request::ProposeCommand(request)) = proto.request
+            else {
+                return;
+            };
+            let Some(attempt_id) = request.rpc_attempt_id else {
+                return;
+            };
+            let Some(request_id) = request.request_id else {
+                return;
+            };
+            let Ok(request_id) = RequestId::from_proto(request_id) else {
+                return;
+            };
+            let Ok(envelope) = ragnordb_common::metadata_codec::MetadataCommandEnvelope::decode(
+                request.command_envelope.as_slice(),
+            ) else {
+                send_metadata_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    request_id,
+                    Err(Error::InvalidArgument(
+                        "metadata proposal envelope could not be decoded".to_string(),
+                    )),
+                );
+                return;
+            };
+            let (reply, response) = mpsc::channel();
+            if metadata_requests
+                .try_send(MetadataHostRequest::Command {
+                    envelope,
+                    reply,
+                    deadline: std::time::Instant::now() + Duration::from_secs(30),
+                })
+                .is_err()
+            {
+                send_metadata_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    request_id,
+                    Err(Error::ProposalUnavailable {
+                        reason: "metadata proposal queue is full".to_string(),
+                    }),
+                );
+                return;
+            }
+
+            let transport = transport.clone();
+            let request_id_for_thread = request_id.clone();
+            let group_id = frame.raft_group_id;
+            thread::spawn(move || {
+                let result = response
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|error| Error::ProposalUnavailable {
+                        reason: format!("metadata proposal forwarding failed: {error}"),
+                    })?;
+                send_metadata_response(
+                    &transport,
+                    source,
+                    group_id,
+                    attempt_id,
+                    request_id_for_thread,
+                    result,
+                );
+                Ok::<(), Error>(())
+            });
+        }
+        MessageType::MetadataResponse => {
+            let Ok(proto) = rpc::MetadataResponse::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let Some(rpc::metadata_response::Response::ProposeCommand(response)) = proto.response
+            else {
+                return;
+            };
+            let Some(attempt_id) = response.rpc_attempt_id else {
+                return;
+            };
+            let Ok(response) = MetadataResponse::from_proto(rpc::MetadataResponse {
+                response: Some(rpc::metadata_response::Response::ProposeCommand(response)),
+            }) else {
+                return;
+            };
+            let mut pending_guard = rpc_state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pending_response = pending_guard
+                .get(&attempt_id)
+                .is_some_and(|pending| pending.target == source)
+                .then(|| pending_guard.remove(&attempt_id))
+                .flatten();
+            if let Some(pending_response) = pending_response {
+                let _ = pending_response
+                    .sender
+                    .send(PendingResponseMessage::Metadata(response));
+            }
+        }
+        MessageType::RaftConsensus => {}
+    }
+}
+
+fn send_metadata_response(
+    transport: &NodeRaftTransport,
+    target: NodeId,
+    group_id: RaftGroupId,
+    attempt_id: u64,
+    request_id: RequestId,
+    result: Result<MetadataApplyOutcome>,
+) {
+    let (success, error_code, error_message, outcome, leader_replica_id) = match result {
+        Ok(outcome) => (
+            true,
+            String::new(),
+            String::new(),
+            Some(metadata_outcome_to_wire(outcome)),
+            None,
+        ),
+        Err(error) => (
+            false,
+            metadata_error_code(&error).to_string(),
+            error.to_string(),
+            None,
+            match error {
+                Error::NotLeader { leader_id } => leader_id,
+                _ => None,
+            },
+        ),
+    };
+    let mut proto = MetadataResponse::ProposeCommand {
+        request_id,
+        success,
+        error_code,
+        error_message,
+        outcome,
+        leader_replica_id: leader_replica_id.map(ReplicaId),
+    }
+    .to_proto();
+    if let Some(rpc::metadata_response::Response::ProposeCommand(response)) =
+        proto.response.as_mut()
+    {
+        response.rpc_attempt_id = Some(attempt_id);
+    }
+    let _ = transport.try_send_rpc(
+        target,
+        RpcFrame {
+            msg_type: MessageType::MetadataResponse,
+            raft_group_id: group_id,
+            payload: proto.encode_to_vec(),
+        },
+    );
+}
+
+fn metadata_outcome_to_wire(
+    outcome: MetadataApplyOutcome,
+) -> ragnordb_common::rpc_codec::MetadataProposalOutcome {
+    match outcome {
+        MetadataApplyOutcome::Applied => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::Applied
+        }
+        MetadataApplyOutcome::AlreadyApplied => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::AlreadyApplied
+        }
+        MetadataApplyOutcome::ClientRegistered { session_epoch, .. } => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRegistered { session_epoch }
+        }
+        MetadataApplyOutcome::ClientRenewed => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRenewed
+        }
+        MetadataApplyOutcome::TableCreated(created) => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::TableCreated {
+                table_id: created.table_id,
+                tablet_id: created.tablet_id,
+                raft_group_id: created.raft_group_id,
+            }
+        }
+        MetadataApplyOutcome::Rejected(rejection) => {
+            ragnordb_common::rpc_codec::MetadataProposalOutcome::Rejected {
+                reason: rejection.to_string(),
+            }
+        }
+    }
+}
+
+fn metadata_error_code(error: &Error) -> &'static str {
+    match error {
+        Error::NotLeader { .. } | Error::LeaderUnknown => "NOT_LEADER",
+        Error::RecoveryRequired { .. } => "RECOVERY_REQUIRED",
+        Error::ConstraintViolation(_) => "METADATA_REJECTED",
+        Error::ProposalUnavailable { .. } => "METADATA_UNAVAILABLE",
+        _ => "METADATA_ERROR",
+    }
+}
+
+fn attach_rpc_attempt_id(
+    msg_type: MessageType,
+    payload: &[u8],
+    attempt_id: u64,
+) -> Result<Vec<u8>> {
+    if attempt_id == 0 {
+        return Err(Error::InvalidArgument(
+            "RPC attempt identity must be non-zero".to_string(),
+        ));
+    }
+    match msg_type {
+        MessageType::TabletCommandRequest => {
+            let mut proto = rpc::TabletCommandRequest::decode(payload).map_err(|error| {
+                Error::InvalidArgument(format!("invalid tablet command: {error}"))
+            })?;
+            proto.rpc_attempt_id = Some(attempt_id);
+            Ok(proto.encode_to_vec())
+        }
+        MessageType::TabletReadRequest => {
+            let mut proto = rpc::TabletReadRequest::decode(payload)
+                .map_err(|error| Error::InvalidArgument(format!("invalid tablet read: {error}")))?;
+            proto.rpc_attempt_id = Some(attempt_id);
+            Ok(proto.encode_to_vec())
+        }
+        MessageType::TabletOutcomeQueryRequest => {
+            let mut proto = rpc::TabletOutcomeQueryRequest::decode(payload).map_err(|error| {
+                Error::InvalidArgument(format!("invalid outcome query: {error}"))
+            })?;
+            proto.rpc_attempt_id = Some(attempt_id);
+            Ok(proto.encode_to_vec())
+        }
+        MessageType::MetadataRequest => {
+            let mut proto = rpc::MetadataRequest::decode(payload).map_err(|error| {
+                Error::InvalidArgument(format!("invalid metadata request: {error}"))
+            })?;
+            if let Some(rpc::metadata_request::Request::ProposeCommand(request)) =
+                proto.request.as_mut()
+            {
+                request.rpc_attempt_id = Some(attempt_id);
+            }
+            Ok(proto.encode_to_vec())
+        }
+        _ => Err(Error::InvalidArgument(
+            "RPC attempts are only valid for request messages".to_string(),
+        )),
     }
 }
 
@@ -907,12 +1271,15 @@ fn send_response(
     transport: &NodeRaftTransport,
     target: NodeId,
     group_id: RaftGroupId,
+    attempt_id: Option<u64>,
     response: TabletCommandResponse,
 ) {
+    let mut proto = response.to_proto();
+    proto.rpc_attempt_id = attempt_id;
     let frame = RpcFrame {
         msg_type: MessageType::TabletCommandResponse,
         raft_group_id: group_id,
-        payload: response.to_proto().encode_to_vec(),
+        payload: proto.encode_to_vec(),
     };
     let _ = transport.try_send_rpc(target, frame);
 }
@@ -1017,6 +1384,26 @@ fn error_leader(error: &Error) -> Option<ReplicaId> {
     }
 }
 
+fn next_unattempted_replica(
+    route: &TabletRoute,
+    attempted: &BTreeSet<(RaftGroupId, ReplicaId)>,
+) -> Result<(ReplicaId, NodeId)> {
+    route
+        .validate()
+        .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+    let mut replicas = route.replicas.iter();
+    let mut preferred = route
+        .replicas
+        .iter()
+        .find(|replica| replica.replica_id == route.leader_replica_id)
+        .into_iter()
+        .chain(replicas.by_ref());
+    preferred
+        .find(|replica| !attempted.contains(&(route.raft_group_id, replica.replica_id)))
+        .map(|replica| (replica.replica_id, replica.node_id))
+        .ok_or(Error::LeaderUnknown)
+}
+
 fn is_retryable_tablet_error(error: &Error) -> bool {
     matches!(
         error,
@@ -1074,6 +1461,7 @@ const fn command_result_code(result: TabletCommandApplyResult) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ragnordb_common::ids::TabletId;
 
     #[test]
     fn command_outcome_wire_roundtrip_preserves_deduplication() {
@@ -1111,6 +1499,77 @@ mod tests {
                 leader_id: Some(12)
             }
         ));
+    }
+
+    /// Realistic bug caught: a delayed response from a timed-out physical
+    /// attempt was previously correlated only by RequestId and could complete
+    /// a later retry waiter for the same logical mutation.
+    #[test]
+    fn delayed_attempt_cannot_complete_a_new_waiter() {
+        let state = RpcState::new();
+        let (old_sender, old_receiver) = mpsc::channel();
+        let (new_sender, new_receiver) = mpsc::channel();
+        let target = NodeId(2);
+
+        state.pending.lock().unwrap().insert(
+            41,
+            PendingResponse {
+                target,
+                sender: old_sender,
+            },
+        );
+        state.pending.lock().unwrap().remove(&41);
+        state.pending.lock().unwrap().insert(
+            42,
+            PendingResponse {
+                target,
+                sender: new_sender,
+            },
+        );
+
+        assert!(state.pending.lock().unwrap().get(&41).is_none());
+        assert!(new_receiver.try_recv().is_err());
+        drop(old_receiver);
+        drop(new_receiver);
+    }
+
+    #[test]
+    fn retry_route_advances_through_each_replica_once() {
+        let route = TabletRoute {
+            raft_group_id: RaftGroupId(7),
+            tablet_id: TabletId(8),
+            tablet_epoch: 1,
+            leader_replica_id: ReplicaId(1),
+            replicas: vec![
+                ReplicaRoute {
+                    replica_id: ReplicaId(1),
+                    node_id: NodeId(11),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(2),
+                    node_id: NodeId(12),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(3),
+                    node_id: NodeId(13),
+                },
+            ],
+        };
+        let mut attempted = BTreeSet::new();
+        assert_eq!(
+            next_unattempted_replica(&route, &attempted).unwrap(),
+            (ReplicaId(1), NodeId(11))
+        );
+        attempted.insert((route.raft_group_id, ReplicaId(1)));
+        assert_eq!(
+            next_unattempted_replica(&route, &attempted).unwrap(),
+            (ReplicaId(2), NodeId(12))
+        );
+        attempted.insert((route.raft_group_id, ReplicaId(2)));
+        assert_eq!(
+            next_unattempted_replica(&route, &attempted).unwrap(),
+            (ReplicaId(3), NodeId(13))
+        );
     }
 
     /// Realistic bug caught:

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use ragnordb_common::{Error, Result, ids::RequestId, ids::TxnId};
+use ragnordb_common::{Error, Result, ids::ClientRequestId, ids::RequestId, ids::TxnId};
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_txn::{Transaction, TransactionManager};
 
@@ -130,15 +130,35 @@ impl SqlSession {
         metadata_request_id: Option<RequestId>,
         metadata_timeout: Duration,
     ) -> Result<ExecutionResult> {
+        self.execute_sql_with_metadata_request_and_identity(
+            sql,
+            executor,
+            transaction_manager,
+            metadata_request_id,
+            None,
+            metadata_timeout,
+        )
+    }
+
+    pub fn execute_sql_with_metadata_request_and_identity<M: TransactionManager>(
+        &mut self,
+        sql: &str,
+        executor: &mut LocalExecutor,
+        transaction_manager: &mut M,
+        metadata_request_id: Option<RequestId>,
+        logical_request_id: Option<ClientRequestId>,
+        metadata_timeout: Duration,
+    ) -> Result<ExecutionResult> {
         let parsed = parse_one(sql)?;
         let bound = analyze(&parsed, executor.catalog())?;
         let plan = plan(bound);
 
-        self.execute_plan_with_metadata_request(
+        self.execute_plan_with_metadata_request_and_identity(
             plan,
             executor,
             transaction_manager,
             metadata_request_id,
+            logical_request_id,
             metadata_timeout,
         )
     }
@@ -169,6 +189,25 @@ impl SqlSession {
         metadata_request_id: Option<RequestId>,
         metadata_timeout: Duration,
     ) -> Result<ExecutionResult> {
+        self.execute_plan_with_metadata_request_and_identity(
+            plan,
+            executor,
+            transaction_manager,
+            metadata_request_id,
+            None,
+            metadata_timeout,
+        )
+    }
+
+    pub fn execute_plan_with_metadata_request_and_identity<M: TransactionManager>(
+        &mut self,
+        plan: Plan,
+        executor: &mut LocalExecutor,
+        transaction_manager: &mut M,
+        metadata_request_id: Option<RequestId>,
+        logical_request_id: Option<ClientRequestId>,
+        metadata_timeout: Duration,
+    ) -> Result<ExecutionResult> {
         match plan {
             Plan::Begin => self.begin(transaction_manager),
 
@@ -186,9 +225,10 @@ impl SqlSession {
                 }
 
                 match metadata_request_id {
-                    Some(request_id) => executor.execute_create_table_with_metadata(
+                    Some(request_id) => executor.execute_create_table_with_metadata_and_identity(
                         plan,
                         request_id,
+                        logical_request_id,
                         metadata_timeout,
                     ),
                     None if executor.metadata_table_creator_installed() => {

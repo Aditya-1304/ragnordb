@@ -17,7 +17,10 @@ use std::{
 use ragnordb_common::{
     Error, Result,
     catalog_codec::TableDefinition,
-    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    ids::{
+        ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
+        TableId, TabletId,
+    },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         MetadataAllocatorState, MetadataCachedOutcome, MetadataClientSession, MetadataCommand,
@@ -380,7 +383,7 @@ pub struct MetadataState {
     /// A replay must return the original result without re-running allocation
     /// against the current table-name map. This is what makes a retry after a
     /// leadership change different from an independent CREATE TABLE request.
-    request_deduplication: BTreeMap<RequestId, MetadataCachedOutcome>,
+    request_deduplication: BTreeMap<LogicalCommandId, MetadataCachedOutcome>,
 
     /// Durable retry-session authority. Tablet/gateway code must fail closed
     /// when a request carries an epoch absent from this committed map.
@@ -496,14 +499,27 @@ impl MetadataState {
         request_id: RequestId,
         command: MetadataCommand,
     ) -> MetadataApplyOutcome {
-        if let Some(outcome) = self.request_deduplication.get(&request_id) {
+        let logical_command_id = compatibility_metadata_logical_id(&request_id);
+        self.apply_with_logical_command_id(logical_command_id, command)
+    }
+
+    /// Apply a request using the topology-independent identity carried by the
+    /// metadata envelope. Proposal/RPC correlation remains separate so a
+    /// reconnect with the same sequence in a newer session cannot collide with
+    /// an older durable command.
+    pub fn apply_with_logical_command_id(
+        &mut self,
+        logical_command_id: LogicalCommandId,
+        command: MetadataCommand,
+    ) -> MetadataApplyOutcome {
+        if let Some(outcome) = self.request_deduplication.get(&logical_command_id) {
             return metadata_outcome_from_cached(outcome);
         }
 
         let outcome = self.apply_command(command);
 
         self.request_deduplication
-            .insert(request_id, metadata_outcome_to_cached(&outcome));
+            .insert(logical_command_id, metadata_outcome_to_cached(&outcome));
 
         outcome
     }
@@ -583,10 +599,13 @@ impl MetadataState {
             request_deduplication: self
                 .request_deduplication
                 .iter()
-                .map(|(request_id, outcome)| MetadataRequestDeduplication {
-                    request_id: request_id.clone(),
-                    outcome: outcome.clone(),
-                })
+                .map(
+                    |(logical_command_id, outcome)| MetadataRequestDeduplication {
+                        request_id: request_id_for_logical_id(logical_command_id),
+                        logical_command_id: *logical_command_id,
+                        outcome: outcome.clone(),
+                    },
+                )
                 .collect(),
 
             client_sessions: self.client_sessions.values().cloned().collect(),
@@ -749,7 +768,7 @@ impl MetadataState {
                 }
 
                 state.request_deduplication.insert(
-                    request.request_id,
+                    request.logical_command_id,
                     MetadataCachedOutcome::TableCreated {
                         table_id,
                         tablet_id,
@@ -759,7 +778,7 @@ impl MetadataState {
             } else {
                 state
                     .request_deduplication
-                    .insert(request.request_id, request.outcome);
+                    .insert(request.logical_command_id, request.outcome);
             }
         }
 
@@ -962,13 +981,9 @@ impl MetadataState {
             ));
         }
 
-        let selected_nodes = self
-            .nodes
-            .values()
-            .filter(|node| node.lifecycle == NodeLifecycle::Active)
-            .map(|node| node.node_id)
-            .take(INITIAL_REPLICATION_FACTOR)
-            .collect::<Vec<_>>();
+        let Some((selected_nodes, placement_policy)) = select_initial_placement(&self.nodes) else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::NoRegisteredNodes);
+        };
 
         if selected_nodes.is_empty() {
             return MetadataApplyOutcome::Rejected(MetadataRejection::NoRegisteredNodes);
@@ -1041,7 +1056,7 @@ impl MetadataState {
         let placement = DesiredReplicaPlacement {
             tablet_id,
             configuration_epoch: 1,
-            placement_policy: PlacementPolicy::for_replica_count(selected_nodes.len()),
+            placement_policy,
             replicas: selected_nodes
                 .into_iter()
                 .enumerate()
@@ -1574,6 +1589,94 @@ impl MetadataState {
     }
 }
 
+/// Select the initial voter set deterministically while spreading replicas
+/// across the locality labels that metadata actually knows. Empty labels are
+/// never counted as a diversity guarantee: placement must not claim failure
+/// isolation that bootstrap configuration did not provide.
+fn select_initial_placement(
+    nodes: &BTreeMap<NodeId, NodeDescriptor>,
+) -> Option<(Vec<NodeId>, PlacementPolicy)> {
+    let mut candidates = nodes
+        .values()
+        .filter(|node| node.lifecycle == NodeLifecycle::Active)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let target_count = candidates.len().min(INITIAL_REPLICATION_FACTOR);
+    let mut selected = Vec::with_capacity(target_count);
+    while selected.len() < target_count {
+        let best_index = (0..candidates.len()).max_by(|left, right| {
+            let left_score = locality_gain(candidates[*left], &selected, nodes);
+            let right_score = locality_gain(candidates[*right], &selected, nodes);
+            left_score
+                .cmp(&right_score)
+                .then_with(|| candidates[*right].node_id.cmp(&candidates[*left].node_id))
+        })?;
+        selected.push(candidates.swap_remove(best_index).node_id);
+    }
+
+    let selected_nodes = selected
+        .iter()
+        .filter_map(|node_id| nodes.get(node_id))
+        .collect::<Vec<_>>();
+    let distinct = |value: fn(&NodeDescriptor) -> Option<&str>| {
+        selected_nodes
+            .iter()
+            .filter_map(|node| value(node))
+            .collect::<BTreeSet<_>>()
+            .len() as u32
+    };
+
+    Some((
+        selected,
+        PlacementPolicy {
+            replication_factor: target_count as u32,
+            min_distinct_regions: distinct(|node| node.region.as_deref()),
+            min_distinct_zones: distinct(|node| node.zone.as_deref()),
+            min_distinct_racks: distinct(|node| node.rack.as_deref()),
+            required_storage_class: None,
+            preferred_leader_nodes: Vec::new(),
+        },
+    ))
+}
+
+fn locality_gain(
+    candidate: &NodeDescriptor,
+    selected: &[NodeId],
+    nodes: &BTreeMap<NodeId, NodeDescriptor>,
+) -> usize {
+    let selected_nodes = selected.iter().filter_map(|node_id| nodes.get(node_id));
+    let regions = selected_nodes
+        .clone()
+        .filter_map(|node| node.region.as_deref())
+        .collect::<BTreeSet<_>>();
+    let zones = selected_nodes
+        .clone()
+        .filter_map(|node| node.zone.as_deref())
+        .collect::<BTreeSet<_>>();
+    let racks = selected_nodes
+        .filter_map(|node| node.rack.as_deref())
+        .collect::<BTreeSet<_>>();
+    usize::from(
+        candidate
+            .region
+            .as_deref()
+            .is_some_and(|value| !regions.contains(value)),
+    ) + usize::from(
+        candidate
+            .zone
+            .as_deref()
+            .is_some_and(|value| !zones.contains(value)),
+    ) + usize::from(
+        candidate
+            .rack
+            .as_deref()
+            .is_some_and(|value| !racks.contains(value)),
+    )
+}
+
 /// Return whether two half-open ranges overlap. Empty starts/ends represent
 /// negative/positive infinity respectively, matching the metadata wire model.
 fn ranges_overlap(
@@ -1587,6 +1690,26 @@ fn ranges_overlap(
     let right_before_left =
         !right_end.is_empty() && !left_start.is_empty() && right_end <= left_start;
     !(left_before_right || right_before_left)
+}
+
+fn compatibility_metadata_logical_id(request_id: &RequestId) -> LogicalCommandId {
+    LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id: request_id.client_id,
+            session_epoch: 1,
+            request_sequence: request_id.sequence,
+        },
+        command_ordinal: 1,
+        kind: CommandKind::Catalog,
+    }
+}
+
+fn request_id_for_logical_id(logical_command_id: &LogicalCommandId) -> RequestId {
+    RequestId {
+        client_id: logical_command_id.client_request_id.client_id,
+        sequence: logical_command_id.client_request_id.request_sequence,
+        raft_group_id: ragnordb_common::metadata_codec::RESERVED_METADATA_RAFT_GROUP_ID,
+    }
 }
 
 impl Catalog for MetadataState {

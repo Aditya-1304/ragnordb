@@ -196,13 +196,14 @@ impl RaftReadyStateMachine for MetadataRaftStateMachine {
     }
 
     fn apply(&mut self, index: u64, command: &[u8]) -> Result<(), Self::Error> {
-        let (request_id, command) = MetadataCommand::decode_with_optional_request_id(command)
-            .map_err(MetadataStateMachineError::CommandDecode)?;
+        let (request_id, logical_command_id, command) =
+            MetadataCommand::decode_with_request_identity(command)
+                .map_err(MetadataStateMachineError::CommandDecode)?;
 
-        let outcome = match &request_id {
-            Some(request_id) => self
+        let outcome = match logical_command_id {
+            Some(logical_command_id) => self
                 .state
-                .apply_with_request_id(request_id.clone(), command),
+                .apply_with_logical_command_id(logical_command_id, command),
             None => self.state.apply(command),
         };
 

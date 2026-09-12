@@ -4,7 +4,10 @@ use ragnordb_catalog::{
 
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    ids::{
+        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
+        RequestId, TableId, TabletId,
+    },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         MetadataCommand, NodeDescriptor, NodeLifecycle, PartitionSpec, PlacementPolicy,
@@ -190,6 +193,86 @@ fn atomic_create_table_publishes_complete_initial_topology() {
     assert_eq!(state.allocator_state().max_table_id, 2);
     assert_eq!(state.allocator_state().max_tablet_id, 2);
     assert_eq!(state.allocator_state().max_raft_group_id, 3);
+}
+
+#[test]
+fn initial_topology_spreads_voters_across_known_failure_domains() {
+    let mut state = MetadataState::new();
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied
+    );
+    for (id, zone) in [(11, "zone-a"), (12, "zone-b"), (13, "zone-c")] {
+        let mut descriptor = node(id, 7100 + id as u16);
+        descriptor.region = Some("region-a".to_string());
+        descriptor.zone = Some(zone.to_string());
+        descriptor.rack = Some(format!("rack-{zone}"));
+        assert_eq!(
+            state.apply(MetadataCommand::RegisterNode(descriptor)),
+            MetadataApplyOutcome::Applied
+        );
+    }
+
+    let outcome = state.apply(MetadataCommand::CreateTableTopology(create_request(
+        "spread",
+    )));
+    let MetadataApplyOutcome::TableCreated(created) = outcome else {
+        panic!("expected a topology allocation");
+    };
+    let placement = state.desired_placement(created.tablet_id).unwrap();
+    assert_eq!(
+        placement
+            .replicas
+            .iter()
+            .map(|replica| replica.node_id)
+            .collect::<Vec<_>>(),
+        vec![NodeId(11), NodeId(12), NodeId(13)]
+    );
+    assert_eq!(placement.placement_policy.min_distinct_regions, 1);
+    assert_eq!(placement.placement_policy.min_distinct_zones, 3);
+    assert_eq!(placement.placement_policy.min_distinct_racks, 3);
+}
+
+#[test]
+fn metadata_deduplication_includes_session_epoch() {
+    let mut state = initialized_state_with_nodes();
+    let first = LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id: 99,
+            session_epoch: 1,
+            request_sequence: 1,
+        },
+        command_ordinal: 1,
+        kind: CommandKind::Catalog,
+    };
+    let second = LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id: 99,
+            session_epoch: 2,
+            request_sequence: 1,
+        },
+        command_ordinal: 1,
+        kind: CommandKind::Catalog,
+    };
+
+    assert!(matches!(
+        state.apply_with_logical_command_id(
+            first,
+            MetadataCommand::CreateTableTopology(create_request("epoch_one"))
+        ),
+        MetadataApplyOutcome::TableCreated(_)
+    ));
+    assert!(matches!(
+        state.apply_with_logical_command_id(
+            second,
+            MetadataCommand::CreateTableTopology(create_request("epoch_two"))
+        ),
+        MetadataApplyOutcome::TableCreated(_)
+    ));
+    assert!(state.table(TableId(2)).is_some());
+    assert!(state.table(TableId(3)).is_some());
 }
 
 #[test]

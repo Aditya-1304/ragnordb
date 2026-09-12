@@ -300,12 +300,14 @@ fn metadata_table_creation_survives_process_restart() {
         );
         for (seed_index, (raft, snapshot, sql, admin)) in addresses.iter().enumerate() {
             config.push_str(&format!(
-                "\n[[seed_nodes]]\nid = {}\nraft_addr = \"{}\"\nsnapshot_addr = \"{}\"\nsql_addr = \"{}\"\nadmin_addr = \"{}\"\n",
+                "\n[[seed_nodes]]\nid = {}\nraft_addr = \"{}\"\nsnapshot_addr = \"{}\"\nsql_addr = \"{}\"\nadmin_addr = \"{}\"\nregion = \"region-a\"\nzone = \"zone-{}\"\nrack = \"rack-{}\"\nstorage_class = \"default\"\n",
                 seed_index + 1,
                 raft,
                 snapshot,
                 sql,
                 admin,
+                seed_index + 1,
+                seed_index + 1,
             ));
         }
         fs::write(&config_path, config).unwrap();
@@ -331,10 +333,13 @@ fn metadata_table_creation_survives_process_restart() {
     wait_for_metadata_table(&nodes, "users", Some(first_leader));
 
     let metadata_leader = wait_for_leader(&nodes, None);
+    // A fresh V2 session must be able to register and issue metadata-backed
+    // SQL through a gateway that is not the currently observed leader.
+    let follower_ingress = (metadata_leader + 1) % nodes.len();
     let client_id = 0xfeed_cafe_u128;
 
     let insert = send_v2_until_ok(
-        nodes[metadata_leader].sql_addr,
+        nodes[follower_ingress].sql_addr,
         client_id,
         1,
         None,
@@ -343,7 +348,7 @@ fn metadata_table_creation_survives_process_restart() {
     assert_eq!(insert["result"]["affected_rows"], 1);
 
     let update = send_v2_until_ok(
-        nodes[metadata_leader].sql_addr,
+        nodes[follower_ingress].sql_addr,
         client_id,
         2,
         Some(1),
@@ -352,7 +357,7 @@ fn metadata_table_creation_survives_process_restart() {
     assert_eq!(update["result"]["affected_rows"], 1);
 
     let before_restart = send_v2_until_ok(
-        nodes[metadata_leader].sql_addr,
+        nodes[follower_ingress].sql_addr,
         client_id,
         3,
         Some(2),

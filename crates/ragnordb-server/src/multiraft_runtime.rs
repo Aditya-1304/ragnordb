@@ -22,7 +22,7 @@ use std::{
 use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
 use ragnordb_common::{
     Error, Result,
-    ids::{NodeId, ReplicaId, RequestId, TabletId},
+    ids::{ClientRequestId, CommandKind, LogicalCommandId, NodeId, ReplicaId, RequestId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplicaRole, MetadataCommand, MetadataCommandEnvelope,
         NodeDescriptor, TabletDescriptor,
@@ -62,7 +62,9 @@ use crate::{
         LocalReplicaRegistry, ReplicaLifecycle,
     },
     replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
-    rpc::{SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher},
+    rpc::{
+        MetadataRpcClient, RpcState, SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher,
+    },
     snapshot_transport::{NodeSnapshotEndpoint, NodeSnapshotTransport},
 };
 
@@ -86,7 +88,7 @@ const METADATA_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
 const METADATA_REQUEST_BUDGET: usize = 64;
 
-enum MetadataHostRequest {
+pub(crate) enum MetadataHostRequest {
     Command {
         envelope: MetadataCommandEnvelope,
         reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
@@ -770,19 +772,32 @@ fn resolve_metadata_tablet_bootstrap(
 pub struct MetadataProposalClient {
     requests: mpsc::SyncSender<MetadataHostRequest>,
     metadata: MetadataRuntimeHandle,
+    metadata_rpc: MetadataRpcClient,
+    metadata_nodes: Vec<NodeId>,
+    local_node_id: NodeId,
 }
 
 impl MetadataProposalClient {
     fn new(
         requests: mpsc::SyncSender<MetadataHostRequest>,
         metadata: MetadataRuntimeHandle,
+        metadata_rpc: MetadataRpcClient,
+        metadata_nodes: Vec<NodeId>,
+        local_node_id: NodeId,
     ) -> Self {
-        Self { requests, metadata }
+        Self {
+            requests,
+            metadata,
+            metadata_rpc,
+            metadata_nodes,
+            local_node_id,
+        }
     }
 
     fn table_topology_for_outcome(
         &self,
         outcome: MetadataApplyOutcome,
+        timeout: Duration,
     ) -> Result<MetadataTableTopology> {
         let MetadataApplyOutcome::TableCreated(created) = outcome else {
             return match outcome {
@@ -801,7 +816,25 @@ impl MetadataProposalClient {
             };
         };
 
-        let state = self.metadata.state_snapshot();
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            Error::InvalidArgument("metadata topology deadline overflowed".into())
+        })?;
+        let state = loop {
+            let state = self.metadata.state_snapshot();
+            if state.table(created.table_id).is_some() && state.tablet(created.tablet_id).is_some()
+            {
+                break state;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::ProposalUnavailable {
+                    reason: format!(
+                        "metadata topology {} was committed remotely but is not visible locally",
+                        created.table_id.0
+                    ),
+                });
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
         let table = state.table(created.table_id).ok_or_else(|| {
             Error::CorruptData(format!(
                 "metadata CREATE TABLE returned table {} without a table definition",
@@ -852,29 +885,85 @@ impl MetadataProposalClient {
         &self,
         request: CreateTableRequest,
         request_id: RequestId,
+        logical_request_id: Option<ClientRequestId>,
         timeout: Duration,
     ) -> Result<MetadataTableTopology> {
         self.propose_metadata_command(
             MetadataCommand::CreateTableTopology(request),
             request_id,
+            logical_request_id,
             timeout,
         )
-        .and_then(|outcome| self.table_topology_for_outcome(outcome))
+        .and_then(|outcome| self.table_topology_for_outcome(outcome, timeout))
     }
 
     fn propose_metadata_command(
         &self,
         command: MetadataCommand,
         request_id: RequestId,
+        logical_request_id: Option<ClientRequestId>,
         timeout: Duration,
     ) -> Result<MetadataApplyOutcome> {
-        let envelope = MetadataCommandEnvelope::new(request_id.clone(), command)
-            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let envelope = match logical_request_id {
+            Some(client_request_id) => MetadataCommandEnvelope::new_with_logical_command_id(
+                request_id.clone(),
+                LogicalCommandId {
+                    client_request_id,
+                    command_ordinal: 1,
+                    kind: CommandKind::Catalog,
+                },
+                command,
+            ),
+            None => MetadataCommandEnvelope::new(request_id.clone(), command),
+        }
+        .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("metadata request deadline overflowed".into()))?;
-        let (reply, response) = mpsc::channel();
+        let envelope_bytes = envelope
+            .encode()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let local_result = self.propose_local(envelope, deadline);
+        match local_result {
+            Ok(outcome) => Ok(outcome),
+            Err(local_error) if metadata_error_can_forward(&local_error) => {
+                let mut last_error = local_error;
+                for target in self
+                    .metadata_nodes
+                    .iter()
+                    .copied()
+                    .filter(|target| *target != self.local_node_id)
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let response = self.metadata_rpc.propose(
+                        target,
+                        METADATA_RAFT_GROUP_ID,
+                        ragnordb_common::rpc_codec::MetadataProposalRequest {
+                            request_id: request_id.clone(),
+                            command_envelope: envelope_bytes.clone(),
+                        },
+                        remaining,
+                    );
+                    match response.and_then(metadata_response_to_outcome) {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(last_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
 
+    fn propose_local(
+        &self,
+        envelope: MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataApplyOutcome> {
+        let (reply, response) = mpsc::channel();
         self.requests
             .try_send(MetadataHostRequest::Command {
                 envelope,
@@ -891,7 +980,7 @@ impl MetadataProposalClient {
             })?;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let outcome = response
+        response
             .recv_timeout(remaining)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => Error::ProposalUnavailable {
@@ -900,9 +989,77 @@ impl MetadataProposalClient {
                 mpsc::RecvTimeoutError::Disconnected => Error::ProposalUnavailable {
                     reason: "metadata Raft host stopped before proposal applied".to_string(),
                 },
-            })??;
+            })?
+    }
+}
 
-        Ok(outcome)
+fn metadata_error_can_forward(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NotLeader { .. }
+            | Error::LeaderUnknown
+            | Error::ProposalUnavailable { .. }
+            | Error::TabletUnavailable { .. }
+    )
+}
+
+fn metadata_response_to_outcome(
+    response: ragnordb_common::rpc_codec::MetadataResponse,
+) -> Result<MetadataApplyOutcome> {
+    let ragnordb_common::rpc_codec::MetadataResponse::ProposeCommand {
+        success,
+        error_code,
+        error_message,
+        outcome,
+        ..
+    } = response
+    else {
+        return Err(Error::CorruptData(
+            "metadata RPC returned a non-proposal response".to_string(),
+        ));
+    };
+    if !success {
+        return match error_code.as_str() {
+            "NOT_LEADER" => Err(Error::NotLeader { leader_id: None }),
+            "RECOVERY_REQUIRED" => Err(Error::RecoveryRequired {
+                reason: error_message,
+            }),
+            "METADATA_REJECTED" => Err(Error::ConstraintViolation(error_message)),
+            _ => Err(Error::ProposalUnavailable {
+                reason: error_message,
+            }),
+        };
+    }
+    match outcome.ok_or_else(|| Error::CorruptData("metadata RPC omitted outcome".to_string()))? {
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::Applied => {
+            Ok(MetadataApplyOutcome::Applied)
+        }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::AlreadyApplied => {
+            Ok(MetadataApplyOutcome::AlreadyApplied)
+        }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRegistered { session_epoch } => {
+            Ok(MetadataApplyOutcome::ClientRegistered {
+                client_id: 0,
+                session_epoch,
+            })
+        }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRenewed => {
+            Ok(MetadataApplyOutcome::ClientRenewed)
+        }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::TableCreated {
+            table_id,
+            tablet_id,
+            raft_group_id,
+        } => Ok(MetadataApplyOutcome::TableCreated(
+            ragnordb_catalog::MetadataTableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            },
+        )),
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::Rejected { reason } => {
+            Err(Error::ConstraintViolation(reason))
+        }
     }
 }
 
@@ -913,7 +1070,7 @@ impl MetadataTableCreator for MetadataProposalClient {
         request_id: RequestId,
         timeout: Duration,
     ) -> Result<ragnordb_common::catalog_codec::TableDefinition> {
-        self.propose_create_table_topology(request, request_id, timeout)
+        self.propose_create_table_topology(request, request_id, None, timeout)
             .map(|topology| topology.definition)
     }
 
@@ -955,7 +1112,17 @@ impl MetadataTableCreator for MetadataProposalClient {
         request_id: RequestId,
         timeout: Duration,
     ) -> Result<MetadataTableTopology> {
-        self.propose_create_table_topology(request, request_id, timeout)
+        self.propose_create_table_topology(request, request_id, None, timeout)
+    }
+
+    fn create_table_topology_with_identity(
+        &self,
+        request: CreateTableRequest,
+        request_id: RequestId,
+        logical_request_id: Option<ClientRequestId>,
+        timeout: Duration,
+    ) -> Result<MetadataTableTopology> {
+        self.propose_create_table_topology(request, request_id, logical_request_id, timeout)
     }
 
     fn register_client(
@@ -965,12 +1132,22 @@ impl MetadataTableCreator for MetadataProposalClient {
         requested_session_epoch: u64,
         timeout: Duration,
     ) -> Result<u64> {
+        let request_sequence = request_id.sequence;
+        let logical_client_id = request_id.client_id;
         let outcome = self.propose_metadata_command(
             MetadataCommand::RegisterClient {
                 client_id,
                 requested_session_epoch,
             },
             request_id,
+            Some(ClientRequestId {
+                // Registration uses a control-plane RequestId namespace so it
+                // cannot collide with the SQL command carrying the same root
+                // sequence on a fresh V2 connection.
+                client_id: logical_client_id,
+                session_epoch: requested_session_epoch.max(1),
+                request_sequence,
+            }),
             timeout,
         )?;
         match outcome {
@@ -998,6 +1175,8 @@ impl MetadataTableCreator for MetadataProposalClient {
         acknowledged_through: u64,
         timeout: Duration,
     ) -> Result<()> {
+        let request_sequence = acknowledged_through.max(1);
+        let logical_client_id = request_id.client_id;
         let outcome = self.propose_metadata_command(
             MetadataCommand::RenewClient {
                 client_id,
@@ -1005,6 +1184,11 @@ impl MetadataTableCreator for MetadataProposalClient {
                 acknowledged_through,
             },
             request_id,
+            Some(ClientRequestId {
+                client_id: logical_client_id,
+                session_epoch,
+                request_sequence,
+            }),
             timeout,
         )?;
         match outcome {
@@ -1448,9 +1632,14 @@ impl MultiRaftRuntime {
 
         let (metadata_request_tx, metadata_request_rx) =
             mpsc::sync_channel(METADATA_REQUEST_CHANNEL_CAPACITY);
+        let rpc_state = RpcState::new();
+        let metadata_rpc = MetadataRpcClient::new(transport.clone(), rpc_state.clone());
         let metadata_creator: SharedMetadataTableCreator = Arc::new(MetadataProposalClient::new(
-            metadata_request_tx,
+            metadata_request_tx.clone(),
             metadata_handle.clone(),
+            metadata_rpc,
+            metadata_nodes.iter().map(|node| node.node_id).collect(),
+            config.node_id,
         ));
 
         let worker_shutdown = Arc::clone(&shutdown);
@@ -1458,8 +1647,10 @@ impl MultiRaftRuntime {
         let (tablet_rpc, rpc_worker) = spawn_dispatcher(
             rpc_inbound,
             transport.clone(),
+            rpc_state,
             tablet_handles,
             metadata_handle.clone(),
+            metadata_request_tx,
             database.clone(),
             shutdown.clone(),
         );
@@ -1615,6 +1806,8 @@ fn run_host(
 ) {
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
+    host.schedule_all_groups_after(1)
+        .expect("active MultiRaft host must accept startup timer scheduling");
     publish_host_status(&host_status, &host);
 
     let mut pending_metadata = BTreeMap::<u64, PendingMetadataProposal>::new();
@@ -1723,10 +1916,33 @@ fn run_host(
         let now = Instant::now();
 
         if now >= next_tick {
-            match host.tick_all(1) {
-                Ok(outbound) => {
-                    send_outbound(&transport, outbound);
-                }
+            match host.schedule_due_ticks(1) {
+                Ok(()) => match host.run_turn(
+                    1,
+                    MultiRaftTurnBudget {
+                        max_groups: HOST_GROUP_BUDGET,
+                        max_messages: HOST_MESSAGE_BUDGET,
+                        ..MultiRaftTurnBudget::default()
+                    },
+                ) {
+                    Ok(turn) => send_outbound(&transport, turn.outbound),
+                    Err(MultiRaftHostError::RecoveryRequired) => {
+                        publish_host_status(&host_status, &host);
+                        signal_metadata_failure(
+                            &mut startup_sender,
+                            "shared Raft WAL requires node recovery".to_string(),
+                        );
+                        fail_pending_metadata(
+                            &mut pending_metadata,
+                            &mut pending_metadata_by_request,
+                            Error::RecoveryRequired {
+                                reason: "shared Raft WAL requires node recovery".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    Err(error) => tracing::warn!(error = %error, "scheduled MultiRaft turn failed"),
+                },
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
                     publish_host_status(&host_status, &host);
@@ -1749,10 +1965,7 @@ fn run_host(
                 }
 
                 Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "MultiRaft tick failed",
-                    );
+                    tracing::warn!(error = %error, "MultiRaft timer scheduling failed");
                 }
             }
 

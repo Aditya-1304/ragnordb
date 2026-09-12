@@ -46,6 +46,10 @@ const fn default_statement_logging() -> StatementLogging {
     StatementLogging::MetadataOnly
 }
 
+fn default_storage_class() -> String {
+    "default".to_string()
+}
+
 const fn default_snapshot_interval_entries() -> u64 {
     DEFAULT_SNAPSHOT_INTERVAL_ENTRIES
 }
@@ -76,6 +80,18 @@ pub struct SeedNodeConfig {
     pub snapshot_addr: SocketAddr,
     pub sql_addr: SocketAddr,
     pub admin_addr: SocketAddr,
+
+    #[serde(default)]
+    pub region: Option<String>,
+
+    #[serde(default)]
+    pub zone: Option<String>,
+
+    #[serde(default)]
+    pub rack: Option<String>,
+
+    #[serde(default = "default_storage_class")]
+    pub storage_class: String,
 }
 
 /// Validated runtime configuration for one RagnorDB node.
@@ -373,6 +389,16 @@ impl NodeConfig {
                 ));
             }
 
+            validate_locality_label("region", &seed.region)?;
+            validate_locality_label("zone", &seed.zone)?;
+            validate_locality_label("rack", &seed.rack)?;
+            if seed.storage_class.trim().is_empty() {
+                return Err(Error::Configuration(format!(
+                    "seed node {} storage_class cannot be empty",
+                    seed.id.0
+                )));
+            }
+
             if !node_ids.insert(seed.id) {
                 return Err(Error::Configuration(format!(
                     "duplicate seed node ID: {}",
@@ -453,6 +479,16 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
+
+fn validate_locality_label(field: &'static str, value: &Option<String>) -> Result<()> {
+    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(Error::Configuration(format!(
+            "seed node {field} cannot be an empty string"
+        )));
+    }
+
+    Ok(())
 }
 
 fn derive_admin_addr(listen_addr: SocketAddr) -> Result<SocketAddr> {

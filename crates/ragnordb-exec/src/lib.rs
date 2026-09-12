@@ -167,6 +167,21 @@ pub trait MetadataTableCreator: Send + Sync {
         })
     }
 
+    /// Identity-aware CREATE TABLE boundary. The legacy method remains the
+    /// compatibility entry point for embedded callers; replicated V2 sessions
+    /// override this method so metadata deduplication includes the session
+    /// epoch and root request sequence.
+    fn create_table_topology_with_identity(
+        &self,
+        request: CreateTableRequest,
+        request_id: ragnordb_common::ids::RequestId,
+        logical_request_id: Option<ClientRequestId>,
+        timeout: Duration,
+    ) -> Result<MetadataTableTopology> {
+        let _ = logical_request_id;
+        self.create_table_topology(request, request_id, timeout)
+    }
+
     /// Return the latest committed metadata definitions for local catalog
     /// cache refresh. Definitions are authoritative but remain read-only here.
     fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition>;
@@ -265,6 +280,8 @@ pub struct TabletRequestContext {
     session_epoch: u64,
     next_read_sequence: u64,
     next_command_sequence: u64,
+    root_request_sequence: u64,
+    next_command_ordinal: u32,
     acknowledged_through: Option<u64>,
     timeout: Duration,
 }
@@ -291,6 +308,8 @@ impl TabletRequestContext {
             session_epoch,
             next_read_sequence: 1,
             next_command_sequence: 1,
+            root_request_sequence: 1,
+            next_command_ordinal: 1,
             acknowledged_through: None,
             timeout: Duration::from_secs(30),
         })
@@ -332,21 +351,28 @@ impl TabletRequestContext {
         }
         context.next_read_sequence = request_sequence;
         context.next_command_sequence = request_sequence;
+        context.root_request_sequence = request_sequence;
+        context.next_command_ordinal = 1;
         context.acknowledged_through = acknowledged_through;
         *self = context;
         Ok(())
     }
 
-    fn logical_command_id(&self, request_id: &RequestId, kind: CommandKind) -> LogicalCommandId {
-        LogicalCommandId {
+    fn next_logical_command_id(&mut self, kind: CommandKind) -> Result<LogicalCommandId> {
+        let command_ordinal = self.next_command_ordinal;
+        self.next_command_ordinal = command_ordinal.checked_add(1).ok_or_else(|| {
+            Error::Configuration("logical command ordinal space is exhausted".to_string())
+        })?;
+
+        Ok(LogicalCommandId {
             client_request_id: ClientRequestId {
                 client_id: self.client_id,
                 session_epoch: self.session_epoch,
-                request_sequence: request_id.sequence,
+                request_sequence: self.root_request_sequence,
             },
-            command_ordinal: 1,
+            command_ordinal,
             kind,
-        }
+        })
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) {
@@ -669,6 +695,16 @@ impl LocalExecutor {
         request_id: ragnordb_common::ids::RequestId,
         timeout: Duration,
     ) -> Result<ExecutionResult> {
+        self.execute_create_table_with_metadata_and_identity(plan, request_id, None, timeout)
+    }
+
+    pub fn execute_create_table_with_metadata_and_identity(
+        &mut self,
+        plan: CreateTablePlan,
+        request_id: ragnordb_common::ids::RequestId,
+        logical_request_id: Option<ClientRequestId>,
+        timeout: Duration,
+    ) -> Result<ExecutionResult> {
         let creator = self
             .metadata_table_creator
             .clone()
@@ -703,7 +739,12 @@ impl LocalExecutor {
             })?;
 
         let expected_request = request.clone();
-        let topology = creator.create_table_topology(request, request_id, timeout)?;
+        let topology = creator.create_table_topology_with_identity(
+            request,
+            request_id,
+            logical_request_id,
+            timeout,
+        )?;
         let definition = topology.definition;
 
         if definition.table_id <= 1 {
@@ -1219,7 +1260,7 @@ impl LocalExecutor {
         });
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let logical_command_id =
-            request_context.logical_command_id(&request_id, CommandKind::SingleShardCommit);
+            request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
         let outcome = match gateway.submit_command_with_identity_and_ack(
             &route,
             request_id.clone(),
@@ -2738,6 +2779,27 @@ mod tests {
         assert_eq!(request_id.sequence, 1);
         assert_eq!(request_id.raft_group_id, RaftGroupId(242));
         assert!(matches!(command, TabletCommand::SingleShardCommit(_)));
+    }
+
+    /// Realistic bug caught: two logical tablet commands emitted by one SQL
+    /// request reused the transport sequence as their durable identity,
+    /// allowing a retry of the second command to collide with the first.
+    #[test]
+    fn logical_command_ordinals_share_one_root_request_identity() {
+        let mut context = TabletRequestContext::new_with_session_epoch(91, 4).unwrap();
+        context.reset_for_root_request(91, 4, 37).unwrap();
+
+        let first = context
+            .next_logical_command_id(CommandKind::SingleShardCommit)
+            .unwrap();
+        let second = context
+            .next_logical_command_id(CommandKind::SingleShardCommit)
+            .unwrap();
+
+        assert_eq!(first.client_request_id, second.client_request_id);
+        assert_eq!(first.client_request_id.request_sequence, 37);
+        assert_eq!(first.command_ordinal, 1);
+        assert_eq!(second.command_ordinal, 2);
     }
 
     /// Realistic bug caught: a metadata-owned tablet has no local SQL mirror,

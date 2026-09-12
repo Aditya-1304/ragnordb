@@ -978,6 +978,10 @@ where
     /// only makes a group runnable; it never bypasses the group-turn budget.
     timers: GroupTimerScheduler,
 
+    /// Prevents a scheduled wall-clock tick from being advanced twice when
+    /// the caller schedules due groups and then executes their bounded turn.
+    timer_advance_pending: bool,
+
     /// Inbound messages remain owned by their tagged group until that group is
     /// serviced. Control messages are kept ahead of bulk append traffic within
     /// the same group, but no message is acknowledged by merely queueing it.
@@ -1033,6 +1037,7 @@ where
             groups: BTreeMap::new(),
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
+            timer_advance_pending: false,
             pending_messages: BTreeMap::new(),
             pending_message_count: 0,
             pending_message_bytes: 0,
@@ -1073,6 +1078,7 @@ where
             groups: BTreeMap::new(),
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
+            timer_advance_pending: false,
             pending_messages: BTreeMap::new(),
             pending_message_count: 0,
             pending_message_bytes: 0,
@@ -1306,6 +1312,7 @@ where
         }
         let group_id = identity.raft_group_id;
         self.groups.insert(group_id, group);
+        self.timers.schedule_after(group_id, 1);
         self.runnable.enqueue(group_id);
         Ok(())
     }
@@ -1388,6 +1395,35 @@ where
         self.ensure_active()?;
         self.ensure_schedulable_group(raft_group_id)?;
         self.timers.schedule_after(raft_group_id, delay);
+        Ok(())
+    }
+
+    /// Seed the event scheduler for groups admitted during startup. This is a
+    /// one-time lifecycle action; explicit per-group deadlines remain
+    /// authoritative and are never postponed by the startup seed.
+    pub fn schedule_all_groups_after(&mut self, delay: u64) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        let group_ids = self.groups.keys().copied().collect::<Vec<_>>();
+        for raft_group_id in group_ids {
+            self.timers.schedule_after(raft_group_id, delay);
+        }
+        Ok(())
+    }
+
+    /// Advance the event scheduler and enqueue only groups whose logical Raft
+    /// timer expired. The production host loop uses this boundary instead of
+    /// enumerating every registered group on every wall-clock tick.
+    pub fn schedule_due_ticks(&mut self, ticks: u64) -> Result<(), MultiRaftHostError> {
+        self.ensure_active()?;
+        for raft_group_id in self.timers.advance(ticks) {
+            if self.groups.contains_key(&raft_group_id)
+                && !self.quarantined.contains_key(&raft_group_id)
+            {
+                self.runnable.enqueue(raft_group_id);
+                self.timers.schedule_after(raft_group_id, 1);
+            }
+        }
+        self.timer_advance_pending = true;
         Ok(())
     }
 
@@ -1485,13 +1521,16 @@ where
     ) -> Result<MultiRaftTurnResult, MultiRaftHostError> {
         self.ensure_active()?;
 
-        for raft_group_id in self.timers.advance(ticks) {
-            if self.groups.contains_key(&raft_group_id)
-                && !self.quarantined.contains_key(&raft_group_id)
-            {
-                self.runnable.enqueue(raft_group_id);
+        if !self.timer_advance_pending {
+            for raft_group_id in self.timers.advance(ticks) {
+                if self.groups.contains_key(&raft_group_id)
+                    && !self.quarantined.contains_key(&raft_group_id)
+                {
+                    self.runnable.enqueue(raft_group_id);
+                }
             }
         }
+        self.timer_advance_pending = false;
 
         let mut result = MultiRaftTurnResult::default();
         let mut persistence_groups = Vec::new();

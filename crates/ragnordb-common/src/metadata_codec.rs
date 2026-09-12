@@ -10,7 +10,10 @@ use prost::Message;
 
 use crate::{
     catalog_codec::{ColumnDefinition, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    ids::{
+        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
+        RequestId, TableId, TabletId,
+    },
     proto::metadata,
 };
 
@@ -109,7 +112,12 @@ pub struct CreateTableRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataCommandEnvelope {
     pub format_version: u32,
+    /// Proposal/RPC correlation identity. This field is not the durable
+    /// metadata deduplication key because it is scoped to a Raft group and
+    /// does not carry a client session epoch.
     pub request_id: RequestId,
+    /// Topology-independent identity retained by metadata state and snapshots.
+    pub logical_command_id: LogicalCommandId,
     pub command: MetadataCommand,
 }
 
@@ -118,9 +126,19 @@ impl MetadataCommandEnvelope {
         request_id: RequestId,
         command: MetadataCommand,
     ) -> Result<Self, MetadataCommandCodecError> {
+        let logical_command_id = compatibility_metadata_logical_id(&request_id);
+        Self::new_with_logical_command_id(request_id, logical_command_id, command)
+    }
+
+    pub fn new_with_logical_command_id(
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        command: MetadataCommand,
+    ) -> Result<Self, MetadataCommandCodecError> {
         let envelope = Self {
             format_version: METADATA_COMMAND_ENVELOPE_VERSION,
             request_id,
+            logical_command_id,
             command,
         };
 
@@ -154,6 +172,10 @@ impl MetadataCommandEnvelope {
             });
         }
 
+        self.logical_command_id
+            .validate()
+            .map_err(MetadataCommandCodecError::InvalidLogicalCommandId)?;
+
         self.command.validate()
     }
 
@@ -173,6 +195,7 @@ impl MetadataCommandEnvelope {
         let mut proto = self.command.to_proto();
         proto.request_id = Some(self.request_id.to_proto());
         proto.envelope_version = self.format_version;
+        proto.logical_command_id = Some(self.logical_command_id.to_proto());
         proto
     }
 
@@ -188,8 +211,16 @@ impl MetadataCommandEnvelope {
         )?)
         .map_err(MetadataCommandCodecError::InvalidRequestId)?;
 
+        let logical_command_id = proto
+            .logical_command_id
+            .clone()
+            .map(LogicalCommandId::from_proto)
+            .transpose()
+            .map_err(MetadataCommandCodecError::InvalidLogicalCommandId)?
+            .unwrap_or_else(|| compatibility_metadata_logical_id(&request_id));
+
         let command = MetadataCommand::from_proto(proto)?;
-        Self::new(request_id, command)
+        Self::new_with_logical_command_id(request_id, logical_command_id, command)
     }
 }
 
@@ -215,6 +246,7 @@ pub enum MetadataCachedOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataRequestDeduplication {
     pub request_id: RequestId,
+    pub logical_command_id: LogicalCommandId,
     pub outcome: MetadataCachedOutcome,
 }
 
@@ -465,6 +497,16 @@ impl MetadataCommand {
     pub fn decode_with_optional_request_id(
         bytes: &[u8],
     ) -> Result<(Option<RequestId>, Self), MetadataCommandCodecError> {
+        let (request_id, _logical_command_id, command) = Self::decode_with_request_identity(bytes)?;
+        Ok((request_id, command))
+    }
+
+    /// Decode a metadata command while preserving both the legacy proposal
+    /// correlation identity and the topology-independent durable identity.
+    pub fn decode_with_request_identity(
+        bytes: &[u8],
+    ) -> Result<(Option<RequestId>, Option<LogicalCommandId>, Self), MetadataCommandCodecError>
+    {
         let proto = metadata::MetadataCommand::decode(bytes)
             .map_err(|error| MetadataCommandCodecError::Decode(error.to_string()))?;
 
@@ -474,6 +516,14 @@ impl MetadataCommand {
             .map(RequestId::from_proto)
             .transpose()
             .map_err(MetadataCommandCodecError::InvalidRequestId)?;
+
+        let logical_command_id = proto
+            .logical_command_id
+            .clone()
+            .map(LogicalCommandId::from_proto)
+            .transpose()
+            .map_err(MetadataCommandCodecError::InvalidLogicalCommandId)?
+            .or_else(|| request_id.as_ref().map(compatibility_metadata_logical_id));
 
         let envelope_version = proto.envelope_version;
         let command = Self::from_proto(proto)?;
@@ -492,12 +542,14 @@ impl MetadataCommand {
             MetadataCommandEnvelope {
                 format_version: METADATA_COMMAND_ENVELOPE_VERSION,
                 request_id: request_id.clone(),
+                logical_command_id: logical_command_id
+                    .expect("request identity exists when validating an envelope"),
                 command: command.clone(),
             }
             .validate()?;
         }
 
-        Ok((request_id, command))
+        Ok((request_id, logical_command_id, command))
     }
 
     pub fn validate(&self) -> Result<(), MetadataCommandCodecError> {
@@ -611,6 +663,7 @@ impl MetadataCommand {
             format_version: METADATA_COMMAND_VERSION,
             request_id: None,
             envelope_version: 0,
+            logical_command_id: None,
             command: Some(command),
         }
     }
@@ -1448,7 +1501,7 @@ impl MetadataSnapshot {
         }
 
         if !strictly_ascending(&self.request_deduplication, |request| {
-            request.request_id.clone()
+            request.logical_command_id
         }) {
             return Err(MetadataCommandCodecError::NonCanonicalSnapshot(
                 "request_deduplication",
@@ -1835,6 +1888,7 @@ impl MetadataRequestDeduplication {
             rejection,
             client_id,
             session_epoch,
+            logical_command_id: Some(self.logical_command_id.to_proto()),
         }
     }
 
@@ -1845,6 +1899,14 @@ impl MetadataRequestDeduplication {
             MetadataCommandCodecError::MissingField("request_deduplication.request_id"),
         )?)
         .map_err(MetadataCommandCodecError::InvalidRequestId)?;
+
+        let logical_command_id = proto
+            .logical_command_id
+            .clone()
+            .map(LogicalCommandId::from_proto)
+            .transpose()
+            .map_err(MetadataCommandCodecError::InvalidLogicalCommandId)?
+            .unwrap_or_else(|| compatibility_metadata_logical_id(&request_id));
 
         let outcome_kind = metadata::MetadataCachedOutcomeKind::try_from(proto.outcome_kind)
             .map_err(|_| MetadataCommandCodecError::InvalidCachedOutcome("unknown outcome kind"))?;
@@ -1884,6 +1946,7 @@ impl MetadataRequestDeduplication {
 
         let request = Self {
             request_id,
+            logical_command_id,
             outcome,
         };
         request.validate()?;
@@ -1912,6 +1975,21 @@ fn validate_client_id(client_id: u128) -> Result<(), MetadataCommandCodecError> 
         return Err(MetadataCommandCodecError::ZeroClientId);
     }
     Ok(())
+}
+
+/// Preserve decode compatibility for pre-V2 metadata entries that carried
+/// only a group-qualified RequestId. New proposals always supply the real
+/// session-bearing logical identity through the envelope constructor.
+fn compatibility_metadata_logical_id(request_id: &RequestId) -> LogicalCommandId {
+    LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id: request_id.client_id,
+            session_epoch: 1,
+            request_sequence: request_id.sequence,
+        },
+        command_ordinal: 1,
+        kind: CommandKind::Catalog,
+    }
 }
 
 fn decode_client_id(bytes: &[u8]) -> Result<u128, MetadataCommandCodecError> {
@@ -1984,6 +2062,9 @@ pub enum MetadataCommandCodecError {
 
     #[error("invalid metadata request ID: {0}")]
     InvalidRequestId(&'static str),
+
+    #[error("invalid metadata logical command ID: {0}")]
+    InvalidLogicalCommandId(&'static str),
 
     #[error(
         "metadata request belongs to Raft group {}, expected metadata group {}",

@@ -689,6 +689,23 @@ impl LocalDatabase {
         metadata_request_id: Option<RequestId>,
         metadata_timeout: std::time::Duration,
     ) -> Result<ExecutionResult> {
+        self.execute_sql_with_metadata_request_and_identity(
+            session,
+            sql,
+            metadata_request_id,
+            None,
+            metadata_timeout,
+        )
+    }
+
+    pub fn execute_sql_with_metadata_request_and_identity(
+        &mut self,
+        session: &mut SqlSession,
+        sql: &str,
+        metadata_request_id: Option<RequestId>,
+        logical_request_id: Option<ragnordb_common::ids::ClientRequestId>,
+        metadata_timeout: std::time::Duration,
+    ) -> Result<ExecutionResult> {
         self.durability_gate.ensure_healthy()?;
         self.executor.refresh_metadata_catalog()?;
 
@@ -699,11 +716,12 @@ impl LocalDatabase {
                 ..
             } = self;
 
-            session.execute_sql_with_metadata_request(
+            session.execute_sql_with_metadata_request_and_identity(
                 sql,
                 executor,
                 transaction_manager,
                 metadata_request_id,
+                logical_request_id,
                 metadata_timeout,
             )
         };
