@@ -255,6 +255,143 @@ impl RequestId {
     }
 }
 
+/// Protocol V2 request identity that is independent of any one Raft group.
+///
+/// `session_epoch` fences a client restart and `request_sequence` identifies
+/// one request within that session. A retry must preserve all three values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClientRequestId {
+    pub client_id: u128,
+    pub session_epoch: u64,
+    pub request_sequence: u64,
+}
+
+impl ClientRequestId {
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.client_id == 0 {
+            return Err("client ID must be non-zero");
+        }
+        if self.session_epoch == 0 {
+            return Err("client session epoch must be non-zero");
+        }
+        if self.request_sequence == 0 {
+            return Err("client request sequence must be non-zero");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(self) -> ids::ClientRequestId {
+        ids::ClientRequestId {
+            client_id: self.client_id.to_le_bytes().to_vec(),
+            session_epoch: self.session_epoch,
+            request_sequence: self.request_sequence,
+        }
+    }
+
+    pub fn from_proto(proto: ids::ClientRequestId) -> Result<Self, &'static str> {
+        if proto.client_id.len() != 16 {
+            return Err("invalid client_id length");
+        }
+        let identity = Self {
+            client_id: u128::from_le_bytes(
+                proto
+                    .client_id
+                    .try_into()
+                    .map_err(|_| "invalid client_id")?,
+            ),
+            session_epoch: proto.session_epoch,
+            request_sequence: proto.request_sequence,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+}
+
+/// Stable semantic kind carried by a logical command identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum CommandKind {
+    Read = 1,
+    Prewrite = 2,
+    Commit = 3,
+    Rollback = 4,
+    ResolveIntent = 5,
+    SingleShardCommit = 6,
+    Catalog = 7,
+    Noop = 8,
+}
+
+impl CommandKind {
+    pub fn to_proto(self) -> ids::CommandKind {
+        match self {
+            Self::Read => ids::CommandKind::Read,
+            Self::Prewrite => ids::CommandKind::Prewrite,
+            Self::Commit => ids::CommandKind::Commit,
+            Self::Rollback => ids::CommandKind::Rollback,
+            Self::ResolveIntent => ids::CommandKind::ResolveIntent,
+            Self::SingleShardCommit => ids::CommandKind::SingleShardCommit,
+            Self::Catalog => ids::CommandKind::Catalog,
+            Self::Noop => ids::CommandKind::Noop,
+        }
+    }
+
+    pub fn from_proto(kind: ids::CommandKind) -> Result<Self, &'static str> {
+        match kind {
+            ids::CommandKind::Read => Ok(Self::Read),
+            ids::CommandKind::Prewrite => Ok(Self::Prewrite),
+            ids::CommandKind::Commit => Ok(Self::Commit),
+            ids::CommandKind::Rollback => Ok(Self::Rollback),
+            ids::CommandKind::ResolveIntent => Ok(Self::ResolveIntent),
+            ids::CommandKind::SingleShardCommit => Ok(Self::SingleShardCommit),
+            ids::CommandKind::Catalog => Ok(Self::Catalog),
+            ids::CommandKind::Noop => Ok(Self::Noop),
+            ids::CommandKind::Unspecified => Err("command kind is unspecified"),
+        }
+    }
+}
+
+/// Protocol V2 identity for one logical command, independent of routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LogicalCommandId {
+    pub client_request_id: ClientRequestId,
+    pub command_ordinal: u32,
+    pub kind: CommandKind,
+}
+
+impl LogicalCommandId {
+    pub fn validate(self) -> Result<(), &'static str> {
+        self.client_request_id.validate()?;
+        if self.command_ordinal == 0 {
+            return Err("logical command ordinal must be non-zero");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(self) -> ids::LogicalCommandId {
+        ids::LogicalCommandId {
+            client_request_id: Some(self.client_request_id.to_proto()),
+            command_ordinal: self.command_ordinal,
+            kind: self.kind.to_proto() as i32,
+        }
+    }
+
+    pub fn from_proto(proto: ids::LogicalCommandId) -> Result<Self, &'static str> {
+        let identity = Self {
+            client_request_id: ClientRequestId::from_proto(
+                proto
+                    .client_request_id
+                    .ok_or("missing logical command client request ID")?,
+            )?,
+            command_ordinal: proto.command_ordinal,
+            kind: CommandKind::from_proto(
+                ids::CommandKind::try_from(proto.kind).map_err(|_| "invalid command kind")?,
+            )?,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+}
+
 /// distributed transaction phase used to derive a stable participant request
 ///
 /// each phase receives an independent request namespace. Recovery and a new
@@ -362,6 +499,45 @@ mod tests {
         };
 
         assert!(RequestId::from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn logical_command_id_roundtrip_preserves_session_and_kind() {
+        let identity = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 77,
+                session_epoch: 4,
+                request_sequence: 9,
+            },
+            command_ordinal: 2,
+            kind: CommandKind::SingleShardCommit,
+        };
+
+        assert_eq!(
+            LogicalCommandId::from_proto(identity.to_proto()).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
+    fn logical_command_id_rejects_zero_session_and_ordinal() {
+        let zero_session = ClientRequestId {
+            client_id: 1,
+            session_epoch: 0,
+            request_sequence: 1,
+        };
+        assert!(zero_session.validate().is_err());
+
+        let zero_ordinal = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 1,
+                session_epoch: 1,
+                request_sequence: 1,
+            },
+            command_ordinal: 0,
+            kind: CommandKind::Noop,
+        };
+        assert!(zero_ordinal.validate().is_err());
     }
 
     #[test]

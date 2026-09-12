@@ -18,6 +18,21 @@ pub struct TabletCommandRequest {
     pub tablet_id: ::core::option::Option<super::ids::TabletId>,
     #[prost(uint64, tag = "4")]
     pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "5")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(uint64, optional, tag = "6")]
+    pub acknowledged_through: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletOutcomeQueryRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(message, optional, tag = "3")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "4")]
+    pub tablet_epoch: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletReadRequest {
@@ -31,6 +46,8 @@ pub struct TabletReadRequest {
     pub row_key: ::core::option::Option<super::row::RowKey>,
     #[prost(message, optional, tag = "5")]
     pub read_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(message, optional, tag = "6")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommandResponse {
@@ -50,6 +67,10 @@ pub struct TabletCommandResponse {
     pub found: bool,
     #[prost(uint64, tag = "8")]
     pub leader_replica_id: u64,
+    #[prost(uint64, tag = "9")]
+    pub current_tablet_epoch: u64,
+    #[prost(uint64, tag = "10")]
+    pub expected_tablet_epoch: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataRequest {
@@ -141,6 +162,7 @@ pub enum MessageType {
     MetadataRequest = 4,
     MetadataResponse = 5,
     TabletReadRequest = 6,
+    TabletOutcomeQueryRequest = 7,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -156,6 +178,9 @@ impl MessageType {
             Self::MetadataRequest => "MESSAGE_TYPE_METADATA_REQUEST",
             Self::MetadataResponse => "MESSAGE_TYPE_METADATA_RESPONSE",
             Self::TabletReadRequest => "MESSAGE_TYPE_TABLET_READ_REQUEST",
+            Self::TabletOutcomeQueryRequest => {
+                "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -168,6 +193,9 @@ impl MessageType {
             "MESSAGE_TYPE_METADATA_REQUEST" => Some(Self::MetadataRequest),
             "MESSAGE_TYPE_METADATA_RESPONSE" => Some(Self::MetadataResponse),
             "MESSAGE_TYPE_TABLET_READ_REQUEST" => Some(Self::TabletReadRequest),
+            "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST" => {
+                Some(Self::TabletOutcomeQueryRequest)
+            }
             _ => None,
         }
     }

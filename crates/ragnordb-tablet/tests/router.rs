@@ -185,3 +185,122 @@ fn incomplete_or_foreign_metadata_is_rejected_before_routing() {
         Err(Error::InvalidArgument(_))
     ));
 }
+
+#[test]
+fn ordered_ranges_route_boundaries_without_hash_remapping() {
+    let table_id = TableId(17);
+    let descriptors = vec![
+        TabletDescriptor {
+            tablet_id: TabletId(102),
+            table_id,
+            raft_group_id: RaftGroupId(202),
+            tablet_epoch: 4,
+            partition: PartitionSpec::Range {
+                start_key: vec![0x80],
+                end_key: Vec::new(),
+            },
+        },
+        TabletDescriptor {
+            tablet_id: TabletId(101),
+            table_id,
+            raft_group_id: RaftGroupId(201),
+            tablet_epoch: 3,
+            partition: PartitionSpec::Range {
+                start_key: Vec::new(),
+                end_key: vec![0x80],
+            },
+        },
+    ];
+
+    let router = TabletRouter::new(table_id, &descriptors).unwrap();
+    assert_eq!(router.route_point(&[0x01]).unwrap(), TabletId(101));
+    assert_eq!(router.route_point(&[0x80]).unwrap(), TabletId(102));
+    assert_eq!(router.route_scan(), vec![TabletId(101), TabletId(102)]);
+}
+
+#[test]
+fn ordered_ranges_reject_gaps_and_overlaps() {
+    let table_id = TableId(17);
+    let descriptor = |tablet_id, raft_group_id, start_key, end_key| TabletDescriptor {
+        tablet_id: TabletId(tablet_id),
+        table_id,
+        raft_group_id: RaftGroupId(raft_group_id),
+        tablet_epoch: 1,
+        partition: PartitionSpec::Range { start_key, end_key },
+    };
+
+    assert!(matches!(
+        TabletRouter::new(
+            table_id,
+            &[
+                descriptor(1, 11, Vec::new(), vec![0x40]),
+                descriptor(2, 12, vec![0x50], Vec::new()),
+            ]
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    assert!(matches!(
+        TabletRouter::new(
+            table_id,
+            &[
+                descriptor(1, 11, Vec::new(), vec![0x80]),
+                descriptor(2, 12, vec![0x40], Vec::new()),
+            ]
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    assert!(matches!(
+        TabletRouter::new(
+            table_id,
+            &[
+                descriptor(1, 11, Vec::new(), Vec::new()),
+                descriptor(2, 12, Vec::new(), Vec::new()),
+            ]
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn ordered_ranges_route_only_the_tablets_intersecting_a_logical_span() {
+    let table_id = TableId(17);
+    let descriptor = |tablet_id, raft_group_id, start_key, end_key| TabletDescriptor {
+        tablet_id: TabletId(tablet_id),
+        table_id,
+        raft_group_id: RaftGroupId(raft_group_id),
+        tablet_epoch: 1,
+        partition: PartitionSpec::Range { start_key, end_key },
+    };
+    let router = TabletRouter::new(
+        table_id,
+        &[
+            descriptor(1, 11, Vec::new(), vec![0x40]),
+            descriptor(2, 12, vec![0x40], vec![0x80]),
+            descriptor(3, 13, vec![0x80], Vec::new()),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        router
+            .route_scan_span(Some(&[0x40]), Some(&[0x80]))
+            .unwrap(),
+        vec![TabletId(2)]
+    );
+    assert_eq!(
+        router
+            .route_scan_span(Some(&[0x20]), Some(&[0x90]))
+            .unwrap(),
+        vec![TabletId(1), TabletId(2), TabletId(3)]
+    );
+    assert_eq!(
+        router.route_scan_span(Some(&[0x80]), None).unwrap(),
+        vec![TabletId(3)]
+    );
+    assert!(matches!(
+        router.route_scan_span(Some(&[0x80]), Some(&[0x40])),
+        Err(Error::InvalidArgument(_))
+    ));
+}

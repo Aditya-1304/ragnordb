@@ -7,7 +7,7 @@ use ragnordb_common::{
     ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
-        MetadataCommand, MetadataCommandEnvelope, NodeDescriptor,
+        MetadataCommand, MetadataCommandEnvelope, NodeDescriptor, NodeLifecycle, PlacementPolicy,
     },
 };
 
@@ -112,6 +112,7 @@ fn reconciliation_adds_promotes_then_removes_in_safe_order() {
         tablet_id: TabletId(9),
 
         configuration_epoch: 5,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![
             DesiredReplica {
@@ -331,6 +332,11 @@ fn metadata_state_machine_replays_the_same_request_result() {
         snapshot_addr: "127.0.0.1:7151".to_string(),
         sql_addr: "127.0.0.1:7201".to_string(),
         admin_addr: "127.0.0.1:7301".to_string(),
+        region: None,
+        zone: None,
+        rack: None,
+        storage_class: "default".to_string(),
+        lifecycle: NodeLifecycle::Active,
     };
     let create = MetadataCommand::CreateTableTopology(CreateTableRequest {
         table_name: "accounts".to_string(),

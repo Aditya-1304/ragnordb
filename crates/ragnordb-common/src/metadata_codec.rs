@@ -52,6 +52,22 @@ pub enum MetadataCommand {
         cluster_id: String,
     },
 
+    /// Allocate or re-establish a durable client retry session. A zero
+    /// requested epoch asks metadata to allocate the next epoch for the
+    /// client; non-zero values are accepted only when no conflicting session
+    /// already exists.
+    RegisterClient {
+        client_id: u128,
+        requested_session_epoch: u64,
+    },
+
+    /// Advance the durable acknowledgement floor for one client session.
+    RenewClient {
+        client_id: u128,
+        session_epoch: u64,
+        acknowledged_through: u64,
+    },
+
     RegisterNode(NodeDescriptor),
 
     CreateTable {
@@ -182,6 +198,11 @@ impl MetadataCommandEnvelope {
 pub enum MetadataCachedOutcome {
     Applied,
     AlreadyApplied,
+    ClientRegistered {
+        client_id: u128,
+        session_epoch: u64,
+    },
+    ClientRenewed,
     TableCreated {
         table_id: TableId,
         tablet_id: TabletId,
@@ -195,6 +216,15 @@ pub enum MetadataCachedOutcome {
 pub struct MetadataRequestDeduplication {
     pub request_id: RequestId,
     pub outcome: MetadataCachedOutcome,
+}
+
+/// Durable retry-session state owned by metadata Raft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataClientSession {
+    pub client_id: u128,
+    pub session_epoch: u64,
+    pub acknowledged_through: u64,
+    pub first_retained_sequence: u64,
 }
 
 /// Monotonic identity high-water marks owned by metadata.
@@ -235,6 +265,23 @@ pub struct NodeDescriptor {
     pub snapshot_addr: String,
     pub sql_addr: String,
     pub admin_addr: String,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    pub rack: Option<String>,
+    pub storage_class: String,
+    pub lifecycle: NodeLifecycle,
+}
+
+/// Durable node lifecycle owned by metadata. Local replica lifecycle is a
+/// separate resource-cleanup state and must not be used as a placement signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeLifecycle {
+    #[default]
+    Active,
+    Draining,
+    Decommissioning,
+    Decommissioned,
+    Tombstoned,
 }
 
 /// V1 partition identity.
@@ -243,7 +290,15 @@ pub struct NodeDescriptor {
 /// prevents routing from inventing another, non-replicated tablet map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionSpec {
-    Hash { bucket: u32, bucket_count: u32 },
+    Hash {
+        bucket: u32,
+        bucket_count: u32,
+    },
+    /// Ordered half-open range. An empty start/end is an unbounded side.
+    Range {
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+    },
 }
 
 /// Stable tablet-to-Raft-group assignment.
@@ -271,6 +326,83 @@ pub struct DesiredReplica {
     pub role: DesiredReplicaRole,
 }
 
+/// Durable placement constraints for one tablet's desired membership.
+///
+/// The policy describes the safety properties metadata expects the
+/// reconciliation worker to preserve. It is intentionally separate from the
+/// currently committed Raft configuration: a group may temporarily contain
+/// extra learners while a safe replacement is being brought up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementPolicy {
+    pub replication_factor: u32,
+    pub min_distinct_regions: u32,
+    pub min_distinct_zones: u32,
+    pub min_distinct_racks: u32,
+    pub required_storage_class: Option<String>,
+    pub preferred_leader_nodes: Vec<NodeId>,
+}
+
+impl Default for PlacementPolicy {
+    fn default() -> Self {
+        Self {
+            replication_factor: 1,
+            min_distinct_regions: 0,
+            min_distinct_zones: 0,
+            min_distinct_racks: 0,
+            required_storage_class: None,
+            preferred_leader_nodes: Vec::new(),
+        }
+    }
+}
+
+impl PlacementPolicy {
+    pub fn for_replica_count(replication_factor: usize) -> Self {
+        Self {
+            replication_factor: replication_factor as u32,
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        if self.replication_factor == 0 {
+            return Err(MetadataCommandCodecError::ZeroReplicationFactor);
+        }
+
+        for (minimum, label) in [
+            (self.min_distinct_regions, "regions"),
+            (self.min_distinct_zones, "zones"),
+            (self.min_distinct_racks, "racks"),
+        ] {
+            if minimum > self.replication_factor {
+                return Err(
+                    MetadataCommandCodecError::PlacementDomainCountExceedsReplication {
+                        domain: label,
+                        count: minimum,
+                        replication_factor: self.replication_factor,
+                    },
+                );
+            }
+        }
+
+        if self
+            .required_storage_class
+            .as_ref()
+            .is_some_and(|storage_class| storage_class.trim().is_empty())
+        {
+            return Err(MetadataCommandCodecError::EmptyRequiredStorageClass);
+        }
+
+        let mut preferred_nodes = BTreeSet::new();
+        for node_id in &self.preferred_leader_nodes {
+            if node_id.0 == 0 || !preferred_nodes.insert(*node_id) {
+                return Err(MetadataCommandCodecError::InvalidLeaderPreference);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Desired membership for one tablet at one metadata epoch.
 ///
 /// Replicas are strictly ascending by ReplicaId. Canonical ordering matters
@@ -281,6 +413,7 @@ pub struct DesiredReplicaPlacement {
     pub tablet_id: TabletId,
     pub configuration_epoch: u64,
     pub replicas: Vec<DesiredReplica>,
+    pub placement_policy: PlacementPolicy,
 }
 
 /// Permanent record that one group-local replica lifetime ended.
@@ -308,6 +441,7 @@ pub struct MetadataSnapshot {
     pub allocator: MetadataAllocatorState,
 
     pub request_deduplication: Vec<MetadataRequestDeduplication>,
+    pub client_sessions: Vec<MetadataClientSession>,
 }
 
 impl MetadataCommand {
@@ -370,6 +504,31 @@ impl MetadataCommand {
         match self {
             Self::ClusterInitialized { cluster_id } => validate_cluster_id(cluster_id),
 
+            Self::RegisterClient {
+                client_id,
+                requested_session_epoch,
+            } => {
+                validate_client_id(*client_id)?;
+                if *requested_session_epoch == 0 {
+                    // Zero is the explicit "allocate the next epoch" value.
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+
+            Self::RenewClient {
+                client_id,
+                session_epoch,
+                ..
+            } => {
+                validate_client_id(*client_id)?;
+                if *session_epoch == 0 {
+                    return Err(MetadataCommandCodecError::ZeroClientSessionEpoch);
+                }
+                Ok(())
+            }
+
             Self::RegisterNode(node) => node.validate(),
 
             Self::CreateTable { table } => validate_table(table),
@@ -402,6 +561,24 @@ impl MetadataCommand {
                     cluster_id: cluster_id.clone(),
                 })
             }
+
+            Self::RegisterClient {
+                client_id,
+                requested_session_epoch,
+            } => Command::RegisterClient(metadata::RegisterClient {
+                client_id: client_id.to_le_bytes().to_vec(),
+                requested_session_epoch: *requested_session_epoch,
+            }),
+
+            Self::RenewClient {
+                client_id,
+                session_epoch,
+                acknowledged_through,
+            } => Command::RenewClient(metadata::RenewClient {
+                client_id: client_id.to_le_bytes().to_vec(),
+                session_epoch: *session_epoch,
+                acknowledged_through: *acknowledged_through,
+            }),
 
             Self::RegisterNode(node) => Command::RegisterNode(metadata::RegisterNode {
                 node: Some(node.to_proto()),
@@ -450,6 +627,17 @@ impl MetadataCommand {
         let command = match proto.command {
             Some(Command::ClusterInitialized(command)) => Self::ClusterInitialized {
                 cluster_id: command.cluster_id,
+            },
+
+            Some(Command::RegisterClient(command)) => Self::RegisterClient {
+                client_id: decode_client_id(&command.client_id)?,
+                requested_session_epoch: command.requested_session_epoch,
+            },
+
+            Some(Command::RenewClient(command)) => Self::RenewClient {
+                client_id: decode_client_id(&command.client_id)?,
+                session_epoch: command.session_epoch,
+                acknowledged_through: command.acknowledged_through,
             },
 
             Some(Command::RegisterNode(command)) => {
@@ -645,6 +833,10 @@ impl NodeDescriptor {
             }
         }
 
+        if self.storage_class.trim().is_empty() {
+            return Err(MetadataCommandCodecError::EmptyNodeStorageClass);
+        }
+
         Ok(())
     }
 
@@ -655,6 +847,17 @@ impl NodeDescriptor {
             snapshot_addr: self.snapshot_addr.clone(),
             sql_addr: self.sql_addr.clone(),
             admin_addr: self.admin_addr.clone(),
+            region: self.region.clone().unwrap_or_default(),
+            zone: self.zone.clone().unwrap_or_default(),
+            rack: self.rack.clone().unwrap_or_default(),
+            storage_class: self.storage_class.clone(),
+            lifecycle: match self.lifecycle {
+                NodeLifecycle::Active => metadata::NodeLifecycle::Active,
+                NodeLifecycle::Draining => metadata::NodeLifecycle::Draining,
+                NodeLifecycle::Decommissioning => metadata::NodeLifecycle::Decommissioning,
+                NodeLifecycle::Decommissioned => metadata::NodeLifecycle::Decommissioned,
+                NodeLifecycle::Tombstoned => metadata::NodeLifecycle::Tombstoned,
+            } as i32,
         }
     }
 
@@ -669,6 +872,24 @@ impl NodeDescriptor {
             snapshot_addr: proto.snapshot_addr,
             sql_addr: proto.sql_addr,
             admin_addr: proto.admin_addr,
+            region: (!proto.region.is_empty()).then_some(proto.region),
+            zone: (!proto.zone.is_empty()).then_some(proto.zone),
+            rack: (!proto.rack.is_empty()).then_some(proto.rack),
+            storage_class: if proto.storage_class.is_empty() {
+                "default".to_string()
+            } else {
+                proto.storage_class
+            },
+            lifecycle: match metadata::NodeLifecycle::try_from(proto.lifecycle) {
+                Ok(metadata::NodeLifecycle::Active) | Ok(metadata::NodeLifecycle::Unspecified) => {
+                    NodeLifecycle::Active
+                }
+                Ok(metadata::NodeLifecycle::Draining) => NodeLifecycle::Draining,
+                Ok(metadata::NodeLifecycle::Decommissioning) => NodeLifecycle::Decommissioning,
+                Ok(metadata::NodeLifecycle::Decommissioned) => NodeLifecycle::Decommissioned,
+                Ok(metadata::NodeLifecycle::Tombstoned) => NodeLifecycle::Tombstoned,
+                Err(_) => return Err(MetadataCommandCodecError::InvalidNodeLifecycle),
+            },
         };
 
         node.validate()?;
@@ -695,6 +916,11 @@ impl PartitionSpec {
                     });
                 }
             }
+            Self::Range { start_key, end_key } => {
+                if !end_key.is_empty() && start_key >= end_key {
+                    return Err(MetadataCommandCodecError::InvalidKeyRange);
+                }
+            }
         }
 
         Ok(())
@@ -711,6 +937,10 @@ impl PartitionSpec {
                 bucket: *bucket,
                 bucket_count: *bucket_count,
             }),
+            Self::Range { start_key, end_key } => Kind::Range(metadata::RangePartition {
+                start_key: start_key.clone(),
+                end_key: end_key.clone(),
+            }),
         };
 
         metadata::PartitionSpec { kind: Some(kind) }
@@ -723,6 +953,11 @@ impl PartitionSpec {
             Some(Kind::Hash(hash)) => Self::Hash {
                 bucket: hash.bucket,
                 bucket_count: hash.bucket_count,
+            },
+
+            Some(Kind::Range(range)) => Self::Range {
+                start_key: range.start_key,
+                end_key: range.end_key,
             },
 
             None => {
@@ -814,6 +1049,8 @@ impl TabletDescriptor {
 
 impl DesiredReplicaPlacement {
     pub fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        self.placement_policy.validate()?;
+
         if self.tablet_id.0 == 0 {
             return Err(MetadataCommandCodecError::ZeroTabletId);
         }
@@ -860,6 +1097,13 @@ impl DesiredReplicaPlacement {
             return Err(MetadataCommandCodecError::PlacementHasNoVoter);
         }
 
+        if voter_count != self.placement_policy.replication_factor as usize {
+            return Err(MetadataCommandCodecError::ReplicationFactorMismatch {
+                expected: self.placement_policy.replication_factor,
+                received: voter_count as u32,
+            });
+        }
+
         Ok(())
     }
 
@@ -868,6 +1112,24 @@ impl DesiredReplicaPlacement {
             tablet_id: Some(self.tablet_id.to_proto()),
 
             configuration_epoch: self.configuration_epoch,
+
+            placement_policy: Some(metadata::PlacementPolicy {
+                replication_factor: self.placement_policy.replication_factor,
+                min_distinct_regions: self.placement_policy.min_distinct_regions,
+                min_distinct_zones: self.placement_policy.min_distinct_zones,
+                min_distinct_racks: self.placement_policy.min_distinct_racks,
+                required_storage_class: self
+                    .placement_policy
+                    .required_storage_class
+                    .clone()
+                    .unwrap_or_default(),
+                preferred_leader_nodes: self
+                    .placement_policy
+                    .preferred_leader_nodes
+                    .iter()
+                    .map(|node_id| node_id.to_proto())
+                    .collect(),
+            }),
 
             replicas: self
                 .replicas
@@ -890,44 +1152,69 @@ impl DesiredReplicaPlacement {
     fn from_proto(
         proto: metadata::SetDesiredReplicaPlacement,
     ) -> Result<Self, MetadataCommandCodecError> {
+        let replicas = proto
+            .replicas
+            .into_iter()
+            .map(|replica| {
+                Ok(DesiredReplica {
+                    replica_id: ReplicaId::from_proto(replica.replica_id.ok_or(
+                        MetadataCommandCodecError::MissingField(
+                            "desired_placement.replicas.replica_id",
+                        ),
+                    )?),
+
+                    node_id: NodeId::from_proto(replica.node_id.ok_or(
+                        MetadataCommandCodecError::MissingField(
+                            "desired_placement.replicas.node_id",
+                        ),
+                    )?),
+
+                    role: match metadata::DesiredReplicaRole::try_from(replica.role) {
+                        Ok(metadata::DesiredReplicaRole::Voter) => DesiredReplicaRole::Voter,
+
+                        Ok(metadata::DesiredReplicaRole::Learner) => DesiredReplicaRole::Learner,
+
+                        _ => {
+                            return Err(MetadataCommandCodecError::InvalidReplicaRole);
+                        }
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, MetadataCommandCodecError>>()?;
+
+        let voter_count = replicas
+            .iter()
+            .filter(|replica| replica.role == DesiredReplicaRole::Voter)
+            .count() as u32;
+        let placement_policy = proto
+            .placement_policy
+            .map(|policy| PlacementPolicy {
+                replication_factor: if policy.replication_factor == 0 {
+                    voter_count
+                } else {
+                    policy.replication_factor
+                },
+                min_distinct_regions: policy.min_distinct_regions,
+                min_distinct_zones: policy.min_distinct_zones,
+                min_distinct_racks: policy.min_distinct_racks,
+                required_storage_class: (!policy.required_storage_class.is_empty())
+                    .then_some(policy.required_storage_class),
+                preferred_leader_nodes: policy
+                    .preferred_leader_nodes
+                    .into_iter()
+                    .map(NodeId::from_proto)
+                    .collect(),
+            })
+            .unwrap_or_else(|| PlacementPolicy::for_replica_count(voter_count as usize));
+
         let placement = Self {
             tablet_id: TabletId::from_proto(proto.tablet_id.ok_or(
                 MetadataCommandCodecError::MissingField("desired_placement.tablet_id"),
             )?),
 
             configuration_epoch: proto.configuration_epoch,
-
-            replicas: proto
-                .replicas
-                .into_iter()
-                .map(|replica| {
-                    Ok(DesiredReplica {
-                        replica_id: ReplicaId::from_proto(replica.replica_id.ok_or(
-                            MetadataCommandCodecError::MissingField(
-                                "desired_placement.replicas.replica_id",
-                            ),
-                        )?),
-
-                        node_id: NodeId::from_proto(replica.node_id.ok_or(
-                            MetadataCommandCodecError::MissingField(
-                                "desired_placement.replicas.node_id",
-                            ),
-                        )?),
-
-                        role: match metadata::DesiredReplicaRole::try_from(replica.role) {
-                            Ok(metadata::DesiredReplicaRole::Voter) => DesiredReplicaRole::Voter,
-
-                            Ok(metadata::DesiredReplicaRole::Learner) => {
-                                DesiredReplicaRole::Learner
-                            }
-
-                            _ => {
-                                return Err(MetadataCommandCodecError::InvalidReplicaRole);
-                            }
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, MetadataCommandCodecError>>()?,
+            replicas,
+            placement_policy,
         };
 
         placement.validate()?;
@@ -1046,6 +1333,7 @@ impl MetadataSnapshot {
                     || !self.tablets.is_empty()
                     || !self.desired_placements.is_empty()
                     || !self.retired_replicas.is_empty()
+                    || !self.client_sessions.is_empty()
                     || !self.request_deduplication.is_empty()
                 {
                     return Err(MetadataCommandCodecError::UninitializedSnapshotHasState);
@@ -1075,6 +1363,10 @@ impl MetadataSnapshot {
 
         for request in &self.request_deduplication {
             request.validate()?;
+        }
+
+        for client_session in &self.client_sessions {
+            client_session.validate()?;
         }
 
         self.allocator.validate()?;
@@ -1163,6 +1455,12 @@ impl MetadataSnapshot {
             ));
         }
 
+        if !strictly_ascending(&self.client_sessions, |session| session.client_id) {
+            return Err(MetadataCommandCodecError::NonCanonicalSnapshot(
+                "client_sessions",
+            ));
+        }
+
         Ok(())
     }
 
@@ -1204,6 +1502,12 @@ impl MetadataSnapshot {
                 .iter()
                 .map(MetadataRequestDeduplication::to_proto)
                 .collect(),
+
+            client_sessions: self
+                .client_sessions
+                .iter()
+                .map(MetadataClientSession::to_proto)
+                .collect(),
         }
     }
 
@@ -1228,6 +1532,7 @@ impl MetadataSnapshot {
             retired_replicas,
             allocator_state,
             request_deduplication,
+            client_sessions,
             ..
         } = proto;
 
@@ -1271,6 +1576,11 @@ impl MetadataSnapshot {
         let request_deduplication = request_deduplication
             .into_iter()
             .map(MetadataRequestDeduplication::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let client_sessions = client_sessions
+            .into_iter()
+            .map(MetadataClientSession::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
 
         let allocator = match (snapshot_version, allocator_state) {
@@ -1325,11 +1635,48 @@ impl MetadataSnapshot {
             retired_replicas,
             allocator,
             request_deduplication,
+            client_sessions,
         };
 
         snapshot.validate()?;
 
         Ok(snapshot)
+    }
+}
+
+impl MetadataClientSession {
+    fn validate(&self) -> Result<(), MetadataCommandCodecError> {
+        validate_client_id(self.client_id)?;
+        if self.session_epoch == 0 {
+            return Err(MetadataCommandCodecError::ZeroClientSessionEpoch);
+        }
+        if self.first_retained_sequence == 0 {
+            return Err(MetadataCommandCodecError::ZeroRetryHorizon);
+        }
+        if self.first_retained_sequence <= self.acknowledged_through {
+            return Err(MetadataCommandCodecError::InvalidRetryHorizon);
+        }
+        Ok(())
+    }
+
+    fn to_proto(&self) -> metadata::ClientSession {
+        metadata::ClientSession {
+            client_id: self.client_id.to_le_bytes().to_vec(),
+            session_epoch: self.session_epoch,
+            acknowledged_through: self.acknowledged_through,
+            first_retained_sequence: self.first_retained_sequence,
+        }
+    }
+
+    fn from_proto(proto: metadata::ClientSession) -> Result<Self, MetadataCommandCodecError> {
+        let session = Self {
+            client_id: decode_client_id(&proto.client_id)?,
+            session_epoch: proto.session_epoch,
+            acknowledged_through: proto.acknowledged_through,
+            first_retained_sequence: proto.first_retained_sequence,
+        };
+        session.validate()?;
+        Ok(session)
     }
 }
 
@@ -1355,7 +1702,19 @@ impl MetadataRequestDeduplication {
         }
 
         match &self.outcome {
-            MetadataCachedOutcome::Applied | MetadataCachedOutcome::AlreadyApplied => {}
+            MetadataCachedOutcome::Applied
+            | MetadataCachedOutcome::AlreadyApplied
+            | MetadataCachedOutcome::ClientRenewed => {}
+
+            MetadataCachedOutcome::ClientRegistered {
+                client_id,
+                session_epoch,
+            } => {
+                validate_client_id(*client_id)?;
+                if *session_epoch == 0 {
+                    return Err(MetadataCommandCodecError::ZeroClientSessionEpoch);
+                }
+            }
 
             MetadataCachedOutcome::TableCreated {
                 table_id,
@@ -1402,40 +1761,70 @@ impl MetadataRequestDeduplication {
     }
 
     fn to_proto(&self) -> metadata::MetadataRequestDeduplication {
-        let (outcome_kind, table_id, tablet_id, raft_group_id, rejection) = match &self.outcome {
-            MetadataCachedOutcome::Applied => (
-                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
-                0,
-                0,
-                0,
-                String::new(),
-            ),
-            MetadataCachedOutcome::AlreadyApplied => (
-                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
-                0,
-                0,
-                0,
-                String::new(),
-            ),
-            MetadataCachedOutcome::TableCreated {
-                table_id,
-                tablet_id,
-                raft_group_id,
-            } => (
-                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
-                table_id.0,
-                tablet_id.0,
-                raft_group_id.0,
-                String::new(),
-            ),
-            MetadataCachedOutcome::Rejected(reason) => (
-                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
-                0,
-                0,
-                0,
-                reason.clone(),
-            ),
-        };
+        let (outcome_kind, table_id, tablet_id, raft_group_id, rejection, client_id, session_epoch) =
+            match &self.outcome {
+                MetadataCachedOutcome::Applied => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                    Vec::new(),
+                    0,
+                ),
+                MetadataCachedOutcome::AlreadyApplied => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                    Vec::new(),
+                    0,
+                ),
+                MetadataCachedOutcome::ClientRegistered {
+                    client_id,
+                    session_epoch,
+                } => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                    client_id.to_le_bytes().to_vec(),
+                    *session_epoch,
+                ),
+                MetadataCachedOutcome::ClientRenewed => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed,
+                    0,
+                    0,
+                    0,
+                    String::new(),
+                    Vec::new(),
+                    0,
+                ),
+                MetadataCachedOutcome::TableCreated {
+                    table_id,
+                    tablet_id,
+                    raft_group_id,
+                } => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
+                    table_id.0,
+                    tablet_id.0,
+                    raft_group_id.0,
+                    String::new(),
+                    Vec::new(),
+                    0,
+                ),
+                MetadataCachedOutcome::Rejected(reason) => (
+                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
+                    0,
+                    0,
+                    0,
+                    reason.clone(),
+                    Vec::new(),
+                    0,
+                ),
+            };
 
         metadata::MetadataRequestDeduplication {
             request_id: Some(self.request_id.to_proto()),
@@ -1444,6 +1833,8 @@ impl MetadataRequestDeduplication {
             tablet_id,
             raft_group_id,
             rejection,
+            client_id,
+            session_epoch,
         }
     }
 
@@ -1464,6 +1855,15 @@ impl MetadataRequestDeduplication {
             }
             metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied => {
                 MetadataCachedOutcome::AlreadyApplied
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered => {
+                MetadataCachedOutcome::ClientRegistered {
+                    client_id: decode_client_id(&proto.client_id)?,
+                    session_epoch: proto.session_epoch,
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed => {
+                MetadataCachedOutcome::ClientRenewed
             }
             metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated => {
                 MetadataCachedOutcome::TableCreated {
@@ -1505,6 +1905,26 @@ fn validate_cluster_id(cluster_id: &str) -> Result<(), MetadataCommandCodecError
     }
 
     Ok(())
+}
+
+fn validate_client_id(client_id: u128) -> Result<(), MetadataCommandCodecError> {
+    if client_id == 0 {
+        return Err(MetadataCommandCodecError::ZeroClientId);
+    }
+    Ok(())
+}
+
+fn decode_client_id(bytes: &[u8]) -> Result<u128, MetadataCommandCodecError> {
+    if bytes.len() != 16 {
+        return Err(MetadataCommandCodecError::InvalidClientId);
+    }
+    let client_id = u128::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| MetadataCommandCodecError::InvalidClientId)?,
+    );
+    validate_client_id(client_id)?;
+    Ok(client_id)
 }
 
 fn validate_socket_addr(field: &'static str, value: &str) -> Result<(), MetadataCommandCodecError> {
@@ -1590,6 +2010,30 @@ pub enum MetadataCommandCodecError {
     #[error("a physical node cannot bind multiple services to metadata endpoint {0}")]
     DuplicateNodeEndpoint(String),
 
+    #[error("metadata node storage class cannot be empty")]
+    EmptyNodeStorageClass,
+
+    #[error("metadata node lifecycle is invalid or unspecified")]
+    InvalidNodeLifecycle,
+
+    #[error("placement policy contains a duplicate or zero preferred leader node")]
+    InvalidLeaderPreference,
+
+    #[error("metadata client ID must be non-zero")]
+    ZeroClientId,
+
+    #[error("metadata client ID must be exactly 16 bytes")]
+    InvalidClientId,
+
+    #[error("metadata client session epoch must be non-zero")]
+    ZeroClientSessionEpoch,
+
+    #[error("metadata retry horizon must retain at least one sequence")]
+    ZeroRetryHorizon,
+
+    #[error("metadata retry horizon is inconsistent")]
+    InvalidRetryHorizon,
+
     #[error("metadata table ID must be non-zero")]
     ZeroTableId,
 
@@ -1632,6 +2076,9 @@ pub enum MetadataCommandCodecError {
     #[error("hash partition bucket {bucket} is outside bucket count {bucket_count}")]
     InvalidHashBucket { bucket: u32, bucket_count: u32 },
 
+    #[error("metadata tablet key range must have start < end")]
+    InvalidKeyRange,
+
     #[error("metadata configuration epoch must be non-zero")]
     ZeroConfigurationEpoch,
 
@@ -1640,6 +2087,24 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata desired placement must contain at least one voter")]
     PlacementHasNoVoter,
+
+    #[error("metadata placement replication factor must be non-zero")]
+    ZeroReplicationFactor,
+
+    #[error(
+        "metadata placement requires {count} distinct {domain}, but replication factor is {replication_factor}"
+    )]
+    PlacementDomainCountExceedsReplication {
+        domain: &'static str,
+        count: u32,
+        replication_factor: u32,
+    },
+
+    #[error("metadata placement required storage class cannot be empty")]
+    EmptyRequiredStorageClass,
+
+    #[error("metadata placement contains {received} voters, but policy requires {expected}")]
+    ReplicationFactorMismatch { expected: u32, received: u32 },
 
     #[error("metadata replica ID must be non-zero")]
     ZeroReplicaId,

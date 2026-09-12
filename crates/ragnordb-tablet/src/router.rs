@@ -1,9 +1,9 @@
 //! Deterministic tablet-selection primitives.
 //!
 //! This module deliberately contains no metadata or process-local state. It
-//! maps the canonical primary-key bytes for a table to a hash bucket so that
-//! every node can independently derive the same tablet assignment from the
-//! same routing inputs.
+//! maps canonical primary-key bytes to immutable metadata-owned tablet ranges.
+//! The legacy hash partitioner remains available only for compatibility with
+//! pre-range metadata snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -89,16 +89,24 @@ impl HashTabletPartitioner {
 
 /// Immutable routing view built from one table's metadata tablet descriptors.
 ///
-/// The constructor requires exactly one valid descriptor for every hash bucket.
-/// This turns metadata validation into a routing invariant: a point operation
-/// always resolves to one tablet, while a scan always has a complete and stable
-/// bucket-ordered fan-out set.
+/// The constructor requires either exactly one valid descriptor for every hash
+/// bucket or a complete, gap-free ordered range cover. This turns metadata
+/// validation into a routing invariant: a point operation always resolves to
+/// one tablet, while a scan has a complete and stable partition-order fan-out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletRouter {
     table_id: TableId,
     bucket_count: u32,
     partitioner: HashTabletPartitioner,
     tablet_ids_by_bucket: BTreeMap<u32, TabletId>,
+    ranges: Vec<RangeRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeRoute {
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+    tablet_id: TabletId,
 }
 
 impl TabletRouter {
@@ -126,16 +134,18 @@ impl TabletRouter {
             bucket_count: 1,
             partitioner: HashTabletPartitioner::new(),
             tablet_ids_by_bucket: BTreeMap::from([(0, tablet_id)]),
+            ranges: Vec::new(),
         })
     }
 
     /// Builds a router from the authoritative metadata descriptors for one table.
     ///
     /// Descriptors may arrive in any order, but they must describe the same
-    /// table, use one bucket count, cover every bucket exactly once, and use a
-    /// distinct tablet identity for each bucket. Rejecting an incomplete view
-    /// prevents a caller from treating a partial metadata snapshot as a valid
-    /// routing table.
+    /// table and use a distinct tablet identity for each partition. Hash
+    /// descriptors must cover every bucket exactly once. Range descriptors
+    /// must cover both unbounded ends with adjacent half-open intervals.
+    /// Rejecting an incomplete view prevents a caller from treating a partial
+    /// metadata snapshot as a valid routing table.
     pub fn new(table_id: TableId, descriptors: &[TabletDescriptor]) -> Result<Self> {
         if table_id.0 == 0 {
             return Err(Error::InvalidArgument(
@@ -152,6 +162,9 @@ impl TabletRouter {
         let mut bucket_count = None;
         let mut tablet_ids_by_bucket = BTreeMap::new();
         let mut tablet_ids = BTreeSet::new();
+        let mut ranges = Vec::new();
+        let mut saw_hash = false;
+        let mut saw_range = false;
 
         for descriptor in descriptors {
             descriptor.validate().map_err(|error| {
@@ -168,11 +181,45 @@ impl TabletRouter {
                 )));
             }
 
-            let (bucket, descriptor_bucket_count) = match descriptor.partition {
+            let partition = match &descriptor.partition {
                 PartitionSpec::Hash {
                     bucket,
                     bucket_count,
-                } => (bucket, bucket_count),
+                } => {
+                    saw_hash = true;
+                    Some((*bucket, *bucket_count))
+                }
+                PartitionSpec::Range { start_key, end_key } => {
+                    saw_range = true;
+                    if !end_key.is_empty() && start_key >= end_key {
+                        return Err(Error::InvalidArgument(format!(
+                            "tablet {} contains an invalid key range",
+                            descriptor.tablet_id.0
+                        )));
+                    }
+                    ranges.push(RangeRoute {
+                        start_key: start_key.clone(),
+                        end_key: end_key.clone(),
+                        tablet_id: descriptor.tablet_id,
+                    });
+                    None
+                }
+            };
+
+            if saw_hash && saw_range {
+                return Err(Error::InvalidArgument(
+                    "tablet routing cannot mix hash and ordered-range descriptors".to_string(),
+                ));
+            }
+
+            let Some((bucket, descriptor_bucket_count)) = partition else {
+                if !tablet_ids.insert(descriptor.tablet_id) {
+                    return Err(Error::InvalidArgument(format!(
+                        "tablet routing reuses tablet {} across ranges",
+                        descriptor.tablet_id.0
+                    )));
+                }
+                continue;
             };
 
             if let Some(expected) = bucket_count {
@@ -204,8 +251,43 @@ impl TabletRouter {
             }
         }
 
+        if !ranges.is_empty() {
+            ranges.sort_by(|left, right| left.start_key.cmp(&right.start_key));
+            if ranges
+                .first()
+                .is_none_or(|range| !range.start_key.is_empty())
+                || ranges.last().is_none_or(|range| !range.end_key.is_empty())
+            {
+                return Err(Error::InvalidArgument(
+                    "ordered tablet ranges must cover both unbounded ends".to_string(),
+                ));
+            }
+            for pair in ranges.windows(2) {
+                if pair[0].end_key.is_empty()
+                    || pair[1].start_key.is_empty()
+                    || pair[0].end_key != pair[1].start_key
+                {
+                    return Err(Error::InvalidArgument(
+                        "ordered tablet ranges contain a gap or overlap".to_string(),
+                    ));
+                }
+            }
+            let bucket_count = u32::try_from(ranges.len()).map_err(|_| {
+                Error::InvalidArgument(
+                    "ordered tablet range count exceeds the routing format".to_string(),
+                )
+            })?;
+            return Ok(Self {
+                table_id,
+                bucket_count,
+                partitioner: HashTabletPartitioner::new(),
+                tablet_ids_by_bucket,
+                ranges,
+            });
+        }
+
         let bucket_count = bucket_count.ok_or_else(|| {
-            Error::InvalidArgument("tablet routing has no bucket count".to_string())
+            Error::InvalidArgument("tablet routing has no partition descriptors".to_string())
         })?;
 
         let expected_descriptor_count = usize::try_from(bucket_count).map_err(|_| {
@@ -227,6 +309,7 @@ impl TabletRouter {
             bucket_count,
             partitioner: HashTabletPartitioner::new(),
             tablet_ids_by_bucket,
+            ranges,
         })
     }
 
@@ -235,13 +318,28 @@ impl TabletRouter {
         self.table_id
     }
 
-    /// Return the number of hash buckets represented by this routing view.
+    /// Return the number of partitions represented by this routing view.
     pub const fn tablet_count(&self) -> u32 {
         self.bucket_count
     }
 
     /// Route one canonical primary key to exactly one tablet.
     pub fn route_point(&self, primary_key_bytes: &[u8]) -> Result<TabletId> {
+        if !self.ranges.is_empty() {
+            let index = self.ranges.partition_point(|range| {
+                range.start_key.is_empty() || range.start_key.as_slice() <= primary_key_bytes
+            });
+            let range = self.ranges.get(index.saturating_sub(1)).ok_or_else(|| {
+                Error::InvalidArgument("key falls before the first tablet range".to_string())
+            })?;
+            if !range.end_key.is_empty() && primary_key_bytes >= range.end_key.as_slice() {
+                return Err(Error::InvalidArgument(
+                    "key does not belong to the published tablet ranges".to_string(),
+                ));
+            }
+            return Ok(range.tablet_id);
+        }
+
         let bucket =
             self.partitioner
                 .bucket_for(self.table_id, primary_key_bytes, self.bucket_count)?;
@@ -257,8 +355,53 @@ impl TabletRouter {
             })
     }
 
-    /// Route a scan to every tablet in deterministic hash-bucket order.
+    /// Route a scan to every tablet in deterministic partition order.
     pub fn route_scan(&self) -> Vec<TabletId> {
+        if !self.ranges.is_empty() {
+            return self.ranges.iter().map(|range| range.tablet_id).collect();
+        }
         self.tablet_ids_by_bucket.values().copied().collect()
+    }
+
+    /// Route a half-open logical scan span to the ordered tablets it intersects.
+    ///
+    /// The returned tablets preserve metadata range order and contain no tablet
+    /// whose ownership interval is disjoint from the requested span. This is a
+    /// routing primitive only: callers still own the read timestamp, per-tablet
+    /// execution, and progress/retry state required for a distributed scan.
+    pub fn route_scan_span(
+        &self,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+    ) -> Result<Vec<TabletId>> {
+        if let (Some(start_key), Some(end_key)) = (start_key, end_key)
+            && start_key >= end_key
+        {
+            return Err(Error::InvalidArgument(
+                "logical scan span must be a non-empty half-open interval".to_string(),
+            ));
+        }
+
+        if self.ranges.is_empty() {
+            // Legacy hash metadata has no ordered key ownership. Preserve its
+            // compatibility behavior by conservatively fanning out to every
+            // bucket rather than pretending a byte span has ordered meaning.
+            return Ok(self.route_scan());
+        }
+
+        Ok(self
+            .ranges
+            .iter()
+            .filter(|range| {
+                let starts_before_end = end_key.is_none_or(|end_key| {
+                    range.start_key.is_empty() || range.start_key.as_slice() < end_key
+                });
+                let ends_after_start = start_key.is_none_or(|start_key| {
+                    range.end_key.is_empty() || range.end_key.as_slice() > start_key
+                });
+                starts_before_end && ends_after_start
+            })
+            .map(|range| range.tablet_id)
+            .collect())
     }
 }

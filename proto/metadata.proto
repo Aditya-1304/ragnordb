@@ -34,6 +34,12 @@ message MetadataCommand {
         // Phase 5.2 authoritative CREATE TABLE transition. The metadata state
         // machine assigns all cluster-global identities when this entry applies.
         CreateTableTopology create_table_topology = 8;
+
+        // Client retry-session control-plane records. Request outcomes remain
+        // tied to the session epoch and may not be silently recreated after
+        // metadata restart or client reconnect.
+        RegisterClient register_client = 11;
+        RenewClient renew_client = 12;
     }
 }
 
@@ -54,6 +60,23 @@ message NodeDescriptor {
     string snapshot_addr = 4;
     string sql_addr = 5;
     string admin_addr = 6;
+
+    // Physical placement and lifecycle metadata. Empty locality labels retain
+    // compatibility with the original static bootstrap format.
+    string region = 7;
+    string zone = 8;
+    string rack = 9;
+    string storage_class = 10;
+    NodeLifecycle lifecycle = 11;
+}
+
+enum NodeLifecycle {
+    NODE_LIFECYCLE_UNSPECIFIED = 0;
+    NODE_LIFECYCLE_ACTIVE = 1;
+    NODE_LIFECYCLE_DRAINING = 2;
+    NODE_LIFECYCLE_DECOMMISSIONING = 3;
+    NODE_LIFECYCLE_DECOMMISSIONED = 4;
+    NODE_LIFECYCLE_TOMBSTONED = 5;
 }
 
 message RegisterNode {
@@ -82,9 +105,16 @@ message HashPartition {
     uint32 bucket_count = 2;
 }
 
+message RangePartition {
+    // Empty start_key means -infinity; empty end_key means +infinity.
+    bytes start_key = 1;
+    bytes end_key = 2;
+}
+
 message PartitionSpec {
     oneof kind {
         HashPartition hash = 1;
+        RangePartition range = 2;
     }
 }
 
@@ -129,11 +159,39 @@ message SetDesiredReplicaPlacement {
     ragnordb.ids.TabletId tablet_id = 1;
     uint64 configuration_epoch = 2;
     repeated DesiredReplica replicas = 3;
+    PlacementPolicy placement_policy = 4;
+}
+
+// Placement constraints are metadata intent, not a copy of the currently
+// committed Raft ConfState. Reconciliation must satisfy these constraints
+// while it moves the group through safe learner/voter transitions.
+message PlacementPolicy {
+    uint32 replication_factor = 1;
+    uint32 min_distinct_regions = 2;
+    uint32 min_distinct_zones = 3;
+    uint32 min_distinct_racks = 4;
+    string required_storage_class = 5;
+    repeated ragnordb.ids.NodeId preferred_leader_nodes = 6;
 }
 
 message UpdateTableSchema {
     uint64 expected_schema_version = 1;
     ragnordb.catalog.TableDefinition table = 2;
+}
+
+message RegisterClient {
+    bytes client_id = 1;
+
+    // Zero requests the next metadata-assigned epoch. A non-zero value is
+    // used by a reconnecting client that has already obtained its epoch from
+    // the control plane and is being re-established at a gateway.
+    uint64 requested_session_epoch = 2;
+}
+
+message RenewClient {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 acknowledged_through = 3;
 }
 
 // Permanent record that one consensus identity has ended.
@@ -179,6 +237,15 @@ message MetadataSnapshot {
     // history, a retry after leadership change or snapshot restore could
     // allocate a second table identity.
     repeated MetadataRequestDeduplication request_deduplication = 10;
+
+    repeated ClientSession client_sessions = 11;
+}
+
+message ClientSession {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 acknowledged_through = 3;
+    uint64 first_retained_sequence = 4;
 }
 
 enum MetadataCachedOutcomeKind {
@@ -187,6 +254,8 @@ enum MetadataCachedOutcomeKind {
     METADATA_CACHED_OUTCOME_ALREADY_APPLIED = 2;
     METADATA_CACHED_OUTCOME_TABLE_CREATED = 3;
     METADATA_CACHED_OUTCOME_REJECTED = 4;
+    METADATA_CACHED_OUTCOME_CLIENT_REGISTERED = 5;
+    METADATA_CACHED_OUTCOME_CLIENT_RENEWED = 6;
 }
 
 message MetadataRequestDeduplication {
@@ -202,4 +271,7 @@ message MetadataRequestDeduplication {
     // rejection text is retained so a replay has the same client-visible
     // deterministic result without re-evaluating current metadata state.
     string rejection = 6;
+
+    bytes client_id = 7;
+    uint64 session_epoch = 8;
 }

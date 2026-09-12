@@ -13,6 +13,7 @@ enum MessageType {
     MESSAGE_TYPE_METADATA_REQUEST = 4;
     MESSAGE_TYPE_METADATA_RESPONSE = 5;
     MESSAGE_TYPE_TABLET_READ_REQUEST = 6;
+    MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST = 7;
 }
 
 message RpcFrame {
@@ -26,6 +27,15 @@ message TabletCommandRequest {
         ragnordb.command.TabletCommand command = 2;
         ragnordb.ids.TabletId tablet_id = 3;
         uint64 tablet_epoch = 4;
+        ragnordb.ids.LogicalCommandId logical_command_id = 5;
+        optional uint64 acknowledged_through = 6;
+}
+
+message TabletOutcomeQueryRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.LogicalCommandId logical_command_id = 2;
+        ragnordb.ids.TabletId tablet_id = 3;
+        uint64 tablet_epoch = 4;
 }
 
 message TabletReadRequest {
@@ -34,6 +44,7 @@ message TabletReadRequest {
         uint64 tablet_epoch = 3;
         ragnordb.row.RowKey row_key = 4;
         ragnordb.ids.Timestamp read_timestamp = 5;
+        ragnordb.ids.LogicalCommandId logical_command_id = 6;
 }
 
 message TabletCommandResponse {
@@ -45,6 +56,8 @@ message TabletCommandResponse {
     bytes result_data = 6;
     bool found = 7;
     uint64 leader_replica_id = 8;
+    uint64 current_tablet_epoch = 9;
+    uint64 expected_tablet_epoch = 10;
 }
 
 message MetadataRequest {

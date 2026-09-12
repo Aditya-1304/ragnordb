@@ -16,6 +16,13 @@ pub struct TabletCommandEnvelope {
     pub expected_epoch: u64,
     #[prost(message, optional, tag = "5")]
     pub command: ::core::option::Option<TabletCommand>,
+    #[prost(message, optional, tag = "6")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    /// Durable retry-horizon watermark observed by the client when this
+    /// command was issued. The tablet may compact outcomes at or below this
+    /// watermark only after the watermark itself has entered the Raft log.
+    #[prost(uint64, optional, tag = "7")]
+    pub acknowledged_through: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommand {
@@ -143,6 +150,12 @@ pub struct TabletStateMachineSnapshot {
     pub clients: ::prost::alloc::vec::Vec<ClientDeduplicationSnapshot>,
     #[prost(message, optional, tag = "5")]
     pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, repeated, tag = "6")]
+    pub logical_commands: ::prost::alloc::vec::Vec<LogicalCommandDeduplicationSnapshot>,
+    #[prost(message, repeated, tag = "7")]
+    pub logical_client_retry_horizons: ::prost::alloc::vec::Vec<
+        LogicalClientRetryHorizon,
+    >,
 }
 /// last applied request and cached result for one client in this Raft group
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -153,6 +166,27 @@ pub struct ClientDeduplicationSnapshot {
     pub cached_result: i32,
     #[prost(message, optional, tag = "3")]
     pub cached_rejection: ::core::option::Option<CachedTabletCommandRejection>,
+}
+/// V2 deduplication entries are keyed by logical command identity rather than
+/// by a group-qualified legacy RequestId. This is what makes a retry safe when
+/// metadata routes the same logical command to a different tablet generation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogicalCommandDeduplicationSnapshot {
+    #[prost(message, optional, tag = "1")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(enumeration = "CachedTabletCommandResult", tag = "2")]
+    pub cached_result: i32,
+    #[prost(message, optional, tag = "3")]
+    pub cached_rejection: ::core::option::Option<CachedTabletCommandRejection>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogicalClientRetryHorizon {
+    #[prost(bytes = "vec", tag = "1")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub session_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub acknowledged_through: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CachedTabletCommandRejection {

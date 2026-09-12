@@ -20,13 +20,15 @@ use std::{
 use prost::Message;
 use ragnordb_common::{
     Error, Result,
-    command_codec::TabletCommand,
-    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp},
+    command_codec::{CachedTabletCommandOutcome, TabletCommand},
+    ids::{
+        LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp,
+    },
     metadata_codec::DesiredReplicaRole,
     proto::rpc,
     rpc_codec::{
         MessageType, ReplicaRoute, RpcFrame, TabletCommandRequest, TabletCommandResponse,
-        TabletReadRequest, TabletRoute,
+        TabletOutcomeQueryRequest, TabletReadRequest, TabletRoute,
     },
 };
 use ragnordb_exec::TabletGateway;
@@ -155,6 +157,36 @@ impl TabletRpcClient {
         command: TabletCommand,
         timeout: Duration,
     ) -> Result<TabletCommandApplyOutcome> {
+        self.submit_command_with_identity(route, request_id, None, command, timeout)
+    }
+
+    pub fn submit_command_with_identity(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: Option<LogicalCommandId>,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        self.submit_command_with_identity_and_ack(
+            route,
+            request_id,
+            logical_command_id,
+            None,
+            command,
+            timeout,
+        )
+    }
+
+    pub fn submit_command_with_identity_and_ack(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: Option<LogicalCommandId>,
+        acknowledged_through: Option<u64>,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
         route
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
@@ -165,14 +197,124 @@ impl TabletRpcClient {
         }
         let request = TabletCommandRequest {
             request_id,
+            logical_command_id,
+            acknowledged_through,
             tablet_id: route.tablet_id,
             tablet_epoch: route.tablet_epoch,
-            command,
+            command: command.clone(),
         };
-        let target = route
-            .leader_node()
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("tablet retry deadline overflowed".into()))?;
+        let mut current_route = route.clone();
+        let mut last_error = None;
+
+        for attempt in 0..=2_u32 {
+            let target = match current_route.leader_node() {
+                Ok(target) => target,
+                Err(_) => {
+                    last_error = Some(Error::LeaderUnknown);
+                    self.rotate_route_leader(&mut current_route, None);
+                    continue;
+                }
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let mut attempt_request = TabletCommandRequest {
+                request_id: request.request_id.clone(),
+                logical_command_id: request.logical_command_id,
+                acknowledged_through: request.acknowledged_through,
+                tablet_id: request.tablet_id,
+                tablet_epoch: request.tablet_epoch,
+                command: request.command.clone(),
+            };
+            // RequestId is retained for transport correlation and legacy
+            // group-scoped deduplication. V2 logical identity is the durable
+            // idempotency key, so a topology move may update this routing
+            // field while preserving the same logical command.
+            attempt_request.request_id.raft_group_id = current_route.raft_group_id;
+            match self.submit_command_to(
+                target,
+                current_route.raft_group_id,
+                attempt_request,
+                remaining,
+            ) {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if is_retryable_tablet_error(&error) && attempt < 2 => {
+                    self.adjust_route_after_error(
+                        &mut current_route,
+                        &command,
+                        logical_command_id.is_some(),
+                        &error,
+                    );
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(5 * (u64::from(attempt) + 1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::TabletUnavailable {
+            reason: "tablet retry deadline elapsed".to_string(),
+        }))
+    }
+
+    /// Query a retained logical mutation outcome without re-executing the
+    /// command. Callers must resolve the outcome before retrying an unknown
+    /// mutation; a missing outcome remains an explicit `None` result.
+    pub fn query_original_outcome(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        timeout: Duration,
+    ) -> Result<Option<CachedTabletCommandOutcome>> {
+        route
+            .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
-        self.submit_command_to(target, route.raft_group_id, request, timeout)
+        if request_id.raft_group_id != route.raft_group_id {
+            return Err(Error::InvalidArgument(
+                "tablet outcome query request group does not match its route".to_string(),
+            ));
+        }
+
+        let request = TabletOutcomeQueryRequest {
+            request_id,
+            logical_command_id,
+            tablet_id: route.tablet_id,
+            tablet_epoch: route.tablet_epoch,
+        };
+        let target = route.leader_node().map_err(|_| Error::LeaderUnknown)?;
+        let response = if target == self.transport.local_node_id() {
+            let handle = self.local_handle(route.raft_group_id)?;
+            let outcome = handle.query_original_outcome(request, timeout)?;
+            return Ok(outcome);
+        } else {
+            self.send_remote(
+                target,
+                RpcFrame {
+                    msg_type: MessageType::TabletOutcomeQueryRequest,
+                    raft_group_id: route.raft_group_id,
+                    payload: request.to_proto().encode_to_vec(),
+                },
+                request.request_id.clone(),
+                timeout,
+                false,
+            )?
+        };
+
+        if !response.success {
+            return Err(response_error(response));
+        }
+        if !response.found {
+            return Ok(None);
+        }
+        CachedTabletCommandOutcome::decode_from_outcome_query(&response.result_data)
+            .map(Some)
+            .map_err(|error| Error::CorruptData(error.to_string()))
     }
 
     /// Read one row from a metadata-selected tablet route.
@@ -192,17 +334,128 @@ impl TabletRpcClient {
                 "tablet read request group does not match its route".to_string(),
             ));
         }
-        let request = TabletReadRequest {
+        let mut request = TabletReadRequest {
             request_id,
+            logical_command_id: None,
             tablet_id: route.tablet_id,
             tablet_epoch: route.tablet_epoch,
             row_key,
             read_timestamp,
         };
-        let target = route
-            .leader_node()
-            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
-        self.read_point_to(target, route.raft_group_id, request, timeout)
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                Error::InvalidArgument("tablet read retry deadline overflowed".into())
+            })?;
+        let mut current_route = route.clone();
+        let mut last_error = None;
+
+        for attempt in 0..=2_u32 {
+            let target = match current_route.leader_node() {
+                Ok(target) => target,
+                Err(_) => {
+                    last_error = Some(Error::LeaderUnknown);
+                    self.rotate_route_leader(&mut current_route, None);
+                    continue;
+                }
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self.read_point_to(
+                target,
+                current_route.raft_group_id,
+                request.clone(),
+                remaining,
+            ) {
+                Ok(row) => return Ok(row),
+                Err(error) if is_retryable_tablet_error(&error) && attempt < 2 => {
+                    if let Error::StaleTabletEpoch { current_epoch, .. } = &error
+                        && *current_epoch != 0
+                    {
+                        current_route.tablet_epoch = *current_epoch;
+                        request.tablet_epoch = *current_epoch;
+                    }
+                    self.rotate_route_leader(&mut current_route, error_leader(&error));
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(5 * (u64::from(attempt) + 1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::TabletUnavailable {
+            reason: "tablet read retry deadline elapsed".to_string(),
+        }))
+    }
+
+    fn adjust_route_after_error(
+        &self,
+        route: &mut TabletRoute,
+        command: &TabletCommand,
+        allow_topology_move: bool,
+        error: &Error,
+    ) {
+        if let Error::StaleTabletEpoch { current_epoch, .. } = error
+            && *current_epoch != 0
+        {
+            route.tablet_epoch = *current_epoch;
+        }
+        if let Some(leader_replica_id) = error_leader(error) {
+            route.leader_replica_id = leader_replica_id;
+            return;
+        }
+
+        if matches!(error, Error::StaleTabletEpoch { .. })
+            && let Some(refreshed) =
+                self.refresh_route_for_command(route, command, allow_topology_move)
+        {
+            *route = refreshed;
+            return;
+        }
+
+        self.rotate_route_leader(route, None);
+    }
+
+    fn refresh_route_for_command(
+        &self,
+        route: &TabletRoute,
+        command: &TabletCommand,
+        allow_topology_move: bool,
+    ) -> Option<TabletRoute> {
+        let key = match command {
+            TabletCommand::SingleShardCommit(command) => command.writes.first()?.key.as_slice(),
+            TabletCommand::Prewrite(command) => command.primary_key.as_slice(),
+            TabletCommand::Commit(command) => command.keys.first()?.as_slice(),
+            TabletCommand::Rollback(command) => command.keys.first()?.as_slice(),
+            TabletCommand::ResolveIntent(command) => command.keys.first()?.as_slice(),
+            TabletCommand::Catalog(_) | TabletCommand::Noop(_) => return None,
+        };
+        let row_key = ragnordb_storage::key::decode_row_key(key).ok()?;
+        self.lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)
+            .ok()
+            .filter(|refreshed| {
+                allow_topology_move || refreshed.raft_group_id == route.raft_group_id
+            })
+    }
+
+    fn rotate_route_leader(&self, route: &mut TabletRoute, preferred: Option<ReplicaId>) {
+        if let Some(preferred) = preferred
+            && route.node_for_replica(preferred).is_some()
+        {
+            route.leader_replica_id = preferred;
+            return;
+        }
+        if let Some(next) = route
+            .replicas
+            .iter()
+            .find(|replica| replica.replica_id != route.leader_replica_id)
+            .map(|replica| replica.replica_id)
+        {
+            route.leader_replica_id = next;
+        }
     }
 
     fn submit_command_to(
@@ -214,7 +467,15 @@ impl TabletRpcClient {
     ) -> Result<TabletCommandApplyOutcome> {
         if target == self.transport.local_node_id() {
             let handle = self.local_handle(group_id)?;
-            return handle.submit_command(request, timeout);
+            let logical_command_id = request.logical_command_id;
+            return match handle.submit_command(request, timeout) {
+                Err(Error::ProposalUnavailable { reason }) if logical_command_id.is_some() => {
+                    Err(Error::RequestOutcomeUnknown {
+                        identity: format!("local tablet proposal outcome unknown: {reason}"),
+                    })
+                }
+                result => result,
+            };
         }
 
         let request_id = request.request_id.clone();
@@ -230,6 +491,7 @@ impl TabletRpcClient {
             },
             request_id,
             timeout,
+            true,
         )?;
         if !response.success {
             return Err(response_error(response));
@@ -260,6 +522,7 @@ impl TabletRpcClient {
             },
             request_id,
             timeout,
+            false,
         )?;
         if !response.success {
             return Err(response_error(response));
@@ -284,6 +547,7 @@ impl TabletRpcClient {
         frame: RpcFrame,
         request_id: RequestId,
         timeout: Duration,
+        outcome_uncertain_on_timeout: bool,
     ) -> Result<TabletCommandResponse> {
         let (sender, receiver) = mpsc::channel();
         {
@@ -318,8 +582,17 @@ impl TabletRpcClient {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&request_id);
-            Error::ProposalUnavailable {
-                reason: "tablet RPC response deadline elapsed".to_string(),
+            if outcome_uncertain_on_timeout {
+                Error::RequestOutcomeUnknown {
+                    identity: format!(
+                        "client={:#034x}/group={}/sequence={}",
+                        request_id.client_id, request_id.raft_group_id.0, request_id.sequence
+                    ),
+                }
+            } else {
+                Error::ProposalUnavailable {
+                    reason: "tablet RPC response deadline elapsed".to_string(),
+                }
             }
         })
     }
@@ -349,6 +622,60 @@ impl TabletGateway for TabletRpcClient {
         timeout: Duration,
     ) -> Result<TabletCommandApplyOutcome> {
         TabletRpcClient::submit_command(self, route, request_id, command, timeout)
+    }
+
+    fn submit_command_with_identity(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        TabletRpcClient::submit_command_with_identity(
+            self,
+            route,
+            request_id,
+            Some(logical_command_id),
+            command,
+            timeout,
+        )
+    }
+
+    fn submit_command_with_identity_and_ack(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        acknowledged_through: Option<u64>,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        TabletRpcClient::submit_command_with_identity_and_ack(
+            self,
+            route,
+            request_id,
+            Some(logical_command_id),
+            acknowledged_through,
+            command,
+            timeout,
+        )
+    }
+
+    fn query_original_outcome(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        timeout: Duration,
+    ) -> Result<Option<CachedTabletCommandOutcome>> {
+        TabletRpcClient::query_original_outcome(
+            self,
+            route,
+            request_id,
+            logical_command_id,
+            timeout,
+        )
     }
 }
 
@@ -435,6 +762,8 @@ fn dispatch_message(
                             result_data: encode_command_outcome(outcome),
                             found: false,
                             leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                            current_tablet_epoch: None,
+                            expected_tablet_epoch: None,
                         },
                     },
                     Err(error) => error_response(request_id, error),
@@ -475,6 +804,67 @@ fn dispatch_message(
                         found: row.is_some(),
                         result_data: row.unwrap_or_default(),
                         leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                        current_tablet_epoch: None,
+                        expected_tablet_epoch: None,
+                    },
+                    Err(error) => error_response(request_id, error),
+                },
+                None => error_response(
+                    request_id,
+                    Error::ProposalUnavailable {
+                        reason: "tablet Raft group is not hosted on this node".to_string(),
+                    },
+                ),
+            };
+            send_response(transport, source, frame.raft_group_id, response);
+        }
+        MessageType::TabletOutcomeQueryRequest => {
+            let Ok(proto) = rpc::TabletOutcomeQueryRequest::decode(frame.payload.as_slice()) else {
+                return;
+            };
+            let Ok(request) = TabletOutcomeQueryRequest::from_proto(proto) else {
+                return;
+            };
+            let request_id = request.request_id.clone();
+            let response = match handles
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&frame.raft_group_id)
+                .cloned()
+            {
+                Some(handle) => match handle
+                    .query_original_outcome(request, Duration::from_secs(30))
+                {
+                    Ok(outcome) => match outcome {
+                        Some(outcome) => match outcome.encode_for_outcome_query() {
+                            Ok(result_data) => TabletCommandResponse {
+                                request_id,
+                                success: true,
+                                error_message: String::new(),
+                                error_code: String::new(),
+                                retryable: false,
+                                result_data,
+                                found: true,
+                                leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                                current_tablet_epoch: None,
+                                expected_tablet_epoch: None,
+                            },
+                            Err(error) => {
+                                error_response(request_id, Error::CorruptData(error.to_string()))
+                            }
+                        },
+                        None => TabletCommandResponse {
+                            request_id,
+                            success: true,
+                            error_message: String::new(),
+                            error_code: String::new(),
+                            retryable: false,
+                            result_data: Vec::new(),
+                            found: false,
+                            leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
+                            current_tablet_epoch: None,
+                            expected_tablet_epoch: None,
+                        },
                     },
                     Err(error) => error_response(request_id, error),
                 },
@@ -529,8 +919,21 @@ fn send_response(
 
 fn error_response(request_id: RequestId, error: Error) -> TabletCommandResponse {
     let (error_code, retryable, leader_replica_id) = match &error {
-        Error::NotLeader { leader_id } => ("NOT_LEADER", true, leader_id.map(ReplicaId)),
-        Error::ProposalUnavailable { .. } => ("PROPOSAL_UNAVAILABLE", true, None),
+        Error::NotLeader {
+            leader_id: Some(leader_id),
+        } => ("NOT_LEADER", true, Some(ReplicaId(*leader_id))),
+        Error::NotLeader { leader_id: None } | Error::LeaderUnknown => {
+            ("LEADER_UNKNOWN", true, None)
+        }
+        Error::ProposalUnavailable { .. } | Error::TabletUnavailable { .. } => {
+            ("TABLET_UNAVAILABLE", true, None)
+        }
+        Error::StaleTabletEpoch { .. } => ("STALE_TABLET_EPOCH", true, None),
+        // An indeterminate result is not a permission to replay the mutation.
+        // The caller must query the original logical command outcome first.
+        Error::RequestOutcomeUnknown { .. } => ("REQUEST_OUTCOME_UNKNOWN", false, None),
+        Error::RequestIdExpired { .. } => ("REQUEST_ID_EXPIRED", false, None),
+        Error::ClientSessionExpired { .. } => ("CLIENT_SESSION_EXPIRED", false, None),
         Error::WriteConflict(_) => ("WRITE_CONFLICT", false, None),
         Error::RecoveryRequired { .. } => ("RECOVERY_REQUIRED", false, None),
         Error::InvalidArgument(_) => ("INVALID_ARGUMENT", false, None),
@@ -545,6 +948,14 @@ fn error_response(request_id: RequestId, error: Error) -> TabletCommandResponse 
         result_data: Vec::new(),
         found: false,
         leader_replica_id,
+        current_tablet_epoch: match &error {
+            Error::StaleTabletEpoch { current_epoch, .. } => Some(*current_epoch),
+            _ => None,
+        },
+        expected_tablet_epoch: match &error {
+            Error::StaleTabletEpoch { expected_epoch, .. } => Some(*expected_epoch),
+            _ => None,
+        },
     }
 }
 
@@ -552,6 +963,33 @@ fn response_error(response: TabletCommandResponse) -> Error {
     if response.error_code == "NOT_LEADER" {
         return Error::NotLeader {
             leader_id: response.leader_replica_id.map(|id| id.0),
+        };
+    }
+    if response.error_code == "LEADER_UNKNOWN" {
+        return Error::LeaderUnknown;
+    }
+    if response.error_code == "STALE_TABLET_EPOCH" {
+        return Error::StaleTabletEpoch {
+            current_epoch: response.current_tablet_epoch.unwrap_or_default(),
+            expected_epoch: response.expected_tablet_epoch.unwrap_or_default(),
+        };
+    }
+    if response.error_code == "REQUEST_OUTCOME_UNKNOWN" {
+        return Error::RequestOutcomeUnknown {
+            identity: response.error_message,
+        };
+    }
+    if response.error_code == "REQUEST_ID_EXPIRED" {
+        return Error::RequestIdExpired {
+            identity: response.error_message,
+        };
+    }
+    if response.error_code == "CLIENT_SESSION_EXPIRED" {
+        return Error::ClientSessionExpired { session_epoch: 0 };
+    }
+    if response.error_code == "TABLET_UNAVAILABLE" {
+        return Error::TabletUnavailable {
+            reason: response.error_message,
         };
     }
     if response.retryable {
@@ -568,6 +1006,26 @@ fn response_error(response: TabletCommandResponse) -> Error {
         return Error::WriteConflict(response.error_message);
     }
     Error::InvalidArgument(response.error_message)
+}
+
+fn error_leader(error: &Error) -> Option<ReplicaId> {
+    match error {
+        Error::NotLeader {
+            leader_id: Some(leader_id),
+        } => Some(ReplicaId(*leader_id)),
+        _ => None,
+    }
+}
+
+fn is_retryable_tablet_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NotLeader { .. }
+            | Error::LeaderUnknown
+            | Error::StaleTabletEpoch { .. }
+            | Error::TabletUnavailable { .. }
+            | Error::ProposalUnavailable { .. }
+    )
 }
 
 fn encode_command_outcome(outcome: TabletCommandApplyOutcome) -> Vec<u8> {
@@ -653,5 +1111,43 @@ mod tests {
                 leader_id: Some(12)
             }
         ));
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// An unknown outcome is not safe to execute again automatically. The
+    /// client must query the original logical command outcome first; marking
+    /// this response retryable would permit a duplicate durable mutation.
+    #[test]
+    fn unknown_outcome_response_requires_outcome_query() {
+        let request_id = RequestId {
+            client_id: 9,
+            sequence: 2,
+            raft_group_id: RaftGroupId(7),
+        };
+        let response = error_response(
+            request_id,
+            Error::RequestOutcomeUnknown {
+                identity: "client=9/session=3/sequence=2".to_string(),
+            },
+        );
+
+        assert_eq!(response.error_code, "REQUEST_OUTCOME_UNKNOWN");
+        assert!(!response.retryable);
+        assert!(matches!(
+            response_error(response),
+            Error::RequestOutcomeUnknown { .. }
+        ));
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// The gateway retry loop must not convert an indeterminate mutation into
+    /// an automatic resend. The caller needs the outcome-query path first.
+    #[test]
+    fn unknown_outcome_is_not_automatically_resubmitted() {
+        assert!(!is_retryable_tablet_error(&Error::RequestOutcomeUnknown {
+            identity: "client=9/session=3/sequence=2".to_string(),
+        }));
     }
 }

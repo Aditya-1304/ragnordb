@@ -20,16 +20,17 @@ use ragnordb_common::{
     ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
-        MetadataAllocatorState, MetadataCachedOutcome, MetadataCommand,
-        MetadataRequestDeduplication, MetadataSnapshot, NodeDescriptor, PartitionSpec,
-        RetiredReplicaLifetime, TabletDescriptor,
+        MetadataAllocatorState, MetadataCachedOutcome, MetadataClientSession, MetadataCommand,
+        MetadataRequestDeduplication, MetadataSnapshot, NodeDescriptor, NodeLifecycle,
+        PartitionSpec, PlacementPolicy, RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
 use crate::{Catalog, TableSchema};
 
-/// Phase 5.2 creates one initial hash bucket per table. Actual key-to-tablet
-/// routing begins in Phase 5.3.
+/// Phase 5.2 creates one initial ordered range per table. The persisted table
+/// count remains only an initial topology hint; live ownership is descriptor
+/// metadata and may change without changing the table identity.
 const INITIAL_TABLET_COUNT: u32 = 1;
 
 /// Initial desired replication factor. Small development clusters use every
@@ -54,13 +55,21 @@ pub struct MetadataTableCreated {
 pub enum MetadataApplyOutcome {
     Applied,
     AlreadyApplied,
+    ClientRegistered { client_id: u128, session_epoch: u64 },
+    ClientRenewed,
     TableCreated(MetadataTableCreated),
     Rejected(MetadataRejection),
 }
 
 impl MetadataApplyOutcome {
     pub const fn changed_state(&self) -> bool {
-        matches!(self, Self::Applied | Self::TableCreated(_))
+        matches!(
+            self,
+            Self::Applied
+                | Self::ClientRegistered { .. }
+                | Self::ClientRenewed
+                | Self::TableCreated(_)
+        )
     }
 }
 
@@ -78,11 +87,46 @@ pub enum MetadataRejection {
     #[error("metadata is already initialized for cluster {existing}, not {received}")]
     ClusterConflict { existing: String, received: String },
 
+    #[error("metadata has no registered retry session for client {0}")]
+    UnknownClient(u128),
+
+    #[error(
+        "client {client_id} session epoch conflicts with durable epoch {existing}; received {received}"
+    )]
+    ClientSessionEpochConflict {
+        client_id: u128,
+        existing: u64,
+        received: u64,
+    },
+
+    #[error("client {0} session epoch space is exhausted")]
+    ClientSessionEpochExhausted(u128),
+
+    #[error("client {client_id} acknowledgement regressed from {existing} to {received}")]
+    AcknowledgementRegression {
+        client_id: u128,
+        existing: u64,
+        received: u64,
+    },
+
+    #[error("client {0} retry horizon sequence space is exhausted")]
+    RetryHorizonExhausted(u128),
+
     #[error(
         "node {} is already registered with a different directory record",
         .0.0
     )]
     NodeIdConflict(NodeId),
+
+    #[error(
+        "node {} cannot transition from lifecycle {from} to {to}",
+        .node_id.0
+    )]
+    InvalidNodeLifecycleTransition {
+        node_id: NodeId,
+        from: &'static str,
+        to: &'static str,
+    },
 
     #[error(
         "endpoint {endpoint} is already owned by node {existing_node}; node {attempted_node} cannot reuse it"
@@ -162,6 +206,30 @@ pub enum MetadataRejection {
         .0.0
     )]
     UnknownNode(NodeId),
+
+    #[error("desired placement references node {} in lifecycle state {lifecycle}", .node_id.0)]
+    NodeNotEligible {
+        node_id: NodeId,
+        lifecycle: &'static str,
+    },
+
+    #[error(
+        "desired placement requires {required} distinct {domain}, but only {observed} eligible values are present"
+    )]
+    PlacementDomainUnsatisfied {
+        domain: &'static str,
+        required: u32,
+        observed: usize,
+    },
+
+    #[error(
+        "desired placement requires storage class {required}, but node {node_id:?} has {received}"
+    )]
+    PlacementStorageClassMismatch {
+        node_id: NodeId,
+        required: String,
+        received: String,
+    },
 
     #[error(
         "first desired placement for tablet {} must use configuration epoch 1, received {received}",
@@ -313,6 +381,10 @@ pub struct MetadataState {
     /// against the current table-name map. This is what makes a retry after a
     /// leadership change different from an independent CREATE TABLE request.
     request_deduplication: BTreeMap<RequestId, MetadataCachedOutcome>,
+
+    /// Durable retry-session authority. Tablet/gateway code must fail closed
+    /// when a request carries an epoch absent from this committed map.
+    client_sessions: BTreeMap<u128, MetadataClientSession>,
 }
 
 impl Default for MetadataState {
@@ -329,6 +401,7 @@ impl Default for MetadataState {
             desired_placements: BTreeMap::new(),
             retired_replicas: BTreeSet::new(),
             request_deduplication: BTreeMap::new(),
+            client_sessions: BTreeMap::new(),
         }
     }
 }
@@ -352,6 +425,10 @@ impl MetadataState {
 
     pub fn nodes(&self) -> impl Iterator<Item = &NodeDescriptor> {
         self.nodes.values()
+    }
+
+    pub fn client_session(&self, client_id: u128) -> Option<&MetadataClientSession> {
+        self.client_sessions.get(&client_id)
     }
 
     pub fn table(&self, table_id: TableId) -> Option<&TableSchema> {
@@ -443,6 +520,17 @@ impl MetadataState {
                 self.apply_cluster_initialized(cluster_id)
             }
 
+            MetadataCommand::RegisterClient {
+                client_id,
+                requested_session_epoch,
+            } => self.apply_register_client(client_id, requested_session_epoch),
+
+            MetadataCommand::RenewClient {
+                client_id,
+                session_epoch,
+                acknowledged_through,
+            } => self.apply_renew_client(client_id, session_epoch, acknowledged_through),
+
             MetadataCommand::RegisterNode(node) => self.apply_register_node(node),
 
             MetadataCommand::CreateTable { table } => self.apply_create_table(table),
@@ -500,6 +588,8 @@ impl MetadataState {
                     outcome: outcome.clone(),
                 })
                 .collect(),
+
+            client_sessions: self.client_sessions.values().cloned().collect(),
         }
     }
 
@@ -522,6 +612,7 @@ impl MetadataState {
             retired_replicas,
             allocator,
             request_deduplication,
+            client_sessions,
         } = snapshot;
 
         if cluster_id.is_none() {
@@ -672,6 +763,18 @@ impl MetadataState {
             }
         }
 
+        for session in client_sessions {
+            if state
+                .client_sessions
+                .insert(session.client_id, session)
+                .is_some()
+            {
+                return Err(Error::CorruptData(
+                    "metadata snapshot contains duplicate client sessions".to_string(),
+                ));
+            }
+        }
+
         Ok(state)
     }
 
@@ -692,6 +795,113 @@ impl MetadataState {
         }
     }
 
+    fn apply_register_client(
+        &mut self,
+        client_id: u128,
+        requested_session_epoch: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        let next_epoch = match self.client_sessions.get(&client_id) {
+            None => requested_session_epoch.max(1),
+            Some(existing) if requested_session_epoch == existing.session_epoch => {
+                return MetadataApplyOutcome::AlreadyApplied;
+            }
+            Some(existing)
+                if requested_session_epoch != 0
+                    && requested_session_epoch < existing.session_epoch =>
+            {
+                return MetadataApplyOutcome::Rejected(
+                    MetadataRejection::ClientSessionEpochConflict {
+                        client_id,
+                        existing: existing.session_epoch,
+                        received: requested_session_epoch,
+                    },
+                );
+            }
+            Some(existing) => match existing.session_epoch.checked_add(1) {
+                Some(epoch) if requested_session_epoch == 0 || requested_session_epoch == epoch => {
+                    epoch
+                }
+                Some(epoch) => {
+                    return MetadataApplyOutcome::Rejected(
+                        MetadataRejection::ClientSessionEpochConflict {
+                            client_id,
+                            existing: epoch - 1,
+                            received: requested_session_epoch,
+                        },
+                    );
+                }
+                None => {
+                    return MetadataApplyOutcome::Rejected(
+                        MetadataRejection::ClientSessionEpochExhausted(client_id),
+                    );
+                }
+            },
+        };
+
+        self.client_sessions.insert(
+            client_id,
+            MetadataClientSession {
+                client_id,
+                session_epoch: next_epoch,
+                acknowledged_through: 0,
+                first_retained_sequence: 1,
+            },
+        );
+
+        MetadataApplyOutcome::ClientRegistered {
+            client_id,
+            session_epoch: next_epoch,
+        }
+    }
+
+    fn apply_renew_client(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        acknowledged_through: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        let Some(session) = self.client_sessions.get_mut(&client_id) else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownClient(client_id));
+        };
+        if session.session_epoch != session_epoch {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::ClientSessionEpochConflict {
+                client_id,
+                existing: session.session_epoch,
+                received: session_epoch,
+            });
+        }
+        if acknowledged_through < session.acknowledged_through {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::AcknowledgementRegression {
+                client_id,
+                existing: session.acknowledged_through,
+                received: acknowledged_through,
+            });
+        }
+        if acknowledged_through == session.acknowledged_through {
+            return MetadataApplyOutcome::AlreadyApplied;
+        }
+
+        let first_retained_sequence = match acknowledged_through.checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::RetryHorizonExhausted(
+                    client_id,
+                ));
+            }
+        };
+        session.acknowledged_through = acknowledged_through;
+        session.first_retained_sequence = first_retained_sequence;
+        MetadataApplyOutcome::ClientRenewed
+    }
+
     fn apply_register_node(&mut self, node: NodeDescriptor) -> MetadataApplyOutcome {
         if let Err(rejection) = self.require_initialized() {
             return MetadataApplyOutcome::Rejected(rejection);
@@ -700,6 +910,21 @@ impl MetadataState {
         if let Some(existing) = self.nodes.get(&node.node_id) {
             return if existing == &node {
                 MetadataApplyOutcome::AlreadyApplied
+            } else if same_node_directory(existing, &node)
+                && lifecycle_can_advance(existing.lifecycle, node.lifecycle)
+            {
+                // Lifecycle is metadata-owned placement intent. Updating it
+                // must preserve the stable directory identity so a draining
+                // node cannot be accidentally reintroduced under a new
+                // endpoint record.
+                self.nodes.insert(node.node_id, node);
+                MetadataApplyOutcome::Applied
+            } else if same_node_directory(existing, &node) {
+                MetadataApplyOutcome::Rejected(MetadataRejection::InvalidNodeLifecycleTransition {
+                    node_id: node.node_id,
+                    from: node_lifecycle_name(existing.lifecycle),
+                    to: node_lifecycle_name(node.lifecycle),
+                })
             } else {
                 MetadataApplyOutcome::Rejected(MetadataRejection::NodeIdConflict(node.node_id))
             };
@@ -739,8 +964,9 @@ impl MetadataState {
 
         let selected_nodes = self
             .nodes
-            .keys()
-            .copied()
+            .values()
+            .filter(|node| node.lifecycle == NodeLifecycle::Active)
+            .map(|node| node.node_id)
             .take(INITIAL_REPLICATION_FACTOR)
             .collect::<Vec<_>>();
 
@@ -800,9 +1026,9 @@ impl MetadataState {
             table_id,
             raft_group_id,
             tablet_epoch: 1,
-            partition: PartitionSpec::Hash {
-                bucket: 0,
-                bucket_count: INITIAL_TABLET_COUNT,
+            partition: PartitionSpec::Range {
+                start_key: Vec::new(),
+                end_key: Vec::new(),
             },
         };
 
@@ -815,6 +1041,7 @@ impl MetadataState {
         let placement = DesiredReplicaPlacement {
             tablet_id,
             configuration_epoch: 1,
+            placement_policy: PlacementPolicy::for_replica_count(selected_nodes.len()),
             replicas: selected_nodes
                 .into_iter()
                 .enumerate()
@@ -853,8 +1080,6 @@ impl MetadataState {
         self.table_ids_by_name.insert(table_name, table_id);
         self.tablet_ids_by_raft_group
             .insert(raft_group_id, tablet_id);
-        self.tablet_ids_by_partition
-            .insert((table_id, 0), tablet_id);
         self.tablets.insert(tablet_id, tablet);
         self.desired_placements.insert(tablet_id, placement);
 
@@ -944,44 +1169,62 @@ impl MetadataState {
             }
         };
 
-        let (bucket, bucket_count) = match &tablet.partition {
+        match &tablet.partition {
             PartitionSpec::Hash {
                 bucket,
                 bucket_count,
-            } => (*bucket, *bucket_count),
-        };
+            } => {
+                if *bucket_count != table.tablet_count {
+                    return MetadataApplyOutcome::Rejected(
+                        MetadataRejection::PartitionCountMismatch {
+                            table_id: tablet.table_id,
+                            expected: table.tablet_count,
+                            received: *bucket_count,
+                        },
+                    );
+                }
 
-        if bucket_count != table.tablet_count {
-            return MetadataApplyOutcome::Rejected(MetadataRejection::PartitionCountMismatch {
-                table_id: tablet.table_id,
-                expected: table.tablet_count,
-                received: bucket_count,
-            });
-        }
+                if self
+                    .tablet_ids_by_partition
+                    .contains_key(&(tablet.table_id, *bucket))
+                {
+                    return MetadataApplyOutcome::Rejected(MetadataRejection::PartitionConflict {
+                        table_id: tablet.table_id,
+                        bucket: *bucket,
+                    });
+                }
 
-        if self
-            .tablet_ids_by_partition
-            .contains_key(&(tablet.table_id, bucket))
-        {
-            return MetadataApplyOutcome::Rejected(MetadataRejection::PartitionConflict {
-                table_id: tablet.table_id,
-                bucket,
-            });
-        }
-
-        let existing_count = self
-            .tablets
-            .values()
-            .filter(|existing| existing.table_id == tablet.table_id)
-            .count();
-
-        let limit = table.tablet_count as usize;
-
-        if existing_count >= limit {
-            return MetadataApplyOutcome::Rejected(MetadataRejection::TabletCountExceeded {
-                table_id: tablet.table_id,
-                limit: table.tablet_count,
-            });
+                let existing_count = self
+                    .tablets
+                    .values()
+                    .filter(|existing| existing.table_id == tablet.table_id)
+                    .count();
+                if existing_count >= table.tablet_count as usize {
+                    return MetadataApplyOutcome::Rejected(
+                        MetadataRejection::TabletCountExceeded {
+                            table_id: tablet.table_id,
+                            limit: table.tablet_count,
+                        },
+                    );
+                }
+            }
+            PartitionSpec::Range { start_key, end_key } => {
+                let overlaps = self.tablets.values().filter(|existing| {
+                    existing.table_id == tablet.table_id
+                        && match &existing.partition {
+                            PartitionSpec::Range {
+                                start_key: existing_start,
+                                end_key: existing_end,
+                            } => ranges_overlap(start_key, end_key, existing_start, existing_end),
+                            PartitionSpec::Hash { .. } => false,
+                        }
+                });
+                if overlaps.count() != 0 {
+                    return MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(
+                        "tablet key range overlaps an existing range".to_string(),
+                    ));
+                }
+            }
         }
 
         let tablet_id = tablet.tablet_id;
@@ -991,8 +1234,10 @@ impl MetadataState {
         self.tablet_ids_by_raft_group
             .insert(raft_group_id, tablet_id);
 
-        self.tablet_ids_by_partition
-            .insert((table_id, bucket), tablet_id);
+        if let PartitionSpec::Hash { bucket, .. } = &tablet.partition {
+            self.tablet_ids_by_partition
+                .insert((table_id, *bucket), tablet_id);
+        }
 
         self.tablets.insert(tablet_id, tablet);
 
@@ -1021,10 +1266,29 @@ impl MetadataState {
         };
 
         for replica in &placement.replicas {
-            if !self.nodes.contains_key(&replica.node_id) {
+            let Some(node) = self.nodes.get(&replica.node_id) else {
                 return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownNode(
                     replica.node_id,
                 ));
+            };
+
+            if node.lifecycle != NodeLifecycle::Active {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::NodeNotEligible {
+                    node_id: replica.node_id,
+                    lifecycle: node_lifecycle_name(node.lifecycle),
+                });
+            }
+
+            if let Some(required) = placement.placement_policy.required_storage_class.as_ref()
+                && &node.storage_class != required
+            {
+                return MetadataApplyOutcome::Rejected(
+                    MetadataRejection::PlacementStorageClassMismatch {
+                        node_id: replica.node_id,
+                        required: required.clone(),
+                        received: node.storage_class.clone(),
+                    },
+                );
             }
 
             if self
@@ -1035,6 +1299,64 @@ impl MetadataState {
                     raft_group_id: tablet.raft_group_id,
                     replica_id: replica.replica_id,
                 });
+            }
+        }
+
+        for preferred_node_id in &placement.placement_policy.preferred_leader_nodes {
+            let Some(node) = self.nodes.get(preferred_node_id) else {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownNode(
+                    *preferred_node_id,
+                ));
+            };
+
+            if node.lifecycle != NodeLifecycle::Active {
+                return MetadataApplyOutcome::Rejected(MetadataRejection::NodeNotEligible {
+                    node_id: *preferred_node_id,
+                    lifecycle: node_lifecycle_name(node.lifecycle),
+                });
+            }
+        }
+
+        for (domain, required, observed) in [
+            (
+                "regions",
+                placement.placement_policy.min_distinct_regions,
+                placement
+                    .replicas
+                    .iter()
+                    .filter_map(|replica| self.nodes[&replica.node_id].region.as_deref())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            ),
+            (
+                "zones",
+                placement.placement_policy.min_distinct_zones,
+                placement
+                    .replicas
+                    .iter()
+                    .filter_map(|replica| self.nodes[&replica.node_id].zone.as_deref())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            ),
+            (
+                "racks",
+                placement.placement_policy.min_distinct_racks,
+                placement
+                    .replicas
+                    .iter()
+                    .filter_map(|replica| self.nodes[&replica.node_id].rack.as_deref())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            ),
+        ] {
+            if required > 0 && observed < required as usize {
+                return MetadataApplyOutcome::Rejected(
+                    MetadataRejection::PlacementDomainUnsatisfied {
+                        domain,
+                        required,
+                        observed,
+                    },
+                );
             }
         }
 
@@ -1252,6 +1574,21 @@ impl MetadataState {
     }
 }
 
+/// Return whether two half-open ranges overlap. Empty starts/ends represent
+/// negative/positive infinity respectively, matching the metadata wire model.
+fn ranges_overlap(
+    left_start: &[u8],
+    left_end: &[u8],
+    right_start: &[u8],
+    right_end: &[u8],
+) -> bool {
+    let left_before_right =
+        !left_end.is_empty() && !right_start.is_empty() && left_end <= right_start;
+    let right_before_left =
+        !right_end.is_empty() && !left_start.is_empty() && right_end <= left_start;
+    !(left_before_right || right_before_left)
+}
+
 impl Catalog for MetadataState {
     fn table_by_name(&self, name: &str) -> Option<Arc<TableSchema>> {
         let table_id = self.table_ids_by_name.get(name)?;
@@ -1272,6 +1609,14 @@ fn metadata_outcome_to_cached(outcome: &MetadataApplyOutcome) -> MetadataCachedO
     match outcome {
         MetadataApplyOutcome::Applied => MetadataCachedOutcome::Applied,
         MetadataApplyOutcome::AlreadyApplied => MetadataCachedOutcome::AlreadyApplied,
+        MetadataApplyOutcome::ClientRegistered {
+            client_id,
+            session_epoch,
+        } => MetadataCachedOutcome::ClientRegistered {
+            client_id: *client_id,
+            session_epoch: *session_epoch,
+        },
+        MetadataApplyOutcome::ClientRenewed => MetadataCachedOutcome::ClientRenewed,
         MetadataApplyOutcome::TableCreated(created) => MetadataCachedOutcome::TableCreated {
             table_id: created.table_id,
             tablet_id: created.tablet_id,
@@ -1287,6 +1632,14 @@ fn metadata_outcome_from_cached(outcome: &MetadataCachedOutcome) -> MetadataAppl
     match outcome {
         MetadataCachedOutcome::Applied => MetadataApplyOutcome::Applied,
         MetadataCachedOutcome::AlreadyApplied => MetadataApplyOutcome::AlreadyApplied,
+        MetadataCachedOutcome::ClientRegistered {
+            client_id,
+            session_epoch,
+        } => MetadataApplyOutcome::ClientRegistered {
+            client_id: *client_id,
+            session_epoch: *session_epoch,
+        },
+        MetadataCachedOutcome::ClientRenewed => MetadataApplyOutcome::ClientRenewed,
         MetadataCachedOutcome::TableCreated {
             table_id,
             tablet_id,
@@ -1311,10 +1664,48 @@ fn node_endpoints(node: &NodeDescriptor) -> [&str; 4] {
     ]
 }
 
+fn same_node_directory(left: &NodeDescriptor, right: &NodeDescriptor) -> bool {
+    left.node_id == right.node_id
+        && left.raft_addr == right.raft_addr
+        && left.snapshot_addr == right.snapshot_addr
+        && left.sql_addr == right.sql_addr
+        && left.admin_addr == right.admin_addr
+        && left.region == right.region
+        && left.zone == right.zone
+        && left.rack == right.rack
+        && left.storage_class == right.storage_class
+}
+
+fn lifecycle_can_advance(from: NodeLifecycle, to: NodeLifecycle) -> bool {
+    lifecycle_rank(to) >= lifecycle_rank(from)
+}
+
+const fn lifecycle_rank(lifecycle: NodeLifecycle) -> u8 {
+    match lifecycle {
+        NodeLifecycle::Active => 0,
+        NodeLifecycle::Draining => 1,
+        NodeLifecycle::Decommissioning => 2,
+        NodeLifecycle::Decommissioned => 3,
+        NodeLifecycle::Tombstoned => 4,
+    }
+}
+
+fn node_lifecycle_name(lifecycle: NodeLifecycle) -> &'static str {
+    match lifecycle {
+        NodeLifecycle::Active => "active",
+        NodeLifecycle::Draining => "draining",
+        NodeLifecycle::Decommissioning => "decommissioning",
+        NodeLifecycle::Decommissioned => "decommissioned",
+        NodeLifecycle::Tombstoned => "tombstoned",
+    }
+}
+
 fn apply_snapshot_command(state: &mut MetadataState, command: MetadataCommand) -> Result<()> {
     match state.apply(command) {
         MetadataApplyOutcome::Applied
         | MetadataApplyOutcome::AlreadyApplied
+        | MetadataApplyOutcome::ClientRegistered { .. }
+        | MetadataApplyOutcome::ClientRenewed
         | MetadataApplyOutcome::TableCreated(_) => Ok(()),
 
         MetadataApplyOutcome::Rejected(rejection) => Err(Error::CorruptData(format!(

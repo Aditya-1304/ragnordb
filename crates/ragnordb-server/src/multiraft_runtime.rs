@@ -87,7 +87,7 @@ const METADATA_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 const METADATA_REQUEST_BUDGET: usize = 64;
 
 enum MetadataHostRequest {
-    CreateTable {
+    Command {
         envelope: MetadataCommandEnvelope,
         reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
         deadline: Instant,
@@ -190,13 +190,20 @@ impl TabletLifecycleManager {
                     identity
                 ))
             })?;
-            let snapshot_frontier = snapshot_frontier.or(existing.snapshot_frontier);
-            let apply_frontier = apply_frontier.or(existing.apply_frontier);
-            if existing.snapshot_frontier != snapshot_frontier
-                || existing.apply_frontier != apply_frontier
-            {
-                self.registry
-                    .update_frontiers(key, snapshot_frontier, apply_frontier)?;
+            // Applied indexes advance on every Raft entry. Persisting that
+            // diagnostic frontier on every host turn rewrites and fsyncs the
+            // complete registry JSON in the steady state. Snapshot creation
+            // is the coarse durability checkpoint: retain the last applied
+            // frontier in the registry only when a newer durable snapshot
+            // boundary is observed.
+            let snapshot_checkpoint =
+                snapshot_frontier.filter(|frontier| existing.snapshot_frontier != Some(*frontier));
+            if snapshot_checkpoint.is_some() {
+                self.registry.update_frontiers(
+                    key,
+                    snapshot_checkpoint,
+                    apply_frontier.or(existing.apply_frontier),
+                )?;
             }
             if status.last_log_index > 0 || status.applied_index > 0 {
                 self.registry.mark_active(key)?;
@@ -783,11 +790,12 @@ impl MetadataProposalClient {
                     Err(Error::ConstraintViolation(rejection.to_string()))
                 }
 
-                MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => {
-                    Err(Error::CorruptData(
-                        "metadata CREATE TABLE apply did not return allocated topology".to_string(),
-                    ))
-                }
+                MetadataApplyOutcome::Applied
+                | MetadataApplyOutcome::AlreadyApplied
+                | MetadataApplyOutcome::ClientRegistered { .. }
+                | MetadataApplyOutcome::ClientRenewed => Err(Error::CorruptData(
+                    "metadata CREATE TABLE apply did not return allocated topology".to_string(),
+                )),
 
                 MetadataApplyOutcome::TableCreated(_) => unreachable!(),
             };
@@ -818,12 +826,10 @@ impl MetadataProposalClient {
         }
 
         let tablets = state.tablets_for_table(created.table_id);
-        if tablets.len() != table.tablet_count as usize {
+        if tablets.is_empty() {
             return Err(Error::CorruptData(format!(
-                "metadata table {} declares {} tablets but state exposes {} descriptors",
+                "metadata table {} exposes no tablet descriptors",
                 created.table_id.0,
-                table.tablet_count,
-                tablets.len()
             )));
         }
 
@@ -848,7 +854,20 @@ impl MetadataProposalClient {
         request_id: RequestId,
         timeout: Duration,
     ) -> Result<MetadataTableTopology> {
-        let command = MetadataCommand::CreateTableTopology(request);
+        self.propose_metadata_command(
+            MetadataCommand::CreateTableTopology(request),
+            request_id,
+            timeout,
+        )
+        .and_then(|outcome| self.table_topology_for_outcome(outcome))
+    }
+
+    fn propose_metadata_command(
+        &self,
+        command: MetadataCommand,
+        request_id: RequestId,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
         let envelope = MetadataCommandEnvelope::new(request_id.clone(), command)
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let deadline = Instant::now()
@@ -857,7 +876,7 @@ impl MetadataProposalClient {
         let (reply, response) = mpsc::channel();
 
         self.requests
-            .try_send(MetadataHostRequest::CreateTable {
+            .try_send(MetadataHostRequest::Command {
                 envelope,
                 reply,
                 deadline,
@@ -876,14 +895,14 @@ impl MetadataProposalClient {
             .recv_timeout(remaining)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => Error::ProposalUnavailable {
-                    reason: "metadata CREATE TABLE deadline elapsed before apply".to_string(),
+                    reason: "metadata proposal deadline elapsed before apply".to_string(),
                 },
                 mpsc::RecvTimeoutError::Disconnected => Error::ProposalUnavailable {
-                    reason: "metadata Raft host stopped before CREATE TABLE applied".to_string(),
+                    reason: "metadata Raft host stopped before proposal applied".to_string(),
                 },
             })??;
 
-        self.table_topology_for_outcome(outcome)
+        Ok(outcome)
     }
 }
 
@@ -903,20 +922,18 @@ impl MetadataTableCreator for MetadataProposalClient {
         table_id: ragnordb_common::ids::TableId,
     ) -> Result<Vec<TabletDescriptor>> {
         let state = self.metadata.state_snapshot();
-        let table = state.table(table_id).ok_or_else(|| {
-            Error::CorruptData(format!(
+        if state.table(table_id).is_none() {
+            return Err(Error::CorruptData(format!(
                 "metadata table {} is missing from the committed state",
                 table_id.0
-            ))
-        })?;
+            )));
+        }
         let tablets = state.tablets_for_table(table_id);
 
-        if tablets.len() != table.tablet_count as usize {
+        if tablets.is_empty() {
             return Err(Error::CorruptData(format!(
-                "metadata table {} declares {} tablets but state exposes {} descriptors",
+                "metadata table {} exposes no tablet descriptors",
                 table_id.0,
-                table.tablet_count,
-                tablets.len()
             )));
         }
 
@@ -939,6 +956,76 @@ impl MetadataTableCreator for MetadataProposalClient {
         timeout: Duration,
     ) -> Result<MetadataTableTopology> {
         self.propose_create_table_topology(request, request_id, timeout)
+    }
+
+    fn register_client(
+        &self,
+        request_id: RequestId,
+        client_id: u128,
+        requested_session_epoch: u64,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let outcome = self.propose_metadata_command(
+            MetadataCommand::RegisterClient {
+                client_id,
+                requested_session_epoch,
+            },
+            request_id,
+            timeout,
+        )?;
+        match outcome {
+            MetadataApplyOutcome::ClientRegistered { session_epoch, .. } => Ok(session_epoch),
+            MetadataApplyOutcome::AlreadyApplied => self
+                .metadata
+                .state_snapshot()
+                .client_session(client_id)
+                .map(|session| session.session_epoch)
+                .ok_or_else(|| Error::CorruptData("registered client session disappeared".into())),
+            MetadataApplyOutcome::Rejected(rejection) => {
+                Err(Error::ConstraintViolation(rejection.to_string()))
+            }
+            other => Err(Error::CorruptData(format!(
+                "metadata client registration returned unexpected outcome {other:?}"
+            ))),
+        }
+    }
+
+    fn renew_client(
+        &self,
+        request_id: RequestId,
+        client_id: u128,
+        session_epoch: u64,
+        acknowledged_through: u64,
+        timeout: Duration,
+    ) -> Result<()> {
+        let outcome = self.propose_metadata_command(
+            MetadataCommand::RenewClient {
+                client_id,
+                session_epoch,
+                acknowledged_through,
+            },
+            request_id,
+            timeout,
+        )?;
+        match outcome {
+            MetadataApplyOutcome::Applied
+            | MetadataApplyOutcome::AlreadyApplied
+            | MetadataApplyOutcome::ClientRenewed => Ok(()),
+            MetadataApplyOutcome::Rejected(rejection) => {
+                Err(Error::ConstraintViolation(rejection.to_string()))
+            }
+            other => Err(Error::CorruptData(format!(
+                "metadata client renewal returned unexpected outcome {other:?}"
+            ))),
+        }
+    }
+
+    fn active_client_session_epoch(&self, client_id: u128) -> Result<Option<u64>> {
+        Ok(self
+            .metadata
+            .state_snapshot()
+            .client_session(client_id)
+            .map(|session| session.session_epoch))
     }
 
     fn list_tables(&self) -> Vec<ragnordb_common::catalog_codec::TableDefinition> {
@@ -1791,7 +1878,7 @@ where
         serviced += 1;
 
         match request {
-            MetadataHostRequest::CreateTable {
+            MetadataHostRequest::Command {
                 envelope,
                 reply,
                 deadline,
@@ -2034,7 +2121,10 @@ mod tests {
 
     use ragnordb_common::{
         ids::{NodeId, RaftGroupId, ReplicaId, TableId, TabletId},
-        metadata_codec::{DesiredReplica, DesiredReplicaPlacement, NodeDescriptor, PartitionSpec},
+        metadata_codec::{
+            DesiredReplica, DesiredReplicaPlacement, NodeDescriptor, NodeLifecycle, PartitionSpec,
+            PlacementPolicy,
+        },
     };
 
     fn node(id: u64) -> NodeDescriptor {
@@ -2044,6 +2134,11 @@ mod tests {
             snapshot_addr: format!("127.0.0.1:{}", 7050 + id),
             sql_addr: format!("127.0.0.1:{}", 7100 + id),
             admin_addr: format!("127.0.0.1:{}", 7200 + id),
+            region: None,
+            zone: None,
+            rack: None,
+            storage_class: "default".to_string(),
+            lifecycle: NodeLifecycle::Active,
         }
     }
 
@@ -2078,6 +2173,7 @@ mod tests {
         let placement = DesiredReplicaPlacement {
             tablet_id: descriptor.tablet_id,
             configuration_epoch: 4,
+            placement_policy: PlacementPolicy::for_replica_count(1),
             replicas: vec![
                 DesiredReplica {
                     replica_id: ReplicaId(1),
@@ -2123,6 +2219,7 @@ mod tests {
         let requested_placement = DesiredReplicaPlacement {
             tablet_id: descriptor.tablet_id,
             configuration_epoch: 4,
+            placement_policy: PlacementPolicy::for_replica_count(1),
             replicas: vec![DesiredReplica {
                 replica_id: ReplicaId(1),
                 node_id: NodeId(3),

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ragnordb_common::{
     Error, Result,
     ids::{RaftGroupId, ReplicaId},
-    metadata_codec::NodeDescriptor,
+    metadata_codec::{NodeDescriptor, NodeLifecycle},
     raft_bootstrap::RaftGroupBootstrap,
 };
 
@@ -284,6 +284,11 @@ fn node_descriptor(seed: &SeedNodeConfig) -> NodeDescriptor {
         snapshot_addr: seed.snapshot_addr.to_string(),
         sql_addr: seed.sql_addr.to_string(),
         admin_addr: seed.admin_addr.to_string(),
+        region: None,
+        zone: None,
+        rack: None,
+        storage_class: "default".to_string(),
+        lifecycle: NodeLifecycle::Active,
     }
 }
 

@@ -38,9 +38,15 @@ use ragnordb_common::{
     catalog_codec::DataType,
     catalog_codec::TableDefinition,
     codec::{Row, Value, WriteKind},
-    command_codec::{SingleShardCommitCommand, TabletCommand, WriteEntry},
+    command_codec::{
+        CachedTabletCommandOutcome, CachedTabletCommandRejectionKind, SingleShardCommitCommand,
+        TabletCommand, WriteEntry,
+    },
     encoding::{decode_row, encode_row},
-    ids::{ColumnId, RaftGroupId, RequestId, RowKey, TableId, TabletId, Timestamp},
+    ids::{
+        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, RaftGroupId, RequestId, RowKey,
+        TableId, TabletId, Timestamp,
+    },
     metadata_codec::{CreateTableRequest, MetadataCommandCodecError, TabletDescriptor},
     proto::snapshot as snapshot_proto,
     rpc_codec::TabletRoute,
@@ -90,6 +96,43 @@ pub trait MetadataTableCreator: Send + Sync {
         request_id: ragnordb_common::ids::RequestId,
         timeout: Duration,
     ) -> Result<ragnordb_common::catalog_codec::TableDefinition>;
+
+    /// Register one durable retry session in metadata control state. The
+    /// request identity is separate from SQL table allocation so reconnects
+    /// cannot silently invent an executable old session epoch.
+    fn register_client(
+        &self,
+        _request_id: ragnordb_common::ids::RequestId,
+        _client_id: u128,
+        _requested_session_epoch: u64,
+        _timeout: Duration,
+    ) -> Result<u64> {
+        Err(Error::NotImplemented(
+            "metadata-backed client registration is unavailable",
+        ))
+    }
+
+    /// Renew a registered retry session and advance its durable acknowledgement
+    /// floor without allowing that floor to regress.
+    fn renew_client(
+        &self,
+        _request_id: ragnordb_common::ids::RequestId,
+        _client_id: u128,
+        _session_epoch: u64,
+        _acknowledged_through: u64,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "metadata-backed client renewal is unavailable",
+        ))
+    }
+
+    /// Read the committed session epoch used to fence stale connections. A
+    /// missing session is distinct from an expired epoch so a caller can
+    /// choose registration or fail closed explicitly.
+    fn active_client_session_epoch(&self, _client_id: u128) -> Result<Option<u64>> {
+        Ok(None)
+    }
 
     /// Return the committed tablet descriptors for one metadata-owned table.
     ///
@@ -158,6 +201,52 @@ pub trait TabletGateway: Send + Sync {
         command: TabletCommand,
         timeout: Duration,
     ) -> Result<TabletCommandApplyOutcome>;
+
+    /// Submit a command with its topology-independent V2 identity. The
+    /// default keeps compatibility gateways source-compatible while ensuring
+    /// new gateways can carry the identity through every retry hop.
+    fn submit_command_with_identity(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        let _ = logical_command_id;
+        self.submit_command(route, request_id, command, timeout)
+    }
+
+    /// Submit a V2 command together with the durable acknowledgement floor
+    /// observed by the client. Compatibility gateways may ignore the optional
+    /// watermark, but the production gateway persists it with the command.
+    fn submit_command_with_identity_and_ack(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        acknowledged_through: Option<u64>,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<TabletCommandApplyOutcome> {
+        let _ = acknowledged_through;
+        self.submit_command_with_identity(route, request_id, logical_command_id, command, timeout)
+    }
+
+    /// Resolve an indeterminate mutation by its stable logical identity. A
+    /// missing outcome must remain unknown; implementations must not convert
+    /// that result into permission to execute a fresh command.
+    fn query_original_outcome(
+        &self,
+        _route: &TabletRoute,
+        _request_id: RequestId,
+        _logical_command_id: LogicalCommandId,
+        _timeout: Duration,
+    ) -> Result<Option<CachedTabletCommandOutcome>> {
+        Err(Error::NotImplemented(
+            "tablet logical outcome lookup is unavailable",
+        ))
+    }
 }
 
 /// Shared server-provided gateway used by metadata-backed SQL tables.
@@ -173,29 +262,91 @@ pub type SharedTabletGateway = Arc<dyn TabletGateway>;
 #[derive(Debug, Clone)]
 pub struct TabletRequestContext {
     client_id: u128,
+    session_epoch: u64,
     next_read_sequence: u64,
     next_command_sequence: u64,
+    acknowledged_through: Option<u64>,
     timeout: Duration,
 }
 
 impl TabletRequestContext {
     pub fn new(client_id: u128) -> Result<Self> {
+        Self::new_with_session_epoch(client_id, 1)
+    }
+
+    pub fn new_with_session_epoch(client_id: u128, session_epoch: u64) -> Result<Self> {
         if client_id == 0 {
             return Err(Error::InvalidArgument(
                 "tablet request client ID 0 is reserved".to_string(),
             ));
         }
+        if session_epoch == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet request session epoch 0 is reserved".to_string(),
+            ));
+        }
 
         Ok(Self {
             client_id,
+            session_epoch,
             next_read_sequence: 1,
             next_command_sequence: 1,
+            acknowledged_through: None,
             timeout: Duration::from_secs(30),
         })
     }
 
     pub fn client_id(&self) -> u128 {
         self.client_id
+    }
+
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    pub fn acknowledged_through(&self) -> Option<u64> {
+        self.acknowledged_through
+    }
+
+    pub fn reset_for_root_request(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+    ) -> Result<()> {
+        self.reset_for_root_request_with_ack(client_id, session_epoch, request_sequence, None)
+    }
+
+    pub fn reset_for_root_request_with_ack(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+        acknowledged_through: Option<u64>,
+    ) -> Result<()> {
+        let mut context = Self::new_with_session_epoch(client_id, session_epoch)?;
+        if request_sequence == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet root request sequence 0 is reserved".to_string(),
+            ));
+        }
+        context.next_read_sequence = request_sequence;
+        context.next_command_sequence = request_sequence;
+        context.acknowledged_through = acknowledged_through;
+        *self = context;
+        Ok(())
+    }
+
+    fn logical_command_id(&self, request_id: &RequestId, kind: CommandKind) -> LogicalCommandId {
+        LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: self.client_id,
+                session_epoch: self.session_epoch,
+                request_sequence: request_id.sequence,
+            },
+            command_ordinal: 1,
+            kind,
+        }
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) {
@@ -1067,8 +1218,46 @@ impl LocalExecutor {
             writes,
         });
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
-        let outcome =
-            gateway.submit_command(&route, request_id, command, request_context.timeout())?;
+        let logical_command_id =
+            request_context.logical_command_id(&request_id, CommandKind::SingleShardCommit);
+        let outcome = match gateway.submit_command_with_identity_and_ack(
+            &route,
+            request_id.clone(),
+            logical_command_id,
+            request_context.acknowledged_through(),
+            command,
+            request_context.timeout(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error @ Error::RequestOutcomeUnknown { .. }) => {
+                match gateway.query_original_outcome(
+                    &route,
+                    request_id,
+                    logical_command_id,
+                    request_context.timeout(),
+                )? {
+                    Some(CachedTabletCommandOutcome::Applied(result)) => {
+                        TabletCommandApplyOutcome {
+                            result: result.into(),
+                            deduplicated: true,
+                        }
+                    }
+                    Some(CachedTabletCommandOutcome::Rejected(rejection)) => {
+                        return Err(match rejection.kind {
+                            CachedTabletCommandRejectionKind::WriteConflict => {
+                                Error::WriteConflict(rejection.reason)
+                            }
+                            CachedTabletCommandRejectionKind::InvalidCommand
+                            | CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                                Error::InvalidArgument(rejection.reason)
+                            }
+                        });
+                    }
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if !matches!(
             outcome.result,
             ragnordb_tablet::command::TabletCommandApplyResult::SingleShardCommit
@@ -1518,12 +1707,10 @@ impl LocalExecutor {
             )));
         }
 
-        if descriptors.len() != definition.tablet_count as usize {
+        if descriptors.is_empty() {
             return Err(Error::CorruptData(format!(
-                "metadata table {} declares {} tablets but returned {} descriptors",
+                "metadata table {} returned no tablet descriptors",
                 definition.table_id,
-                definition.tablet_count,
-                descriptors.len()
             )));
         }
 
@@ -1533,15 +1720,6 @@ impl LocalExecutor {
                 definition.table_id, error
             ))
         })?;
-
-        if router.tablet_count() != definition.tablet_count {
-            return Err(Error::CorruptData(format!(
-                "metadata table {} routing map declares {} buckets, expected {}",
-                definition.table_id,
-                router.tablet_count(),
-                definition.tablet_count
-            )));
-        }
 
         Ok(router)
     }

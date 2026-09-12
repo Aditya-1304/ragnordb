@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::command_codec::TabletCommand;
-use crate::ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp};
+use crate::ids::{
+    LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp,
+};
 use crate::proto::rpc;
 
 /// A logical inter-node message on the multiplexed TCP transport.
@@ -18,6 +20,7 @@ use crate::proto::rpc;
 ///   0x04 — MetadataRequest
 ///   0x05 — MetadataResponse
 ///   0x06 — TabletReadRequest
+///   0x07 — TabletOutcomeQueryRequest
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
@@ -33,6 +36,7 @@ pub enum MessageType {
     MetadataRequest,
     MetadataResponse,
     TabletReadRequest,
+    TabletOutcomeQueryRequest,
 }
 
 impl MessageType {
@@ -48,6 +52,7 @@ impl MessageType {
             Self::MetadataRequest => 0x04,
             Self::MetadataResponse => 0x05,
             Self::TabletReadRequest => 0x06,
+            Self::TabletOutcomeQueryRequest => 0x07,
         }
     }
 
@@ -59,6 +64,7 @@ impl MessageType {
             0x04 => Ok(Self::MetadataRequest),
             0x05 => Ok(Self::MetadataResponse),
             0x06 => Ok(Self::TabletReadRequest),
+            0x07 => Ok(Self::TabletOutcomeQueryRequest),
             _ => Err("unknown RPC message type"),
         }
     }
@@ -71,6 +77,7 @@ impl MessageType {
             MessageType::MetadataRequest => rpc::MessageType::MetadataRequest,
             MessageType::MetadataResponse => rpc::MessageType::MetadataResponse,
             MessageType::TabletReadRequest => rpc::MessageType::TabletReadRequest,
+            MessageType::TabletOutcomeQueryRequest => rpc::MessageType::TabletOutcomeQueryRequest,
         }
     }
 
@@ -82,6 +89,9 @@ impl MessageType {
             rpc::MessageType::MetadataRequest => Ok(MessageType::MetadataRequest),
             rpc::MessageType::MetadataResponse => Ok(MessageType::MetadataResponse),
             rpc::MessageType::TabletReadRequest => Ok(MessageType::TabletReadRequest),
+            rpc::MessageType::TabletOutcomeQueryRequest => {
+                Ok(MessageType::TabletOutcomeQueryRequest)
+            }
             rpc::MessageType::Unspecified => Err("unspecified message type"),
         }
     }
@@ -125,6 +135,8 @@ impl RpcFrame {
 /// it includes the RequestId for idempotent retry deduplication
 pub struct TabletCommandRequest {
     pub request_id: RequestId,
+    pub logical_command_id: Option<LogicalCommandId>,
+    pub acknowledged_through: Option<u64>,
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
     pub command: TabletCommand,
@@ -134,6 +146,8 @@ impl TabletCommandRequest {
     pub fn to_proto(&self) -> Result<rpc::TabletCommandRequest, &'static str> {
         Ok(rpc::TabletCommandRequest {
             request_id: Some(self.request_id.to_proto()),
+            logical_command_id: self.logical_command_id.map(|id| id.to_proto()),
+            acknowledged_through: self.acknowledged_through,
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
             command: Some(self.command.to_proto()?),
@@ -154,9 +168,62 @@ impl TabletCommandRequest {
 
         Ok(TabletCommandRequest {
             request_id,
+            logical_command_id: proto
+                .logical_command_id
+                .map(LogicalCommandId::from_proto)
+                .transpose()?,
+            acknowledged_through: proto.acknowledged_through,
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
             command: TabletCommand::from_proto(proto.command.ok_or("missing command")?)?,
+        })
+    }
+}
+
+/// Read-only query for the durable result of a topology-independent mutation.
+/// The request ID is transport correlation only; the logical command ID is the
+/// identity whose outcome is being inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletOutcomeQueryRequest {
+    pub request_id: RequestId,
+    pub logical_command_id: LogicalCommandId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+}
+
+impl TabletOutcomeQueryRequest {
+    pub fn to_proto(&self) -> rpc::TabletOutcomeQueryRequest {
+        rpc::TabletOutcomeQueryRequest {
+            request_id: Some(self.request_id.to_proto()),
+            logical_command_id: Some(self.logical_command_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletOutcomeQueryRequest) -> Result<Self, &'static str> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+        let logical_command_id = LogicalCommandId::from_proto(
+            proto
+                .logical_command_id
+                .ok_or("missing logical_command_id")?,
+        )?;
+        let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+        if request_id.client_id == 0
+            || request_id.sequence == 0
+            || request_id.raft_group_id.0 == 0
+            || tablet_id.0 == 0
+            || proto.tablet_epoch == 0
+        {
+            return Err("tablet outcome query contains a reserved zero identity");
+        }
+        logical_command_id.validate()?;
+
+        Ok(Self {
+            request_id,
+            logical_command_id,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
         })
     }
 }
@@ -170,6 +237,7 @@ impl TabletCommandRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletReadRequest {
     pub request_id: RequestId,
+    pub logical_command_id: Option<LogicalCommandId>,
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
     pub row_key: crate::ids::RowKey,
@@ -180,6 +248,7 @@ impl TabletReadRequest {
     pub fn to_proto(&self) -> rpc::TabletReadRequest {
         rpc::TabletReadRequest {
             request_id: Some(self.request_id.to_proto()),
+            logical_command_id: self.logical_command_id.map(|id| id.to_proto()),
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
             row_key: Some(self.row_key.to_proto()),
@@ -209,6 +278,10 @@ impl TabletReadRequest {
 
         Ok(Self {
             request_id,
+            logical_command_id: proto
+                .logical_command_id
+                .map(LogicalCommandId::from_proto)
+                .transpose()?,
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
             row_key,
@@ -235,6 +308,8 @@ pub struct TabletCommandResponse {
     pub result_data: Vec<u8>,
     pub found: bool,
     pub leader_replica_id: Option<ReplicaId>,
+    pub current_tablet_epoch: Option<u64>,
+    pub expected_tablet_epoch: Option<u64>,
 }
 
 impl TabletCommandResponse {
@@ -248,6 +323,8 @@ impl TabletCommandResponse {
             result_data: self.result_data.clone(),
             found: self.found,
             leader_replica_id: self.leader_replica_id.map(|id| id.0).unwrap_or(0),
+            current_tablet_epoch: self.current_tablet_epoch.unwrap_or(0),
+            expected_tablet_epoch: self.expected_tablet_epoch.unwrap_or(0),
         }
     }
 
@@ -262,6 +339,10 @@ impl TabletCommandResponse {
             found: proto.found,
             leader_replica_id: (proto.leader_replica_id != 0)
                 .then_some(ReplicaId(proto.leader_replica_id)),
+            current_tablet_epoch: (proto.current_tablet_epoch != 0)
+                .then_some(proto.current_tablet_epoch),
+            expected_tablet_epoch: (proto.expected_tablet_epoch != 0)
+                .then_some(proto.expected_tablet_epoch),
         })
     }
 }
@@ -737,6 +818,8 @@ mod tests {
                 sequence: 1,
                 raft_group_id: RaftGroupId(5),
             },
+            logical_command_id: None,
+            acknowledged_through: None,
             tablet_id: TabletId(9),
             tablet_epoch: 3,
             command: TabletCommand::Commit(CommitCommand {
@@ -755,6 +838,32 @@ mod tests {
     }
 
     #[test]
+    fn tablet_outcome_query_roundtrip_preserves_logical_identity() {
+        let logical_command_id = crate::ids::LogicalCommandId {
+            client_request_id: crate::ids::ClientRequestId {
+                client_id: 77,
+                session_epoch: 4,
+                request_sequence: 9,
+            },
+            command_ordinal: 1,
+            kind: crate::ids::CommandKind::SingleShardCommit,
+        };
+        let request = TabletOutcomeQueryRequest {
+            request_id: RequestId {
+                client_id: 77,
+                sequence: 10,
+                raft_group_id: RaftGroupId(8),
+            },
+            logical_command_id,
+            tablet_id: TabletId(12),
+            tablet_epoch: 3,
+        };
+
+        let decoded = TabletOutcomeQueryRequest::from_proto(request.to_proto()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn tablet_read_request_roundtrip_preserves_generation_and_snapshot() {
         let request = TabletReadRequest {
             request_id: RequestId {
@@ -762,6 +871,7 @@ mod tests {
                 sequence: 4,
                 raft_group_id: RaftGroupId(8),
             },
+            logical_command_id: None,
             tablet_id: TabletId(12),
             tablet_epoch: 9,
             row_key: crate::ids::RowKey {
@@ -785,6 +895,8 @@ mod tests {
                 }
                 .to_proto(),
             ),
+            logical_command_id: None,
+            acknowledged_through: None,
             tablet_id: Some(TabletId(12).to_proto()),
             tablet_epoch: 0,
             command: Some(
@@ -814,6 +926,8 @@ mod tests {
             result_data: vec![10, 20, 30],
             found: true,
             leader_replica_id: Some(ReplicaId(2)),
+            current_tablet_epoch: None,
+            expected_tablet_epoch: None,
         };
         let proto = resp.to_proto();
         let decoded = TabletCommandResponse::from_proto(proto).unwrap();

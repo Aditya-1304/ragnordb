@@ -39,3 +39,31 @@ message RequestId {
     uint64 sequence = 2;
     RaftGroupId raft_group_id = 3;
 }
+
+// Stable client identity for protocol V2. The session epoch fences a client
+// restart, while request sequence remains monotonic within that epoch.
+message ClientRequestId {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 request_sequence = 3;
+}
+
+enum CommandKind {
+    COMMAND_KIND_UNSPECIFIED = 0;
+    COMMAND_KIND_READ = 1;
+    COMMAND_KIND_PREWRITE = 2;
+    COMMAND_KIND_COMMIT = 3;
+    COMMAND_KIND_ROLLBACK = 4;
+    COMMAND_KIND_RESOLVE_INTENT = 5;
+    COMMAND_KIND_SINGLE_SHARD_COMMIT = 6;
+    COMMAND_KIND_CATALOG = 7;
+    COMMAND_KIND_NOOP = 8;
+}
+
+// Topology-independent logical identity. Raft-group routing is deliberately
+// absent so a retry after a range move keeps one deduplication identity.
+message LogicalCommandId {
+    ClientRequestId client_request_id = 1;
+    uint32 command_ordinal = 2;
+    CommandKind kind = 3;
+}

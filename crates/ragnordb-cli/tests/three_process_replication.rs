@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ragnordb_common::protocol::{ClientRequestV2, encode_client_request_v2};
 use serde_json::Value;
 
 struct ProcessNode {
@@ -66,6 +67,37 @@ fn sql(address: SocketAddr, statement: &str) -> Option<Value> {
     stream.write_all(&(bytes.len() as u32).to_le_bytes()).ok()?;
     stream.write_all(bytes).ok()?;
     stream.flush().ok()?;
+    read_sql_response(&mut stream)
+}
+
+fn sql_v2(
+    address: SocketAddr,
+    client_id: u128,
+    request_sequence: u64,
+    acknowledged_through: Option<u64>,
+    statement: &str,
+) -> Option<Value> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(35)))
+        .ok()?;
+    let request = ClientRequestV2 {
+        protocol_version: 2,
+        client_id,
+        client_session_epoch: 1,
+        request_sequence,
+        acknowledged_through,
+        statement_timeout_ms: 5_000,
+        sql: statement.to_string(),
+    };
+    stream
+        .write_all(&encode_client_request_v2(&request).ok()?)
+        .ok()?;
+    stream.flush().ok()?;
+    read_sql_response(&mut stream)
+}
+
+fn read_sql_response(stream: &mut TcpStream) -> Option<Value> {
     let mut length = [0_u8; 4];
     stream.read_exact(&mut length).ok()?;
     let mut response = vec![0_u8; u32::from_le_bytes(length) as usize];
@@ -114,6 +146,67 @@ fn wait_for_metadata_table(nodes: &[ProcessNode], table_name: &str, excluded: Op
             panic!("metadata table {table_name} did not become visible; statuses={statuses:?}");
         }
 
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn send_v2_until_ok(
+    address: SocketAddr,
+    client_id: u128,
+    request_sequence: u64,
+    acknowledged_through: Option<u64>,
+    statement: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_response = None;
+    loop {
+        if let Some(response) = sql_v2(
+            address,
+            client_id,
+            request_sequence,
+            acknowledged_through,
+            statement,
+        ) {
+            if response["ok"] == true {
+                return response;
+            }
+            last_response = Some(response);
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "V2 SQL request did not succeed: statement={statement:?}, response={last_response:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_v2_rows(
+    address: SocketAddr,
+    client_id: u128,
+    request_sequence: u64,
+    acknowledged_through: Option<u64>,
+    statement: &str,
+    expected_rows: Value,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = send_v2_until_ok(
+            address,
+            client_id,
+            request_sequence,
+            acknowledged_through,
+            statement,
+        );
+        if response["rows"] == expected_rows {
+            return response;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "V2 SQL query did not observe expected rows: statement={statement:?}, response={response}"
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -171,10 +264,10 @@ fn create_metadata_table(nodes: &[ProcessNode], statement: &str) {
 /// An in-process cluster can hide missing CLI/server wiring, port binding, data
 /// directory recovery, and process-lifetime failures. This test crosses the
 /// public SQL and admin sockets of three OS processes, creates a metadata-owned
-/// table, stops a process, and verifies that the committed metadata projection
-/// survives both process restart and full-cluster restart. DML is intentionally
-/// not asserted here because this test focuses on process/recovery lifecycle;
-/// routed DML has dedicated Phase 5.6 coverage.
+/// table, routes V2 DML through a live process, stops a process, and verifies
+/// that both the metadata projection and committed row survive a full process
+/// restart. The in-process runtime test covers the separate non-leader gateway
+/// route; this process test additionally covers the public V2 socket boundary.
 #[test]
 fn metadata_table_creation_survives_process_restart() {
     let root = tempfile::tempdir().unwrap();
@@ -237,6 +330,40 @@ fn metadata_table_creation_survives_process_restart() {
     // cache, and observing only the leader would not prove restart safety.
     wait_for_metadata_table(&nodes, "users", Some(first_leader));
 
+    let metadata_leader = wait_for_leader(&nodes, None);
+    let client_id = 0xfeed_cafe_u128;
+
+    let insert = send_v2_until_ok(
+        nodes[metadata_leader].sql_addr,
+        client_id,
+        1,
+        None,
+        "INSERT INTO users (id, name) VALUES (7, 'alice')",
+    );
+    assert_eq!(insert["result"]["affected_rows"], 1);
+
+    let update = send_v2_until_ok(
+        nodes[metadata_leader].sql_addr,
+        client_id,
+        2,
+        Some(1),
+        "UPDATE users SET name = 'bob' WHERE id = 7",
+    );
+    assert_eq!(update["result"]["affected_rows"], 1);
+
+    let before_restart = send_v2_until_ok(
+        nodes[metadata_leader].sql_addr,
+        client_id,
+        3,
+        Some(2),
+        "SELECT id, name FROM users WHERE id = 7",
+    );
+    assert_eq!(
+        before_restart["rows"],
+        serde_json::json!([[7, "bob"]]),
+        "routed V2 read before restart: {before_restart}"
+    );
+
     // The metadata command has committed and applied on the initial quorum.
     // Stopping the legacy tablet leader must not remove metadata already
     // replicated to the surviving nodes.
@@ -256,4 +383,18 @@ fn metadata_table_creation_survives_process_restart() {
     }
     let recovered_leader = wait_for_leader(&nodes, None);
     wait_for_metadata_table(&nodes, "users", Some(recovered_leader));
+
+    let after_restart = wait_for_v2_rows(
+        nodes[recovered_leader].sql_addr,
+        client_id,
+        4,
+        Some(3),
+        "SELECT id, name FROM users WHERE id = 7",
+        serde_json::json!([[7, "bob"]]),
+    );
+    assert_eq!(
+        after_restart["rows"],
+        serde_json::json!([[7, "bob"]]),
+        "routed V2 read after restart: {after_restart}"
+    );
 }

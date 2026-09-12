@@ -6,7 +6,8 @@ use ragnordb_common::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         LEGACY_METADATA_SNAPSHOT_VERSION, METADATA_SNAPSHOT_VERSION, MetadataAllocatorState,
         MetadataCommand, MetadataCommandCodecError, MetadataCommandEnvelope, MetadataSnapshot,
-        NodeDescriptor, PartitionSpec, RetiredReplicaLifetime, TabletDescriptor,
+        NodeDescriptor, NodeLifecycle, PartitionSpec, PlacementPolicy, RetiredReplicaLifetime,
+        TabletDescriptor,
     },
 };
 
@@ -40,6 +41,11 @@ fn node(node_id: u64, base_port: u16) -> NodeDescriptor {
         sql_addr: format!("127.0.0.1:{}", base_port + 100),
 
         admin_addr: format!("127.0.0.1:{}", base_port + 200),
+        region: None,
+        zone: None,
+        rack: None,
+        storage_class: "default".to_string(),
+        lifecycle: NodeLifecycle::Active,
     }
 }
 
@@ -61,6 +67,7 @@ fn placement() -> DesiredReplicaPlacement {
     DesiredReplicaPlacement {
         tablet_id: TabletId(17),
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![
             DesiredReplica {
@@ -82,6 +89,15 @@ fn metadata_v2_commands_roundtrip_every_authoritative_field() {
     let commands = vec![
         MetadataCommand::ClusterInitialized {
             cluster_id: "cluster-a".to_string(),
+        },
+        MetadataCommand::RegisterClient {
+            client_id: 11,
+            requested_session_epoch: 0,
+        },
+        MetadataCommand::RenewClient {
+            client_id: 11,
+            session_epoch: 1,
+            acknowledged_through: 3,
         },
         MetadataCommand::RegisterNode(node(11, 7001)),
         MetadataCommand::CreateTable { table: table() },
@@ -136,6 +152,7 @@ fn desired_placement_requires_canonical_replica_order_and_a_voter() {
         tablet_id: TabletId(17),
 
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![
             DesiredReplica {
@@ -160,6 +177,7 @@ fn desired_placement_requires_canonical_replica_order_and_a_voter() {
         tablet_id: TabletId(17),
 
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(31),
@@ -262,6 +280,7 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
         },
 
         request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
     };
 
     let encoded = snapshot.encode().unwrap();
@@ -284,6 +303,7 @@ fn metadata_snapshot_rejects_noncanonical_node_order() {
         allocator: MetadataAllocatorState::initial(),
 
         request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
     };
 
     assert_eq!(
@@ -313,6 +333,7 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
         },
 
         request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
@@ -346,6 +367,7 @@ fn current_metadata_snapshot_requires_allocator_state() {
         allocator: MetadataAllocatorState::initial(),
 
         request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
@@ -378,6 +400,7 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
         },
 
         request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
     };
 
     let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(

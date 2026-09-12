@@ -23,7 +23,8 @@ use data_directory_lock::DataDirectoryLock;
 use database::{LocalDatabase, SharedLocalDatabase};
 use multiraft_runtime::MultiRaftRuntime;
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
-use ragnordb_common::protocol::{read_frame, write_frame};
+use ragnordb_common::protocol::{ClientRequestFrame, read_client_frame, write_frame};
+use ragnordb_exec::SharedMetadataTableCreator;
 use replicated_tablet::ReplicatedTabletHandle;
 use session::Session;
 use tokio::net::TcpListener;
@@ -152,6 +153,9 @@ impl Server {
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
         let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
+        let metadata_creator = replicated_runtime
+            .as_ref()
+            .map(MultiRaftRuntime::metadata_table_creator);
         let multiraft_status = replicated_runtime
             .as_ref()
             .map(MultiRaftRuntime::host_status_handle);
@@ -226,6 +230,7 @@ impl Server {
 
                                     let connection_database = database.clone();
                                     let connection_replicated = replicated_handle.clone();
+                                    let connection_metadata_creator = metadata_creator.clone();
 
                                     let connection_shutdown = server_shutdown.clone();
 
@@ -235,6 +240,7 @@ impl Server {
                                                 stream,
                                                 connection_database,
                                                 connection_replicated,
+                                                connection_metadata_creator,
                                                 connection_shutdown,
                                                 statement_timeout_ms,
                                                 statement_logging,
@@ -378,6 +384,7 @@ pub async fn handle_connection(
         stream,
         database,
         None,
+        None,
         CancellationToken::new(),
         30_000,
         StatementLogging::MetadataOnly,
@@ -389,6 +396,7 @@ async fn handle_connection_with_policy(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
     replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
+    metadata_creator: Option<SharedMetadataTableCreator>,
     shutdown: CancellationToken,
     statement_timeout_ms: u64,
     statement_logging: StatementLogging,
@@ -399,13 +407,76 @@ async fn handle_connection_with_policy(
     session.statement_timeout_ms = statement_timeout_ms;
 
     loop {
-        let sql = tokio::select! {
+        let request_frame = tokio::select! {
             _ = shutdown.cancelled() => break,
-            frame = read_frame(&mut reader) => match frame {
-                Ok(sql) => sql,
+            frame = read_client_frame(&mut reader) => match frame {
+                Ok(frame) => frame,
                 Err(_) => break,
             },
         };
+
+        let (sql, root_request_sequence) = match request_frame {
+            ClientRequestFrame::V1(sql) => (sql, None),
+            ClientRequestFrame::V2(request) => {
+                if let Some(creator) = metadata_creator.as_ref()
+                    && let Some(active_epoch) =
+                        creator.active_client_session_epoch(request.client_id)?
+                    && active_epoch != request.client_session_epoch
+                {
+                    return Err(Box::new(ragnordb_common::Error::ClientSessionExpired {
+                        session_epoch: request.client_session_epoch,
+                    }));
+                }
+                if let Some(creator) = metadata_creator.as_ref()
+                    && !session.v2_metadata_registered()
+                {
+                    let registration_request_id = session.metadata_registration_request_id(
+                        request.client_id,
+                        request.client_session_epoch,
+                        request.request_sequence,
+                    )?;
+                    let registered_epoch = creator.register_client(
+                        registration_request_id,
+                        request.client_id,
+                        request.client_session_epoch,
+                        Duration::from_millis(request.statement_timeout_ms),
+                    )?;
+                    if registered_epoch != request.client_session_epoch {
+                        return Err(Box::new(ragnordb_common::Error::ClientSessionExpired {
+                            session_epoch: request.client_session_epoch,
+                        }));
+                    }
+                    session.mark_v2_metadata_registered();
+                }
+                if let Some(creator) = metadata_creator.as_ref()
+                    && let Some(acknowledged_through) = request.acknowledged_through
+                    && acknowledged_through > 0
+                    && session.should_renew_metadata_ack(acknowledged_through)
+                {
+                    creator.renew_client(
+                        session.metadata_renewal_request_id(
+                            request.client_id,
+                            request.client_session_epoch,
+                            acknowledged_through,
+                        )?,
+                        request.client_id,
+                        request.client_session_epoch,
+                        acknowledged_through,
+                        Duration::from_millis(request.statement_timeout_ms),
+                    )?;
+                    session.mark_metadata_acknowledged(acknowledged_through);
+                }
+                session.accept_v2_request(
+                    request.client_id,
+                    request.client_session_epoch,
+                    request.request_sequence,
+                    request.acknowledged_through,
+                    request.statement_timeout_ms,
+                )?;
+                (request.sql, Some(request.request_sequence))
+            }
+        };
+        let statement_timeout_ms = session.statement_timeout_ms;
 
         let trimmed = sql.trim().to_string();
 
@@ -414,7 +485,10 @@ async fn handle_connection_with_policy(
         // catalog path. Non-CREATE statements simply carry and ignore this
         // optional identity at the executor boundary.
         let metadata_request_id = if replicated_tablet.is_some() {
-            Some(session.next_metadata_request_id()?)
+            Some(match root_request_sequence {
+                Some(sequence) => session.metadata_request_id_for_sequence(sequence)?,
+                None => session.next_metadata_request_id()?,
+            })
         } else {
             None
         };
@@ -457,6 +531,16 @@ async fn handle_connection_with_policy(
                     let mut sql_session = std::mem::take(&mut session.sql);
                     sql_session
                         .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
+                    if let Some(root_sequence) = root_request_sequence {
+                        sql_session.set_client_request_identity_with_ack(
+                            session.client_id(),
+                            session.v2_session_epoch().ok_or(
+                                ragnordb_common::Error::ClientSessionExpired { session_epoch: 0 },
+                            )?,
+                            root_sequence,
+                            session.acknowledged_through(),
+                        )?;
+                    }
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result, status) =
@@ -623,6 +707,7 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod operational_tests {
     use super::*;
+    use ragnordb_common::protocol::{ClientRequestV2, encode_client_request_v2, read_frame};
     use tokio::io::AsyncWriteExt;
 
     /// Realistic bug caught:
@@ -644,6 +729,7 @@ mod operational_tests {
             handle_connection_with_policy(
                 stream,
                 handler_database,
+                None,
                 None,
                 CancellationToken::new(),
                 20,
@@ -670,6 +756,61 @@ mod operational_tests {
 
         drop(client);
         drop(held_database_owner);
+        server.await.unwrap();
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A V2 client envelope could be parsed successfully but silently fall
+    /// back to the legacy session path, losing the client session identity
+    /// before SQL execution. This exercises the actual TCP handler boundary.
+    #[tokio::test]
+    async fn v2_client_frame_executes_through_the_session_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = LocalDatabase::shared();
+        let handler_database = database.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_with_policy(
+                stream,
+                handler_database,
+                None,
+                None,
+                CancellationToken::new(),
+                1_000,
+                StatementLogging::Off,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 0x1234,
+            client_session_epoch: 7,
+            request_sequence: 1,
+            acknowledged_through: None,
+            statement_timeout_ms: 1_000,
+            sql: "BEGIN".to_string(),
+        };
+        client
+            .write_all(&encode_client_request_v2(&request).unwrap())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(response["ok"], true, "V2 response: {response}");
+        assert!(
+            response["result"]["transaction_id"].is_number(),
+            "V2 response: {response}"
+        );
+
+        drop(client);
         server.await.unwrap();
     }
 }

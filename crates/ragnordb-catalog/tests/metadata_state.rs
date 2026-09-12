@@ -7,7 +7,8 @@ use ragnordb_common::{
     ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
-        MetadataCommand, NodeDescriptor, PartitionSpec, TabletDescriptor,
+        MetadataCommand, NodeDescriptor, NodeLifecycle, PartitionSpec, PlacementPolicy,
+        TabletDescriptor,
     },
 };
 
@@ -64,6 +65,11 @@ fn node(id: u64, base_port: u16) -> NodeDescriptor {
         sql_addr: format!("127.0.0.1:{}", base_port + 100),
 
         admin_addr: format!("127.0.0.1:{}", base_port + 200),
+        region: None,
+        zone: None,
+        rack: None,
+        storage_class: "default".to_string(),
+        lifecycle: NodeLifecycle::Active,
     }
 }
 
@@ -167,14 +173,15 @@ fn atomic_create_table_publishes_complete_initial_topology() {
 
     assert_eq!(
         state.tablet(TabletId(2)).unwrap().partition,
-        PartitionSpec::Hash {
-            bucket: 0,
-            bucket_count: 1,
+        PartitionSpec::Range {
+            start_key: Vec::new(),
+            end_key: Vec::new(),
         }
     );
 
     let placement = state.desired_placement(TabletId(2)).unwrap();
     assert_eq!(placement.configuration_epoch, 1);
+    assert_eq!(placement.placement_policy.replication_factor, 3);
     assert_eq!(placement.replicas.len(), 3);
     assert_eq!(placement.replicas[0].node_id, NodeId(11));
     assert_eq!(placement.replicas[1].node_id, NodeId(12));
@@ -265,6 +272,85 @@ fn atomic_create_table_caps_initial_replication_at_three_nodes() {
             .iter()
             .all(|replica| replica.node_id != NodeId(40))
     );
+}
+
+/// Realistic bug caught:
+///
+/// A node must be drainable without changing its stable network identity.
+/// Treating the lifecycle transition as a registration conflict would leave
+/// metadata unable to stop new placement on a node that is being retired.
+#[test]
+fn registered_node_can_advance_lifecycle_without_changing_directory_identity() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let active = node(11, 7001);
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterNode(active.clone())),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let mut draining = active;
+    draining.lifecycle = NodeLifecycle::Draining;
+
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterNode(draining)),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        state.node(NodeId(11)).unwrap().lifecycle,
+        NodeLifecycle::Draining
+    );
+}
+
+#[test]
+fn client_retry_session_epoch_and_horizon_survive_metadata_snapshot() {
+    let mut state = MetadataState::new();
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterClient {
+            client_id: 55,
+            requested_session_epoch: 0,
+        }),
+        MetadataApplyOutcome::ClientRegistered {
+            client_id: 55,
+            session_epoch: 1,
+        },
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::RenewClient {
+            client_id: 55,
+            session_epoch: 1,
+            acknowledged_through: 3,
+        }),
+        MetadataApplyOutcome::ClientRenewed,
+    );
+    assert!(matches!(
+        state.apply(MetadataCommand::RenewClient {
+            client_id: 55,
+            session_epoch: 0,
+            acknowledged_through: 4,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(_))
+    ));
+
+    let recovered = MetadataState::from_snapshot(state.to_snapshot()).unwrap();
+    let session = recovered.client_session(55).unwrap();
+    assert_eq!(session.session_epoch, 1);
+    assert_eq!(session.acknowledged_through, 3);
+    assert_eq!(session.first_retained_sequence, 4);
 }
 
 #[test]
@@ -472,6 +558,7 @@ fn committed_metadata_replay_preserves_tablet_partition_and_desired_placement() 
         tablet_id: TabletId(17),
 
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![
             DesiredReplica {
@@ -515,6 +602,7 @@ fn stale_metadata_command_is_a_rejection_not_a_state_machine_failure() {
         tablet_id: TabletId(17),
 
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(31),
@@ -532,6 +620,7 @@ fn stale_metadata_command_is_a_rejection_not_a_state_machine_failure() {
         tablet_id: TabletId(17),
 
         configuration_epoch: 3,
+        placement_policy: PlacementPolicy::for_replica_count(1),
 
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(31),
@@ -557,6 +646,7 @@ fn desired_placement_can_revert_before_replica_removal_is_committed() {
     let initial = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
         configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(31),
             node_id: NodeId(11),
@@ -575,6 +665,7 @@ fn desired_placement_can_revert_before_replica_removal_is_committed() {
     let replacement = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
         configuration_epoch: 2,
+        placement_policy: PlacementPolicy::for_replica_count(1),
         replicas: vec![DesiredReplica {
             replica_id: ReplicaId(32),
             node_id: NodeId(12),
@@ -599,6 +690,7 @@ fn desired_placement_can_revert_before_replica_removal_is_committed() {
     let reverted = DesiredReplicaPlacement {
         tablet_id: TabletId(17),
         configuration_epoch: 3,
+        placement_policy: PlacementPolicy::for_replica_count(2),
         replicas: vec![
             DesiredReplica {
                 replica_id: ReplicaId(31),
@@ -617,6 +709,39 @@ fn desired_placement_can_revert_before_replica_removal_is_committed() {
         state.apply(MetadataCommand::SetDesiredReplicaPlacement(reverted)),
         MetadataApplyOutcome::Applied,
     );
+}
+
+#[test]
+fn draining_node_cannot_be_retained_as_a_preferred_leader() {
+    let mut state = bootstrap_state();
+    let mut draining = node(11, 7001);
+    draining.lifecycle = NodeLifecycle::Draining;
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterNode(draining)),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let placement = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 1,
+        placement_policy: PlacementPolicy {
+            preferred_leader_nodes: vec![NodeId(11)],
+            ..PlacementPolicy::for_replica_count(1)
+        },
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(31),
+            node_id: NodeId(12),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+
+    assert!(matches!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(placement)),
+        MetadataApplyOutcome::Rejected(MetadataRejection::NodeNotEligible {
+            node_id: NodeId(11),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -674,6 +799,7 @@ fn metadata_snapshot_roundtrip_preserves_replica_tombstones() {
             tablet_id: TabletId(17),
 
             configuration_epoch: 1,
+            placement_policy: PlacementPolicy::for_replica_count(1),
 
             replicas: vec![
                 DesiredReplica {
@@ -695,6 +821,7 @@ fn metadata_snapshot_roundtrip_preserves_replica_tombstones() {
             tablet_id: TabletId(17),
 
             configuration_epoch: 2,
+            placement_policy: PlacementPolicy::for_replica_count(1),
 
             replicas: vec![DesiredReplica {
                 replica_id: ReplicaId(32),

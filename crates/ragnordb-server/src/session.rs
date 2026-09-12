@@ -22,6 +22,11 @@ use ragnordb_exec::SqlSession;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_CLIENT_ID: OnceLock<u128> = OnceLock::new();
 
+/// Metadata client-session renewals are deliberately coarse-grained. Tablet
+/// commands carry the current acknowledgement floor on the data path; the
+/// metadata Raft group only needs periodic durable control-plane checkpoints.
+pub const CLIENT_SESSION_RENEWAL_BATCH: u64 = 64;
+
 fn process_client_id() -> u128 {
     *PROCESS_CLIENT_ID.get_or_init(|| {
         let clock_nanos = SystemTime::now()
@@ -59,6 +64,13 @@ pub struct Session {
     /// embedded `SqlSession` context so the two Raft-group namespaces remain
     /// independently ordered.
     next_metadata_sequence: u64,
+
+    /// V2 session identity is connection-bound after the first request. A
+    /// gateway must not silently switch epochs on an existing connection.
+    v2_identity: Option<(u128, u64)>,
+    acknowledged_through: Option<u64>,
+    metadata_acknowledged_through: u64,
+    v2_metadata_registered: bool,
 }
 
 impl Session {
@@ -83,6 +95,10 @@ impl Session {
             statement_timeout_ms: 30_000,
             client_id,
             next_metadata_sequence: 1,
+            v2_identity: None,
+            acknowledged_through: None,
+            metadata_acknowledged_through: 0,
+            v2_metadata_registered: false,
         }
     }
 
@@ -106,6 +122,115 @@ impl Session {
             sequence,
             raft_group_id: RESERVED_METADATA_RAFT_GROUP_ID,
         })
+    }
+
+    pub fn metadata_request_id_for_sequence(&mut self, sequence: u64) -> Result<RequestId> {
+        if sequence == 0 {
+            return Err(Error::InvalidArgument(
+                "metadata request sequence 0 is reserved".to_string(),
+            ));
+        }
+        self.next_metadata_sequence = self.next_metadata_sequence.max(sequence.saturating_add(1));
+        Ok(RequestId {
+            client_id: self.client_id,
+            sequence,
+            raft_group_id: RESERVED_METADATA_RAFT_GROUP_ID,
+        })
+    }
+
+    pub fn metadata_registration_request_id(
+        &self,
+        client_id: u128,
+        session_epoch: u64,
+        sequence: u64,
+    ) -> Result<RequestId> {
+        if client_id == 0 || session_epoch == 0 || sequence == 0 {
+            return Err(Error::InvalidArgument(
+                "metadata client-session identity must be non-zero".to_string(),
+            ));
+        }
+        // Keep control-plane deduplication in a namespace distinct from SQL
+        // metadata mutations that reuse the root request sequence.
+        let control_client_id = client_id
+            ^ ((session_epoch as u128) << 64)
+            ^ 0x5241_474e_4f52_434c_4945_4e54_0000_0001_u128;
+        Ok(RequestId {
+            client_id: control_client_id.max(1),
+            sequence,
+            raft_group_id: RESERVED_METADATA_RAFT_GROUP_ID,
+        })
+    }
+
+    pub fn metadata_renewal_request_id(
+        &self,
+        client_id: u128,
+        session_epoch: u64,
+        acknowledged_through: u64,
+    ) -> Result<RequestId> {
+        let mut request_id = self.metadata_registration_request_id(
+            client_id,
+            session_epoch,
+            acknowledged_through.max(1),
+        )?;
+        request_id.client_id ^= 0x2;
+        Ok(request_id)
+    }
+
+    pub fn mark_v2_metadata_registered(&mut self) {
+        self.v2_metadata_registered = true;
+    }
+
+    pub fn v2_metadata_registered(&self) -> bool {
+        self.v2_metadata_registered
+    }
+
+    pub fn v2_session_epoch(&self) -> Option<u64> {
+        self.v2_identity.map(|(_, session_epoch)| session_epoch)
+    }
+
+    pub fn acknowledged_through(&self) -> Option<u64> {
+        self.acknowledged_through
+    }
+
+    pub fn should_renew_metadata_ack(&self, acknowledged_through: u64) -> bool {
+        acknowledged_through > self.metadata_acknowledged_through
+            && acknowledged_through.saturating_sub(self.metadata_acknowledged_through)
+                >= CLIENT_SESSION_RENEWAL_BATCH
+    }
+
+    pub fn mark_metadata_acknowledged(&mut self, acknowledged_through: u64) {
+        self.metadata_acknowledged_through =
+            self.metadata_acknowledged_through.max(acknowledged_through);
+    }
+
+    pub fn accept_v2_request(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+        acknowledged_through: Option<u64>,
+        statement_timeout_ms: u64,
+    ) -> Result<()> {
+        if let Some((existing_client_id, existing_epoch)) = self.v2_identity
+            && (existing_client_id != client_id || existing_epoch != session_epoch)
+        {
+            return Err(Error::ClientSessionExpired { session_epoch });
+        }
+        if acknowledged_through.is_some_and(|acknowledged| {
+            self.acknowledged_through
+                .is_some_and(|previous| acknowledged < previous)
+        }) {
+            return Err(Error::InvalidArgument(
+                "acknowledged request floor cannot regress".to_string(),
+            ));
+        }
+        self.v2_identity = Some((client_id, session_epoch));
+        self.acknowledged_through = acknowledged_through.or(self.acknowledged_through);
+        self.client_id = client_id;
+        self.sql
+            .set_client_request_identity(client_id, session_epoch, request_sequence)?;
+        self.statement_timeout_ms = statement_timeout_ms;
+        Ok(())
     }
 
     /// Return whether standalone data statements use implicit transactions.
@@ -150,5 +275,18 @@ mod tests {
         let second = Session::new();
 
         assert_ne!(first.session_id, second.session_id);
+    }
+
+    #[test]
+    fn metadata_acknowledgements_are_renewed_in_bounded_batches() {
+        let mut session = Session::new();
+
+        assert!(!session.should_renew_metadata_ack(1));
+        assert!(!session.should_renew_metadata_ack(CLIENT_SESSION_RENEWAL_BATCH - 1));
+        assert!(session.should_renew_metadata_ack(CLIENT_SESSION_RENEWAL_BATCH));
+
+        session.mark_metadata_acknowledged(CLIENT_SESSION_RENEWAL_BATCH);
+        assert!(!session.should_renew_metadata_ack(CLIENT_SESSION_RENEWAL_BATCH + 1));
+        assert!(session.should_renew_metadata_ack(CLIENT_SESSION_RENEWAL_BATCH * 2));
     }
 }

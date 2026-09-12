@@ -29,13 +29,14 @@ use ragnordb_common::{
     Error, Result,
     codec::WriteKind,
     command_codec::{
-        NoopCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
+        CachedTabletCommandOutcome, NoopCommand, SingleShardCommitCommand, TabletCommand,
+        TabletCommandEnvelope, WriteEntry,
     },
     durability::DurabilityGate,
     encoding::{decode_row, encode_row},
     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, TxnId},
     raft_bootstrap::RaftGroupBootstrap,
-    rpc_codec::{TabletCommandRequest, TabletReadRequest},
+    rpc_codec::{TabletCommandRequest, TabletOutcomeQueryRequest, TabletReadRequest},
 };
 use ragnordb_multiraft::{
     bootstrap::{FileBootstrapStore, load_durable_group_bootstrap},
@@ -171,6 +172,11 @@ enum HostRequest {
     ReadPoint {
         request: TabletReadRequest,
         reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+        deadline: Instant,
+    },
+    OutcomeQuery {
+        request: TabletOutcomeQueryRequest,
+        reply: mpsc::Sender<Result<Option<CachedTabletCommandOutcome>>>,
         deadline: Instant,
     },
 }
@@ -675,6 +681,33 @@ impl ReplicatedTabletHandle {
             .recv_timeout(timeout)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet read deadline elapsed before execution".to_string(),
+            })?
+    }
+
+    /// Query a retained V2 mutation outcome without proposing or executing a
+    /// new command. Unknown outcomes remain unknown to the caller.
+    pub fn query_original_outcome(
+        &self,
+        request: TabletOutcomeQueryRequest,
+        timeout: Duration,
+    ) -> Result<Option<CachedTabletCommandOutcome>> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("outcome query deadline overflowed".into()))?;
+        let (reply, response) = mpsc::channel();
+        self.requests
+            .send(HostRequest::OutcomeQuery {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "replicated tablet runtime has stopped".to_string(),
+            })?;
+        response
+            .recv_timeout(timeout)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "tablet outcome query deadline elapsed".to_string(),
             })?
     }
 }
@@ -1921,6 +1954,18 @@ where
                     reply,
                     deadline,
                 ),
+                HostRequest::OutcomeQuery {
+                    request,
+                    reply,
+                    deadline,
+                } => admit_outcome_query(
+                    request,
+                    &tablet,
+                    serving_leader,
+                    ready_loop.raft().leader_id().map(|id| id.get()),
+                    reply,
+                    deadline,
+                ),
                 request => admit_request(
                     request,
                     &mut ready_loop,
@@ -2100,6 +2145,35 @@ const fn internal_barrier_client_id(term: u64) -> u128 {
     (INTERNAL_BARRIER_CLIENT_NAMESPACE as u128) << 64 | term as u128
 }
 
+fn admit_outcome_query(
+    request: TabletOutcomeQueryRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+    reply: mpsc::Sender<Result<Option<CachedTabletCommandOutcome>>>,
+    _deadline: Instant,
+) {
+    if !serving_leader {
+        let _ = reply.send(Err(Error::NotLeader { leader_id }));
+        return;
+    }
+
+    if request.tablet_id != tablet.state_machine().tablet().id()
+        || request.tablet_epoch != tablet.state_machine().epoch()
+    {
+        let _ = reply.send(Err(Error::StaleTabletEpoch {
+            current_epoch: tablet.state_machine().epoch(),
+            expected_epoch: request.tablet_epoch,
+        }));
+        return;
+    }
+
+    let _ = reply.send(Ok(tablet
+        .state_machine()
+        .logical_command_outcome(&request.logical_command_id)
+        .cloned()));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_request<W, LS, SS>(
     request: HostRequest,
@@ -2188,28 +2262,53 @@ fn admit_request<W, LS, SS>(
             request,
             reply,
             deadline,
-        } => match TabletCommandEnvelope::new(
-            request.request_id,
-            request.tablet_id,
-            request.tablet_epoch,
-            request.command,
-        ) {
-            Ok(envelope) => (envelope, deadline, ClientReply::Command(reply), None),
-            Err(source) => {
-                let _ = reply.send(Err(Error::InvalidArgument(source.to_string())));
-                return;
+        } => {
+            let envelope = match request.logical_command_id {
+                Some(logical_command_id) => {
+                    TabletCommandEnvelope::new_with_logical_command_id_and_ack(
+                        request.request_id,
+                        logical_command_id,
+                        request.tablet_id,
+                        request.tablet_epoch,
+                        request.acknowledged_through,
+                        request.command,
+                    )
+                }
+                None => TabletCommandEnvelope::new(
+                    request.request_id,
+                    request.tablet_id,
+                    request.tablet_epoch,
+                    request.command,
+                ),
+            };
+            match envelope {
+                Ok(envelope) => (envelope, deadline, ClientReply::Command(reply), None),
+                Err(source) => {
+                    let _ = reply.send(Err(Error::InvalidArgument(source.to_string())));
+                    return;
+                }
             }
-        },
+        }
         HostRequest::ReadPoint { reply, .. } => {
             let _ = reply.send(Err(Error::InvalidArgument(
                 "tablet reads must use the read admission path".to_string(),
             )));
             return;
         }
+        HostRequest::OutcomeQuery { reply, .. } => {
+            let _ = reply.send(Err(Error::InvalidArgument(
+                "tablet outcome queries must use the outcome admission path".to_string(),
+            )));
+            return;
+        }
     };
 
     if let Err(source) = tablet.state_machine().validate_proposal(&envelope) {
-        send_client_error(reply, Error::InvalidArgument(source.to_string()));
+        // Routing/generation failures are checked before proposal admission
+        // and before deduplication. Preserve their typed meaning so a gateway
+        // can refresh metadata instead of treating a stale route as malformed
+        // SQL or replaying a mutation against the wrong tablet.
+        send_client_error(reply, map_tablet_rejection(source));
         return;
     }
     let request_id = envelope.request_id.clone();
@@ -2295,9 +2394,10 @@ fn admit_read_request(
         return;
     }
     if request.tablet_epoch != identity.target.tablet_epoch {
-        let _ = reply.send(Err(Error::InvalidArgument(
-            "tablet read request targets a stale tablet epoch".to_string(),
-        )));
+        let _ = reply.send(Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        }));
         return;
     }
     if request.read_timestamp.0 == 0
@@ -3048,6 +3148,21 @@ fn forward_completion(reply: ClientReply, completion: Completion) {
 fn map_tablet_rejection(rejection: TabletCommandApplyError) -> Error {
     match rejection {
         TabletCommandApplyError::WriteConflict { reason } => Error::WriteConflict(reason),
+        TabletCommandApplyError::TabletEpochMismatch {
+            current_epoch,
+            expected_epoch,
+        } => Error::StaleTabletEpoch {
+            current_epoch,
+            expected_epoch,
+        },
+        TabletCommandApplyError::RequestIdExpired {
+            client_id,
+            session_epoch,
+            sequence,
+            ..
+        } => Error::RequestIdExpired {
+            identity: format!("client={client_id:#034x}/epoch={session_epoch}/sequence={sequence}"),
+        },
         other => Error::InvalidArgument(other.to_string()),
     }
 }
@@ -3067,6 +3182,9 @@ fn reply_error(request: HostRequest, error: Error) {
             let _ = reply.send(Err(error));
         }
         HostRequest::ReadPoint { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        HostRequest::OutcomeQuery { reply, .. } => {
             let _ = reply.send(Err(error));
         }
     }
@@ -3173,6 +3291,7 @@ mod tests {
                 sequence: 1,
                 raft_group_id: RaftGroupId(9),
             },
+            logical_command_id: None,
             tablet_id: TabletId(3),
             tablet_epoch: 6,
             row_key: RowKey {
@@ -3195,8 +3314,10 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            Err(Error::InvalidArgument(message))
-                if message.contains("stale tablet epoch")
+            Err(Error::StaleTabletEpoch {
+                current_epoch: 7,
+                expected_epoch: 6,
+            })
         ));
     }
 

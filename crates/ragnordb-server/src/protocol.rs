@@ -193,6 +193,28 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
 
         Error::NotLeader { .. } => error_response("NOT_LEADER", &error.to_string(), true),
 
+        Error::StaleTabletEpoch { .. } => {
+            error_response("STALE_TABLET_EPOCH", &error.to_string(), true)
+        }
+
+        Error::LeaderUnknown => error_response("LEADER_UNKNOWN", &error.to_string(), true),
+
+        Error::TabletUnavailable { .. } => {
+            error_response("TABLET_UNAVAILABLE", &error.to_string(), true)
+        }
+
+        Error::RequestOutcomeUnknown { .. } => {
+            error_response("REQUEST_OUTCOME_UNKNOWN", &error.to_string(), false)
+        }
+
+        Error::RequestIdExpired { .. } => {
+            error_response("REQUEST_ID_EXPIRED", &error.to_string(), false)
+        }
+
+        Error::ClientSessionExpired { .. } => {
+            error_response("CLIENT_SESSION_EXPIRED", &error.to_string(), false)
+        }
+
         Error::ProposalUnavailable { .. } => {
             error_response("PROPOSAL_UNAVAILABLE", &error.to_string(), true)
         }

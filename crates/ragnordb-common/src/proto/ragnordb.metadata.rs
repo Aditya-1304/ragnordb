@@ -18,7 +18,7 @@ pub struct MetadataCommand {
     /// startup entries without an envelope.
     #[prost(uint32, tag = "10")]
     pub envelope_version: u32,
-    #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "metadata_command::Command", tags = "2, 3, 4, 5, 6, 7, 8, 11, 12")]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
 /// Nested message and enum types in `MetadataCommand`.
@@ -41,6 +41,13 @@ pub mod metadata_command {
         /// machine assigns all cluster-global identities when this entry applies.
         #[prost(message, tag = "8")]
         CreateTableTopology(super::CreateTableTopology),
+        /// Client retry-session control-plane records. Request outcomes remain
+        /// tied to the session epoch and may not be silently recreated after
+        /// metadata restart or client reconnect.
+        #[prost(message, tag = "11")]
+        RegisterClient(super::RegisterClient),
+        #[prost(message, tag = "12")]
+        RenewClient(super::RenewClient),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -64,6 +71,18 @@ pub struct NodeDescriptor {
     pub sql_addr: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub admin_addr: ::prost::alloc::string::String,
+    /// Physical placement and lifecycle metadata. Empty locality labels retain
+    /// compatibility with the original static bootstrap format.
+    #[prost(string, tag = "7")]
+    pub region: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub zone: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub rack: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub storage_class: ::prost::alloc::string::String,
+    #[prost(enumeration = "NodeLifecycle", tag = "11")]
+    pub lifecycle: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RegisterNode {
@@ -97,17 +116,27 @@ pub struct HashPartition {
     #[prost(uint32, tag = "2")]
     pub bucket_count: u32,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangePartition {
+    /// Empty start_key means -infinity; empty end_key means +infinity.
+    #[prost(bytes = "vec", tag = "1")]
+    pub start_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub end_key: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionSpec {
-    #[prost(oneof = "partition_spec::Kind", tags = "1")]
+    #[prost(oneof = "partition_spec::Kind", tags = "1, 2")]
     pub kind: ::core::option::Option<partition_spec::Kind>,
 }
 /// Nested message and enum types in `PartitionSpec`.
 pub mod partition_spec {
-    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
         Hash(super::HashPartition),
+        #[prost(message, tag = "2")]
+        Range(super::RangePartition),
     }
 }
 /// Stable mapping from one logical tablet to one Raft group.
@@ -115,7 +144,7 @@ pub mod partition_spec {
 /// Field 5 was schema_version in the experimental metadata format. Schema
 /// version belongs to the table definition and would become stale on every
 /// schema update, so that field is permanently retired.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletDescriptor {
     #[prost(message, optional, tag = "1")]
     pub tablet_id: ::core::option::Option<super::ids::TabletId>,
@@ -128,7 +157,7 @@ pub struct TabletDescriptor {
     #[prost(message, optional, tag = "6")]
     pub partition: ::core::option::Option<PartitionSpec>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateTablet {
     #[prost(message, optional, tag = "1")]
     pub tablet: ::core::option::Option<TabletDescriptor>,
@@ -155,6 +184,26 @@ pub struct SetDesiredReplicaPlacement {
     pub configuration_epoch: u64,
     #[prost(message, repeated, tag = "3")]
     pub replicas: ::prost::alloc::vec::Vec<DesiredReplica>,
+    #[prost(message, optional, tag = "4")]
+    pub placement_policy: ::core::option::Option<PlacementPolicy>,
+}
+/// Placement constraints are metadata intent, not a copy of the currently
+/// committed Raft ConfState. Reconciliation must satisfy these constraints
+/// while it moves the group through safe learner/voter transitions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PlacementPolicy {
+    #[prost(uint32, tag = "1")]
+    pub replication_factor: u32,
+    #[prost(uint32, tag = "2")]
+    pub min_distinct_regions: u32,
+    #[prost(uint32, tag = "3")]
+    pub min_distinct_zones: u32,
+    #[prost(uint32, tag = "4")]
+    pub min_distinct_racks: u32,
+    #[prost(string, tag = "5")]
+    pub required_storage_class: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "6")]
+    pub preferred_leader_nodes: ::prost::alloc::vec::Vec<super::ids::NodeId>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateTableSchema {
@@ -162,6 +211,25 @@ pub struct UpdateTableSchema {
     pub expected_schema_version: u64,
     #[prost(message, optional, tag = "2")]
     pub table: ::core::option::Option<super::catalog::TableDefinition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterClient {
+    #[prost(bytes = "vec", tag = "1")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    /// Zero requests the next metadata-assigned epoch. A non-zero value is
+    /// used by a reconnecting client that has already obtained its epoch from
+    /// the control plane and is being re-established at a gateway.
+    #[prost(uint64, tag = "2")]
+    pub requested_session_epoch: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewClient {
+    #[prost(bytes = "vec", tag = "1")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub session_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub acknowledged_through: u64,
 }
 /// Permanent record that one consensus identity has ended.
 ///
@@ -218,6 +286,19 @@ pub struct MetadataSnapshot {
     /// allocate a second table identity.
     #[prost(message, repeated, tag = "10")]
     pub request_deduplication: ::prost::alloc::vec::Vec<MetadataRequestDeduplication>,
+    #[prost(message, repeated, tag = "11")]
+    pub client_sessions: ::prost::alloc::vec::Vec<ClientSession>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientSession {
+    #[prost(bytes = "vec", tag = "1")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub session_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub acknowledged_through: u64,
+    #[prost(uint64, tag = "4")]
+    pub first_retained_sequence: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataRequestDeduplication {
@@ -237,6 +318,48 @@ pub struct MetadataRequestDeduplication {
     /// deterministic result without re-evaluating current metadata state.
     #[prost(string, tag = "6")]
     pub rejection: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "7")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "8")]
+    pub session_epoch: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NodeLifecycle {
+    Unspecified = 0,
+    Active = 1,
+    Draining = 2,
+    Decommissioning = 3,
+    Decommissioned = 4,
+    Tombstoned = 5,
+}
+impl NodeLifecycle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NODE_LIFECYCLE_UNSPECIFIED",
+            Self::Active => "NODE_LIFECYCLE_ACTIVE",
+            Self::Draining => "NODE_LIFECYCLE_DRAINING",
+            Self::Decommissioning => "NODE_LIFECYCLE_DECOMMISSIONING",
+            Self::Decommissioned => "NODE_LIFECYCLE_DECOMMISSIONED",
+            Self::Tombstoned => "NODE_LIFECYCLE_TOMBSTONED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NODE_LIFECYCLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "NODE_LIFECYCLE_ACTIVE" => Some(Self::Active),
+            "NODE_LIFECYCLE_DRAINING" => Some(Self::Draining),
+            "NODE_LIFECYCLE_DECOMMISSIONING" => Some(Self::Decommissioning),
+            "NODE_LIFECYCLE_DECOMMISSIONED" => Some(Self::Decommissioned),
+            "NODE_LIFECYCLE_TOMBSTONED" => Some(Self::Tombstoned),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -275,6 +398,8 @@ pub enum MetadataCachedOutcomeKind {
     MetadataCachedOutcomeAlreadyApplied = 2,
     MetadataCachedOutcomeTableCreated = 3,
     MetadataCachedOutcomeRejected = 4,
+    MetadataCachedOutcomeClientRegistered = 5,
+    MetadataCachedOutcomeClientRenewed = 6,
 }
 impl MetadataCachedOutcomeKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -294,6 +419,12 @@ impl MetadataCachedOutcomeKind {
                 "METADATA_CACHED_OUTCOME_TABLE_CREATED"
             }
             Self::MetadataCachedOutcomeRejected => "METADATA_CACHED_OUTCOME_REJECTED",
+            Self::MetadataCachedOutcomeClientRegistered => {
+                "METADATA_CACHED_OUTCOME_CLIENT_REGISTERED"
+            }
+            Self::MetadataCachedOutcomeClientRenewed => {
+                "METADATA_CACHED_OUTCOME_CLIENT_RENEWED"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -311,6 +442,12 @@ impl MetadataCachedOutcomeKind {
             }
             "METADATA_CACHED_OUTCOME_REJECTED" => {
                 Some(Self::MetadataCachedOutcomeRejected)
+            }
+            "METADATA_CACHED_OUTCOME_CLIENT_REGISTERED" => {
+                Some(Self::MetadataCachedOutcomeClientRegistered)
+            }
+            "METADATA_CACHED_OUTCOME_CLIENT_RENEWED" => {
+                Some(Self::MetadataCachedOutcomeClientRenewed)
             }
             _ => None,
         }

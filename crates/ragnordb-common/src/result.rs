@@ -58,6 +58,35 @@ pub enum Error {
     #[error("node is not the tablet leader; current leader is {leader_id:?}")]
     NotLeader { leader_id: Option<u64> },
 
+    /// The route was valid when issued, but the tablet generation changed
+    /// before admission. The caller must refresh metadata before retrying.
+    #[error("tablet epoch is stale; expected {expected_epoch}, current epoch is {current_epoch}")]
+    StaleTabletEpoch {
+        current_epoch: u64,
+        expected_epoch: u64,
+    },
+
+    /// No authoritative leader was published for the requested group.
+    #[error("tablet leader is currently unknown")]
+    LeaderUnknown,
+
+    /// The group exists in metadata but cannot currently admit work.
+    #[error("tablet is temporarily unavailable: {reason}")]
+    TabletUnavailable { reason: String },
+
+    /// The server cannot prove whether the logical operation was applied.
+    /// Retries are safe only after the retained identity outcome is queried.
+    #[error("logical request outcome is unknown: {identity}")]
+    RequestOutcomeUnknown { identity: String },
+
+    /// The request identity has fallen outside the retained retry horizon.
+    #[error("request identity has expired: {identity}")]
+    RequestIdExpired { identity: String },
+
+    /// A session epoch older than the durable client session floor was used.
+    #[error("client session epoch has expired: {session_epoch}")]
+    ClientSessionExpired { session_epoch: u64 },
+
     /// A proposal lost leadership or exceeded its deadline before apply.
     #[error("replicated proposal did not reach a known apply result: {reason}")]
     ProposalUnavailable { reason: String },
@@ -163,5 +192,70 @@ pub enum Error {
     },
 }
 
+/// Canonical action associated with a client-visible distributed error.
+///
+/// This is deliberately more precise than the legacy boolean `retryable`: an
+/// unknown mutation must be queried with its original identity, never replayed
+/// as a fresh transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    None,
+    RetrySameRequest,
+    RestartTransaction,
+    QueryOriginalOutcome,
+}
+
+impl Error {
+    pub const fn retry_action(&self) -> RetryAction {
+        match self {
+            Self::NotLeader { .. }
+            | Self::StaleTabletEpoch { .. }
+            | Self::LeaderUnknown
+            | Self::TabletUnavailable { .. }
+            | Self::ProposalUnavailable { .. }
+            | Self::StatementTimeout { .. } => RetryAction::RetrySameRequest,
+            Self::RequestOutcomeUnknown { .. }
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::CatalogOutcomeUnknown { .. }
+            | Self::CheckpointOutcomeUnknown { .. } => RetryAction::QueryOriginalOutcome,
+            Self::WriteConflict(_) => RetryAction::RestartTransaction,
+            Self::RequestIdExpired { .. }
+            | Self::ClientSessionExpired { .. }
+            | Self::ConstraintViolation(_)
+            | Self::InvalidArgument(_)
+            | Self::CorruptData(_)
+            | Self::NotImplemented(_)
+            | Self::SqlParse(_)
+            | Self::UnsupportedSql(_)
+            | Self::SchemaMismatch(_)
+            | Self::Configuration(_)
+            | Self::WalAppendNotStaged { .. }
+            | Self::RecoveryRequired { .. }
+            | Self::RecoveryFailed { .. }
+            | Self::SnapshotPublicationFailed { .. } => RetryAction::None,
+        }
+    }
+}
+
 /// Standard result type used throughout RagnorDB
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, RetryAction};
+
+    #[test]
+    fn unknown_mutation_outcome_requires_lookup_not_fresh_retry() {
+        assert_eq!(
+            Error::RequestOutcomeUnknown {
+                identity: "client=1/epoch=2/sequence=3".to_string(),
+            }
+            .retry_action(),
+            RetryAction::QueryOriginalOutcome
+        );
+        assert_eq!(
+            Error::NotLeader { leader_id: None }.retry_action(),
+            RetryAction::RetrySameRequest
+        );
+    }
+}

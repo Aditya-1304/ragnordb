@@ -153,6 +153,12 @@ impl DurabilityGate {
             Error::NotImplemented(_)
             | Error::InvalidArgument(_)
             | Error::NotLeader { .. }
+            | Error::StaleTabletEpoch { .. }
+            | Error::LeaderUnknown
+            | Error::TabletUnavailable { .. }
+            | Error::RequestOutcomeUnknown { .. }
+            | Error::RequestIdExpired { .. }
+            | Error::ClientSessionExpired { .. }
             | Error::ProposalUnavailable { .. }
             | Error::WriteConflict(_)
             | Error::SqlParse(_)

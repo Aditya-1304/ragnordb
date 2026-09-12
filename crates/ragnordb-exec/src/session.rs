@@ -53,6 +53,30 @@ impl SqlSession {
         Ok(())
     }
 
+    pub fn set_client_request_identity(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+    ) -> Result<()> {
+        self.set_client_request_identity_with_ack(client_id, session_epoch, request_sequence, None)
+    }
+
+    pub fn set_client_request_identity_with_ack(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+        acknowledged_through: Option<u64>,
+    ) -> Result<()> {
+        self.tablet_request_context.reset_for_root_request_with_ack(
+            client_id,
+            session_epoch,
+            request_sequence,
+            acknowledged_through,
+        )
+    }
+
     /// Update the bounded RPC deadline for this connection's next statement.
     pub fn set_tablet_request_timeout(&mut self, timeout: Duration) {
         self.tablet_request_context.set_timeout(timeout);

@@ -1,7 +1,106 @@
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const LEN_SIZE: usize = 4;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const V2_MAGIC: &[u8; 4] = b"RDB2";
+
+/// Client-owned V2 request envelope. The root identity is preserved across
+/// gateways and topology changes; only the tablet route is allowed to change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRequestV2 {
+    pub protocol_version: u16,
+    pub client_id: u128,
+    pub client_session_epoch: u64,
+    pub request_sequence: u64,
+    pub acknowledged_through: Option<u64>,
+    pub statement_timeout_ms: u64,
+    pub sql: String,
+}
+
+impl ClientRequestV2 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.protocol_version != 2 {
+            return Err("unsupported client request protocol version");
+        }
+        if self.client_id == 0 {
+            return Err("client ID must be non-zero");
+        }
+        if self.client_session_epoch == 0 {
+            return Err("client session epoch must be non-zero");
+        }
+        if self.request_sequence == 0 {
+            return Err("client request sequence must be non-zero");
+        }
+        if self
+            .acknowledged_through
+            .is_some_and(|acknowledged| acknowledged > self.request_sequence)
+        {
+            return Err("acknowledged request sequence is ahead of the request");
+        }
+        if self.statement_timeout_ms == 0 {
+            return Err("client statement timeout must be non-zero");
+        }
+        if self.sql.trim().is_empty() {
+            return Err("client SQL must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Wire-level request accepted by the server without breaking the V1 SQL
+/// framing used by the existing shell and compatibility clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequestFrame {
+    V1(String),
+    V2(ClientRequestV2),
+}
+
+pub async fn read_client_frame<R>(
+    reader: &mut R,
+) -> Result<ClientRequestFrame, Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; LEN_SIZE];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(format!("frame size {len} exceeds maximum of {MAX_FRAME_SIZE}").into());
+    }
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    if buf.starts_with(V2_MAGIC) {
+        let request: ClientRequestV2 = serde_json::from_slice(&buf[V2_MAGIC.len()..])?;
+        request
+            .validate()
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        Ok(ClientRequestFrame::V2(request))
+    } else {
+        Ok(ClientRequestFrame::V1(String::from_utf8(buf)?))
+    }
+}
+
+pub fn encode_client_request_v2(
+    request: &ClientRequestV2,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    request
+        .validate()
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let body = serde_json::to_vec(request)?;
+    let total = V2_MAGIC.len() + body.len();
+    if total > MAX_FRAME_SIZE {
+        return Err(
+            format!("V2 request frame size {total} exceeds maximum of {MAX_FRAME_SIZE}").into(),
+        );
+    }
+    let mut frame = Vec::with_capacity(LEN_SIZE + total);
+    frame.extend_from_slice(&u32::try_from(total)?.to_le_bytes());
+    frame.extend_from_slice(V2_MAGIC);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
 
 /// V1 client wire protocol: length-prefixed TCP frames
 ///
@@ -197,6 +296,42 @@ mod tests {
         client.write_all(&invalid_utf8).await.unwrap();
 
         assert!(read_frame(&mut server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn v2_request_round_trip_preserves_logical_retry_identity() {
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 17,
+            client_session_epoch: 4,
+            request_sequence: 9,
+            acknowledged_through: Some(8),
+            statement_timeout_ms: 30_000,
+            sql: "INSERT INTO users (id) VALUES (1)".to_string(),
+        };
+        let encoded = encode_client_request_v2(&request).unwrap();
+        let (mut writer, mut reader) = duplex(4096);
+        writer.write_all(&encoded).await.unwrap();
+
+        assert_eq!(
+            read_client_frame(&mut reader).await.unwrap(),
+            ClientRequestFrame::V2(request)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_request_rejects_acknowledgement_beyond_root_sequence() {
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 1,
+            client_session_epoch: 1,
+            request_sequence: 2,
+            acknowledged_through: Some(3),
+            statement_timeout_ms: 30_000,
+            sql: "SELECT 1".to_string(),
+        };
+
+        assert!(encode_client_request_v2(&request).is_err());
     }
 
     /// Realistic bug caught:
