@@ -19,7 +19,7 @@ use raft::{
     },
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, Role, Term},
+    types::{ConfChange, LogIndex, Role, Term},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 
@@ -184,6 +184,19 @@ pub struct MultiRaftGroupStatus {
     pub pending_messages: usize,
     pub pending_message_bytes: usize,
     pub quarantine_reason: Option<String>,
+    /// Durable membership epoch currently observed by the Raft core.
+    pub conf_state_version: Option<u64>,
+    /// True only for an explicitly bootstrapped passive joiner. A removed
+    /// member is not relabeled as a joiner.
+    pub joining: bool,
+    pub voters: Vec<ReplicaId>,
+    pub learners: Vec<ReplicaId>,
+    pub outgoing_voters: Vec<ReplicaId>,
+    /// Latest per-replica replication match frontier, including the local
+    /// replica. This is diagnostic state and never drives host placement.
+    pub replica_match_indices: Vec<(ReplicaId, u64)>,
+    /// First unapplied configuration entry, if one is outstanding.
+    pub pending_conf_change_index: Option<u64>,
 }
 
 /// Lifecycle state of the physical MultiRaft host.
@@ -480,6 +493,13 @@ pub trait HostedRaftGroup: Send {
             pending_messages: 0,
             pending_message_bytes: 0,
             quarantine_reason: None,
+            conf_state_version: None,
+            joining: false,
+            voters: Vec::new(),
+            learners: Vec::new(),
+            outgoing_voters: Vec::new(),
+            replica_match_indices: Vec::new(),
+            pending_conf_change_index: None,
         }
     }
 
@@ -530,6 +550,17 @@ pub trait HostedRaftGroup: Send {
         command: Vec<u8>,
         encoded_len: usize,
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError>;
+
+    /// Admits one typed membership transition through the same Ready and
+    /// shared-WAL boundary as an application proposal.
+    fn propose_conf_change(
+        &mut self,
+        _change: ConfChange,
+    ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        Err(HostedGroupError::Rejected(
+            "hosted group does not expose Raft membership proposals".to_string(),
+        ))
+    }
 
     /// Executes one bounded group turn. Group adapters with finer-grained
     /// apply or snapshot work can override this method; the default preserves
@@ -821,6 +852,35 @@ where
             pending_messages: 0,
             pending_message_bytes: 0,
             quarantine_reason: None,
+            conf_state_version: Some(raft.conf_state().version),
+            joining: raft.is_joining(),
+            voters: raft
+                .conf_state()
+                .voters
+                .iter()
+                .copied()
+                .map(ReplicaId::from_raft)
+                .collect(),
+            learners: raft
+                .conf_state()
+                .learners
+                .iter()
+                .copied()
+                .map(ReplicaId::from_raft)
+                .collect(),
+            outgoing_voters: raft
+                .conf_state()
+                .outgoing_voters
+                .iter()
+                .copied()
+                .map(ReplicaId::from_raft)
+                .collect(),
+            replica_match_indices: raft
+                .replication_match_indices()
+                .into_iter()
+                .map(|(replica_id, index)| (ReplicaId::from_raft(replica_id), index))
+                .collect(),
+            pending_conf_change_index: raft.pending_conf_change_index(),
         }
     }
 
@@ -854,6 +914,36 @@ where
         self.ready_loop
             .read_index(context)
             .map_err(classify_ready_error)
+    }
+
+    fn propose_conf_change(
+        &mut self,
+        change: ConfChange,
+    ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            return Err(HostedGroupError::Retryable(
+                "a shared-WAL batch is still awaiting completion".to_string(),
+            ));
+        }
+
+        let mut turn = self.drain_ready()?;
+        self.defer_read_states(&mut turn);
+
+        if self.ready_loop.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still being resumed".to_string(),
+            ));
+        }
+
+        let index = self
+            .ready_loop
+            .propose_conf_change(change)
+            .map_err(classify_ready_error)?;
+        let mut after_proposal = self.drain_ready()?;
+        self.defer_read_states(&mut after_proposal);
+        turn.outbound.extend(after_proposal.outbound);
+
+        Ok((index, turn.outbound))
     }
 
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
@@ -2250,24 +2340,68 @@ where
             group.propose_and_drain(command, encoded_len)
         };
 
+        self.finish_group_proposal(raft_group_id, result)
+    }
+
+    /// Proposes one typed membership transition through the group-owned Ready
+    /// lifecycle. Configuration entries are not exposed as SQL/tablet
+    /// commands and become authoritative only after the same shared-WAL and
+    /// applied-frontier acknowledgements used for all Raft entries.
+    pub fn propose_conf_change(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        change: ConfChange,
+    ) -> Result<HostedProposal, MultiRaftHostError> {
+        self.ensure_active()?;
+
+        const CONFIGURATION_ENTRY_BYTES: usize = 24;
+        if CONFIGURATION_ENTRY_BYTES > self.config.max_proposal_bytes {
+            return Err(MultiRaftHostError::ProposalTooLarge {
+                raft_group_id,
+                encoded_len: CONFIGURATION_ENTRY_BYTES,
+                max_bytes: self.config.max_proposal_bytes,
+            });
+        }
+
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
+                raft_group_id,
+                reason: reason.clone(),
+            });
+        }
+
+        let result = {
+            let group = self
+                .groups
+                .get_mut(&raft_group_id)
+                .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?;
+
+            group.propose_conf_change(change)
+        };
+
+        self.finish_group_proposal(raft_group_id, result)
+    }
+
+    fn finish_group_proposal(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        result: Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError>,
+    ) -> Result<HostedProposal, MultiRaftHostError> {
         let (index, messages) = match result {
             Ok(result) => result,
 
             Err(HostedGroupError::RecoveryRequired) => {
                 self.state = HostState::RecoveryRequired;
-
                 return Err(MultiRaftHostError::RecoveryRequired);
             }
 
             Err(HostedGroupError::Group(reason)) => {
                 if self.node_wal.recovery_required() {
                     self.state = HostState::RecoveryRequired;
-
                     return Err(MultiRaftHostError::RecoveryRequired);
                 }
 
                 self.quarantined.insert(raft_group_id, reason.clone());
-
                 return Err(MultiRaftHostError::Group {
                     raft_group_id,
                     reason,
@@ -2572,6 +2706,13 @@ mod tests {
         ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
             Ok((0, std::mem::take(&mut self.outbound)))
         }
+
+        fn propose_conf_change(
+            &mut self,
+            _: ConfChange,
+        ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+            Ok((7, std::mem::take(&mut self.outbound)))
+        }
     }
 
     #[derive(Clone)]
@@ -2870,6 +3011,29 @@ mod tests {
             host.propose(RaftGroupId(20), vec![1], 1).unwrap_err(),
             MultiRaftHostError::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn typed_membership_proposal_uses_the_hosted_group_boundary() {
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(healthy_group(group_identity, Vec::new())))
+            .unwrap();
+        host.activate().unwrap();
+
+        let proposal = host
+            .propose_conf_change(
+                RaftGroupId(10),
+                ConfChange {
+                    expected_version: 1,
+                    kind: raft::types::ConfChangeKind::AddLearner(RaftReplicaId::must(202)),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(proposal.index, 7);
+        assert!(proposal.outbound.is_empty());
     }
 
     #[test]

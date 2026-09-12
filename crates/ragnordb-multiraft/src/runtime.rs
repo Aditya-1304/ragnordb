@@ -39,7 +39,7 @@ use raft::{
     entry::EntryPayload,
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
+    types::{ConfChange, HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
 };
 
 use crate::storage::{
@@ -526,6 +526,22 @@ where
 
         self.raft
             .propose_with_size(command, encoded_len)
+            .map_err(ReadyLoopError::Proposal)
+    }
+
+    /// Admits one typed Raft membership transition.
+    ///
+    /// Configuration entries use the same Ready boundary as application
+    /// commands: the transition is only visible after the shared WAL has
+    /// acknowledged the Ready and the committed entry has crossed the
+    /// applied frontier. Keeping this method beside normal proposal admission
+    /// prevents hosts from appending membership records outside that ordering.
+    pub fn propose_conf_change(&mut self, change: ConfChange) -> Result<LogIndex, ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+
+        self.raft
+            .propose_conf_change(change)
             .map_err(ReadyLoopError::Proposal)
     }
 

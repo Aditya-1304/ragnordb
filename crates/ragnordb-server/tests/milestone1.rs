@@ -112,6 +112,13 @@ async fn admin_status_returns_json() {
                 pending_messages: 0,
                 pending_message_bytes: 0,
                 quarantine_reason: None,
+                conf_state_version: None,
+                joining: false,
+                voters: Vec::new(),
+                learners: Vec::new(),
+                outgoing_voters: Vec::new(),
+                replica_match_indices: Vec::new(),
+                pending_conf_change_index: None,
             },
             MultiRaftGroupStatus {
                 identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity::new(
@@ -132,6 +139,13 @@ async fn admin_status_returns_json() {
                 pending_messages: 0,
                 pending_message_bytes: 0,
                 quarantine_reason: None,
+                conf_state_version: None,
+                joining: false,
+                voters: Vec::new(),
+                learners: Vec::new(),
+                outgoing_voters: Vec::new(),
+                replica_match_indices: Vec::new(),
+                pending_conf_change_index: None,
             },
         ],
     }));

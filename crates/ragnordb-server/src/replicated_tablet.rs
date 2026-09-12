@@ -24,7 +24,7 @@ use raft::{
     entry::EntryPayload,
     message::{Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{HardState, LogIndex, SnapshotMetadata},
+    types::{ConfChange, HardState, LogIndex, SnapshotMetadata},
 };
 
 use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog};
@@ -158,6 +158,13 @@ pub struct ReplicatedTabletStatus {
     /// lifecycle destruction must wait rather than infer removal from
     /// metadata placement alone.
     pub replica_in_conf_state: Option<bool>,
+    pub conf_state_version: Option<u64>,
+    pub joining: bool,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub outgoing_voters: Vec<u64>,
+    pub replica_match_indices: Vec<(u64, u64)>,
+    pub pending_conf_change_index: Option<u64>,
 }
 
 enum HostRequest {
@@ -234,6 +241,11 @@ enum RaftHostControl {
         encoded_len: usize,
         reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
+
+    ProposeConfChange {
+        change: ConfChange,
+        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+    },
 }
 
 /// Return a terminal runtime reason only for errors that cross a correctness
@@ -265,7 +277,8 @@ fn reply_snapshot_blocked_host_control(control: RaftHostControl, reason: &str) {
             let _ = reply.send(Err(HostedGroupError::Retryable(reason.to_string())));
         }
 
-        RaftHostControl::Propose { reply, .. } => {
+        RaftHostControl::Propose { reply, .. }
+        | RaftHostControl::ProposeConfChange { reply, .. } => {
             let _ = reply.send(Err(HostedGroupError::Retryable(reason.to_string())));
         }
     }
@@ -445,6 +458,9 @@ impl ReplicatedTabletGroupProxy {
                 encoded_len,
                 reply,
             },
+            RaftHostControl::ProposeConfChange { change, .. } => {
+                RaftHostControl::ProposeConfChange { change, reply }
+            }
         };
 
         self.control
@@ -481,6 +497,17 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
             pending_messages: 0,
             pending_message_bytes: 0,
             quarantine_reason: status.runtime_error,
+            conf_state_version: status.conf_state_version,
+            joining: status.joining,
+            voters: status.voters.into_iter().map(ReplicaId).collect(),
+            learners: status.learners.into_iter().map(ReplicaId).collect(),
+            outgoing_voters: status.outgoing_voters.into_iter().map(ReplicaId).collect(),
+            replica_match_indices: status
+                .replica_match_indices
+                .into_iter()
+                .map(|(replica_id, index)| (ReplicaId(replica_id), index))
+                .collect(),
+            pending_conf_change_index: status.pending_conf_change_index,
         }
     }
 
@@ -542,6 +569,28 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         let RaftHostControlResult::Proposed(index) = result else {
             return Err(HostedGroupError::Group(
                 "tablet proposal control returned a non-proposal result".to_string(),
+            ));
+        };
+
+        Ok((index, Vec::new()))
+    }
+
+    fn propose_conf_change(
+        &mut self,
+        change: ConfChange,
+    ) -> std::result::Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        if self.pending.is_some() {
+            return Err(HostedGroupError::Retryable(
+                "replicated tablet operation is still pending".to_string(),
+            ));
+        }
+        let result = self.submit_direct(RaftHostControl::ProposeConfChange {
+            change,
+            reply: mpsc::channel().0,
+        })?;
+        let RaftHostControlResult::Proposed(index) = result else {
+            return Err(HostedGroupError::Group(
+                "tablet membership proposal control returned a non-proposal result".to_string(),
             ));
         };
 
@@ -1646,6 +1695,65 @@ where
                             }
                             let index = ready_loop
                                 .propose(command, encoded_len)
+                                .map_err(classify_ready_error)?;
+                            if let Some(metadata) = drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                                &identity,
+                                &mut pending_read_states,
+                            )? {
+                                expected_snapshot_install = Some(metadata);
+                                pending_snapshot_install = None;
+                            }
+                            Ok(index)
+                        })(
+                        );
+
+                        let fatal_reason = fatal_host_control_reason(&result);
+                        let _ = reply.send(result.map(RaftHostControlResult::Proposed));
+                        if let Some(reason) = fatal_reason {
+                            return Err(reason);
+                        }
+                    }
+
+                    RaftHostControl::ProposeConfChange { change, reply } => {
+                        let result: std::result::Result<LogIndex, HostedGroupError> = (|| {
+                            let had_pending_ready = ready_loop.has_pending_work();
+                            if let Some(metadata) = drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                                &identity,
+                                &mut pending_read_states,
+                            )? {
+                                expected_snapshot_install = Some(metadata);
+                                pending_snapshot_install = None;
+                            }
+                            if had_pending_ready {
+                                return Err(HostedGroupError::Retryable(
+                                    "a previous Ready generation is still being resumed"
+                                        .to_string(),
+                                ));
+                            }
+
+                            // Membership entries are handled by the Raft core
+                            // and Ready persistence boundary. They deliberately
+                            // never pass through the tablet command decoder.
+                            let index = ready_loop
+                                .propose_conf_change(change)
                                 .map_err(classify_ready_error)?;
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
@@ -3884,6 +3992,31 @@ fn publish_status<W, LS, SS>(
         .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
         .map(|progress| progress.inflight_bytes)
         .sum();
+    let conf_state = ready_loop.raft().conf_state();
+    published.conf_state_version = Some(conf_state.version);
+    published.joining = ready_loop.raft().is_joining();
+    published.voters = conf_state
+        .voters
+        .iter()
+        .map(|replica_id| replica_id.get())
+        .collect();
+    published.learners = conf_state
+        .learners
+        .iter()
+        .map(|replica_id| replica_id.get())
+        .collect();
+    published.outgoing_voters = conf_state
+        .outgoing_voters
+        .iter()
+        .map(|replica_id| replica_id.get())
+        .collect();
+    published.replica_match_indices = ready_loop
+        .raft()
+        .replication_match_indices()
+        .into_iter()
+        .map(|(replica_id, index)| (replica_id.get(), index))
+        .collect();
+    published.pending_conf_change_index = ready_loop.raft().pending_conf_change_index();
     let local_replica = ready_loop.raft().id();
     published.replica_in_conf_state = ready_loop
         .raft()
@@ -4126,7 +4259,9 @@ mod tests {
                         .send(Ok(RaftHostControlResult::Completed))
                         .expect("the tick reply must be delivered");
                 }
-                RaftHostControl::Step { .. } | RaftHostControl::Propose { .. } => {
+                RaftHostControl::Step { .. }
+                | RaftHostControl::Propose { .. }
+                | RaftHostControl::ProposeConfChange { .. } => {
                     panic!("the test queued a tick")
                 }
             }

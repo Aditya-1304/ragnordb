@@ -4,7 +4,7 @@ use raft::{
     core::node::RaftNode,
     message::{Envelope, InstallSnapshotRequest, Message, ReadIndexResponse},
     storage::mem::MemStorage,
-    types::{ConfState, Snapshot},
+    types::{ConfChange, ConfChangeKind, ConfState, Snapshot},
 };
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
@@ -199,6 +199,83 @@ fn persisted_ready_applies_committed_entries_before_acknowledging_applied_fronti
     assert_eq!(
         loop_.applied_frontier(),
         Some(AppliedRaftFrontier::new(1, ready.committed_entries[0].term))
+    );
+}
+
+/// Catches configuration entries being routed through the tablet/state-machine
+/// decoder as if they were application commands, and catches membership state
+/// becoming visible before the shared Ready persistence boundary completes.
+#[test]
+fn configuration_ready_updates_membership_without_applying_a_tablet_command() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let index = loop_
+        .propose_conf_change(ConfChange {
+            expected_version: 1,
+            kind: ConfChangeKind::AddLearner(raft::types::ReplicaId::must(2)),
+        })
+        .unwrap();
+    let mut store = MemorySnapshotStore::default();
+    let mut state_machine = RecordingStateMachine::default();
+
+    let ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(index, 1);
+    assert!(matches!(
+        ready.committed_entries.first().map(|entry| &entry.payload),
+        Some(raft::entry::EntryPayload::Configuration(_))
+    ));
+    assert!(state_machine.applied.is_empty());
+    assert_eq!(loop_.raft().conf_state().version, 2);
+    assert!(
+        loop_
+            .raft()
+            .conf_state()
+            .learners
+            .contains(&raft::types::ReplicaId::must(2))
+    );
+    assert_eq!(loop_.raft().last_applied(), index);
+}
+
+#[test]
+fn host_status_publishes_committed_membership_and_replication_frontiers() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose_conf_change(
+        group_identity.raft_group_id,
+        ConfChange {
+            expected_version: 1,
+            kind: ConfChangeKind::AddLearner(raft::types::ReplicaId::must(2)),
+        },
+    )
+    .unwrap();
+
+    let status = &host.status().groups[0];
+    assert_eq!(status.conf_state_version, Some(2));
+    assert!(!status.joining);
+    assert_eq!(status.voters, vec![ReplicaId(1)]);
+    assert_eq!(status.learners, vec![ReplicaId(2)]);
+    assert_eq!(status.outgoing_voters, Vec::<ReplicaId>::new());
+    assert_eq!(status.pending_conf_change_index, None);
+    assert_eq!(
+        status.replica_match_indices,
+        vec![(ReplicaId(1), 1), (ReplicaId(2), 0)]
     );
 }
 
