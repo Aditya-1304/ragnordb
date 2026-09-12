@@ -7,8 +7,13 @@ use std::{
 use ragnordb_common::{
     Error,
     catalog_codec::{ColumnDefinition, DataType},
-    codec::Value,
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId},
+    codec::{Row, Value, WriteKind},
+    command_codec::{SingleShardCommitCommand, TabletCommand, WriteEntry},
+    encoding::decode_row,
+    ids::{
+        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
+        RequestId, Timestamp, TxnId,
+    },
     metadata_codec::CreateTableRequest,
 };
 use ragnordb_exec::{ExecutionResult, SqlSession};
@@ -18,6 +23,7 @@ use ragnordb_server::{
     database::{LocalDatabase, SharedLocalDatabase},
     multiraft_runtime::MultiRaftRuntime,
 };
+use ragnordb_storage::key::make_row_key;
 use tempfile::TempDir;
 
 fn unused_address() -> std::net::SocketAddr {
@@ -708,6 +714,69 @@ async fn stale_routed_tablet_leader_fails_over_after_runtime_drop() {
         }
     ));
 
+    // The metadata route is deliberately made stale without changing the
+    // placement. A stale epoch response must re-resolve the complete route
+    // instead of patching only the epoch; the same lookup is what keeps a
+    // later metadata move to another tablet or Raft group safe.
+    let row_key = make_row_key(
+        ragnordb_common::ids::TableId(topology.definition.table_id),
+        &[Value::Int(42)],
+    )
+    .unwrap();
+    let tablet_client = nodes[gateway_index].runtime.tablet_rpc_client();
+    let route = tablet_client
+        .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)
+        .unwrap();
+    let follower = route
+        .replicas
+        .iter()
+        .find(|replica| replica.replica_id != route.leader_replica_id)
+        .expect("the routed tablet must have a live follower for the hint test")
+        .replica_id;
+    let mut follower_route = route.clone();
+    follower_route.leader_replica_id = follower;
+    let hinted_read = tablet_client
+        .read_point(
+            &follower_route,
+            RequestId {
+                client_id: 0x66,
+                sequence: 2,
+                raft_group_id: follower_route.raft_group_id,
+            },
+            row_key.clone(),
+            Timestamp(u64::MAX),
+            Duration::from_secs(5),
+        )
+        .expect("a live follower must return a typed leader hint and be retried");
+    assert_eq!(
+        decode_row(&hinted_read.expect("the committed row must remain visible")).unwrap(),
+        ragnordb_common::codec::Row {
+            values: vec![Value::Int(42), Value::Text("before-failover".to_string())],
+        }
+    );
+
+    let mut stale_route = route;
+    stale_route.tablet_epoch += 1;
+    let stale_read = tablet_client
+        .read_point(
+            &stale_route,
+            RequestId {
+                client_id: 0x66,
+                sequence: 3,
+                raft_group_id: stale_route.raft_group_id,
+            },
+            row_key.clone(),
+            Timestamp(u64::MAX),
+            Duration::from_secs(5),
+        )
+        .expect("a stale tablet epoch must refresh the metadata route and retry");
+    assert_eq!(
+        decode_row(&stale_read.expect("the committed row must remain visible")).unwrap(),
+        ragnordb_common::codec::Row {
+            values: vec![Value::Int(42), Value::Text("before-failover".to_string())],
+        }
+    );
+
     let failed = nodes.swap_remove(old_leader_node);
     let TestNode {
         database,
@@ -745,9 +814,27 @@ async fn stale_routed_tablet_leader_fails_over_after_runtime_drop() {
     assert_ne!(new_leader_replica, old_leader_replica);
     // Host status publishes the elected replica before its tablet worker has
     // completed the current-term serving activation used by routed reads.
-    // Keep this bounded settle inside the acceptance test so the stale-route
-    // request exercises failover rather than racing that known lifecycle edge.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Poll that observable lifecycle boundary instead of using a fixed sleep;
+    // the test must remain deterministic on both fast and loaded hosts.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let serving_new_leader = nodes.iter().any(|node| {
+                node.runtime
+                    .tablet_rpc_client()
+                    .tablet_status(routed_group_id)
+                    .is_some_and(|status| {
+                        status.serving_leader
+                            && status.leader_replica_id == Some(new_leader_replica.0)
+                    })
+            });
+            if serving_new_leader {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the elected tablet leader must cross its serving activation boundary");
 
     let observed = tokio::time::timeout(
         Duration::from_secs(20),
@@ -787,6 +874,69 @@ async fn stale_routed_tablet_leader_fails_over_after_runtime_drop() {
             }],
         })
     );
+
+    // Exercise the mutation-side stale-epoch route refresh after failover has
+    // completed. Keeping it after the SQL acceptance prevents this additional
+    // command from changing the warmed route cache used by the failover read.
+    let mutation_client = nodes[0].runtime.tablet_rpc_client();
+    let mut stale_mutation_route = mutation_client
+        .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)
+        .unwrap();
+    stale_mutation_route.tablet_epoch += 1;
+    let mutation_row_key = make_row_key(row_key.table_id, &[Value::Int(43)]).unwrap();
+    let mutation = TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+        txn_id: TxnId(901),
+        start_timestamp: Timestamp(1_000),
+        commit_timestamp: Timestamp(1_001),
+        writes: vec![WriteEntry {
+            key: ragnordb_storage::key::encode_row_key(&mutation_row_key).unwrap(),
+            row: Some(Row {
+                values: vec![Value::Int(43), Value::Text("stale-epoch".to_string())],
+            }),
+            op: WriteKind::Put,
+        }],
+    });
+    let logical_command_id = LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id: 0x67,
+            session_epoch: 1,
+            request_sequence: 1,
+        },
+        command_ordinal: 1,
+        kind: CommandKind::SingleShardCommit,
+    };
+    let command_request_id = RequestId {
+        client_id: 0x67,
+        sequence: 1,
+        raft_group_id: stale_mutation_route.raft_group_id,
+    };
+    let first_command = mutation_client
+        .submit_command_with_identity_and_ack(
+            &stale_mutation_route,
+            command_request_id.clone(),
+            Some(logical_command_id),
+            None,
+            mutation.clone(),
+            Duration::from_secs(5),
+        )
+        .expect("a stale epoch mutation must refresh its route and apply once");
+    assert!(matches!(
+        first_command.result,
+        ragnordb_tablet::command::TabletCommandApplyResult::SingleShardCommit
+    ));
+    assert!(!first_command.deduplicated);
+
+    let repeated_command = mutation_client
+        .submit_command_with_identity_and_ack(
+            &stale_mutation_route,
+            command_request_id,
+            Some(logical_command_id),
+            None,
+            mutation,
+            Duration::from_secs(5),
+        )
+        .expect("repeating the same logical command must use the retained outcome");
+    assert!(repeated_command.deduplicated);
 
     drop(gateway_database);
     drop(nodes);

@@ -41,7 +41,7 @@ use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResu
 
 use crate::database::SharedLocalDatabase;
 use crate::multiraft_runtime::MetadataHostRequest;
-use crate::replicated_tablet::ReplicatedTabletHandle;
+use crate::replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletStatus};
 
 /// Group-qualified handles published by the lifecycle owner after a tablet
 /// runtime has crossed its activation boundary.
@@ -264,6 +264,18 @@ impl TabletRpcClient {
         Ok(route)
     }
 
+    /// Return the local tablet lifecycle status when this node hosts the
+    /// requested group. This is intentionally read-only: callers use the
+    /// serving-leader bit to distinguish an elected Raft leader from a tablet
+    /// that has completed its current-term activation boundary.
+    pub fn tablet_status(&self, group_id: RaftGroupId) -> Option<ReplicatedTabletStatus> {
+        self.handles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&group_id)
+            .map(|handle| handle.status())
+    }
+
     /// Submit one command to a metadata-selected tablet route.
     pub fn submit_command(
         &self,
@@ -367,13 +379,22 @@ impl TabletRpcClient {
                     if is_retryable_tablet_error(&error)
                         && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
                 {
-                    self.adjust_route_after_error(
+                    let route_refreshed = self.adjust_route_after_error(
                         &mut current_route,
                         target_replica,
                         &command,
                         logical_command_id.is_some(),
                         &error,
                     );
+                    if route_refreshed {
+                        // The rejecting leader may still be the correct leader
+                        // after metadata returns the current epoch. Clear only
+                        // attempts for the refreshed group so that leader can
+                        // be retried without allowing a stale old-group
+                        // target to be reused after a topology move.
+                        attempted_replicas
+                            .retain(|(group_id, _)| *group_id != current_route.raft_group_id);
+                    }
                     last_error = Some(error);
                     let backoff = retry_backoff(
                         attempt,
@@ -580,11 +601,31 @@ impl TabletRpcClient {
                     if is_retryable_tablet_error(&error)
                         && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
                 {
-                    if let Error::StaleTabletEpoch { current_epoch, .. } = &error
-                        && *current_epoch != 0
-                    {
-                        current_route.tablet_epoch = *current_epoch;
-                        request.tablet_epoch = *current_epoch;
+                    let route_refreshed =
+                        if let Error::StaleTabletEpoch { current_epoch, .. } = &error {
+                            if *current_epoch == 0 {
+                                false
+                            } else if let Ok(refreshed) = self.lookup_tablet_route(
+                                request.row_key.table_id,
+                                &request.row_key.primary_key_bytes,
+                            ) {
+                                current_route = refreshed;
+                                true
+                            } else {
+                                current_route.tablet_epoch = *current_epoch;
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                    if route_refreshed {
+                        // A stale epoch can be returned by the current leader
+                        // before the route's leader hint changes. Reusing the
+                        // old group's attempted set would skip that leader on
+                        // the refreshed route and turn a recoverable epoch
+                        // change into a false LeaderUnknown result.
+                        attempted_replicas
+                            .retain(|(group_id, _)| *group_id != current_route.raft_group_id);
                     }
                     self.update_route_after_error(&mut current_route, target_replica, &error);
                     last_error = Some(error);
@@ -700,7 +741,7 @@ impl TabletRpcClient {
         command: &TabletCommand,
         allow_topology_move: bool,
         error: &Error,
-    ) {
+    ) -> bool {
         if let Error::StaleTabletEpoch { current_epoch, .. } = error
             && *current_epoch != 0
         {
@@ -708,7 +749,7 @@ impl TabletRpcClient {
         }
         self.update_route_after_error(route, rejected_leader, error);
         if error_leader(error).is_some() {
-            return;
+            return false;
         }
 
         if matches!(error, Error::StaleTabletEpoch { .. })
@@ -716,7 +757,9 @@ impl TabletRpcClient {
                 self.refresh_route_for_command(route, command, allow_topology_move)
         {
             *route = refreshed;
+            return true;
         }
+        false
     }
 
     fn refresh_route_for_command(

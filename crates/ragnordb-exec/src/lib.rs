@@ -2506,7 +2506,7 @@ mod tests {
     use super::*;
     use ragnordb_common::{
         catalog_codec::{ColumnDefinition, TableDefinition},
-        command_codec::TabletCommand,
+        command_codec::{CachedTabletCommandResult, TabletCommand},
         ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TxnId},
         metadata_codec::PartitionSpec,
         rpc_codec::{ReplicaRoute, TabletRoute},
@@ -2548,6 +2548,8 @@ mod tests {
         row: Vec<u8>,
         read_requests: Mutex<Vec<RequestId>>,
         commands: Mutex<Vec<(RequestId, TabletCommand)>>,
+        unknown_outcome_once: Mutex<bool>,
+        outcome_queries: Mutex<Vec<LogicalCommandId>>,
     }
 
     impl TabletGateway for RecordingGateway {
@@ -2580,6 +2582,42 @@ mod tests {
                 result: TabletCommandApplyResult::SingleShardCommit,
                 deduplicated: false,
             })
+        }
+
+        fn submit_command_with_identity_and_ack(
+            &self,
+            route: &TabletRoute,
+            request_id: RequestId,
+            _logical_command_id: LogicalCommandId,
+            _acknowledged_through: Option<u64>,
+            command: TabletCommand,
+            timeout: Duration,
+        ) -> Result<TabletCommandApplyOutcome> {
+            let mut unknown_outcome_once = self.unknown_outcome_once.lock().unwrap();
+            if *unknown_outcome_once {
+                *unknown_outcome_once = false;
+                return Err(Error::RequestOutcomeUnknown {
+                    identity: "recording-gateway-test-command".to_string(),
+                });
+            }
+            drop(unknown_outcome_once);
+            self.submit_command(route, request_id, command, timeout)
+        }
+
+        fn query_original_outcome(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            logical_command_id: LogicalCommandId,
+            _timeout: Duration,
+        ) -> Result<Option<CachedTabletCommandOutcome>> {
+            self.outcome_queries
+                .lock()
+                .unwrap()
+                .push(logical_command_id);
+            Ok(Some(CachedTabletCommandOutcome::Applied(
+                CachedTabletCommandResult::SingleShardCommit,
+            )))
         }
     }
 
@@ -2642,6 +2680,8 @@ mod tests {
             row: encode_row(&row).unwrap(),
             read_requests: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
+            unknown_outcome_once: Mutex::new(false),
+            outcome_queries: Mutex::new(Vec::new()),
         });
         let mut executor = LocalExecutor::new();
         executor.replace_metadata_table_creator(Arc::new(StaticMetadata {
@@ -2857,5 +2897,35 @@ mod tests {
         assert_eq!(commands[0].0.client_id, 99);
         assert_eq!(reads[0].sequence, 1);
         assert_eq!(commands[0].0.sequence, 1);
+    }
+
+    /// Realistic bug caught: a command response can be lost after the tablet
+    /// has durably applied the mutation. The executor must query the original
+    /// logical identity and accept its retained outcome without submitting a
+    /// second command that could duplicate the write.
+    #[test]
+    fn unknown_remote_commit_queries_original_outcome_without_resubmission() {
+        let (mut executor, gateway, _) = remote_executor();
+        *gateway.unknown_outcome_once.lock().unwrap() = true;
+        let mut session = SqlSession::with_client_id(100);
+        let mut manager = LocalTransactionManager::new();
+
+        let result = session
+            .execute_sql(
+                "INSERT INTO remote_users (id, name) VALUES (8, 'alice')",
+                &mut executor,
+                &mut manager,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ExecutionResult::Mutation {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(gateway.commands.lock().unwrap().is_empty());
+        assert_eq!(gateway.outcome_queries.lock().unwrap().len(), 1);
     }
 }
