@@ -30,7 +30,7 @@ use ragnordb_common::{
     rpc_codec::{
         MessageType, MetadataProposalRequest, MetadataRequest, MetadataResponse, ReplicaRoute,
         RpcFrame, TabletCommandRequest, TabletCommandResponse, TabletOutcomeQueryRequest,
-        TabletReadRequest, TabletRoute,
+        TabletReadRequest, TabletRoute, TabletRouteCache,
     },
 };
 use ragnordb_exec::TabletGateway;
@@ -168,6 +168,7 @@ pub struct TabletRpcClient {
     handles: SharedTabletHandleRegistry,
     rpc_state: RpcState,
     metadata: MetadataRuntimeHandle,
+    route_cache: Arc<RwLock<TabletRouteCache>>,
 }
 
 impl TabletRpcClient {
@@ -182,6 +183,7 @@ impl TabletRpcClient {
             handles,
             rpc_state,
             metadata,
+            route_cache: Arc::new(RwLock::new(TabletRouteCache::new())),
         }
     }
 
@@ -245,16 +247,20 @@ impl TabletRpcClient {
                     .any(|replica| replica.replica_id == *leader)
             })
             .unwrap_or(placement_leader_replica_id);
-        let route = TabletRoute {
+        let mut route = TabletRoute {
             raft_group_id: descriptor.raft_group_id,
             tablet_id: descriptor.tablet_id,
             tablet_epoch: descriptor.tablet_epoch,
             leader_replica_id,
             replicas,
         };
+        if let Some(cached_leader) = self.cached_leader_for(&route) {
+            route.leader_replica_id = cached_leader;
+        }
         route
             .validate()
             .map_err(|error| Error::CorruptData(error.to_string()))?;
+        self.cache_authoritative_route(&route);
         Ok(route)
     }
 
@@ -319,7 +325,7 @@ impl TabletRpcClient {
         let mut last_error = None;
         let mut attempted_replicas = BTreeSet::new();
 
-        for attempt in 0..=2_u32 {
+        for attempt in 0..MAX_TABLET_RETRY_ATTEMPTS {
             let (target_replica, target) =
                 match next_unattempted_replica(&current_route, &attempted_replicas) {
                     Ok(target) => target,
@@ -353,16 +359,29 @@ impl TabletRpcClient {
                 attempt_request,
                 remaining,
             ) {
-                Ok(outcome) => return Ok(outcome),
-                Err(error) if is_retryable_tablet_error(&error) && attempt < 2 => {
+                Ok(outcome) => {
+                    self.record_successful_leader(&current_route, target_replica);
+                    return Ok(outcome);
+                }
+                Err(error)
+                    if is_retryable_tablet_error(&error)
+                        && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
+                {
                     self.adjust_route_after_error(
                         &mut current_route,
+                        target_replica,
                         &command,
                         logical_command_id.is_some(),
                         &error,
                     );
                     last_error = Some(error);
-                    thread::sleep(Duration::from_millis(5 * (u64::from(attempt) + 1)));
+                    let backoff = retry_backoff(
+                        attempt,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if !backoff.is_zero() {
+                        thread::sleep(backoff);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -462,7 +481,7 @@ impl TabletRpcClient {
         let mut last_error = None;
         let mut attempted_replicas = BTreeSet::new();
 
-        for attempt in 0..=2_u32 {
+        for attempt in 0..MAX_TABLET_RETRY_ATTEMPTS {
             let (target_replica, target) =
                 match next_unattempted_replica(&current_route, &attempted_replicas) {
                     Ok(target) => target,
@@ -486,19 +505,29 @@ impl TabletRpcClient {
                 request.clone(),
                 remaining,
             ) {
-                Ok(row) => return Ok(row),
-                Err(error) if is_retryable_tablet_error(&error) && attempt < 2 => {
+                Ok(row) => {
+                    self.record_successful_leader(&current_route, target_replica);
+                    return Ok(row);
+                }
+                Err(error)
+                    if is_retryable_tablet_error(&error)
+                        && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
+                {
                     if let Error::StaleTabletEpoch { current_epoch, .. } = &error
                         && *current_epoch != 0
                     {
                         current_route.tablet_epoch = *current_epoch;
                         request.tablet_epoch = *current_epoch;
                     }
-                    if let Some(leader) = error_leader(&error) {
-                        current_route.leader_replica_id = leader;
-                    }
+                    self.update_route_after_error(&mut current_route, target_replica, &error);
                     last_error = Some(error);
-                    thread::sleep(Duration::from_millis(5 * (u64::from(attempt) + 1)));
+                    let backoff = retry_backoff(
+                        attempt,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if !backoff.is_zero() {
+                        thread::sleep(backoff);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -509,9 +538,90 @@ impl TabletRpcClient {
         }))
     }
 
+    fn cached_leader_for(&self, route: &TabletRoute) -> Option<ReplicaId> {
+        let cache = self
+            .route_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = cache.get(route.tablet_id)?;
+        (cached.raft_group_id == route.raft_group_id
+            && cached.tablet_epoch == route.tablet_epoch
+            && cached.replicas == route.replicas)
+            .then(|| cache.leader_hint(route.tablet_id).ok().flatten())
+            .flatten()
+    }
+
+    fn cache_authoritative_route(&self, route: &TabletRoute) {
+        let mut cache = self
+            .route_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache
+            .get(route.tablet_id)
+            .is_some_and(|cached| same_route_identity(cached, route))
+        {
+            return;
+        }
+        let _ = cache.insert(route.clone());
+    }
+
+    fn record_successful_leader(&self, route: &TabletRoute, leader: ReplicaId) {
+        let mut updated = route.clone();
+        if !apply_leader_hint(&mut updated, leader) {
+            return;
+        }
+
+        let mut cache = self
+            .route_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cache.get(route.tablet_id).cloned() {
+            Some(cached) if same_route_identity(&cached, route) => {
+                let _ = cache.update_leader(route.tablet_id, leader);
+            }
+            Some(_) => {}
+            None => {
+                let _ = cache.insert(updated);
+            }
+        }
+    }
+
+    fn update_route_after_error(
+        &self,
+        route: &mut TabletRoute,
+        rejected_leader: ReplicaId,
+        error: &Error,
+    ) {
+        let mut cache = self
+            .route_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match error {
+            Error::NotLeader {
+                leader_id: Some(leader_id),
+            } => {
+                let leader = ReplicaId(*leader_id);
+                if apply_leader_hint(route, leader) {
+                    let _ = cache.update_leader_if_current(
+                        route.tablet_id,
+                        Some(rejected_leader),
+                        Some(leader),
+                    );
+                } else {
+                    let _ = cache.invalidate_leader(route.tablet_id, rejected_leader);
+                }
+            }
+            Error::NotLeader { leader_id: None } | Error::LeaderUnknown => {
+                let _ = cache.invalidate_leader(route.tablet_id, rejected_leader);
+            }
+            _ => {}
+        }
+    }
+
     fn adjust_route_after_error(
         &self,
         route: &mut TabletRoute,
+        rejected_leader: ReplicaId,
         command: &TabletCommand,
         allow_topology_move: bool,
         error: &Error,
@@ -521,8 +631,8 @@ impl TabletRpcClient {
         {
             route.tablet_epoch = *current_epoch;
         }
-        if let Some(leader_replica_id) = error_leader(error) {
-            route.leader_replica_id = leader_replica_id;
+        self.update_route_after_error(route, rejected_leader, error);
+        if error_leader(error).is_some() {
             return;
         }
 
@@ -1384,6 +1494,33 @@ fn error_leader(error: &Error) -> Option<ReplicaId> {
     }
 }
 
+const MAX_TABLET_RETRY_ATTEMPTS: u32 = 3;
+const TABLET_RETRY_BACKOFF_BASE_MS: u64 = 5;
+const TABLET_RETRY_BACKOFF_MAX_MS: u64 = 100;
+
+fn apply_leader_hint(route: &mut TabletRoute, leader: ReplicaId) -> bool {
+    if route.node_for_replica(leader).is_none() {
+        return false;
+    }
+    route.leader_replica_id = leader;
+    true
+}
+
+fn same_route_identity(left: &TabletRoute, right: &TabletRoute) -> bool {
+    left.raft_group_id == right.raft_group_id
+        && left.tablet_id == right.tablet_id
+        && left.tablet_epoch == right.tablet_epoch
+        && left.replicas == right.replicas
+}
+
+fn retry_backoff(attempt: u32, remaining: Duration) -> Duration {
+    let multiplier = 1_u64 << attempt.min(20);
+    let delay_ms = TABLET_RETRY_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(TABLET_RETRY_BACKOFF_MAX_MS);
+    Duration::from_millis(delay_ms).min(remaining)
+}
+
 fn next_unattempted_replica(
     route: &TabletRoute,
     attempted: &BTreeSet<(RaftGroupId, ReplicaId)>,
@@ -1570,6 +1707,54 @@ mod tests {
             next_unattempted_replica(&route, &attempted).unwrap(),
             (ReplicaId(3), NodeId(13))
         );
+    }
+
+    /// Realistic bug caught: linear or uncapped retry delays can create a
+    /// retry storm and can sleep past the statement deadline instead of
+    /// returning the bounded retry result to the caller.
+    #[test]
+    fn retry_backoff_is_exponential_and_deadline_bounded() {
+        assert_eq!(
+            retry_backoff(0, Duration::from_millis(100)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            retry_backoff(1, Duration::from_millis(100)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            retry_backoff(2, Duration::from_millis(100)),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            retry_backoff(10, Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            retry_backoff(1, Duration::from_millis(3)),
+            Duration::from_millis(3)
+        );
+    }
+
+    /// Realistic bug caught: a stale or malicious leader hint can replace the
+    /// route's leader with a replica outside the authoritative placement and
+    /// make later retries target an invalid node.
+    #[test]
+    fn invalid_leader_hint_does_not_replace_route_leader() {
+        let mut route = TabletRoute {
+            raft_group_id: RaftGroupId(7),
+            tablet_id: TabletId(8),
+            tablet_epoch: 1,
+            leader_replica_id: ReplicaId(1),
+            replicas: vec![ReplicaRoute {
+                replica_id: ReplicaId(1),
+                node_id: NodeId(11),
+            }],
+        };
+
+        assert!(!apply_leader_hint(&mut route, ReplicaId(99)));
+        assert_eq!(route.leader_replica_id, ReplicaId(1));
+        assert!(apply_leader_hint(&mut route, ReplicaId(1)));
     }
 
     /// Realistic bug caught:

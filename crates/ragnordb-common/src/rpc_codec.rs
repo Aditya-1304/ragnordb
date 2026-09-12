@@ -592,6 +592,8 @@ pub enum TabletRouteError {
     DuplicateNode(NodeId),
     #[error("leader replica {0:?} is absent from the tablet route")]
     LeaderAbsent(ReplicaId),
+    #[error("tablet route has no cached leader hint")]
+    LeaderUnknown,
     #[error("metadata response does not contain a tablet route")]
     NotTabletResponse,
     #[error("tablet route cache cannot install an empty topology")]
@@ -665,6 +667,7 @@ impl TabletRoute {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TabletRouteCache {
     routes: BTreeMap<TabletId, TabletRoute>,
+    leader_hints: BTreeMap<TabletId, Option<ReplicaId>>,
 }
 
 impl TabletRouteCache {
@@ -682,11 +685,15 @@ impl TabletRouteCache {
         }
 
         let mut replacement = BTreeMap::new();
+        let mut replacement_hints = BTreeMap::new();
         for route in routes {
             route.validate()?;
-            if replacement.insert(route.tablet_id, route.clone()).is_some() {
-                return Err(TabletRouteError::DuplicateTablet(route.tablet_id));
+            let tablet_id = route.tablet_id;
+            let leader_replica_id = route.leader_replica_id;
+            if replacement.insert(tablet_id, route).is_some() {
+                return Err(TabletRouteError::DuplicateTablet(tablet_id));
             }
+            replacement_hints.insert(tablet_id, Some(leader_replica_id));
         }
 
         for tablet_id in expected_tablets {
@@ -704,15 +711,23 @@ impl TabletRouteCache {
         }
 
         self.routes = replacement;
+        self.leader_hints = replacement_hints;
         Ok(())
     }
 
     pub fn insert(&mut self, route: TabletRoute) -> Result<(), TabletRouteError> {
         route.validate()?;
-        self.routes.insert(route.tablet_id, route);
+        let tablet_id = route.tablet_id;
+        let leader_replica_id = route.leader_replica_id;
+        self.routes.insert(tablet_id, route);
+        self.leader_hints.insert(tablet_id, Some(leader_replica_id));
         Ok(())
     }
 
+    /// Return the immutable metadata route snapshot for a tablet. Its
+    /// `leader_replica_id` is the snapshot's seed hint; callers that need the
+    /// current cache state must use [`Self::leader_hint`] or
+    /// [`Self::leader_node`].
     pub fn get(&self, tablet_id: TabletId) -> Option<&TabletRoute> {
         self.routes.get(&tablet_id)
     }
@@ -721,9 +736,20 @@ impl TabletRouteCache {
         self.get(tablet_id)?.node_for_replica(replica_id)
     }
 
-    /// Update only the soft leader hint after a successful request or a
-    /// `NotLeader` response. Placement remains unchanged and an unknown
-    /// replica can never be promoted by a stale response.
+    /// Return the current soft leader hint without exposing the immutable
+    /// route snapshot. `None` means the cache deliberately has no usable
+    /// leader hint after a failed or stale request.
+    pub fn leader_hint(&self, tablet_id: TabletId) -> Result<Option<ReplicaId>, TabletRouteError> {
+        self.leader_hints
+            .get(&tablet_id)
+            .copied()
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))
+    }
+
+    /// Update the soft leader hint from an authoritative status or metadata
+    /// refresh. Placement remains unchanged and an unknown replica can never
+    /// be promoted. Responses from a possibly stale request should use
+    /// [`Self::update_leader_if_current`] instead.
     pub fn update_leader(
         &mut self,
         tablet_id: TabletId,
@@ -731,24 +757,76 @@ impl TabletRouteCache {
     ) -> Result<(), TabletRouteError> {
         let route = self
             .routes
-            .get_mut(&tablet_id)
+            .get(&tablet_id)
             .ok_or(TabletRouteError::MissingTablet(tablet_id))?;
-        if route.node_for_replica(leader_replica_id).is_none() {
-            return Err(TabletRouteError::LeaderAbsent(leader_replica_id));
-        }
-        route.leader_replica_id = leader_replica_id;
+        validate_leader_replica(route, leader_replica_id)?;
+        self.leader_hints.insert(tablet_id, Some(leader_replica_id));
         Ok(())
     }
 
-    pub fn leader_node(&self, tablet_id: TabletId) -> Result<NodeId, TabletRouteError> {
-        self.routes
+    /// Apply a leader hint only if the cache still contains the expected
+    /// previous hint. This compare-and-update boundary prevents a delayed
+    /// `NotLeader` response from overwriting a newer status or response hint.
+    /// Both the rejected replica and the replacement hint must belong to the
+    /// immutable route; a rejected update leaves all cache state unchanged.
+    pub fn update_leader_if_current(
+        &mut self,
+        tablet_id: TabletId,
+        expected_leader_replica_id: Option<ReplicaId>,
+        leader_replica_id: Option<ReplicaId>,
+    ) -> Result<bool, TabletRouteError> {
+        let route = self
+            .routes
             .get(&tablet_id)
-            .ok_or(TabletRouteError::MissingTablet(tablet_id))?
-            .leader_node()
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))?;
+        if let Some(expected_leader_replica_id) = expected_leader_replica_id {
+            validate_leader_replica(route, expected_leader_replica_id)?;
+        }
+        if let Some(leader_replica_id) = leader_replica_id {
+            validate_leader_replica(route, leader_replica_id)?;
+        }
+
+        let current = self
+            .leader_hints
+            .get(&tablet_id)
+            .copied()
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))?;
+        if current != expected_leader_replica_id {
+            return Ok(false);
+        }
+
+        self.leader_hints.insert(tablet_id, leader_replica_id);
+        Ok(true)
+    }
+
+    /// Invalidate a hint only when the rejected replica is still the cached
+    /// hint. A delayed response from an older attempt therefore becomes a
+    /// no-op instead of erasing a newer leader observation.
+    pub fn invalidate_leader(
+        &mut self,
+        tablet_id: TabletId,
+        rejected_leader_replica_id: ReplicaId,
+    ) -> Result<bool, TabletRouteError> {
+        self.update_leader_if_current(tablet_id, Some(rejected_leader_replica_id), None)
+    }
+
+    pub fn leader_node(&self, tablet_id: TabletId) -> Result<NodeId, TabletRouteError> {
+        let route = self
+            .routes
+            .get(&tablet_id)
+            .ok_or(TabletRouteError::MissingTablet(tablet_id))?;
+        let leader_replica_id = self
+            .leader_hint(tablet_id)?
+            .ok_or(TabletRouteError::LeaderUnknown)?;
+        route
+            .node_for_replica(leader_replica_id)
+            .ok_or(TabletRouteError::LeaderAbsent(leader_replica_id))
     }
 
     pub fn remove(&mut self, tablet_id: TabletId) -> Option<TabletRoute> {
-        self.routes.remove(&tablet_id)
+        let route = self.routes.remove(&tablet_id);
+        self.leader_hints.remove(&tablet_id);
+        route
     }
 
     pub fn len(&self) -> usize {
@@ -758,6 +836,19 @@ impl TabletRouteCache {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
+}
+
+fn validate_leader_replica(
+    route: &TabletRoute,
+    leader_replica_id: ReplicaId,
+) -> Result<(), TabletRouteError> {
+    if leader_replica_id.0 == 0 {
+        return Err(TabletRouteError::ZeroLeaderReplicaId);
+    }
+    if route.node_for_replica(leader_replica_id).is_none() {
+        return Err(TabletRouteError::LeaderAbsent(leader_replica_id));
+    }
+    Ok(())
 }
 
 /// Responses from the metadata Raft group.
@@ -1290,10 +1381,82 @@ mod tests {
         cache.update_leader(TabletId(10), ReplicaId(12)).unwrap();
         assert_eq!(cache.leader_node(TabletId(10)), Ok(NodeId(2)));
         assert_eq!(
+            cache.get(TabletId(10)).unwrap().leader_replica_id,
+            ReplicaId(11)
+        );
+        assert_eq!(
             cache.update_leader(TabletId(10), ReplicaId(99)),
             Err(TabletRouteError::LeaderAbsent(ReplicaId(99)))
         );
         assert_eq!(cache.leader_node(TabletId(10)), Ok(NodeId(2)));
+    }
+
+    /// Realistic bug caught: a delayed `NotLeader` response from an older
+    /// attempt could invalidate or replace a newer leader hint. The cache
+    /// must apply a response only when the rejected replica is still the
+    /// current hint, while retaining immutable route identity and placement.
+    #[test]
+    fn tablet_route_cache_applies_not_leader_updates_only_to_current_hint() {
+        let mut cache = TabletRouteCache::new();
+        let route = TabletRoute {
+            raft_group_id: RaftGroupId(7),
+            tablet_id: TabletId(10),
+            tablet_epoch: 2,
+            leader_replica_id: ReplicaId(11),
+            replicas: vec![
+                ReplicaRoute {
+                    replica_id: ReplicaId(11),
+                    node_id: NodeId(1),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(12),
+                    node_id: NodeId(2),
+                },
+                ReplicaRoute {
+                    replica_id: ReplicaId(13),
+                    node_id: NodeId(3),
+                },
+            ],
+        };
+        cache.insert(route.clone()).unwrap();
+
+        assert_eq!(
+            cache.update_leader_if_current(TabletId(10), Some(ReplicaId(11)), Some(ReplicaId(12)),),
+            Ok(true)
+        );
+        assert_eq!(cache.leader_hint(TabletId(10)), Ok(Some(ReplicaId(12))));
+
+        assert_eq!(
+            cache.update_leader_if_current(TabletId(10), Some(ReplicaId(11)), Some(ReplicaId(13)),),
+            Ok(false)
+        );
+        assert_eq!(cache.leader_hint(TabletId(10)), Ok(Some(ReplicaId(12))));
+
+        assert_eq!(
+            cache.update_leader_if_current(TabletId(10), Some(ReplicaId(12)), Some(ReplicaId(99)),),
+            Err(TabletRouteError::LeaderAbsent(ReplicaId(99)))
+        );
+        assert_eq!(cache.leader_hint(TabletId(10)), Ok(Some(ReplicaId(12))));
+
+        assert_eq!(
+            cache.invalidate_leader(TabletId(10), ReplicaId(12)),
+            Ok(true)
+        );
+        assert_eq!(cache.leader_hint(TabletId(10)), Ok(None));
+        assert_eq!(
+            cache.leader_node(TabletId(10)),
+            Err(TabletRouteError::LeaderUnknown)
+        );
+
+        assert_eq!(
+            cache.invalidate_leader(TabletId(10), ReplicaId(11)),
+            Ok(false)
+        );
+        let cached_route = cache.get(TabletId(10)).unwrap();
+        assert_eq!(cached_route.raft_group_id, route.raft_group_id);
+        assert_eq!(cached_route.tablet_id, route.tablet_id);
+        assert_eq!(cached_route.tablet_epoch, route.tablet_epoch);
+        assert_eq!(cached_route.replicas, route.replicas);
     }
 
     #[test]
