@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use ragnordb_catalog::MetadataState;
 use ragnordb_common::{
     ids::{NodeId, RaftGroupId, ReplicaId, TabletId},
+    metadata_codec::RESERVED_METADATA_RAFT_GROUP_ID,
     metadata_codec::{DesiredReplicaRole, NodeLifecycle},
 };
 use ragnordb_multiraft::host::{MultiRaftHostStatus, MultiRaftRole};
@@ -211,6 +212,20 @@ pub fn compute_node_drain_status(
                 && desired.replica_id == group.identity.replica_id
         });
         if !represented_by_desired_metadata {
+            let local_replica_in_committed_conf_state =
+                group.voters.contains(&group.identity.replica_id)
+                    || group.learners.contains(&group.identity.replica_id)
+                    || group.outgoing_voters.contains(&group.identity.replica_id);
+            let removed_metadata_replica = group.identity.raft_group_id
+                == RESERVED_METADATA_RAFT_GROUP_ID
+                && !local_replica_in_committed_conf_state;
+            if removed_metadata_replica {
+                // The metadata group has no tablet desired-placement record.
+                // Once its committed ConfState proves local removal, the
+                // remaining runtime is stale cleanup rather than a live
+                // placement obligation.
+                continue;
+            }
             let blocker = NodeDrainBlocker::HostedReplicaNotInMetadata {
                 raft_group_id: group.identity.raft_group_id,
                 replica_id: group.identity.replica_id,
@@ -223,11 +238,7 @@ pub fn compute_node_drain_status(
                 local_group_present: true,
                 local_role: group.role,
                 local_leader: group.role == Some(MultiRaftRole::Leader),
-                local_replica_in_committed_conf_state: group
-                    .voters
-                    .contains(&group.identity.replica_id)
-                    || group.learners.contains(&group.identity.replica_id)
-                    || group.outgoing_voters.contains(&group.identity.replica_id),
+                local_replica_in_committed_conf_state,
                 replacement_candidates: Vec::new(),
                 blockers: vec![blocker.clone()],
             });
@@ -257,7 +268,7 @@ pub fn compute_node_drain_status(
     }
 }
 
-fn eligible_replacement_nodes(
+pub(crate) fn eligible_replacement_nodes(
     metadata: &MetadataState,
     placement: &ragnordb_common::metadata_codec::DesiredReplicaPlacement,
     removed_node_id: NodeId,

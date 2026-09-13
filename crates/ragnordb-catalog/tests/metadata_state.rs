@@ -785,6 +785,7 @@ fn legacy_creation_commands_advance_identity_high_water_marks() {
             max_table_id: 7,
             max_tablet_id: 17,
             max_raft_group_id: 23,
+            max_replica_id: 0,
         },
     );
 }
@@ -1053,6 +1054,132 @@ fn draining_node_cannot_be_retained_as_a_preferred_leader() {
             ..
         })
     ));
+}
+
+#[test]
+fn replacement_placement_can_retain_a_draining_source_until_membership_removal() {
+    let mut state = bootstrap_state();
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            DesiredReplicaPlacement {
+                tablet_id: TabletId(17),
+                configuration_epoch: 1,
+                placement_policy: PlacementPolicy::for_replica_count(1),
+                replicas: vec![DesiredReplica {
+                    replica_id: ReplicaId(31),
+                    node_id: NodeId(11),
+                    role: DesiredReplicaRole::Voter,
+                }],
+            },
+        )),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Draining,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    // Realistic bug caught: rejecting the source from this transitional
+    // placement would force metadata to remove a voter before its replacement
+    // has joined the Raft group, reducing quorum during an ordinary drain.
+    let transitional = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 2,
+        placement_policy: PlacementPolicy::for_replica_count(2),
+        replicas: vec![
+            DesiredReplica {
+                replica_id: ReplicaId(31),
+                node_id: NodeId(11),
+                role: DesiredReplicaRole::Voter,
+            },
+            DesiredReplica {
+                replica_id: ReplicaId(33),
+                node_id: NodeId(12),
+                role: DesiredReplicaRole::Voter,
+            },
+        ],
+    };
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            transitional.clone()
+        )),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(state.desired_placement(TabletId(17)), Some(&transitional));
+}
+
+#[test]
+fn replica_allocator_does_not_reuse_ids_across_drain_epochs() {
+    let mut state = bootstrap_state();
+    let source = DesiredReplica {
+        replica_id: ReplicaId(31),
+        node_id: NodeId(11),
+        role: DesiredReplicaRole::Voter,
+    };
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            DesiredReplicaPlacement {
+                tablet_id: TabletId(17),
+                configuration_epoch: 1,
+                placement_policy: PlacementPolicy::for_replica_count(1),
+                replicas: vec![source.clone()],
+            },
+        )),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(state.next_replica_id(), Some(ReplicaId(32)));
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Draining,
+        }),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            DesiredReplicaPlacement {
+                tablet_id: TabletId(17),
+                configuration_epoch: 2,
+                placement_policy: PlacementPolicy::for_replica_count(2),
+                replicas: vec![
+                    source,
+                    DesiredReplica {
+                        replica_id: ReplicaId(32),
+                        node_id: NodeId(12),
+                        role: DesiredReplicaRole::Voter,
+                    },
+                ],
+            },
+        )),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(state.next_replica_id(), Some(ReplicaId(33)));
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            DesiredReplicaPlacement {
+                tablet_id: TabletId(17),
+                configuration_epoch: 3,
+                placement_policy: PlacementPolicy::for_replica_count(1),
+                replicas: vec![DesiredReplica {
+                    replica_id: ReplicaId(32),
+                    node_id: NodeId(12),
+                    role: DesiredReplicaRole::Voter,
+                }],
+            },
+        )),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        state.next_replica_id(),
+        Some(ReplicaId(33)),
+        "a removed source identity must remain above the allocator floor"
+    );
 }
 
 #[test]

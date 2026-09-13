@@ -293,6 +293,7 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
             max_table_id: 7,
             max_tablet_id: 17,
             max_raft_group_id: 23,
+            max_replica_id: 32,
         },
 
         request_deduplication: Vec::new(),
@@ -346,6 +347,7 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
             max_table_id: 100,
             max_tablet_id: 200,
             max_raft_group_id: 300,
+            max_replica_id: 32,
         },
 
         request_deduplication: Vec::new(),
@@ -367,6 +369,7 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
             max_table_id: 7,
             max_tablet_id: 17,
             max_raft_group_id: 2,
+            max_replica_id: 32,
         },
     );
 }
@@ -413,6 +416,7 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
             max_table_id: 10,
             max_tablet_id: 20,
             max_raft_group_id: 30,
+            max_replica_id: 0,
         },
 
         request_deduplication: Vec::new(),

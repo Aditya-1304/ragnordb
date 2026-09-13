@@ -243,6 +243,11 @@ message MetadataAllocatorState {
     uint64 max_table_id = 1;
     uint64 max_tablet_id = 2;
     uint64 max_raft_group_id = 3;
+    // Replica IDs are group-local but their allocation high-water mark is
+    // cluster-owned. Retaining it prevents a replacement lifetime from being
+    // reused in the interval between desired-placement removal and the second
+    // committed retirement proof.
+    uint64 max_replica_id = 4;
 }
 
 // Deterministic snapshot of the metadata Raft state machine.

@@ -4,6 +4,7 @@ pub mod build_info;
 pub mod config;
 pub mod data_directory_lock;
 pub mod database;
+pub mod drain_jobs;
 pub mod metrics;
 pub mod multiraft_runtime;
 pub mod node_lifecycle;

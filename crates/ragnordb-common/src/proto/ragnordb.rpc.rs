@@ -136,7 +136,7 @@ pub struct TabletCommandResponse {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataRequest {
-    #[prost(oneof = "metadata_request::Request", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "metadata_request::Request", tags = "1, 2, 3, 4, 5")]
     pub request: ::core::option::Option<metadata_request::Request>,
 }
 /// Nested message and enum types in `MetadataRequest`.
@@ -151,6 +151,8 @@ pub mod metadata_request {
         LookupSchema(super::LookupSchemaRequest),
         #[prost(message, tag = "4")]
         ProposeCommand(super::MetadataProposalRequest),
+        #[prost(message, tag = "5")]
+        ProposeConfChange(super::MetadataConfChangeRequest),
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -169,7 +171,7 @@ pub struct LookupSchemaRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataResponse {
-    #[prost(oneof = "metadata_response::Response", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "metadata_response::Response", tags = "1, 2, 3, 4, 5")]
     pub response: ::core::option::Option<metadata_response::Response>,
 }
 /// Nested message and enum types in `MetadataResponse`.
@@ -184,6 +186,8 @@ pub mod metadata_response {
         LookupSchema(super::LookupSchemaResponse),
         #[prost(message, tag = "4")]
         ProposeCommand(super::MetadataProposalResponse),
+        #[prost(message, tag = "5")]
+        ProposeConfChange(super::MetadataConfChangeResponse),
     }
 }
 /// A metadata proposal is forwarded as the exact command envelope created by
@@ -213,6 +217,33 @@ pub struct MetadataProposalResponse {
     #[prost(bytes = "vec", tag = "6")]
     pub outcome: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "7")]
+    pub leader_replica_id: u64,
+}
+/// Internal control-plane request used when a draining metadata member is not
+/// the metadata leader. The receiving node proposes the ConfChange through its
+/// Ready owner; it never mutates membership directly from the RPC thread.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MetadataConfChangeRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "2")]
+    pub expected_conf_state_version: u64,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(bool, tag = "4")]
+    pub remove_replica: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataConfChangeResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    #[prost(string, tag = "3")]
+    pub error_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub error_message: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
     pub leader_replica_id: u64,
 }
 /// Control-plane admission for a post-bootstrap replica lifetime. The target

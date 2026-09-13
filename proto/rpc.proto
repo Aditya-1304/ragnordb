@@ -110,6 +110,7 @@ message MetadataRequest {
         LookupTabletRequest lookup_tablet = 2;
         LookupSchemaRequest lookup_schema = 3;
         MetadataProposalRequest propose_command = 4;
+        MetadataConfChangeRequest propose_conf_change = 5;
     }
 }
 
@@ -131,6 +132,7 @@ message MetadataResponse {
         LookupTabletResponse lookup_tablet = 2;
         LookupSchemaResponse lookup_schema = 3;
         MetadataProposalResponse propose_command = 4;
+        MetadataConfChangeResponse propose_conf_change = 5;
     }
 }
 
@@ -151,6 +153,24 @@ message MetadataProposalResponse {
     string error_message = 5;
     bytes outcome = 6;
     uint64 leader_replica_id = 7;
+}
+
+// Internal control-plane request used when a draining metadata member is not
+// the metadata leader. The receiving node proposes the ConfChange through its
+// Ready owner; it never mutates membership directly from the RPC thread.
+message MetadataConfChangeRequest {
+    optional uint64 rpc_attempt_id = 1;
+    uint64 expected_conf_state_version = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    bool remove_replica = 4;
+}
+
+message MetadataConfChangeResponse {
+    optional uint64 rpc_attempt_id = 1;
+    bool success = 2;
+    string error_code = 3;
+    string error_message = 4;
+    uint64 leader_replica_id = 5;
 }
 
 // Control-plane admission for a post-bootstrap replica lifetime. The target

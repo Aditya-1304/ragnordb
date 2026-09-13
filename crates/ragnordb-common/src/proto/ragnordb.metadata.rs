@@ -301,6 +301,12 @@ pub struct MetadataAllocatorState {
     pub max_tablet_id: u64,
     #[prost(uint64, tag = "3")]
     pub max_raft_group_id: u64,
+    /// Replica IDs are group-local but their allocation high-water mark is
+    /// cluster-owned. Retaining it prevents a replacement lifetime from being
+    /// reused in the interval between desired-placement removal and the second
+    /// committed retirement proof.
+    #[prost(uint64, tag = "4")]
+    pub max_replica_id: u64,
 }
 /// Deterministic snapshot of the metadata Raft state machine.
 ///

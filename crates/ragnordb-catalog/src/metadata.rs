@@ -457,6 +457,21 @@ impl MetadataState {
         self.allocator
     }
 
+    /// Return the next never-published replica identity.
+    ///
+    /// The high-water mark is advanced when a desired placement is committed,
+    /// before any Raft learner or voter transition is attempted. That ordering
+    /// prevents a replacement from reusing an identity during the interval
+    /// between a committed membership removal and its metadata retirement
+    /// proof.
+    pub fn next_replica_id(&self) -> Option<ReplicaId> {
+        self.allocator
+            .max_replica_id
+            .checked_add(1)
+            .filter(|id| *id != 0)
+            .map(ReplicaId)
+    }
+
     pub fn node(&self, node_id: NodeId) -> Option<&NodeDescriptor> {
         self.nodes.get(&node_id)
     }
@@ -753,6 +768,14 @@ impl MetadataState {
             }
             // Canonical ordering and voter checks are already enforced by
             // `snapshot.validate()`, which was called above.
+            state.allocator.max_replica_id = state.allocator.max_replica_id.max(
+                placement
+                    .replicas
+                    .iter()
+                    .map(|replica| replica.replica_id.0)
+                    .max()
+                    .unwrap_or(0),
+            );
             state
                 .desired_placements
                 .insert(placement.tablet_id, placement);
@@ -790,6 +813,8 @@ impl MetadataState {
             state
                 .retired_replicas
                 .insert((retired.raft_group_id, retired.replica_id), retired);
+            state.allocator.max_replica_id =
+                state.allocator.max_replica_id.max(retired.replica_id.0);
         }
 
         // Snapshot validation proved that these high-water marks dominate all
@@ -1223,6 +1248,17 @@ impl MetadataState {
         self.allocator.max_table_id = table_id.0;
         self.allocator.max_tablet_id = tablet_id.0;
         self.allocator.max_raft_group_id = raft_group_id.0;
+        self.allocator.max_replica_id = self
+            .desired_placements
+            .get(&tablet_id)
+            .and_then(|placement| {
+                placement
+                    .replicas
+                    .iter()
+                    .map(|replica| replica.replica_id.0)
+                    .max()
+            })
+            .unwrap_or(self.allocator.max_replica_id);
 
         MetadataApplyOutcome::TableCreated(MetadataTableCreated {
             table_id,
@@ -1470,6 +1506,15 @@ impl MetadataState {
             }
         };
 
+        let existing = self.desired_placements.get(&placement.tablet_id).cloned();
+
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing == &placement)
+        {
+            return MetadataApplyOutcome::AlreadyApplied;
+        }
+
         for replica in &placement.replicas {
             let Some(node) = self.nodes.get(&replica.node_id) else {
                 return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownNode(
@@ -1477,7 +1522,20 @@ impl MetadataState {
                 ));
             };
 
-            if node.lifecycle != NodeLifecycle::Active {
+            let retained_from_existing = existing.as_ref().is_some_and(|previous| {
+                previous.replicas.iter().any(|old_replica| {
+                    old_replica.replica_id == replica.replica_id
+                        && old_replica.node_id == replica.node_id
+                })
+            });
+
+            if node.lifecycle != NodeLifecycle::Active
+                && !(retained_from_existing
+                    && matches!(
+                        node.lifecycle,
+                        NodeLifecycle::Draining | NodeLifecycle::Decommissioning
+                    ))
+            {
                 return MetadataApplyOutcome::Rejected(MetadataRejection::NodeNotEligible {
                     node_id: replica.node_id,
                     lifecycle: node_lifecycle_name(node.lifecycle),
@@ -1565,15 +1623,6 @@ impl MetadataState {
             }
         }
 
-        let existing = self.desired_placements.get(&placement.tablet_id).cloned();
-
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing == &placement)
-        {
-            return MetadataApplyOutcome::AlreadyApplied;
-        }
-
         match &existing {
             None => {
                 if placement.configuration_epoch != 1 {
@@ -1639,6 +1688,14 @@ impl MetadataState {
             }
         }
 
+        self.allocator.max_replica_id = self.allocator.max_replica_id.max(
+            placement
+                .replicas
+                .iter()
+                .map(|replica| replica.replica_id.0)
+                .max()
+                .unwrap_or(0),
+        );
         self.desired_placements
             .insert(placement.tablet_id, placement);
 

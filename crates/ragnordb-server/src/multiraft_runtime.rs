@@ -11,7 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -26,8 +26,8 @@ use ragnordb_common::{
         ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
     },
     metadata_codec::{
-        CreateTableRequest, DesiredReplicaRole, MetadataCommand, MetadataCommandEnvelope,
-        NodeDescriptor, NodeLifecycle, TabletDescriptor,
+        CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
+        MetadataCommand, MetadataCommandEnvelope, NodeDescriptor, NodeLifecycle, TabletDescriptor,
     },
     raft_bootstrap::RaftGroupBootstrap,
 };
@@ -63,6 +63,8 @@ use crate::{
     config::NodeConfig,
     data_directory_lock::DataDirectoryLock,
     database::SharedLocalDatabase,
+    drain_jobs::{DrainJobRegistry, DrainReplicaJobRecord, DrainReplicaJobStage},
+    node_lifecycle::eligible_replacement_nodes,
     replica_join::{
         JoiningMembershipWitness, JoiningReplicaLifecycle, JoiningReplicaRecord,
         JoiningReplicaRegistry,
@@ -112,9 +114,14 @@ const REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY: usize = 128;
 
 pub(crate) enum MetadataHostRequest {
     Command {
-        envelope: MetadataCommandEnvelope,
+        envelope: Box<MetadataCommandEnvelope>,
         reply: mpsc::Sender<Result<MetadataApplyOutcome>>,
         deadline: Instant,
+    },
+    ConfChange {
+        expected_conf_state_version: u64,
+        replica_id: ReplicaId,
+        reply: mpsc::Sender<Result<()>>,
     },
 }
 
@@ -153,6 +160,10 @@ struct TabletLifecycleManager {
     writers: BTreeMap<RaftReplicaIdentity, NodeRaftWalHandle<LocalWal>>,
     tablet_handles: SharedTabletHandleRegistry,
     pending_retirements: BTreeSet<(RaftGroupId, ReplicaId)>,
+    drain_jobs: DrainJobRegistry,
+    metadata_control: Option<MetadataProposalClient>,
+    pending_drain_proposals: Arc<Mutex<BTreeSet<(RaftGroupId, ReplicaId, u8)>>>,
+    pending_metadata_membership_removals: Arc<Mutex<BTreeSet<(ReplicaId, u64)>>>,
 }
 
 impl TabletLifecycleManager {
@@ -170,8 +181,13 @@ impl TabletLifecycleManager {
         recovered: RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
         tablet_handles: SharedTabletHandleRegistry,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let cluster_id = config.cluster_id.as_deref().ok_or_else(|| {
+            Error::Configuration("drain jobs require a configured cluster ID".to_string())
+        })?;
+        let drain_jobs =
+            DrainJobRegistry::open(config.data_dir.join("node-drain-jobs.json"), cluster_id)?;
+        Ok(Self {
             config,
             wal,
             database,
@@ -187,7 +203,15 @@ impl TabletLifecycleManager {
             writers: BTreeMap::new(),
             tablet_handles,
             pending_retirements: BTreeSet::new(),
-        }
+            drain_jobs,
+            metadata_control: None,
+            pending_drain_proposals: Arc::new(Mutex::new(BTreeSet::new())),
+            pending_metadata_membership_removals: Arc::new(Mutex::new(BTreeSet::new())),
+        })
+    }
+
+    fn install_metadata_control(&mut self, metadata_control: MetadataProposalClient) {
+        self.metadata_control = Some(metadata_control);
     }
 
     /// Materialize all currently desired local tablet replicas.
@@ -851,6 +875,452 @@ impl TabletLifecycleManager {
             }
         }
         Ok(())
+    }
+
+    /// Reconcile the node-level drain workflow from durable metadata and the
+    /// local committed Raft observations. Placement edits are submitted through
+    /// the asynchronous metadata client, so a follower node never blocks its
+    /// own host loop while forwarding a control-plane proposal.
+    fn reconcile_node_drain(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        metadata: &MetadataRuntimeHandle,
+        metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+    ) -> Result<()> {
+        let state = metadata.state_snapshot();
+        let Some(node) = state.node(self.config.node_id) else {
+            return Ok(());
+        };
+        if node.lifecycle == NodeLifecycle::Active {
+            return Ok(());
+        }
+
+        self.ensure_drain_jobs(&state)?;
+        let host_status = host.status();
+        for job in self.drain_jobs.records()? {
+            if job.node_id != self.config.node_id || job.stage == DrainReplicaJobStage::Complete {
+                continue;
+            }
+            self.reconcile_drain_job(&job, &state, &host_status)?;
+        }
+
+        self.reconcile_metadata_group_removal(host, &state, metadata_replica_to_node)?;
+
+        let status = crate::node_lifecycle::compute_node_drain_status(
+            &state,
+            Some(&host_status),
+            self.config.node_id,
+        );
+        match node.lifecycle {
+            NodeLifecycle::Decommissioning if status.ready_for_decommissioned => {
+                self.submit_node_lifecycle(NodeLifecycle::Decommissioned, 4);
+            }
+            NodeLifecycle::Decommissioned if status.blockers.is_empty() => {
+                self.submit_node_lifecycle(NodeLifecycle::Tombstoned, 5);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Create one durable plan per local source lifetime. A voter replacement
+    /// is represented in two metadata epochs: first the old voter plus the new
+    /// voter (allowing Raft to add/promote safely), then the final placement
+    /// without the draining source. Learners can be removed directly.
+    fn ensure_drain_jobs(&mut self, state: &MetadataState) -> Result<()> {
+        let existing_jobs = self.drain_jobs.records()?;
+        let mut reserved_replacement_ids = existing_jobs
+            .iter()
+            .filter_map(|job| job.replacement_replica_id)
+            .collect::<BTreeSet<_>>();
+        let mut next_replacement_id = state.next_replica_id();
+
+        for descriptor in state.tablets() {
+            let Some(placement) = state.desired_placement(descriptor.tablet_id) else {
+                continue;
+            };
+            for source in placement
+                .replicas
+                .iter()
+                .filter(|replica| replica.node_id == self.config.node_id)
+            {
+                if state.is_replica_retired(descriptor.raft_group_id, source.replica_id)
+                    || self
+                        .drain_jobs
+                        .record(descriptor.raft_group_id, source.replica_id)?
+                        .is_some()
+                {
+                    continue;
+                }
+
+                let preferred_leader_nodes: Vec<NodeId> = placement
+                    .placement_policy
+                    .preferred_leader_nodes
+                    .iter()
+                    .copied()
+                    .filter(|node_id| *node_id != self.config.node_id)
+                    .collect();
+                let mut final_policy = placement.placement_policy.clone();
+                final_policy.preferred_leader_nodes = preferred_leader_nodes.clone();
+
+                let mut final_placement = placement.clone();
+                final_placement.configuration_epoch = placement
+                    .configuration_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        Error::Configuration("drain placement epoch exhausted".into())
+                    })?;
+                final_placement.placement_policy = final_policy.clone();
+                final_placement
+                    .replicas
+                    .retain(|replica| replica.replica_id != source.replica_id);
+
+                let (replacement_node_id, replacement_replica_id, replacement_placement) = if source
+                    .role
+                    == DesiredReplicaRole::Voter
+                {
+                    let replacement_node_id =
+                        eligible_replacement_nodes(state, placement, self.config.node_id)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| Error::ProposalUnavailable {
+                                reason: format!(
+                                    "no eligible replacement for replica {} of group {}",
+                                    source.replica_id.0, descriptor.raft_group_id.0
+                                ),
+                            })?;
+                    let replacement_replica_id = loop {
+                        let candidate =
+                            next_replacement_id.ok_or_else(|| Error::ProposalUnavailable {
+                                reason: "replica identity space exhausted during node drain".into(),
+                            })?;
+                        next_replacement_id = candidate
+                            .0
+                            .checked_add(1)
+                            .filter(|id| *id != 0)
+                            .map(ReplicaId);
+                        if reserved_replacement_ids.insert(candidate) {
+                            break candidate;
+                        }
+                    };
+                    let mut transitional = placement.clone();
+                    transitional.configuration_epoch = placement
+                        .configuration_epoch
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            Error::Configuration("drain placement epoch exhausted".into())
+                        })?;
+                    transitional.placement_policy.replication_factor = transitional
+                        .placement_policy
+                        .replication_factor
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            Error::Configuration(
+                                "drain temporary replication factor exhausted".into(),
+                            )
+                        })?;
+                    transitional.placement_policy.preferred_leader_nodes = preferred_leader_nodes;
+                    transitional.replicas.push(DesiredReplica {
+                        replica_id: replacement_replica_id,
+                        node_id: replacement_node_id,
+                        role: DesiredReplicaRole::Voter,
+                    });
+                    transitional
+                        .replicas
+                        .sort_by_key(|replica| replica.replica_id);
+                    final_placement.replicas.push(DesiredReplica {
+                        replica_id: replacement_replica_id,
+                        node_id: replacement_node_id,
+                        role: DesiredReplicaRole::Voter,
+                    });
+                    final_placement
+                        .replicas
+                        .sort_by_key(|replica| replica.replica_id);
+                    final_placement.configuration_epoch = placement
+                        .configuration_epoch
+                        .checked_add(2)
+                        .ok_or_else(|| {
+                            Error::Configuration("drain placement epoch exhausted".into())
+                        })?;
+                    (
+                        Some(replacement_node_id),
+                        Some(replacement_replica_id),
+                        Some(transitional),
+                    )
+                } else {
+                    (None, None, None)
+                };
+
+                self.drain_jobs.ensure(DrainReplicaJobRecord {
+                    cluster_id: self.config.cluster_id.clone().unwrap_or_default(),
+                    node_id: self.config.node_id,
+                    raft_group_id: descriptor.raft_group_id,
+                    tablet_id: descriptor.tablet_id,
+                    source_replica_id: source.replica_id,
+                    replacement_node_id,
+                    replacement_replica_id,
+                    replacement_placement,
+                    final_placement,
+                    stage: DrainReplicaJobStage::Planned,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_drain_job(
+        &mut self,
+        job: &DrainReplicaJobRecord,
+        state: &MetadataState,
+        host_status: &MultiRaftHostStatus,
+    ) -> Result<()> {
+        let current = state.desired_placement(job.tablet_id);
+        match job.stage {
+            DrainReplicaJobStage::Planned => {
+                if current == Some(&job.final_placement) {
+                    self.drain_jobs
+                        .advance(job.key(), DrainReplicaJobStage::SourceRemovalDesired)?;
+                } else if job.replacement_placement.as_ref() == current {
+                    self.drain_jobs
+                        .advance(job.key(), DrainReplicaJobStage::ReplacementDesired)?;
+                } else if let Some(replacement) = &job.replacement_placement {
+                    self.submit_drain_placement(job, replacement, 1);
+                } else {
+                    self.submit_drain_placement(job, &job.final_placement, 2);
+                }
+            }
+            DrainReplicaJobStage::ReplacementDesired => {
+                if current == Some(&job.final_placement) {
+                    self.drain_jobs
+                        .advance(job.key(), DrainReplicaJobStage::SourceRemovalDesired)?;
+                } else if self.replacement_is_ready(job, host_status) {
+                    self.submit_drain_placement(job, &job.final_placement, 2);
+                }
+            }
+            DrainReplicaJobStage::SourceRemovalDesired => {
+                if !state.is_replica_retired(job.raft_group_id, job.source_replica_id)
+                    && current != Some(&job.final_placement)
+                {
+                    self.submit_drain_placement(job, &job.final_placement, 2);
+                } else if state.is_replica_retired(job.raft_group_id, job.source_replica_id) {
+                    self.drain_jobs
+                        .advance(job.key(), DrainReplicaJobStage::Retired)?;
+                }
+            }
+            DrainReplicaJobStage::Retired => {
+                let still_hosted = host_status.groups.iter().any(|group| {
+                    group.identity.raft_group_id == job.raft_group_id
+                        && group.identity.replica_id == job.source_replica_id
+                });
+                if !still_hosted {
+                    self.drain_jobs
+                        .advance(job.key(), DrainReplicaJobStage::Complete)?;
+                }
+            }
+            DrainReplicaJobStage::Complete => {}
+        }
+        Ok(())
+    }
+
+    fn replacement_is_ready(
+        &self,
+        job: &DrainReplicaJobRecord,
+        host_status: &MultiRaftHostStatus,
+    ) -> bool {
+        let Some(replacement_replica_id) = job.replacement_replica_id else {
+            return false;
+        };
+        host_status
+            .groups
+            .iter()
+            .find(|group| {
+                group.identity.raft_group_id == job.raft_group_id
+                    && group.identity.replica_id == job.source_replica_id
+            })
+            .is_some_and(|group| {
+                group.voters.contains(&replacement_replica_id)
+                    && group.outgoing_voters.is_empty()
+                    && group.pending_conf_change_index.is_none()
+                    && group
+                        .replica_match_indices
+                        .iter()
+                        .find(|(replica_id, _)| *replica_id == replacement_replica_id)
+                        .is_some_and(|(_, match_index)| *match_index >= group.commit_index)
+            })
+    }
+
+    fn reconcile_metadata_group_removal(
+        &mut self,
+        host: &mut MultiRaftHost<LocalWal>,
+        state: &MetadataState,
+        metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+    ) -> Result<()> {
+        let Some(node) = state.node(self.config.node_id) else {
+            return Ok(());
+        };
+        if !matches!(
+            node.lifecycle,
+            NodeLifecycle::Draining | NodeLifecycle::Decommissioning
+        ) {
+            return Ok(());
+        }
+        let Some(status) = host
+            .status()
+            .groups
+            .into_iter()
+            .find(|group| group.identity.raft_group_id == METADATA_RAFT_GROUP_ID)
+        else {
+            return Ok(());
+        };
+        let local_replica_id = status.identity.replica_id;
+        let local_in_conf_state = status.voters.contains(&local_replica_id)
+            || status.learners.contains(&local_replica_id)
+            || status.outgoing_voters.contains(&local_replica_id);
+        if !local_in_conf_state
+            || !status.outgoing_voters.is_empty()
+            || status.pending_conf_change_index.is_some()
+            || status.voters.len() <= 1
+        {
+            return Ok(());
+        }
+
+        // Do not remove this member while another metadata voter is already
+        // draining; the metadata group has no tablet placement policy to
+        // supply a replacement quorum check.
+        let remaining_voters_are_active = status
+            .voters
+            .iter()
+            .filter(|replica_id| **replica_id != local_replica_id)
+            .all(|replica_id| {
+                metadata_replica_to_node
+                    .get(replica_id)
+                    .and_then(|node_id| state.node(*node_id))
+                    .is_some_and(|node| node.lifecycle == NodeLifecycle::Active)
+            });
+        if !remaining_voters_are_active {
+            return Ok(());
+        }
+
+        let expected_version =
+            status
+                .conf_state_version
+                .ok_or_else(|| Error::ProposalUnavailable {
+                    reason: "metadata membership version is not published".into(),
+                })?;
+        self.submit_metadata_group_removal(local_replica_id, expected_version);
+        Ok(())
+    }
+
+    fn submit_metadata_group_removal(&self, replica_id: ReplicaId, expected_version: u64) {
+        let Some(metadata_control) = self.metadata_control.clone() else {
+            return;
+        };
+        let key = (replica_id, expected_version);
+        let mut pending = self
+            .pending_metadata_membership_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.insert(key) {
+            return;
+        }
+        drop(pending);
+
+        let pending_removals = Arc::clone(&self.pending_metadata_membership_removals);
+        let _ = thread::Builder::new()
+            .name("ragnordb-metadata-removal".to_string())
+            .spawn(move || {
+                let result = metadata_control.remove_metadata_replica(
+                    replica_id,
+                    expected_version,
+                    Duration::from_secs(30),
+                );
+                if let Err(error) = result {
+                    tracing::debug!(
+                        replica_id = replica_id.0,
+                        expected_version,
+                        %error,
+                        "metadata membership removal will be retried"
+                    );
+                }
+                pending_removals
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+            });
+    }
+
+    fn submit_drain_placement(
+        &self,
+        job: &DrainReplicaJobRecord,
+        placement: &DesiredReplicaPlacement,
+        phase: u8,
+    ) {
+        let Some(metadata_control) = self.metadata_control.clone() else {
+            return;
+        };
+        let pending_key = (job.raft_group_id, job.source_replica_id, phase);
+        let mut pending = self
+            .pending_drain_proposals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.insert(pending_key) {
+            return;
+        }
+        drop(pending);
+        let pending_requests = Arc::clone(&self.pending_drain_proposals);
+        let placement = placement.clone();
+        let request_id = drain_request_id(
+            self.config.node_id,
+            job.raft_group_id,
+            job.source_replica_id,
+            phase,
+        );
+        let _ = thread::Builder::new()
+            .name("ragnordb-drain-proposal".to_string())
+            .spawn(move || {
+                if let Err(error) = metadata_control.set_desired_replica_placement(
+                    placement,
+                    request_id,
+                    Duration::from_secs(2),
+                ) {
+                    tracing::debug!(error = %error, "node-drain placement proposal will be retried");
+                }
+                pending_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&pending_key);
+            });
+    }
+
+    fn submit_node_lifecycle(&self, lifecycle: NodeLifecycle, phase: u8) {
+        let Some(metadata_control) = self.metadata_control.clone() else {
+            return;
+        };
+        let pending_key = (RaftGroupId(0), ReplicaId(self.config.node_id.0), phase);
+        let mut pending = self
+            .pending_drain_proposals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.insert(pending_key) {
+            return;
+        }
+        let pending_requests = Arc::clone(&self.pending_drain_proposals);
+        let node_id = self.config.node_id;
+        let _ = thread::Builder::new()
+            .name("ragnordb-drain-lifecycle".to_string())
+            .spawn(move || {
+                if let Err(error) = metadata_control.set_node_lifecycle(
+                    node_id,
+                    lifecycle,
+                    Duration::from_secs(2),
+                ) {
+                    tracing::debug!(error = %error, "node-drain lifecycle proposal will be retried");
+                }
+                pending_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&pending_key);
+            });
     }
 
     /// Admit one post-bootstrap replica request on the host owner thread.
@@ -1670,6 +2140,28 @@ fn join_request_from_record(
     }
 }
 
+/// Derive a stable metadata request identity for one drain phase. The
+/// namespace is separate from client/admin requests; replaying the same phase
+/// therefore hits metadata deduplication instead of creating another edit.
+fn drain_request_id(
+    node_id: NodeId,
+    raft_group_id: RaftGroupId,
+    source_replica_id: ReplicaId,
+    phase: u8,
+) -> RequestId {
+    let sequence = raft_group_id
+        .0
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ source_replica_id.0.rotate_left(31)
+        ^ u64::from(phase);
+    RequestId {
+        client_id: (0xD4A1_0000_0000_0000_u128 << 64) | u128::from(node_id.0),
+        sequence: sequence.max(1),
+        raft_group_id: METADATA_RAFT_GROUP_ID,
+    }
+}
+
 fn metadata_tablet_bootstrap(
     cluster_id: &str,
     descriptor: &TabletDescriptor,
@@ -1789,6 +2281,106 @@ impl MetadataProposalClient {
             None,
             timeout,
         )
+    }
+
+    /// Submit one desired-placement checkpoint through the same forwarding and
+    /// durable metadata-apply path used by administrative lifecycle changes.
+    /// The caller supplies a stable request identity so a retry after a
+    /// timeout or process restart cannot create a second topology transition.
+    pub fn set_desired_replica_placement(
+        &self,
+        placement: DesiredReplicaPlacement,
+        request_id: RequestId,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        self.propose_metadata_command(
+            MetadataCommand::SetDesiredReplicaPlacement(placement),
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Propose removal of one physical metadata member through the metadata
+    /// leader. A draining node is commonly a follower, so this path first
+    /// attempts the local Ready owner and then uses the authenticated metadata
+    /// RPC route to try the other configured metadata members. The RPC only
+    /// forwards a proposal request; the receiving host remains the sole owner
+    /// allowed to append a Raft ConfChange.
+    fn remove_metadata_replica(
+        &self,
+        replica_id: ReplicaId,
+        expected_conf_state_version: u64,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("metadata removal deadline overflowed".into()))?;
+        let local_result =
+            self.propose_local_conf_change(replica_id, expected_conf_state_version, deadline);
+        match local_result {
+            Ok(()) => Ok(()),
+            Err(local_error) if metadata_error_can_forward(&local_error) => {
+                let mut last_error = local_error;
+                for target in self
+                    .metadata_nodes
+                    .iter()
+                    .copied()
+                    .filter(|target| *target != self.local_node_id)
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let response = self.metadata_rpc.propose_conf_change(
+                        target,
+                        expected_conf_state_version,
+                        replica_id,
+                        remaining,
+                    );
+                    match response.and_then(metadata_conf_change_response_to_result) {
+                        Ok(()) => return Ok(()),
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(last_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn propose_local_conf_change(
+        &self,
+        replica_id: ReplicaId,
+        expected_conf_state_version: u64,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (reply, response) = mpsc::channel();
+        self.requests
+            .try_send(MetadataHostRequest::ConfChange {
+                expected_conf_state_version,
+                replica_id,
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Error::ProposalUnavailable {
+                    reason: "metadata ConfChange queue is full".to_string(),
+                },
+                mpsc::TrySendError::Disconnected(_) => Error::ProposalUnavailable {
+                    reason: "metadata Raft host is not running".to_string(),
+                },
+            })?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        response
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Error::ProposalUnavailable {
+                    reason: "metadata ConfChange deadline elapsed before proposal".to_string(),
+                },
+                mpsc::RecvTimeoutError::Disconnected => Error::ProposalUnavailable {
+                    reason: "metadata Raft host stopped before ConfChange proposal".to_string(),
+                },
+            })?
     }
 
     fn table_topology_for_outcome(
@@ -1963,7 +2555,7 @@ impl MetadataProposalClient {
         let (reply, response) = mpsc::channel();
         self.requests
             .try_send(MetadataHostRequest::Command {
-                envelope,
+                envelope: Box::new(envelope),
                 reply,
                 deadline,
             })
@@ -2057,6 +2649,36 @@ fn metadata_response_to_outcome(
         ragnordb_common::rpc_codec::MetadataProposalOutcome::Rejected { reason } => {
             Err(Error::ConstraintViolation(reason))
         }
+    }
+}
+
+fn metadata_conf_change_response_to_result(
+    response: ragnordb_common::rpc_codec::MetadataResponse,
+) -> Result<()> {
+    let ragnordb_common::rpc_codec::MetadataResponse::ProposeConfChange {
+        success,
+        error_code,
+        error_message,
+        leader_replica_id,
+    } = response
+    else {
+        return Err(Error::CorruptData(
+            "metadata RPC returned a non-ConfChange response".to_string(),
+        ));
+    };
+    if success {
+        return Ok(());
+    }
+    match error_code.as_str() {
+        "NOT_LEADER" => Err(Error::NotLeader {
+            leader_id: leader_replica_id.map(|replica_id| replica_id.0),
+        }),
+        "RECOVERY_REQUIRED" => Err(Error::RecoveryRequired {
+            reason: error_message,
+        }),
+        _ => Err(Error::ProposalUnavailable {
+            reason: error_message,
+        }),
     }
 }
 
@@ -2631,7 +3253,7 @@ impl MultiRaftRuntime {
             recovered,
             Arc::clone(&start_gate),
             tablet_handles.clone(),
-        );
+        )?;
         tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
         tablet_lifecycle.register_unmaterialized_recovered(
             &mut host,
@@ -2674,6 +3296,7 @@ impl MultiRaftRuntime {
             metadata_nodes.iter().map(|node| node.node_id).collect(),
             config.node_id,
         );
+        tablet_lifecycle.install_metadata_control(metadata_proposal.clone());
         let metadata_creator: SharedMetadataTableCreator = Arc::new(metadata_proposal.clone());
 
         let worker_shutdown = Arc::clone(&shutdown);
@@ -3096,6 +3719,11 @@ fn run_host(
         }
         if let Err(error) = tablet_lifecycle.reconcile_retirement_records(&mut host, &metadata) {
             tracing::warn!(error = %error, "replica retirement publication pass failed; retrying");
+        }
+        if let Err(error) =
+            tablet_lifecycle.reconcile_node_drain(&mut host, &metadata, &metadata_replica_to_node)
+        {
+            tracing::warn!(error = %error, "node-drain orchestration pass failed; retrying");
         }
         expire_metadata_proposals(&mut pending_metadata, &mut pending_metadata_by_request, now);
 
@@ -3591,6 +4219,51 @@ where
                         return false;
                     }
 
+                    Err(error) => {
+                        let _ = reply.send(Err(Error::ProposalUnavailable {
+                            reason: error.to_string(),
+                        }));
+                    }
+                }
+            }
+            MetadataHostRequest::ConfChange {
+                expected_conf_state_version,
+                replica_id,
+                reply,
+            } => {
+                let raft_replica_id = match replica_id.to_raft() {
+                    Ok(replica_id) => replica_id,
+                    Err(reason) => {
+                        let _ = reply.send(Err(Error::Configuration(format!(
+                            "invalid metadata ConfChange replica identity: {reason}"
+                        ))));
+                        continue;
+                    }
+                };
+                match host.propose_conf_change(
+                    METADATA_RAFT_GROUP_ID,
+                    raft::types::ConfChange {
+                        expected_version: expected_conf_state_version,
+                        kind: raft::types::ConfChangeKind::RemoveReplica(raft_replica_id),
+                    },
+                ) {
+                    Ok(proposal) => {
+                        send_outbound(transport, proposal.outbound);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(MultiRaftHostError::GroupRejected { raft_group_id, .. })
+                        if raft_group_id == METADATA_RAFT_GROUP_ID =>
+                    {
+                        let _ = reply.send(Err(Error::NotLeader { leader_id: None }));
+                    }
+                    Err(MultiRaftHostError::GroupRetryable { reason, .. }) => {
+                        let _ = reply.send(Err(Error::ProposalUnavailable { reason }));
+                    }
+                    Err(MultiRaftHostError::RecoveryRequired) => {
+                        let _ = reply.send(Err(Error::RecoveryRequired {
+                            reason: "shared Raft WAL requires node recovery".to_string(),
+                        }));
+                    }
                     Err(error) => {
                         let _ = reply.send(Err(Error::ProposalUnavailable {
                             reason: error.to_string(),

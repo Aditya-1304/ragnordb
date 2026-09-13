@@ -39,6 +39,7 @@ use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRpcInbound};
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
 use ragnordb_tablet::{ScanSpan, TabletRouter};
 
+use crate::bootstrap::METADATA_RAFT_GROUP_ID;
 use crate::database::SharedLocalDatabase;
 use crate::multiraft_runtime::MetadataHostRequest;
 use crate::replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletStatus};
@@ -224,6 +225,74 @@ impl MetadataRpcClient {
                     .remove(&attempt_id);
                 Err(Error::ProposalUnavailable {
                     reason: "metadata RPC response deadline elapsed".to_string(),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn propose_conf_change(
+        &self,
+        target: NodeId,
+        expected_conf_state_version: u64,
+        replica_id: ReplicaId,
+        timeout: Duration,
+    ) -> Result<MetadataResponse> {
+        let attempt_id = self.rpc_state.next_attempt_id()?;
+        let request = rpc::MetadataConfChangeRequest {
+            rpc_attempt_id: Some(attempt_id),
+            expected_conf_state_version,
+            replica_id: Some(replica_id.to_proto()),
+            remove_replica: true,
+        };
+        let frame = RpcFrame {
+            msg_type: MessageType::MetadataRequest,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+            payload: rpc::MetadataRequest {
+                request: Some(rpc::metadata_request::Request::ProposeConfChange(request)),
+            }
+            .encode_to_vec(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.rpc_state
+            .pending
+            .lock()
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "metadata ConfChange pending-response lock is poisoned".to_string(),
+            })?
+            .insert(attempt_id, PendingResponse { target, sender });
+        if let Err(error) = self.transport.try_send_rpc(
+            target,
+            RpcFrame {
+                msg_type: frame.msg_type,
+                raft_group_id: frame.raft_group_id,
+                payload: frame.payload,
+            },
+        ) {
+            self.rpc_state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&attempt_id);
+            return Err(Error::ProposalUnavailable {
+                reason: format!("metadata ConfChange RPC could not be queued: {error}"),
+            });
+        }
+
+        match receiver.recv_timeout(timeout) {
+            Ok(PendingResponseMessage::Metadata(response)) => Ok(response),
+            Ok(PendingResponseMessage::Tablet(_)) | Ok(PendingResponseMessage::ReplicaJoin(_)) => {
+                Err(Error::CorruptData(
+                    "metadata ConfChange waiter received an unrelated response".to_string(),
+                ))
+            }
+            Err(_) => {
+                self.rpc_state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&attempt_id);
+                Err(Error::ProposalUnavailable {
+                    reason: "metadata ConfChange response deadline elapsed".to_string(),
                 })
             }
         }
@@ -1735,6 +1804,76 @@ fn dispatch_message(
             let Ok(proto) = rpc::MetadataRequest::decode(frame.payload.as_slice()) else {
                 return;
             };
+            if let Some(rpc::metadata_request::Request::ProposeConfChange(request)) =
+                proto.request.as_ref()
+            {
+                let Some(attempt_id) = request.rpc_attempt_id else {
+                    return;
+                };
+                let Some(replica_id) = request.replica_id.as_ref() else {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        Err(Error::InvalidArgument(
+                            "metadata ConfChange request omitted replica_id".to_string(),
+                        )),
+                    );
+                    return;
+                };
+                let replica_id = ReplicaId::from_proto(*replica_id);
+                if !request.remove_replica
+                    || request.expected_conf_state_version == 0
+                    || replica_id.0 == 0
+                {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        Err(Error::InvalidArgument(
+                            "metadata ConfChange request is invalid".to_string(),
+                        )),
+                    );
+                    return;
+                }
+                let (reply, response) = mpsc::channel();
+                if metadata_requests
+                    .try_send(MetadataHostRequest::ConfChange {
+                        expected_conf_state_version: request.expected_conf_state_version,
+                        replica_id,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        Err(Error::ProposalUnavailable {
+                            reason: "metadata ConfChange queue is full".to_string(),
+                        }),
+                    );
+                    return;
+                }
+
+                let transport = transport.clone();
+                let group_id = frame.raft_group_id;
+                thread::spawn(move || {
+                    let result = response
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|error| Error::ProposalUnavailable {
+                            reason: format!("metadata ConfChange forwarding failed: {error}"),
+                        })
+                        .and_then(|result| result);
+                    send_metadata_conf_change_response(
+                        &transport, source, group_id, attempt_id, result,
+                    );
+                });
+                return;
+            }
             let Some(rpc::metadata_request::Request::ProposeCommand(request)) = proto.request
             else {
                 return;
@@ -1766,7 +1905,7 @@ fn dispatch_message(
             let (reply, response) = mpsc::channel();
             if metadata_requests
                 .try_send(MetadataHostRequest::Command {
-                    envelope,
+                    envelope: Box::new(envelope),
                     reply,
                     deadline: std::time::Instant::now() + Duration::from_secs(30),
                 })
@@ -1809,16 +1948,19 @@ fn dispatch_message(
             let Ok(proto) = rpc::MetadataResponse::decode(frame.payload.as_slice()) else {
                 return;
             };
-            let Some(rpc::metadata_response::Response::ProposeCommand(response)) = proto.response
-            else {
+            let attempt_id = match proto.response.as_ref() {
+                Some(rpc::metadata_response::Response::ProposeCommand(response)) => {
+                    response.rpc_attempt_id
+                }
+                Some(rpc::metadata_response::Response::ProposeConfChange(response)) => {
+                    response.rpc_attempt_id
+                }
+                _ => None,
+            };
+            let Some(attempt_id) = attempt_id else {
                 return;
             };
-            let Some(attempt_id) = response.rpc_attempt_id else {
-                return;
-            };
-            let Ok(response) = MetadataResponse::from_proto(rpc::MetadataResponse {
-                response: Some(rpc::metadata_response::Response::ProposeCommand(response)),
-            }) else {
+            let Ok(response) = MetadataResponse::from_proto(proto) else {
                 return;
             };
             let mut pending_guard = rpc_state
@@ -1918,6 +2060,47 @@ fn send_metadata_response(
     );
 }
 
+fn send_metadata_conf_change_response(
+    transport: &NodeRaftTransport,
+    target: NodeId,
+    group_id: RaftGroupId,
+    attempt_id: u64,
+    result: Result<()>,
+) {
+    let (success, error_code, error_message, leader_replica_id) = match result {
+        Ok(()) => (true, String::new(), String::new(), None),
+        Err(error) => (
+            false,
+            metadata_error_code(&error).to_string(),
+            error.to_string(),
+            match error {
+                Error::NotLeader { leader_id } => leader_id.map(ReplicaId),
+                _ => None,
+            },
+        ),
+    };
+    let mut proto = MetadataResponse::ProposeConfChange {
+        success,
+        error_code,
+        error_message,
+        leader_replica_id,
+    }
+    .to_proto();
+    if let Some(rpc::metadata_response::Response::ProposeConfChange(response)) =
+        proto.response.as_mut()
+    {
+        response.rpc_attempt_id = Some(attempt_id);
+    }
+    let _ = transport.try_send_rpc(
+        target,
+        RpcFrame {
+            msg_type: MessageType::MetadataResponse,
+            raft_group_id: group_id,
+            payload: proto.encode_to_vec(),
+        },
+    );
+}
+
 fn metadata_outcome_to_wire(
     outcome: MetadataApplyOutcome,
 ) -> ragnordb_common::rpc_codec::MetadataProposalOutcome {
@@ -2000,10 +2183,14 @@ fn attach_rpc_attempt_id(
             let mut proto = rpc::MetadataRequest::decode(payload).map_err(|error| {
                 Error::InvalidArgument(format!("invalid metadata request: {error}"))
             })?;
-            if let Some(rpc::metadata_request::Request::ProposeCommand(request)) =
-                proto.request.as_mut()
-            {
-                request.rpc_attempt_id = Some(attempt_id);
+            match proto.request.as_mut() {
+                Some(rpc::metadata_request::Request::ProposeCommand(request)) => {
+                    request.rpc_attempt_id = Some(attempt_id);
+                }
+                Some(rpc::metadata_request::Request::ProposeConfChange(request)) => {
+                    request.rpc_attempt_id = Some(attempt_id);
+                }
+                _ => {}
             }
             Ok(proto.encode_to_vec())
         }

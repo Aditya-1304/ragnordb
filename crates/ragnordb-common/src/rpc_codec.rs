@@ -634,12 +634,20 @@ pub enum MetadataRequest {
     LookupTablet { table_id: u64, key: Vec<u8> },
     LookupSchema { table_id: u64 },
     ProposeCommand(MetadataProposalRequest),
+    ProposeConfChange(MetadataConfChangeRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataProposalRequest {
     pub request_id: RequestId,
     pub command_envelope: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataConfChangeRequest {
+    pub expected_conf_state_version: u64,
+    pub replica_id: ReplicaId,
+    pub remove_replica: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,6 +801,14 @@ impl MetadataRequest {
                     command_envelope: request.command_envelope.clone(),
                 }),
             ),
+            MetadataRequest::ProposeConfChange(request) => Some(
+                rpc::metadata_request::Request::ProposeConfChange(rpc::MetadataConfChangeRequest {
+                    rpc_attempt_id: None,
+                    expected_conf_state_version: request.expected_conf_state_version,
+                    replica_id: Some(request.replica_id.to_proto()),
+                    remove_replica: request.remove_replica,
+                }),
+            ),
         };
         rpc::MetadataRequest { request }
     }
@@ -821,6 +837,22 @@ impl MetadataRequest {
                     )?,
                     command_envelope: req.command_envelope,
                 }))
+            }
+            Some(rpc::metadata_request::Request::ProposeConfChange(req)) => {
+                let replica_id = ReplicaId::from_proto(
+                    req.replica_id
+                        .ok_or("missing metadata ConfChange replica_id")?,
+                );
+                if req.expected_conf_state_version == 0 || replica_id.0 == 0 {
+                    return Err("metadata ConfChange identity must be non-zero");
+                }
+                Ok(MetadataRequest::ProposeConfChange(
+                    MetadataConfChangeRequest {
+                        expected_conf_state_version: req.expected_conf_state_version,
+                        replica_id,
+                        remove_replica: req.remove_replica,
+                    },
+                ))
             }
             None => Err("missing metadata request"),
         }
@@ -1152,6 +1184,12 @@ pub enum MetadataResponse {
         outcome: Option<MetadataProposalOutcome>,
         leader_replica_id: Option<ReplicaId>,
     },
+    ProposeConfChange {
+        success: bool,
+        error_code: String,
+        error_message: String,
+        leader_replica_id: Option<ReplicaId>,
+    },
 }
 
 impl MetadataResponse {
@@ -1235,6 +1273,20 @@ impl MetadataResponse {
                         .as_ref()
                         .map(|outcome| outcome.to_proto().encode_to_vec())
                         .unwrap_or_default(),
+                    leader_replica_id: leader_replica_id.map(|id| id.0).unwrap_or(0),
+                },
+            )),
+            MetadataResponse::ProposeConfChange {
+                success,
+                error_code,
+                error_message,
+                leader_replica_id,
+            } => Some(rpc::metadata_response::Response::ProposeConfChange(
+                rpc::MetadataConfChangeResponse {
+                    rpc_attempt_id: None,
+                    success: *success,
+                    error_code: error_code.clone(),
+                    error_message: error_message.clone(),
                     leader_replica_id: leader_replica_id.map(|id| id.0).unwrap_or(0),
                 },
             )),
@@ -1330,6 +1382,15 @@ impl MetadataResponse {
                     error_code: resp.error_code,
                     error_message: resp.error_message,
                     outcome,
+                    leader_replica_id: (resp.leader_replica_id != 0)
+                        .then_some(ReplicaId(resp.leader_replica_id)),
+                })
+            }
+            Some(rpc::metadata_response::Response::ProposeConfChange(resp)) => {
+                Ok(MetadataResponse::ProposeConfChange {
+                    success: resp.success,
+                    error_code: resp.error_code,
+                    error_message: resp.error_message,
                     leader_replica_id: (resp.leader_replica_id != 0)
                         .then_some(ReplicaId(resp.leader_replica_id)),
                 })
@@ -1542,6 +1603,40 @@ mod tests {
         assert!(matches!(
             decoded,
             MetadataRequest::LookupSchema { table_id: 200 }
+        ));
+    }
+
+    #[test]
+    fn metadata_conf_change_roundtrip_preserves_removal_witness() {
+        let request = MetadataRequest::ProposeConfChange(MetadataConfChangeRequest {
+            expected_conf_state_version: 9,
+            replica_id: ReplicaId(4),
+            remove_replica: true,
+        });
+        let decoded = MetadataRequest::from_proto(request.to_proto()).unwrap();
+        assert!(matches!(
+            decoded,
+            MetadataRequest::ProposeConfChange(MetadataConfChangeRequest {
+                expected_conf_state_version: 9,
+                replica_id: ReplicaId(4),
+                remove_replica: true,
+            })
+        ));
+
+        let response = MetadataResponse::ProposeConfChange {
+            success: false,
+            error_code: "NOT_LEADER".to_string(),
+            error_message: "leader is elsewhere".to_string(),
+            leader_replica_id: Some(ReplicaId(2)),
+        };
+        let decoded = MetadataResponse::from_proto(response.to_proto()).unwrap();
+        assert!(matches!(
+            decoded,
+            MetadataResponse::ProposeConfChange {
+                success: false,
+                leader_replica_id: Some(ReplicaId(2)),
+                ..
+            }
         ));
     }
 

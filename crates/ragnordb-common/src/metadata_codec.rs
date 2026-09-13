@@ -7,6 +7,7 @@
 use std::{collections::BTreeSet, net::SocketAddr};
 
 use prost::Message;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     catalog_codec::{ColumnDefinition, TableDefinition},
@@ -288,6 +289,11 @@ pub struct MetadataAllocatorState {
     pub max_table_id: u64,
     pub max_tablet_id: u64,
     pub max_raft_group_id: u64,
+    /// Highest replica identity ever published in metadata. Replica IDs are
+    /// scoped by Raft group, but this cluster-wide floor makes replacement
+    /// allocation monotonic even while a removal proof is between its Raft and
+    /// metadata commits.
+    pub max_replica_id: u64,
 }
 
 impl MetadataAllocatorState {
@@ -296,6 +302,7 @@ impl MetadataAllocatorState {
             max_table_id: INITIAL_METADATA_TABLE_HIGH_WATER,
             max_tablet_id: INITIAL_METADATA_TABLET_HIGH_WATER,
             max_raft_group_id: INITIAL_METADATA_RAFT_GROUP_HIGH_WATER,
+            max_replica_id: 0,
         }
     }
 }
@@ -364,14 +371,15 @@ pub struct TabletDescriptor {
 }
 
 /// Requested final role after reconciliation completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DesiredReplicaRole {
     Voter,
     Learner,
 }
 
 /// One desired consensus identity and its physical host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredReplica {
     pub replica_id: ReplicaId,
     pub node_id: NodeId,
@@ -384,7 +392,7 @@ pub struct DesiredReplica {
 /// reconciliation worker to preserve. It is intentionally separate from the
 /// currently committed Raft configuration: a group may temporarily contain
 /// extra learners while a safe replacement is being brought up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementPolicy {
     pub replication_factor: u32,
     pub min_distinct_regions: u32,
@@ -460,7 +468,7 @@ impl PlacementPolicy {
 /// Replicas are strictly ascending by ReplicaId. Canonical ordering matters
 /// because the same logical metadata transition must have one durable byte
 /// representation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredReplicaPlacement {
     pub tablet_id: TabletId,
     pub configuration_epoch: u64,
@@ -1508,6 +1516,7 @@ impl MetadataAllocatorState {
             max_table_id: self.max_table_id,
             max_tablet_id: self.max_tablet_id,
             max_raft_group_id: self.max_raft_group_id,
+            max_replica_id: self.max_replica_id,
         }
     }
 
@@ -1518,6 +1527,7 @@ impl MetadataAllocatorState {
             max_table_id: proto.max_table_id,
             max_tablet_id: proto.max_tablet_id,
             max_raft_group_id: proto.max_raft_group_id,
+            max_replica_id: proto.max_replica_id,
         };
 
         allocator.validate()?;
@@ -1636,6 +1646,31 @@ impl MetadataSnapshot {
                 kind: "raft_group",
                 high_water: self.allocator.max_raft_group_id,
                 visible: visible_max_raft_group_id,
+            });
+        }
+
+        let visible_max_replica_id = self
+            .desired_placements
+            .iter()
+            .flat_map(|placement| {
+                placement
+                    .replicas
+                    .iter()
+                    .map(|replica| replica.replica_id.0)
+            })
+            .chain(
+                self.retired_replicas
+                    .iter()
+                    .map(|retired| retired.replica_id.0),
+            )
+            .max()
+            .unwrap_or(0);
+
+        if self.allocator.max_replica_id < visible_max_replica_id {
+            return Err(MetadataCommandCodecError::AllocatorBelowVisibleState {
+                kind: "replica",
+                high_water: self.allocator.max_replica_id,
+                visible: visible_max_replica_id,
             });
         }
 
@@ -1801,7 +1836,7 @@ impl MetadataSnapshot {
             .map(MetadataClientSession::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let allocator = match (snapshot_version, allocator_state) {
+        let mut allocator = match (snapshot_version, allocator_state) {
             (METADATA_SNAPSHOT_VERSION, Some(allocator))
             | (LEGACY_METADATA_SNAPSHOT_VERSION, Some(allocator)) => {
                 MetadataAllocatorState::from_proto(allocator)?
@@ -1839,10 +1874,40 @@ impl MetadataSnapshot {
                     .max()
                     .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER)
                     .max(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER),
+
+                max_replica_id: desired_placements
+                    .iter()
+                    .flat_map(|placement| {
+                        placement
+                            .replicas
+                            .iter()
+                            .map(|replica| replica.replica_id.0)
+                    })
+                    .chain(retired_replicas.iter().map(|retired| retired.replica_id.0))
+                    .max()
+                    .unwrap_or(0),
             },
 
             _ => unreachable!("snapshot version checked above"),
         };
+
+        // Version-2 snapshots written before the replica high-water field was
+        // introduced decode it as zero. Reconstruct that one additive field
+        // from every visible or retired lifetime; newer snapshots already
+        // carry the monotonic value and are left untouched.
+        if allocator.max_replica_id == 0 {
+            allocator.max_replica_id = desired_placements
+                .iter()
+                .flat_map(|placement| {
+                    placement
+                        .replicas
+                        .iter()
+                        .map(|replica| replica.replica_id.0)
+                })
+                .chain(retired_replicas.iter().map(|retired| retired.replica_id.0))
+                .max()
+                .unwrap_or(0);
+        }
 
         let snapshot = Self {
             cluster_id,
