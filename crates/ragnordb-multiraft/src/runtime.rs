@@ -32,7 +32,10 @@ use std::{
 
 use raft::{
     core::{
-        node::{ProposeError, RaftError, RaftNode, SnapshotInstallError, StepError},
+        node::{
+            LeadershipTransferError, LeadershipTransferStatus, ProposeError, RaftError, RaftNode,
+            SnapshotInstallError, StepError,
+        },
         read_index::{ReadIndexError, ReadState},
         ready::{AdvanceError, Ready},
     },
@@ -162,6 +165,9 @@ pub enum ReadyLoopError {
 
     #[error("Raft proposal failed: {0:?}")]
     Proposal(ProposeError),
+
+    #[error("Raft leadership transfer failed: {0:?}")]
+    LeadershipTransfer(LeadershipTransferError),
 
     #[error("Raft ReadIndex admission failed: {0:?}")]
     ReadIndex(ReadIndexError),
@@ -545,6 +551,26 @@ where
         self.raft
             .propose_conf_change(change)
             .map_err(ReadyLoopError::Proposal)
+    }
+
+    /// Requests a bounded leadership transfer through the Raft core.
+    ///
+    /// Leadership transfer is a volatile protocol operation: it emits a
+    /// targeted control message and fences new proposals while the transfer
+    /// is active, but it does not create a database log entry or a WAL record.
+    /// The Ready boundary is still checked first so a caller cannot overlap a
+    /// transfer request with an earlier unpersisted Raft mutation.
+    pub fn transfer_leadership(
+        &mut self,
+        target: raft::types::NodeId,
+        timeout_ticks: u64,
+    ) -> Result<LeadershipTransferStatus, ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+
+        self.raft
+            .transfer_leadership(target, timeout_ticks)
+            .map_err(|error: LeadershipTransferError| ReadyLoopError::LeadershipTransfer(error))
     }
 
     /// Records that the host has applied the current-term activation entry.

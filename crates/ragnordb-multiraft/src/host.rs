@@ -13,7 +13,10 @@ use std::{
 
 use raft::{
     core::{
-        node::{ProposeError, RaftError, SnapshotInstallError, StepError},
+        node::{
+            LeadershipTransferError, LeadershipTransferStatus, ProposeError, RaftError,
+            SnapshotInstallError, StepError,
+        },
         read_index::{ReadIndexError, ReadState},
         ready::AdvanceError,
     },
@@ -56,6 +59,17 @@ pub struct RoutedRaftMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostedProposal {
     pub index: LogIndex,
+    pub outbound: Vec<RoutedRaftMessage>,
+}
+
+/// Result of requesting leadership transfer for one hosted Raft group.
+///
+/// A transfer has no log index because it is a control-plane protocol action,
+/// not a replicated database command. Its targeted control message still
+/// crosses the host's normal group routing boundary before it is released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedLeadershipTransfer {
+    pub status: LeadershipTransferStatus,
     pub outbound: Vec<RoutedRaftMessage>,
 }
 
@@ -451,6 +465,7 @@ pub(crate) fn is_control_message(message: &RaftMessageEnvelope) -> bool {
             | raft::message::Message::RequestVoteResponse(_)
             | raft::message::Message::ReadIndex(_)
             | raft::message::Message::ReadIndexResponse(_)
+            | raft::message::Message::TimeoutNow(_)
             | raft::message::Message::AppendEntriesResponse(_)
             | raft::message::Message::InstallSnapshot(_)
             | raft::message::Message::InstallSnapshotResponse(_)
@@ -569,6 +584,18 @@ pub trait HostedRaftGroup: Send {
     ) -> Result<(LogIndex, Vec<RaftMessageEnvelope>), HostedGroupError> {
         Err(HostedGroupError::Rejected(
             "hosted group does not expose Raft membership proposals".to_string(),
+        ))
+    }
+
+    /// Requests leadership transfer without treating the control-plane action
+    /// as an application or membership proposal.
+    fn transfer_leadership(
+        &mut self,
+        _target: ReplicaId,
+        _timeout_ticks: u64,
+    ) -> Result<(LeadershipTransferStatus, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        Err(HostedGroupError::Rejected(
+            "hosted group does not expose Raft leadership transfer".to_string(),
         ))
     }
 
@@ -962,6 +989,41 @@ where
         Ok((index, turn.outbound))
     }
 
+    fn transfer_leadership(
+        &mut self,
+        target: ReplicaId,
+        timeout_ticks: u64,
+    ) -> Result<(LeadershipTransferStatus, Vec<RaftMessageEnvelope>), HostedGroupError> {
+        if self.ready_loop.has_pending_persistence() {
+            return Err(HostedGroupError::Retryable(
+                "a shared-WAL batch is still awaiting completion".to_string(),
+            ));
+        }
+
+        let mut turn = self.drain_ready()?;
+        self.defer_read_states(&mut turn);
+
+        if self.ready_loop.has_pending_work() {
+            return Err(HostedGroupError::Retryable(
+                "a previous Ready generation is still being resumed".to_string(),
+            ));
+        }
+
+        let target = target.to_raft().map_err(|reason| {
+            HostedGroupError::Rejected(format!("invalid leadership-transfer target: {reason}"))
+        })?;
+        let status = self
+            .ready_loop
+            .transfer_leadership(target, timeout_ticks)
+            .map_err(classify_ready_error)?;
+
+        let mut after_transfer = self.drain_ready()?;
+        self.defer_read_states(&mut after_transfer);
+        turn.outbound.extend(after_transfer.outbound);
+
+        Ok((status, turn.outbound))
+    }
+
     fn tick_and_drain(&mut self, ticks: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
         if self.ready_loop.has_pending_persistence() {
             return Err(HostedGroupError::Retryable(
@@ -1158,6 +1220,7 @@ pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
         | ReadyLoopError::Tick(RaftError::RecoveryRequired)
         | ReadyLoopError::Step(StepError::RecoveryRequired)
         | ReadyLoopError::Proposal(ProposeError::RecoveryRequired)
+        | ReadyLoopError::LeadershipTransfer(LeadershipTransferError::RecoveryRequired)
         | ReadyLoopError::ReadIndex(ReadIndexError::RecoveryRequired)
         | ReadyLoopError::SnapshotInstall(SnapshotInstallError::RecoveryRequired)
         | ReadyLoopError::Advance(AdvanceError::RecoveryRequired) => {
@@ -1168,9 +1231,18 @@ pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
             HostedGroupError::Retryable(error.to_string())
         }
 
-        ReadyLoopError::Proposal(_) | ReadyLoopError::ReadIndex(_) | ReadyLoopError::Step(_) => {
-            HostedGroupError::Rejected(error.to_string())
-        }
+        ReadyLoopError::LeadershipTransfer(
+            LeadershipTransferError::JointConsensusInProgress
+            | LeadershipTransferError::ConfigurationChangePending
+            | LeadershipTransferError::TransferInProgress { .. }
+            | LeadershipTransferError::TargetProgressUnavailable(_)
+            | LeadershipTransferError::TargetNotCaughtUp { .. },
+        ) => HostedGroupError::Retryable(error.to_string()),
+
+        ReadyLoopError::Proposal(_)
+        | ReadyLoopError::LeadershipTransfer(_)
+        | ReadyLoopError::ReadIndex(_)
+        | ReadyLoopError::Step(_) => HostedGroupError::Rejected(error.to_string()),
 
         other => HostedGroupError::Group(other.to_string()),
     }
@@ -2398,6 +2470,98 @@ where
         self.finish_group_proposal(raft_group_id, result)
     }
 
+    /// Requests a bounded leadership transfer for one local Raft group.
+    ///
+    /// Transfer is deliberately kept separate from proposal admission: it
+    /// does not allocate a log index or create a database record. The hosted
+    /// group still completes any direct Ready work before returning, and the
+    /// host retains the same recovery/quarantine/error-isolation policy used
+    /// by other direct group operations.
+    pub fn transfer_leadership(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        target: ReplicaId,
+        timeout_ticks: u64,
+    ) -> Result<HostedLeadershipTransfer, MultiRaftHostError> {
+        self.ensure_active()?;
+
+        if let Some(reason) = self.quarantined.get(&raft_group_id) {
+            return Err(MultiRaftHostError::GroupQuarantined {
+                raft_group_id,
+                reason: reason.clone(),
+            });
+        }
+
+        let result = {
+            let group = self
+                .groups
+                .get_mut(&raft_group_id)
+                .ok_or(MultiRaftHostError::UnknownGroup(raft_group_id))?;
+
+            group.transfer_leadership(target, timeout_ticks)
+        };
+
+        let (status, messages) = match result {
+            Ok(result) => result,
+
+            Err(HostedGroupError::RecoveryRequired) => {
+                self.state = HostState::RecoveryRequired;
+                return Err(MultiRaftHostError::RecoveryRequired);
+            }
+
+            Err(HostedGroupError::Group(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                self.quarantined.insert(raft_group_id, reason.clone());
+                return Err(MultiRaftHostError::Group {
+                    raft_group_id,
+                    reason,
+                });
+            }
+
+            Err(HostedGroupError::Retryable(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRetryable {
+                    raft_group_id,
+                    reason,
+                });
+            }
+
+            Err(HostedGroupError::Rejected(reason)) => {
+                if self.node_wal.recovery_required() {
+                    self.state = HostState::RecoveryRequired;
+                    return Err(MultiRaftHostError::RecoveryRequired);
+                }
+
+                return Err(MultiRaftHostError::GroupRejected {
+                    raft_group_id,
+                    reason,
+                });
+            }
+        };
+
+        self.ensure_shared_wal_healthy()?;
+        self.reschedule_after_turn(raft_group_id);
+
+        Ok(HostedLeadershipTransfer {
+            status,
+            outbound: messages
+                .into_iter()
+                .map(|envelope| RoutedRaftMessage {
+                    raft_group_id,
+                    envelope,
+                })
+                .collect(),
+        })
+    }
+
     /// Propose one planner-produced membership action only if the group still
     /// exposes the exact ConfState version that was observed by reconciliation.
     /// The check is repeated immediately before Raft admission; a stale
@@ -2746,7 +2910,7 @@ pub enum MultiRaftHostError {
 mod tests {
     use super::*;
     use raft::{
-        message::{InstallSnapshotRequest, Message},
+        message::{InstallSnapshotRequest, Message, TimeoutNowRequest},
         types::{ReplicaId as RaftReplicaId, SnapshotMetadata},
     };
     use ragnordb_common::ids::ReplicaId;
@@ -3179,7 +3343,9 @@ mod tests {
     fn nested_recovery_required_is_never_rejected_or_group() {
         use crate::runtime::ReadyLoopError;
         use raft::core::{
-            node::{ProposeError, RaftError, SnapshotInstallError, StepError},
+            node::{
+                LeadershipTransferError, ProposeError, RaftError, SnapshotInstallError, StepError,
+            },
             ready::AdvanceError,
         };
 
@@ -3188,6 +3354,7 @@ mod tests {
             ReadyLoopError::Tick(RaftError::RecoveryRequired),
             ReadyLoopError::Step(StepError::RecoveryRequired),
             ReadyLoopError::Proposal(ProposeError::RecoveryRequired),
+            ReadyLoopError::LeadershipTransfer(LeadershipTransferError::RecoveryRequired),
             ReadyLoopError::SnapshotInstall(SnapshotInstallError::RecoveryRequired),
             ReadyLoopError::Advance(AdvanceError::RecoveryRequired),
         ];
@@ -3216,6 +3383,41 @@ mod tests {
             classify_ready_error(retryable),
             HostedGroupError::Retryable(_)
         ));
+
+        // Realistic bug caught: a caught-up requirement that is temporarily
+        // false must not quarantine a healthy group; the target may become
+        // eligible after normal replication progress.
+        let transfer_retryable =
+            ReadyLoopError::LeadershipTransfer(LeadershipTransferError::TargetNotCaughtUp {
+                target: raft::types::NodeId::must(2),
+                match_index: 4,
+                leader_last_index: 5,
+            });
+        assert!(matches!(
+            classify_ready_error(transfer_retryable),
+            HostedGroupError::Retryable(_)
+        ));
+    }
+
+    /// Realistic bug caught: a targeted leadership-transfer request queued
+    /// behind bulk replication traffic can expire before the target receives
+    /// it, making a healthy handoff appear to have failed.
+    #[test]
+    fn timeout_now_uses_the_host_control_lane() {
+        let message = Envelope {
+            from: RaftReplicaId::must(1),
+            to: RaftReplicaId::must(2),
+            msg: Message::TimeoutNow(TimeoutNowRequest {
+                term: 3,
+                leader_id: RaftReplicaId::must(1),
+                target_id: RaftReplicaId::must(2),
+                transfer_id: 7,
+                last_log_index: 12,
+                last_log_term: 3,
+            }),
+        };
+
+        assert!(is_control_message(&message));
     }
 
     #[test]

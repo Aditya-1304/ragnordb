@@ -18,6 +18,7 @@ use std::{
 
 use raft::{
     core::{
+        node::LeadershipTransferStatus,
         read_index::{ReadIndexError, ReadState},
         ready::Ready,
     },
@@ -231,6 +232,7 @@ struct PendingReadBarrier {
 enum RaftHostControlResult {
     Completed,
     Proposed(LogIndex),
+    Transferred(LeadershipTransferStatus),
 }
 
 enum RaftHostControl {
@@ -252,6 +254,12 @@ enum RaftHostControl {
 
     ProposeConfChange {
         change: ConfChange,
+        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+    },
+
+    TransferLeadership {
+        target: raft::types::NodeId,
+        timeout_ticks: u64,
         reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 }
@@ -286,7 +294,8 @@ fn reply_snapshot_blocked_host_control(control: RaftHostControl, reason: &str) {
         }
 
         RaftHostControl::Propose { reply, .. }
-        | RaftHostControl::ProposeConfChange { reply, .. } => {
+        | RaftHostControl::ProposeConfChange { reply, .. }
+        | RaftHostControl::TransferLeadership { reply, .. } => {
             let _ = reply.send(Err(HostedGroupError::Retryable(reason.to_string())));
         }
     }
@@ -469,6 +478,15 @@ impl ReplicatedTabletGroupProxy {
             RaftHostControl::ProposeConfChange { change, .. } => {
                 RaftHostControl::ProposeConfChange { change, reply }
             }
+            RaftHostControl::TransferLeadership {
+                target,
+                timeout_ticks,
+                ..
+            } => RaftHostControl::TransferLeadership {
+                target,
+                timeout_ticks,
+                reply,
+            },
         };
 
         self.control
@@ -607,6 +625,38 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         };
 
         Ok((index, Vec::new()))
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        target: ReplicaId,
+        timeout_ticks: u64,
+    ) -> std::result::Result<(LeadershipTransferStatus, Vec<RaftMessageEnvelope>), HostedGroupError>
+    {
+        if self.pending.is_some() {
+            return Err(HostedGroupError::Retryable(
+                "replicated tablet operation is still pending".to_string(),
+            ));
+        }
+
+        let target = target.to_raft().map_err(|reason| {
+            HostedGroupError::Rejected(format!("invalid leadership-transfer target: {reason}"))
+        })?;
+        let result = self.submit_direct(RaftHostControl::TransferLeadership {
+            target,
+            timeout_ticks,
+            reply: mpsc::channel().0,
+        })?;
+        let RaftHostControlResult::Transferred(status) = result else {
+            return Err(HostedGroupError::Group(
+                "tablet leadership-transfer control returned a non-transfer result".to_string(),
+            ));
+        };
+
+        // The worker owns transport publication. Returning an empty envelope
+        // list prevents the physical host from publishing the same control
+        // message a second time while still exposing the transfer status.
+        Ok((status, Vec::new()))
     }
 
     fn tick_and_prepare_budgeted(
@@ -1939,6 +1989,71 @@ where
 
                         let fatal_reason = fatal_host_control_reason(&result);
                         let _ = reply.send(result.map(RaftHostControlResult::Proposed));
+                        if let Some(reason) = fatal_reason {
+                            return Err(reason);
+                        }
+                    }
+
+                    RaftHostControl::TransferLeadership {
+                        target,
+                        timeout_ticks,
+                        reply,
+                    } => {
+                        let result: std::result::Result<
+                            LeadershipTransferStatus,
+                            HostedGroupError,
+                        > = (|| {
+                            let had_pending_ready = ready_loop.has_pending_work();
+                            if let Some(metadata) = drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                                &identity,
+                                &mut pending_read_states,
+                            )? {
+                                expected_snapshot_install = Some(metadata);
+                                pending_snapshot_install = None;
+                            }
+                            if had_pending_ready {
+                                return Err(HostedGroupError::Retryable(
+                                    "a previous Ready generation is still being resumed"
+                                        .to_string(),
+                                ));
+                            }
+
+                            // Leadership transfer is a control-plane action;
+                            // it emits TimeoutNow through the normal Ready
+                            // message path but creates no database entry.
+                            let status = ready_loop
+                                .transfer_leadership(target, timeout_ticks)
+                                .map_err(classify_ready_error)?;
+                            if let Some(metadata) = drain_ready(
+                                &mut ready_loop,
+                                &mut tablet,
+                                &mut registry,
+                                &database,
+                                &transport,
+                                &snapshot_endpoint,
+                                &latest_snapshot,
+                                catalog_cache.as_ref(),
+                                &snapshot_policy,
+                                &identity,
+                                &mut pending_read_states,
+                            )? {
+                                expected_snapshot_install = Some(metadata);
+                                pending_snapshot_install = None;
+                            }
+                            Ok(status)
+                        })();
+
+                        let fatal_reason = fatal_host_control_reason(&result);
+                        let _ = reply.send(result.map(RaftHostControlResult::Transferred));
                         if let Some(reason) = fatal_reason {
                             return Err(reason);
                         }
@@ -4431,7 +4546,8 @@ mod tests {
                 }
                 RaftHostControl::Step { .. }
                 | RaftHostControl::Propose { .. }
-                | RaftHostControl::ProposeConfChange { .. } => {
+                | RaftHostControl::ProposeConfChange { .. }
+                | RaftHostControl::TransferLeadership { .. } => {
                     panic!("the test queued a tick")
                 }
             }
