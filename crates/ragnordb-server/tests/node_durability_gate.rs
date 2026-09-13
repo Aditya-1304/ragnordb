@@ -201,6 +201,7 @@ async fn status_reports_recovery_required_reason() {
         database: LocalDatabase::shared(),
         replicated_tablet: None,
         multiraft_status: None,
+        node_lifecycle: None,
     });
     let server = tokio::spawn(async move {
         serve_admin(listener, state, server_shutdown).await.unwrap();

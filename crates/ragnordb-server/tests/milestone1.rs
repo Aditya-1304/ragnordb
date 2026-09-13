@@ -162,6 +162,7 @@ async fn admin_status_returns_json() {
         database: LocalDatabase::shared(),
         replicated_tablet: None,
         multiraft_status: Some(multiraft_status),
+        node_lifecycle: None,
     });
 
     let server_task = {
@@ -207,6 +208,7 @@ async fn admin_metrics_returns_prometheus_text() {
         database: LocalDatabase::shared(),
         replicated_tablet: None,
         multiraft_status: None,
+        node_lifecycle: None,
     });
 
     let server_task = {
@@ -295,6 +297,7 @@ async fn admin_status_uses_json_content_type() {
         database: LocalDatabase::shared(),
         replicated_tablet: None,
         multiraft_status: None,
+        node_lifecycle: None,
     });
 
     let server_task = {

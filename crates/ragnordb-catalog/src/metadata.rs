@@ -132,6 +132,18 @@ pub enum MetadataRejection {
     },
 
     #[error(
+        "node {} cannot enter terminal lifecycle while replica {} of Raft group {} is still desired",
+        .node_id.0,
+        .replica_id.0,
+        .raft_group_id.0
+    )]
+    NodeStillExpected {
+        node_id: NodeId,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+    },
+
+    #[error(
         "endpoint {endpoint} is already owned by node {existing_node}; node {attempted_node} cannot reuse it"
     )]
     NodeEndpointConflict {
@@ -582,6 +594,10 @@ impl MetadataState {
 
             MetadataCommand::RegisterNode(node) => self.apply_register_node(node),
 
+            MetadataCommand::SetNodeLifecycle { node_id, lifecycle } => {
+                self.apply_set_node_lifecycle(node_id, lifecycle)
+            }
+
             MetadataCommand::CreateTable { table } => self.apply_create_table(table),
 
             MetadataCommand::CreateTablet { tablet } => self.apply_create_tablet(tablet),
@@ -692,7 +708,7 @@ impl MetadataState {
         )?;
 
         for node in nodes {
-            apply_snapshot_command(&mut state, MetadataCommand::RegisterNode(node))?;
+            apply_snapshot_node(&mut state, node)?;
         }
 
         for table in tables {
@@ -971,21 +987,14 @@ impl MetadataState {
         if let Some(existing) = self.nodes.get(&node.node_id) {
             return if existing == &node {
                 MetadataApplyOutcome::AlreadyApplied
-            } else if same_node_directory(existing, &node)
-                && lifecycle_can_advance(existing.lifecycle, node.lifecycle)
-            {
+            } else if same_node_directory(existing, &node) {
                 // Lifecycle is metadata-owned placement intent. Updating it
                 // must preserve the stable directory identity so a draining
                 // node cannot be accidentally reintroduced under a new
-                // endpoint record.
-                self.nodes.insert(node.node_id, node);
-                MetadataApplyOutcome::Applied
-            } else if same_node_directory(existing, &node) {
-                MetadataApplyOutcome::Rejected(MetadataRejection::InvalidNodeLifecycleTransition {
-                    node_id: node.node_id,
-                    from: node_lifecycle_name(existing.lifecycle),
-                    to: node_lifecycle_name(node.lifecycle),
-                })
+                // endpoint record. Reuse the dedicated command path so the
+                // terminal-obligation check cannot be bypassed by resubmitting
+                // a complete directory descriptor.
+                self.apply_set_node_lifecycle(node.node_id, node.lifecycle)
             } else {
                 MetadataApplyOutcome::Rejected(MetadataRejection::NodeIdConflict(node.node_id))
             };
@@ -1005,8 +1014,79 @@ impl MetadataState {
             }
         }
 
+        if node.lifecycle != NodeLifecycle::Active {
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::InvalidNodeLifecycleTransition {
+                    node_id: node.node_id,
+                    from: "unregistered",
+                    to: node_lifecycle_name(node.lifecycle),
+                },
+            );
+        }
+
         self.nodes.insert(node.node_id, node);
 
+        MetadataApplyOutcome::Applied
+    }
+
+    fn apply_set_node_lifecycle(
+        &mut self,
+        node_id: NodeId,
+        lifecycle: NodeLifecycle,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        let Some(existing) = self.nodes.get(&node_id).cloned() else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownNode(node_id));
+        };
+
+        if existing.lifecycle == lifecycle {
+            return MetadataApplyOutcome::AlreadyApplied;
+        }
+
+        if !lifecycle_can_advance(existing.lifecycle, lifecycle) {
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::InvalidNodeLifecycleTransition {
+                    node_id,
+                    from: node_lifecycle_name(existing.lifecycle),
+                    to: node_lifecycle_name(lifecycle),
+                },
+            );
+        }
+
+        if matches!(
+            lifecycle,
+            NodeLifecycle::Decommissioned | NodeLifecycle::Tombstoned
+        ) && let Some((raft_group_id, replica_id)) = self
+            .tablets
+            .values()
+            .filter_map(|tablet| {
+                self.desired_placements
+                    .get(&tablet.tablet_id)
+                    .map(|placement| (tablet.raft_group_id, placement))
+            })
+            .flat_map(|(raft_group_id, placement)| {
+                placement
+                    .replicas
+                    .iter()
+                    .map(move |replica| (raft_group_id, replica))
+            })
+            .find_map(|(raft_group_id, replica)| {
+                (replica.node_id == node_id).then_some((raft_group_id, replica.replica_id))
+            })
+        {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::NodeStillExpected {
+                node_id,
+                raft_group_id,
+                replica_id,
+            });
+        }
+
+        let mut updated = existing;
+        updated.lifecycle = lifecycle;
+        self.nodes.insert(node_id, updated);
         MetadataApplyOutcome::Applied
     }
 
@@ -1910,7 +1990,16 @@ fn same_node_directory(left: &NodeDescriptor, right: &NodeDescriptor) -> bool {
 }
 
 fn lifecycle_can_advance(from: NodeLifecycle, to: NodeLifecycle) -> bool {
-    lifecycle_rank(to) >= lifecycle_rank(from)
+    matches!(
+        (from, to),
+        (NodeLifecycle::Active, NodeLifecycle::Draining)
+            | (NodeLifecycle::Draining, NodeLifecycle::Decommissioning)
+            | (
+                NodeLifecycle::Decommissioning,
+                NodeLifecycle::Decommissioned
+            )
+            | (NodeLifecycle::Decommissioned, NodeLifecycle::Tombstoned)
+    )
 }
 
 const fn lifecycle_rank(lifecycle: NodeLifecycle) -> u8 {
@@ -1931,6 +2020,29 @@ fn node_lifecycle_name(lifecycle: NodeLifecycle) -> &'static str {
         NodeLifecycle::Decommissioned => "decommissioned",
         NodeLifecycle::Tombstoned => "tombstoned",
     }
+}
+
+fn apply_snapshot_node(state: &mut MetadataState, mut node: NodeDescriptor) -> Result<()> {
+    let node_id = node.node_id;
+    let target_lifecycle = node.lifecycle;
+    node.lifecycle = NodeLifecycle::Active;
+    apply_snapshot_command(state, MetadataCommand::RegisterNode(node))?;
+
+    for lifecycle in [
+        NodeLifecycle::Draining,
+        NodeLifecycle::Decommissioning,
+        NodeLifecycle::Decommissioned,
+        NodeLifecycle::Tombstoned,
+    ] {
+        if lifecycle_rank(lifecycle) <= lifecycle_rank(target_lifecycle) {
+            apply_snapshot_command(
+                state,
+                MetadataCommand::SetNodeLifecycle { node_id, lifecycle },
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_snapshot_command(state: &mut MetadataState, command: MetadataCommand) -> Result<()> {

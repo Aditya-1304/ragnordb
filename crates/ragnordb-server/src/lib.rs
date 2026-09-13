@@ -6,6 +6,7 @@ pub mod data_directory_lock;
 pub mod database;
 pub mod metrics;
 pub mod multiraft_runtime;
+pub mod node_lifecycle;
 pub mod protocol;
 pub(crate) mod replica_join;
 pub mod replica_registry;
@@ -167,6 +168,14 @@ impl Server {
         let multiraft_status = replicated_runtime
             .as_ref()
             .map(MultiRaftRuntime::host_status_handle);
+        let node_lifecycle =
+            replicated_runtime
+                .as_ref()
+                .map(|runtime| admin::NodeLifecycleAdminState {
+                    node_id: self.config.node_id,
+                    metadata: runtime.metadata_handle(),
+                    control: runtime.metadata_control(),
+                });
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),
@@ -175,6 +184,7 @@ impl Server {
             database: database.clone(),
             replicated_tablet: replicated_handle.clone(),
             multiraft_status,
+            node_lifecycle,
         });
 
         info!(

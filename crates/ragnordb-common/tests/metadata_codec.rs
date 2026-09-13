@@ -100,6 +100,10 @@ fn metadata_v2_commands_roundtrip_every_authoritative_field() {
             acknowledged_through: 3,
         },
         MetadataCommand::RegisterNode(node(11, 7001)),
+        MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Draining,
+        },
         MetadataCommand::CreateTable { table: table() },
         MetadataCommand::CreateTablet { tablet: tablet() },
         MetadataCommand::CreateTableTopology(CreateTableRequest {

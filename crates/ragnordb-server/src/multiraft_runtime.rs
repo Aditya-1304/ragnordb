@@ -12,11 +12,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
@@ -90,6 +90,15 @@ const HOST_MESSAGE_BUDGET: usize = 256;
 const METADATA_ELECTION_TIMEOUT_TICKS: u64 = 10;
 
 const METADATA_HEARTBEAT_INTERVAL_TICKS: u64 = 3;
+
+/// The host gives a transfer enough logical ticks for the target to receive
+/// the final frontier and start its election, while keeping proposal fencing
+/// bounded during placement reconciliation.
+const LEADERSHIP_TRANSFER_TIMEOUT_TICKS: u64 = 20;
+
+/// Shutdown is allowed to hand leadership to already-eligible voters, but it
+/// must not hold process teardown open indefinitely when a peer is unavailable.
+const SHUTDOWN_LEADERSHIP_TRANSFER_DEADLINE: Duration = Duration::from_secs(2);
 
 const METADATA_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -559,6 +568,7 @@ impl TabletLifecycleManager {
         host: &mut MultiRaftHost<LocalWal>,
         metadata: &MetadataRuntimeHandle,
         replica_join_rpc: &ReplicaJoinRpcClient,
+        metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
     ) -> Result<()> {
         let state = metadata.state_snapshot();
         if state.cluster_id() != Some(self.config.cluster_id.as_deref().unwrap_or_default()) {
@@ -714,18 +724,41 @@ impl TabletLifecycleManager {
                         | Err(MultiRaftHostError::StaleMembershipObservation { .. })
                         | Err(MultiRaftHostError::StaleMembershipAction { .. }) => {}
                         Err(MultiRaftHostError::LeaderTransferRequired { .. }) => {
-                            tracing::info!(
-                                raft_group_id = group_status.identity.raft_group_id.0,
-                                "membership removal deferred until leadership transfer is available",
+                            let latest_routes = replica_routes_for_group(
+                                &latest_state,
+                                group_status.identity.raft_group_id,
+                                metadata_replica_to_node,
                             );
+                            request_leadership_transfer(
+                                host,
+                                &self.transport,
+                                &group_status,
+                                &latest_routes,
+                                &active_node_ids(&latest_state),
+                                "membership removal",
+                            )?;
                         }
                         Err(error) => return Err(host_error(error)),
                     }
                 }
                 MembershipDecision::WaitForCatchUp { .. }
-                | MembershipDecision::LeaderTransferRequired { .. }
                 | MembershipDecision::PausedJointConsensus
                 | MembershipDecision::Noop => {}
+                MembershipDecision::LeaderTransferRequired { .. } => {
+                    let latest_routes = replica_routes_for_group(
+                        &latest_state,
+                        group_status.identity.raft_group_id,
+                        metadata_replica_to_node,
+                    );
+                    request_leadership_transfer(
+                        host,
+                        &self.transport,
+                        &group_status,
+                        &latest_routes,
+                        &active_node_ids(&latest_state),
+                        "membership removal",
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1681,17 +1714,20 @@ fn metadata_tablet_bootstrap(
     .map_err(|source| Error::Configuration(source.to_string()))
 }
 
-/// Client-side proposal boundary for metadata-owned SQL schema operations.
+/// Client-side proposal boundary for metadata-owned control-plane operations.
 ///
 /// The SQL executor never allocates a table identity and never writes through
 /// the legacy catalog WAL when this client is installed. A request is accepted
 /// only after the metadata host has correlated the committed Raft apply result.
+#[derive(Clone)]
 pub struct MetadataProposalClient {
     requests: mpsc::SyncSender<MetadataHostRequest>,
     metadata: MetadataRuntimeHandle,
     metadata_rpc: MetadataRpcClient,
     metadata_nodes: Vec<NodeId>,
     local_node_id: NodeId,
+    admin_client_id: u128,
+    next_admin_sequence: Arc<AtomicU64>,
 }
 
 impl MetadataProposalClient {
@@ -1702,13 +1738,57 @@ impl MetadataProposalClient {
         metadata_nodes: Vec<NodeId>,
         local_node_id: NodeId,
     ) -> Self {
+        let process_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(1);
+        let admin_client_id = process_nonce
+            .wrapping_add(u128::from(local_node_id.0))
+            .max(1);
+
         Self {
             requests,
             metadata,
             metadata_rpc,
             metadata_nodes,
             local_node_id,
+            admin_client_id,
+            next_admin_sequence: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Submit one durable physical-node lifecycle transition.
+    ///
+    /// The request uses a process-scoped administrative identity for proposal
+    /// correlation. The lifecycle itself remains idempotent in metadata, so a
+    /// retry of the same target state cannot move a node backwards or replay a
+    /// completed transition.
+    pub fn set_node_lifecycle(
+        &self,
+        node_id: NodeId,
+        lifecycle: NodeLifecycle,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let sequence = self
+            .next_admin_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::InvalidArgument("administrative request sequence exhausted".into())
+            })?;
+        let request_id = RequestId {
+            client_id: self.admin_client_id,
+            sequence,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+        };
+
+        self.propose_metadata_command(
+            MetadataCommand::SetNodeLifecycle { node_id, lifecycle },
+            request_id,
+            None,
+            timeout,
+        )
     }
 
     fn table_topology_for_outcome(
@@ -2145,6 +2225,8 @@ pub struct MultiRaftRuntime {
     metadata: MetadataRuntimeHandle,
 
     metadata_creator: SharedMetadataTableCreator,
+
+    metadata_control: MetadataProposalClient,
 
     host_status: SharedMultiRaftHostStatus,
 
@@ -2585,13 +2667,14 @@ impl MultiRaftRuntime {
             mpsc::sync_channel(METADATA_REQUEST_CHANNEL_CAPACITY);
         let rpc_state = RpcState::new();
         let metadata_rpc = MetadataRpcClient::new(transport.clone(), rpc_state.clone());
-        let metadata_creator: SharedMetadataTableCreator = Arc::new(MetadataProposalClient::new(
+        let metadata_proposal = MetadataProposalClient::new(
             metadata_request_tx.clone(),
             metadata_handle.clone(),
             metadata_rpc,
             metadata_nodes.iter().map(|node| node.node_id).collect(),
             config.node_id,
-        ));
+        );
+        let metadata_creator: SharedMetadataTableCreator = Arc::new(metadata_proposal.clone());
 
         let worker_shutdown = Arc::clone(&shutdown);
 
@@ -2629,6 +2712,7 @@ impl MultiRaftRuntime {
                     worker_host_status,
                     cluster_id,
                     metadata_nodes,
+                    metadata_bootstrap.replica_to_node.clone(),
                     metadata_ready_tx,
                     tablet_lifecycle,
                     join_request_rx,
@@ -2694,6 +2778,8 @@ impl MultiRaftRuntime {
 
             metadata_creator,
 
+            metadata_control: metadata_proposal,
+
             host_status,
 
             _snapshot_transport: snapshot_transport,
@@ -2734,6 +2820,13 @@ impl MultiRaftRuntime {
         self.metadata_creator.clone()
     }
 
+    /// Return the metadata proposal boundary used by administrative lifecycle
+    /// controls. The returned client shares only channels and read-only
+    /// publications; the host thread remains the sole Raft owner.
+    pub fn metadata_control(&self) -> MetadataProposalClient {
+        self.metadata_control.clone()
+    }
+
     /// Return the last published point-in-time status for every local Raft
     /// group. The host worker remains the sole owner of mutable Raft state.
     pub fn host_status(&self) -> MultiRaftHostStatus {
@@ -2759,6 +2852,7 @@ fn run_host(
     host_status: SharedMultiRaftHostStatus,
     cluster_id: String,
     metadata_nodes: Vec<NodeDescriptor>,
+    metadata_replica_to_node: BTreeMap<ReplicaId, NodeId>,
     metadata_ready: mpsc::SyncSender<std::result::Result<(), String>>,
     mut tablet_lifecycle: TabletLifecycleManager,
     join_requests: mpsc::Receiver<ReplicaJoinAdmission>,
@@ -2778,6 +2872,23 @@ fn run_host(
     let mut startup_sender = Some(metadata_ready);
 
     while !shutdown.load(Ordering::Acquire) {
+        if let Err(error) = reconcile_draining_leadership(
+            &mut host,
+            &transport,
+            &metadata,
+            &metadata_replica_to_node,
+        ) {
+            publish_host_status(&host_status, &host);
+            signal_metadata_failure(&mut startup_sender, error.to_string());
+            fail_pending_metadata(
+                &mut pending_metadata,
+                &mut pending_metadata_by_request,
+                error,
+            );
+            tracing::error!("draining-node leadership handoff failed");
+            return;
+        }
+
         let mut admitted_joins = 0;
         while admitted_joins < REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY {
             let Ok(admission) = join_requests.try_recv() else {
@@ -2975,9 +3086,12 @@ fn run_host(
             tracing::error!("metadata tablet lifecycle reconciliation failed");
             return;
         }
-        if let Err(error) =
-            tablet_lifecycle.reconcile_membership(&mut host, &metadata, &replica_join_rpc)
-        {
+        if let Err(error) = tablet_lifecycle.reconcile_membership(
+            &mut host,
+            &metadata,
+            &replica_join_rpc,
+            &metadata_replica_to_node,
+        ) {
             tracing::warn!(error = %error, "membership reconciliation pass failed; retrying");
         }
         if let Err(error) = tablet_lifecycle.reconcile_retirement_records(&mut host, &metadata) {
@@ -3059,6 +3173,335 @@ fn run_host(
 
         thread::sleep(Duration::from_millis(2));
     }
+
+    graceful_leadership_handoff(
+        &mut host,
+        &transport,
+        &inbound,
+        &metadata,
+        &metadata_replica_to_node,
+    );
+
+    publish_host_status(&host_status, &host);
+}
+
+/// Select the smallest eligible replica ID so transfer decisions are stable
+/// across host turns. Eligibility is deliberately stricter than the Raft
+/// core's final validation: the scheduler only asks a current, non-joint
+/// voter on an Active physical node that already advertises the leader's
+/// complete log frontier.
+struct TransferTargetState<'a> {
+    leader_replica_id: Option<ReplicaId>,
+    voters: &'a [ReplicaId],
+    learners: &'a [ReplicaId],
+    outgoing_voters: &'a [ReplicaId],
+    replica_match_indices: &'a [(ReplicaId, u64)],
+    last_log_index: u64,
+}
+
+fn select_transfer_target(
+    state: TransferTargetState<'_>,
+    replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+    active_nodes: &BTreeSet<NodeId>,
+) -> Option<ReplicaId> {
+    state
+        .voters
+        .iter()
+        .copied()
+        .filter(|replica_id| Some(*replica_id) != state.leader_replica_id)
+        .filter(|replica_id| !state.learners.contains(replica_id))
+        .filter(|replica_id| !state.outgoing_voters.contains(replica_id))
+        .filter(|replica_id| {
+            state
+                .replica_match_indices
+                .iter()
+                .any(|(candidate, match_index)| {
+                    candidate == replica_id && *match_index >= state.last_log_index
+                })
+        })
+        .filter(|replica_id| {
+            replica_to_node
+                .get(replica_id)
+                .is_some_and(|node_id| active_nodes.contains(node_id))
+        })
+        .min()
+}
+
+fn active_node_ids(state: &MetadataState) -> BTreeSet<NodeId> {
+    state
+        .nodes()
+        .filter(|node| node.lifecycle == NodeLifecycle::Active)
+        .map(|node| node.node_id)
+        .collect()
+}
+
+/// Resolve the physical placement authority used to choose a transfer target.
+/// Metadata-group membership comes from its durable bootstrap; tablet-group
+/// membership comes from the committed desired placement. Neither mapping is
+/// inferred from a NodeId because replica IDs are independently allocated.
+fn replica_routes_for_group(
+    state: &MetadataState,
+    raft_group_id: RaftGroupId,
+    metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+) -> BTreeMap<ReplicaId, NodeId> {
+    if raft_group_id == METADATA_RAFT_GROUP_ID {
+        return metadata_replica_to_node.clone();
+    }
+
+    state
+        .tablet_for_raft_group(raft_group_id)
+        .and_then(|tablet| state.desired_placement(tablet.tablet_id))
+        .map(|placement| {
+            placement
+                .replicas
+                .iter()
+                .map(|replica| (replica.replica_id, replica.node_id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Initiate one bounded transfer and release any targeted control message
+/// through the normal physical-node transport. Retryable outcomes are
+/// expected while a target is catching up or a previous transfer is active;
+/// shared-WAL uncertainty remains fatal and is propagated to the host owner.
+fn request_leadership_transfer(
+    host: &mut MultiRaftHost<LocalWal>,
+    transport: &NodeRaftTransport,
+    group_status: &MultiRaftGroupStatus,
+    replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+    active_nodes: &BTreeSet<NodeId>,
+    reason: &str,
+) -> Result<()> {
+    let Some(target) = select_transfer_target(
+        TransferTargetState {
+            leader_replica_id: group_status.leader_replica_id,
+            voters: &group_status.voters,
+            learners: &group_status.learners,
+            outgoing_voters: &group_status.outgoing_voters,
+            replica_match_indices: &group_status.replica_match_indices,
+            last_log_index: group_status.last_log_index,
+        },
+        replica_to_node,
+        active_nodes,
+    ) else {
+        tracing::debug!(
+            raft_group_id = group_status.identity.raft_group_id.0,
+            reason,
+            "no eligible voter is ready for leadership transfer",
+        );
+        return Ok(());
+    };
+
+    match host.transfer_leadership(
+        group_status.identity.raft_group_id,
+        target,
+        LEADERSHIP_TRANSFER_TIMEOUT_TICKS,
+    ) {
+        Ok(transfer) => {
+            send_outbound(transport, transfer.outbound);
+            tracing::info!(
+                raft_group_id = group_status.identity.raft_group_id.0,
+                target_replica_id = target.0,
+                reason,
+                "leadership transfer requested",
+            );
+        }
+
+        Err(MultiRaftHostError::GroupRejected { .. })
+        | Err(MultiRaftHostError::GroupRetryable { .. }) => {
+            tracing::debug!(
+                raft_group_id = group_status.identity.raft_group_id.0,
+                target_replica_id = target.0,
+                reason,
+                "leadership transfer will be retried",
+            );
+        }
+
+        Err(error) => return Err(host_error(error)),
+    }
+
+    Ok(())
+}
+
+/// Keep a node that metadata has moved beyond Active from retaining
+/// leadership. The check runs before request admission so the transfer fence
+/// is installed before another metadata or tablet proposal can be accepted by
+/// the local host.
+fn reconcile_draining_leadership(
+    host: &mut MultiRaftHost<LocalWal>,
+    transport: &NodeRaftTransport,
+    metadata: &MetadataRuntimeHandle,
+    metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+) -> Result<()> {
+    let node_id = host.node_id();
+    let Some(node) = metadata.node(node_id) else {
+        return Ok(());
+    };
+    if node.lifecycle == NodeLifecycle::Active {
+        return Ok(());
+    }
+
+    let state = metadata.state_snapshot();
+    let active_nodes = active_node_ids(&state);
+    for group_status in host.status().groups {
+        if group_status.role != Some(ragnordb_multiraft::host::MultiRaftRole::Leader) {
+            continue;
+        }
+
+        let routes = replica_routes_for_group(
+            &state,
+            group_status.identity.raft_group_id,
+            metadata_replica_to_node,
+        );
+        request_leadership_transfer(
+            host,
+            transport,
+            &group_status,
+            &routes,
+            &active_nodes,
+            "node lifecycle is no longer Active",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn drain_shutdown_messages(
+    host: &mut MultiRaftHost<LocalWal>,
+    inbound: &NodeRaftInbound,
+) -> Result<()> {
+    let mut admitted_messages = 0;
+    while admitted_messages < HOST_MESSAGE_BUDGET {
+        match inbound.try_recv() {
+            Ok(message) => match host.enqueue_message(message) {
+                Ok(()) => admitted_messages += 1,
+                Err(MultiRaftHostError::RecoveryRequired) => {
+                    return Err(Error::RecoveryRequired {
+                        reason:
+                            "shared Raft WAL requires recovery during shutdown leadership handoff"
+                                .to_string(),
+                    });
+                }
+                Err(error) => tracing::debug!(
+                    error = %error,
+                    "Raft message was not admitted during shutdown handoff",
+                ),
+            },
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Give every local leader a bounded opportunity to hand off before the
+/// worker exits. The host continues to process Raft messages and logical
+/// ticks during this window, which lets the target receive the final frontier
+/// and start an ordinary election if the targeted transfer times out.
+fn graceful_leadership_handoff(
+    host: &mut MultiRaftHost<LocalWal>,
+    transport: &NodeRaftTransport,
+    inbound: &NodeRaftInbound,
+    metadata: &MetadataRuntimeHandle,
+    metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
+) {
+    let deadline = Instant::now() + SHUTDOWN_LEADERSHIP_TRANSFER_DEADLINE;
+    let mut next_tick = Instant::now();
+
+    loop {
+        if let Err(error) = drain_shutdown_messages(host, inbound) {
+            tracing::error!(error = %error, "shutdown leadership handoff hit recovery-required state");
+            break;
+        }
+
+        let state = metadata.state_snapshot();
+        let active_nodes = active_node_ids(&state);
+        let leaders = host
+            .status()
+            .groups
+            .into_iter()
+            .filter(|group_status| {
+                group_status.role == Some(ragnordb_multiraft::host::MultiRaftRole::Leader)
+            })
+            .collect::<Vec<_>>();
+
+        if leaders.is_empty() {
+            tracing::info!("all local Raft leadership was handed off before shutdown");
+            break;
+        }
+
+        for group_status in &leaders {
+            let routes = replica_routes_for_group(
+                &state,
+                group_status.identity.raft_group_id,
+                metadata_replica_to_node,
+            );
+            if let Err(error) = request_leadership_transfer(
+                host,
+                transport,
+                group_status,
+                &routes,
+                &active_nodes,
+                "graceful shutdown",
+            ) {
+                tracing::warn!(
+                    error = %error,
+                    raft_group_id = group_status.identity.raft_group_id.0,
+                    "shutdown leadership transfer could not be started",
+                );
+            }
+        }
+
+        match host.run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: HOST_GROUP_BUDGET,
+                max_messages: HOST_MESSAGE_BUDGET,
+                ..MultiRaftTurnBudget::default()
+            },
+        ) {
+            Ok(turn) => send_outbound(transport, turn.outbound),
+            Err(error) => tracing::debug!(error = %error, "shutdown host turn failed"),
+        }
+
+        let now = Instant::now();
+        if now >= next_tick {
+            match host.run_turn(
+                1,
+                MultiRaftTurnBudget {
+                    max_groups: HOST_GROUP_BUDGET,
+                    max_messages: HOST_MESSAGE_BUDGET,
+                    ..MultiRaftTurnBudget::default()
+                },
+            ) {
+                Ok(turn) => send_outbound(transport, turn.outbound),
+                Err(error) => tracing::debug!(error = %error, "shutdown Raft tick failed"),
+            }
+            next_tick = now + TICK_INTERVAL;
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let remaining = host
+        .status()
+        .groups
+        .into_iter()
+        .filter(|group_status| {
+            group_status.role == Some(ragnordb_multiraft::host::MultiRaftRole::Leader)
+        })
+        .map(|group_status| group_status.identity.raft_group_id.0)
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        tracing::warn!(
+            raft_group_ids = ?remaining,
+            "shutdown leadership handoff deadline elapsed; peers will use ordinary election",
+        );
+    }
 }
 
 fn publish_host_status(status: &SharedMultiRaftHostStatus, host: &MultiRaftHost<impl RaftWal>) {
@@ -3102,8 +3545,7 @@ where
 
                 if deadline <= Instant::now() {
                     let _ = reply.send(Err(Error::ProposalUnavailable {
-                        reason: "metadata CREATE TABLE deadline elapsed before proposal"
-                            .to_string(),
+                        reason: "metadata proposal deadline elapsed before proposal".to_string(),
                     }));
                     continue;
                 }
@@ -3211,7 +3653,7 @@ fn expire_metadata_proposals(
 
         pending_by_request.remove(&proposal.request_id);
         let _ = proposal.reply.send(Err(Error::ProposalUnavailable {
-            reason: "metadata CREATE TABLE deadline elapsed before apply".to_string(),
+            reason: "metadata proposal deadline elapsed before apply".to_string(),
         }));
     }
 }
@@ -3265,7 +3707,12 @@ fn next_metadata_bootstrap_command(
                 return Ok(Some(MetadataCommand::RegisterNode(expected.clone())));
             }
 
-            Some(existing) if existing == expected => {}
+            Some(existing) if same_metadata_node_directory(existing, expected) => {
+                // Lifecycle is durable metadata state, not static bootstrap
+                // identity. A restart of a draining or terminal node must
+                // accept the persisted lifecycle while still rejecting any
+                // endpoint or locality drift.
+            }
 
             Some(existing) => {
                 return Err(format!(
@@ -3277,6 +3724,18 @@ fn next_metadata_bootstrap_command(
     }
 
     Ok(None)
+}
+
+fn same_metadata_node_directory(left: &NodeDescriptor, right: &NodeDescriptor) -> bool {
+    left.node_id == right.node_id
+        && left.raft_addr == right.raft_addr
+        && left.snapshot_addr == right.snapshot_addr
+        && left.sql_addr == right.sql_addr
+        && left.admin_addr == right.admin_addr
+        && left.region == right.region
+        && left.zone == right.zone
+        && left.rack == right.rack
+        && left.storage_class == right.storage_class
 }
 
 fn signal_metadata_failure(
@@ -3366,6 +3825,22 @@ mod tests {
         );
     }
 
+    /// Realistic bug caught: a restarted draining node must retain the
+    /// metadata lifecycle from its durable directory rather than failing
+    /// bootstrap because static seed configuration still describes it as
+    /// Active.
+    #[test]
+    fn metadata_bootstrap_directory_match_ignores_lifecycle_state() {
+        let expected = node(1);
+        let mut persisted = expected.clone();
+        persisted.lifecycle = NodeLifecycle::Draining;
+
+        assert!(same_metadata_node_directory(&persisted, &expected));
+
+        persisted.sql_addr = "127.0.0.1:9999".to_string();
+        assert!(!same_metadata_node_directory(&persisted, &expected));
+    }
+
     #[test]
     fn metadata_tablet_bootstrap_preserves_committed_membership_roles() {
         let descriptor = TabletDescriptor {
@@ -3407,6 +3882,45 @@ mod tests {
             bootstrap.initial_learners,
             [ReplicaId(2)].into_iter().collect()
         );
+    }
+
+    /// Realistic bug caught: a leadership handoff must not select a learner,
+    /// a lagging voter, a joint-consensus voter, or a node already leaving the
+    /// cluster. Selecting any of those targets can make a planned removal
+    /// loop indefinitely or hand leadership to a replica that cannot safely
+    /// serve the committed log frontier.
+    #[test]
+    fn leadership_transfer_target_requires_caught_up_active_voter() {
+        let voters = [ReplicaId(1), ReplicaId(2), ReplicaId(3), ReplicaId(4)];
+        let learners = [ReplicaId(5)];
+        let outgoing_voters = [ReplicaId(4)];
+        let replica_match_indices = [
+            (ReplicaId(1), 100),
+            (ReplicaId(2), 100),
+            (ReplicaId(3), 99),
+            (ReplicaId(4), 100),
+            (ReplicaId(5), 100),
+        ];
+        let target = select_transfer_target(
+            TransferTargetState {
+                leader_replica_id: Some(ReplicaId(1)),
+                voters: &voters,
+                learners: &learners,
+                outgoing_voters: &outgoing_voters,
+                replica_match_indices: &replica_match_indices,
+                last_log_index: 100,
+            },
+            &BTreeMap::from([
+                (ReplicaId(1), NodeId(1)),
+                (ReplicaId(2), NodeId(2)),
+                (ReplicaId(3), NodeId(3)),
+                (ReplicaId(4), NodeId(4)),
+                (ReplicaId(5), NodeId(5)),
+            ]),
+            &BTreeSet::from([NodeId(1), NodeId(2), NodeId(3), NodeId(5)]),
+        );
+
+        assert_eq!(target, Some(ReplicaId(2)));
     }
 
     /// Realistic bug caught: a replica in the outgoing voter set is still

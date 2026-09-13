@@ -392,6 +392,162 @@ fn registered_node_can_advance_lifecycle_without_changing_directory_identity() {
     );
 }
 
+/// Realistic bug caught:
+///
+/// A decommission request that skips the drain and migration phases could
+/// make metadata report a terminal node lifecycle while desired placements
+/// still reference live replicas on that node.
+#[test]
+fn lifecycle_transition_cannot_skip_required_safety_phases() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let active = node(11, 7001);
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterNode(active.clone())),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let mut decommissioned = active;
+    decommissioned.lifecycle = NodeLifecycle::Decommissioned;
+
+    assert!(matches!(
+        state.apply(MetadataCommand::RegisterNode(decommissioned)),
+        MetadataApplyOutcome::Rejected(MetadataRejection::InvalidNodeLifecycleTransition {
+            node_id: NodeId(11),
+            from: "active",
+            to: "decommissioned",
+        })
+    ));
+    assert_eq!(
+        state.node(NodeId(11)).unwrap().lifecycle,
+        NodeLifecycle::Active
+    );
+}
+
+/// Realistic bug caught:
+///
+/// An administrative lifecycle command must be idempotent while preserving
+/// the endpoint directory and must not provide a second path around the
+/// ordered drain protocol.
+#[test]
+fn lifecycle_control_is_idempotent_and_preserves_directory_identity() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let active = node(11, 7001);
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterNode(active.clone())),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Draining,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Draining,
+        }),
+        MetadataApplyOutcome::AlreadyApplied,
+    );
+    assert_eq!(state.node(NodeId(11)).unwrap().raft_addr, active.raft_addr);
+    let restored = MetadataState::from_snapshot(state.to_snapshot()).unwrap();
+    assert_eq!(
+        restored.node(NodeId(11)).unwrap().lifecycle,
+        NodeLifecycle::Draining
+    );
+    assert!(matches!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Decommissioned,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::InvalidNodeLifecycleTransition {
+            node_id: NodeId(11),
+            from: "draining",
+            to: "decommissioned",
+        })
+    ));
+}
+
+#[test]
+fn terminal_lifecycle_requires_metadata_replica_obligations_to_be_removed() {
+    let mut state = bootstrap_state();
+    let original = DesiredReplicaPlacement {
+        tablet_id: TabletId(17),
+        configuration_epoch: 1,
+        placement_policy: PlacementPolicy::for_replica_count(1),
+        replicas: vec![DesiredReplica {
+            replica_id: ReplicaId(31),
+            node_id: NodeId(11),
+            role: DesiredReplicaRole::Voter,
+        }],
+    };
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(original)),
+        MetadataApplyOutcome::Applied
+    );
+    for lifecycle in [NodeLifecycle::Draining, NodeLifecycle::Decommissioning] {
+        assert_eq!(
+            state.apply(MetadataCommand::SetNodeLifecycle {
+                node_id: NodeId(11),
+                lifecycle,
+            }),
+            MetadataApplyOutcome::Applied
+        );
+    }
+
+    assert!(matches!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Decommissioned,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::NodeStillExpected {
+            node_id: NodeId(11),
+            raft_group_id: RaftGroupId(23),
+            replica_id: ReplicaId(31),
+        })
+    ));
+
+    assert_eq!(
+        state.apply(MetadataCommand::SetDesiredReplicaPlacement(
+            DesiredReplicaPlacement {
+                tablet_id: TabletId(17),
+                configuration_epoch: 2,
+                placement_policy: PlacementPolicy::for_replica_count(1),
+                replicas: vec![DesiredReplica {
+                    replica_id: ReplicaId(32),
+                    node_id: NodeId(12),
+                    role: DesiredReplicaRole::Voter,
+                }],
+            },
+        )),
+        MetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::SetNodeLifecycle {
+            node_id: NodeId(11),
+            lifecycle: NodeLifecycle::Decommissioned,
+        }),
+        MetadataApplyOutcome::Applied
+    );
+}
+
 #[test]
 fn client_retry_session_epoch_and_horizon_survive_metadata_snapshot() {
     let mut state = MetadataState::new();

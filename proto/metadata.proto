@@ -49,6 +49,11 @@ message MetadataCommand {
 
         // Independent metadata proof that a committed Raft removal completed.
         RecordReplicaRetirement record_replica_retirement = 14;
+
+        // Lifecycle changes are committed independently from the physical
+        // directory record so administrative control cannot rewrite endpoint
+        // identity while advancing a node through the drain protocol.
+        SetNodeLifecycle set_node_lifecycle = 15;
     }
 }
 
@@ -90,6 +95,11 @@ enum NodeLifecycle {
 
 message RegisterNode {
     NodeDescriptor node = 1;
+}
+
+message SetNodeLifecycle {
+    ragnordb.ids.NodeId node_id = 1;
+    NodeLifecycle lifecycle = 2;
 }
 
 message CreateTable {

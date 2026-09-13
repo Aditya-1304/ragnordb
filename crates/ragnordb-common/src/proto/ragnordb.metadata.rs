@@ -26,7 +26,7 @@ pub struct MetadataCommand {
     pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
     #[prost(
         oneof = "metadata_command::Command",
-        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14"
+        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15"
     )]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
@@ -60,6 +60,11 @@ pub mod metadata_command {
         /// Independent metadata proof that a committed Raft removal completed.
         #[prost(message, tag = "14")]
         RecordReplicaRetirement(super::RecordReplicaRetirement),
+        /// Lifecycle changes are committed independently from the physical
+        /// directory record so administrative control cannot rewrite endpoint
+        /// identity while advancing a node through the drain protocol.
+        #[prost(message, tag = "15")]
+        SetNodeLifecycle(super::SetNodeLifecycle),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -100,6 +105,13 @@ pub struct NodeDescriptor {
 pub struct RegisterNode {
     #[prost(message, optional, tag = "1")]
     pub node: ::core::option::Option<NodeDescriptor>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SetNodeLifecycle {
+    #[prost(message, optional, tag = "1")]
+    pub node_id: ::core::option::Option<super::ids::NodeId>,
+    #[prost(enumeration = "NodeLifecycle", tag = "2")]
+    pub lifecycle: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateTable {

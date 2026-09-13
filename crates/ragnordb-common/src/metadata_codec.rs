@@ -73,6 +73,14 @@ pub enum MetadataCommand {
 
     RegisterNode(NodeDescriptor),
 
+    /// Advance one physical node through the metadata-owned drain lifecycle.
+    /// Endpoint identity remains in the existing directory record and cannot
+    /// be changed by this control-plane operation.
+    SetNodeLifecycle {
+        node_id: NodeId,
+        lifecycle: NodeLifecycle,
+    },
+
     CreateTable {
         table: TableDefinition,
     },
@@ -599,6 +607,13 @@ impl MetadataCommand {
 
             Self::RegisterNode(node) => node.validate(),
 
+            Self::SetNodeLifecycle { node_id, .. } => {
+                if node_id.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroNodeId);
+                }
+                Ok(())
+            }
+
             Self::CreateTable { table } => validate_table(table),
 
             Self::CreateTablet { tablet } => tablet.validate(),
@@ -667,6 +682,19 @@ impl MetadataCommand {
             Self::RegisterNode(node) => Command::RegisterNode(metadata::RegisterNode {
                 node: Some(node.to_proto()),
             }),
+
+            Self::SetNodeLifecycle { node_id, lifecycle } => {
+                Command::SetNodeLifecycle(metadata::SetNodeLifecycle {
+                    node_id: Some(node_id.to_proto()),
+                    lifecycle: match lifecycle {
+                        NodeLifecycle::Active => metadata::NodeLifecycle::Active,
+                        NodeLifecycle::Draining => metadata::NodeLifecycle::Draining,
+                        NodeLifecycle::Decommissioning => metadata::NodeLifecycle::Decommissioning,
+                        NodeLifecycle::Decommissioned => metadata::NodeLifecycle::Decommissioned,
+                        NodeLifecycle::Tombstoned => metadata::NodeLifecycle::Tombstoned,
+                    } as i32,
+                })
+            }
 
             Self::CreateTable { table } => Command::CreateTable(metadata::CreateTable {
                 table: Some(table.to_proto()),
@@ -746,6 +774,22 @@ impl MetadataCommand {
                     MetadataCommandCodecError::MissingField("register_node.node"),
                 )?)?)
             }
+
+            Some(Command::SetNodeLifecycle(command)) => Self::SetNodeLifecycle {
+                node_id: NodeId::from_proto(command.node_id.ok_or(
+                    MetadataCommandCodecError::MissingField("set_node_lifecycle.node_id"),
+                )?),
+                lifecycle: match metadata::NodeLifecycle::try_from(command.lifecycle) {
+                    Ok(metadata::NodeLifecycle::Active) => NodeLifecycle::Active,
+                    Ok(metadata::NodeLifecycle::Draining) => NodeLifecycle::Draining,
+                    Ok(metadata::NodeLifecycle::Decommissioning) => NodeLifecycle::Decommissioning,
+                    Ok(metadata::NodeLifecycle::Decommissioned) => NodeLifecycle::Decommissioned,
+                    Ok(metadata::NodeLifecycle::Tombstoned) => NodeLifecycle::Tombstoned,
+                    Ok(metadata::NodeLifecycle::Unspecified) | Err(_) => {
+                        return Err(MetadataCommandCodecError::InvalidNodeLifecycle);
+                    }
+                },
+            },
 
             Some(Command::CreateTable(command)) => Self::CreateTable {
                 table: TableDefinition::from_proto(command.table.ok_or(
