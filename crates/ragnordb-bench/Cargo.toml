@@ -11,10 +11,12 @@ hdrhistogram = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread", "macros", "sync"] }
+ragnordb-common = { path = "../ragnordb-common" }
 
 [dev-dependencies]
 criterion = "0.8"
-ragnordb-common = { path = "../ragnordb-common" }
+tempfile = "3"
+prost = { workspace = true }
 ragnordb-storage = { path = "../ragnordb-storage" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
 ragnordb-multiraft = { path = "../ragnordb-multiraft" }
@@ -22,4 +24,8 @@ wal = { workspace = true }
 
 [[bench]]
 name = "milestone4"
+harness = false
+
+[[bench]]
+name = "phase5a"
 harness = false
