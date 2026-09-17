@@ -17,3 +17,4 @@ thiserror.workspace = true
 prost.workspace = true
 blake3.workspace = true
 tracing.workspace = true
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }

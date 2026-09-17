@@ -6,10 +6,10 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io,
+    net::{SocketAddr, TcpListener},
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
     },
@@ -28,6 +28,13 @@ use ragnordb_common::{
     proto::raft::RaftTransportEnvelope,
     raft_bootstrap::RaftGroupBootstrap,
     rpc_codec::{MessageType, RpcFrame},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream},
+    runtime::Builder,
+    sync::{Notify, Semaphore, watch},
+    time::timeout,
 };
 
 use crate::host::{RaftMessageEnvelope, RoutedRaftMessage};
@@ -63,6 +70,9 @@ pub struct NodeRaftTransportConfig {
     pub outbound_queue_capacity: usize,
     pub outbound_queue_bytes: usize,
     pub inbound_connection_capacity: usize,
+    /// Retained for configuration compatibility. The evented reactor no
+    /// longer allocates one blocking worker per connection; active
+    /// connections are bounded by `inbound_connection_capacity`.
     pub inbound_connection_workers: usize,
     pub cluster_id: Option<String>,
 }
@@ -100,8 +110,6 @@ impl NodeRaftTransportConfig {
             || self.outbound_queue_capacity == 0
             || self.outbound_queue_bytes == 0
             || self.inbound_connection_capacity == 0
-            || self.inbound_connection_workers == 0
-            || self.inbound_connection_workers > self.inbound_connection_capacity
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -615,7 +623,7 @@ struct OutboundPeer {
     max_frame_bytes: usize,
     shutdown: Arc<AtomicBool>,
     state: Mutex<OutboundPeerState>,
-    wake: Condvar,
+    wake: Arc<Notify>,
 }
 
 impl OutboundPeer {
@@ -666,88 +674,95 @@ impl OutboundPeer {
         Ok(())
     }
 
-    fn next(&self) -> Option<QueuedOutbound> {
+    fn pop_next(&self) -> Option<QueuedOutbound> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        if self.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+
+        if let Some(message) = state.control.pop_front() {
+            if !message.coalescible_heartbeat {
+                return Some(message);
+            }
+
+            let mut messages = vec![message];
+            let mut encoded_bytes = messages[0].payload.len();
+            while messages.len() < MAX_HEARTBEAT_BATCH_ITEMS {
+                let Some(next) = state.control.front() else {
+                    break;
+                };
+                if !next.coalescible_heartbeat {
+                    break;
+                }
+
+                let projected_body_bytes = HEARTBEAT_BATCH_COUNT_BYTES
+                    .saturating_add(
+                        messages
+                            .len()
+                            .saturating_add(1)
+                            .saturating_mul(HEARTBEAT_BATCH_ITEM_LENGTH_BYTES),
+                    )
+                    .saturating_add(encoded_bytes)
+                    .saturating_add(next.payload.len());
+                if MULTIRAFT_FRAME_HEADER_BYTES.saturating_add(projected_body_bytes)
+                    > self.max_frame_bytes
+                {
+                    break;
+                }
+
+                let next = state
+                    .control
+                    .pop_front()
+                    .expect("control queue front was checked above");
+                encoded_bytes = encoded_bytes.saturating_add(next.payload.len());
+                messages.push(next);
+            }
+
+            if messages.len() == 1 {
+                return messages.pop();
+            }
+
+            let wire_bytes = messages.iter().map(|message| message.wire_bytes).sum();
+            let first = messages
+                .first()
+                .expect("heartbeat batch contains at least one item");
+            let payloads = messages
+                .iter()
+                .map(|message| message.payload.as_slice())
+                .collect::<Vec<_>>();
+            return Some(QueuedOutbound {
+                payload: encode_heartbeat_batch(&payloads, self.max_frame_bytes)
+                    .expect("admitted heartbeat records must fit the batch frame limit"),
+                wire_bytes,
+                raft_group_id: first.raft_group_id,
+                class: first.class,
+                coalescible_heartbeat: false,
+            });
+        }
+        if let Some(message) = state.rpc.pop_front() {
+            return Some(message);
+        }
+        if let Some(message) = state.bulk.pop_front() {
+            return Some(message);
+        }
+
+        None
+    }
+
+    async fn next(&self) -> Option<QueuedOutbound> {
         loop {
+            let notified = self.wake.notified();
+            if let Some(message) = self.pop_next() {
+                return Some(message);
+            }
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
             }
-
-            if let Some(message) = state.control.pop_front() {
-                if !message.coalescible_heartbeat {
-                    return Some(message);
-                }
-
-                let mut messages = vec![message];
-                let mut encoded_bytes = messages[0].payload.len();
-                while messages.len() < MAX_HEARTBEAT_BATCH_ITEMS {
-                    let Some(next) = state.control.front() else {
-                        break;
-                    };
-                    if !next.coalescible_heartbeat {
-                        break;
-                    }
-
-                    let projected_body_bytes = HEARTBEAT_BATCH_COUNT_BYTES
-                        .saturating_add(
-                            messages
-                                .len()
-                                .saturating_add(1)
-                                .saturating_mul(HEARTBEAT_BATCH_ITEM_LENGTH_BYTES),
-                        )
-                        .saturating_add(encoded_bytes)
-                        .saturating_add(next.payload.len());
-                    if MULTIRAFT_FRAME_HEADER_BYTES.saturating_add(projected_body_bytes)
-                        > self.max_frame_bytes
-                    {
-                        break;
-                    }
-
-                    let next = state
-                        .control
-                        .pop_front()
-                        .expect("control queue front was checked above");
-                    encoded_bytes = encoded_bytes.saturating_add(next.payload.len());
-                    messages.push(next);
-                }
-
-                if messages.len() == 1 {
-                    return messages.pop();
-                }
-
-                let wire_bytes = messages.iter().map(|message| message.wire_bytes).sum();
-                let first = messages
-                    .first()
-                    .expect("heartbeat batch contains at least one item");
-                let payloads = messages
-                    .iter()
-                    .map(|message| message.payload.as_slice())
-                    .collect::<Vec<_>>();
-                return Some(QueuedOutbound {
-                    payload: encode_heartbeat_batch(&payloads, self.max_frame_bytes)
-                        .expect("admitted heartbeat records must fit the batch frame limit"),
-                    wire_bytes,
-                    raft_group_id: first.raft_group_id,
-                    class: first.class,
-                    coalescible_heartbeat: false,
-                });
-            }
-            if let Some(message) = state.rpc.pop_front() {
-                return Some(message);
-            }
-            if let Some(message) = state.bulk.pop_front() {
-                return Some(message);
-            }
-
-            state = self
-                .wake
-                .wait_timeout(state, Duration::from_millis(50))
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .0;
+            notified.await;
         }
     }
 
@@ -762,44 +777,35 @@ impl OutboundPeer {
 
 struct NodeRaftListenerLifecycle {
     shutdown: Arc<AtomicBool>,
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
-    connection_workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    outbound_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    shutdown_signal: watch::Sender<bool>,
+    reactor_shutdown: Arc<Notify>,
+    reactor: Mutex<Option<thread::JoinHandle<()>>>,
     outbound_peers: Vec<Arc<OutboundPeer>>,
 }
 
 impl Drop for NodeRaftListenerLifecycle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // A watch channel retains the shutdown value for receivers that are
+        // created or polled during teardown. This avoids the lost-wakeup race
+        // inherent in using a one-shot notification for both the reactor and
+        // an arbitrary number of active connections.
+        let _ = self.shutdown_signal.send(true);
+        self.reactor_shutdown.notify_one();
         for peer in &self.outbound_peers {
-            peer.wake.notify_all();
+            // There is exactly one evented writer task per logical peer, so a
+            // retained one-shot permit is sufficient and closes the race
+            // between its shutdown check and awaiting the queue notification.
+            peer.wake.notify_one();
         }
 
-        if let Some(worker) = self
-            .worker
+        if let Some(reactor) = self
+            .reactor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            let _ = worker.join();
-        }
-
-        for worker in self
-            .connection_workers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-        {
-            let _ = worker.join();
-        }
-
-        for worker in self
-            .outbound_workers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-        {
-            let _ = worker.join();
+            let _ = reactor.join();
         }
     }
 }
@@ -861,45 +867,12 @@ impl NodeRaftTransport {
         let (inbound_tx, inbound_rx, rpc_inbound_rx) = inbound_queues(&config);
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (shutdown_signal, _) = watch::channel(false);
+        let reactor_shutdown = Arc::new(Notify::new());
 
         let routes = Arc::new(RwLock::new(BTreeMap::new()));
-        let (connection_tx, connection_rx) = mpsc::sync_channel(config.inbound_connection_capacity);
-        let connection_rx = Arc::new(Mutex::new(connection_rx));
-
-        let worker = spawn_listener(listener, connection_tx, Arc::clone(&shutdown))?;
-
-        let mut connection_workers = Vec::with_capacity(config.inbound_connection_workers);
-        for worker_index in 0..config.inbound_connection_workers {
-            let connection_rx = Arc::clone(&connection_rx);
-            let inbound = inbound_tx.clone();
-            let codec = codec.clone();
-            let routes = Arc::clone(&routes);
-            let node_addresses = node_addresses.clone();
-            let cluster_id = config.cluster_id.clone();
-            let shutdown = Arc::clone(&shutdown);
-            let max_frame_bytes = config.max_frame_bytes;
-
-            connection_workers.push(
-                thread::Builder::new()
-                    .name(format!("ragnordb-multiraft-connection-{worker_index}"))
-                    .spawn(move || {
-                        connection_worker(
-                            connection_rx,
-                            inbound,
-                            codec,
-                            routes,
-                            node_addresses,
-                            cluster_id,
-                            local_node_id,
-                            max_frame_bytes,
-                            shutdown,
-                        );
-                    })?,
-            );
-        }
 
         let mut outbound_peers = BTreeMap::new();
-        let mut outbound_workers = Vec::with_capacity(node_addresses.len());
         for (target_node_id, address) in &node_addresses {
             let peer = Arc::new(OutboundPeer {
                 target_node_id: *target_node_id,
@@ -911,22 +884,32 @@ impl NodeRaftTransport {
                 max_frame_bytes: config.max_frame_bytes,
                 shutdown: Arc::clone(&shutdown),
                 state: Mutex::new(OutboundPeerState::default()),
-                wake: Condvar::new(),
+                wake: Arc::new(Notify::new()),
             });
-            let worker_peer = Arc::clone(&peer);
-            outbound_workers.push(
-                thread::Builder::new()
-                    .name(format!("ragnordb-multiraft-outbound-{}", target_node_id.0))
-                    .spawn(move || outbound_worker(worker_peer))?,
-            );
             outbound_peers.insert(*target_node_id, peer);
         }
 
+        let reactor = spawn_evented_transport_reactor(
+            listener,
+            inbound_tx.clone(),
+            codec.clone(),
+            Arc::clone(&routes),
+            node_addresses.clone(),
+            config.cluster_id.clone(),
+            local_node_id,
+            config.max_frame_bytes,
+            config.inbound_connection_capacity,
+            Arc::clone(&shutdown),
+            shutdown_signal.clone(),
+            Arc::clone(&reactor_shutdown),
+            outbound_peers.values().cloned().collect(),
+        )?;
+
         let lifecycle = Arc::new(NodeRaftListenerLifecycle {
             shutdown,
-            worker: Mutex::new(Some(worker)),
-            connection_workers: Mutex::new(connection_workers),
-            outbound_workers: Mutex::new(outbound_workers),
+            shutdown_signal,
+            reactor_shutdown,
+            reactor: Mutex::new(Some(reactor)),
             outbound_peers: outbound_peers.values().cloned().collect(),
         });
 
@@ -1704,44 +1687,118 @@ fn decode_routed_message(
     })
 }
 
-fn spawn_listener(
+#[allow(clippy::too_many_arguments)]
+fn spawn_evented_transport_reactor(
     listener: TcpListener,
-    connections: SyncSender<TcpStream>,
+    inbound: InboundSenders,
+    codec: ByteEnvelopeCodec,
+    routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
+    node_addresses: BTreeMap<NodeId, SocketAddr>,
+    cluster_id: Option<String>,
+    local_node_id: NodeId,
+    max_frame_bytes: usize,
+    inbound_connection_capacity: usize,
     shutdown: Arc<AtomicBool>,
+    shutdown_signal: watch::Sender<bool>,
+    reactor_shutdown: Arc<Notify>,
+    outbound_peers: Vec<Arc<OutboundPeer>>,
 ) -> io::Result<thread::JoinHandle<()>> {
+    let runtime = Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+
     thread::Builder::new()
-        .name("ragnordb-multiraft-listener".to_string())
+        .name("ragnordb-multiraft-transport-reactor".to_string())
         .spawn(move || {
-            while !shutdown.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if connections.try_send(stream).is_err() {
-                            tracing::debug!(
-                                "MultiRaft inbound connection queue is full; dropping connection"
-                            );
-                        }
-                    }
-
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "MultiRaft listener accept failed",
-                        );
-
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                }
-            }
+            runtime.block_on(evented_transport_reactor(
+                listener,
+                inbound,
+                codec,
+                routes,
+                node_addresses,
+                cluster_id,
+                local_node_id,
+                max_frame_bytes,
+                inbound_connection_capacity,
+                shutdown,
+                shutdown_signal,
+                reactor_shutdown,
+                outbound_peers,
+            ));
         })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn connection_worker(
-    connections: Arc<Mutex<Receiver<TcpStream>>>,
+async fn evented_transport_reactor(
+    listener: TcpListener,
+    inbound: InboundSenders,
+    codec: ByteEnvelopeCodec,
+    routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
+    node_addresses: BTreeMap<NodeId, SocketAddr>,
+    cluster_id: Option<String>,
+    local_node_id: NodeId,
+    max_frame_bytes: usize,
+    inbound_connection_capacity: usize,
+    shutdown: Arc<AtomicBool>,
+    shutdown_signal: watch::Sender<bool>,
+    reactor_shutdown: Arc<Notify>,
+    outbound_peers: Vec<Arc<OutboundPeer>>,
+) {
+    let listener = match TokioTcpListener::from_std(listener) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(error = %error, "MultiRaft evented listener initialization failed");
+            return;
+        }
+    };
+    let connection_slots = Arc::new(Semaphore::new(inbound_connection_capacity));
+
+    for peer in outbound_peers {
+        tokio::spawn(outbound_worker(peer));
+    }
+
+    loop {
+        tokio::select! {
+            _ = reactor_shutdown.notified() => break,
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::debug!(error = %error, "MultiRaft evented listener accept failed");
+                        continue;
+                    }
+                };
+
+                let Ok(slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    tracing::debug!("MultiRaft active connection capacity is full; dropping connection");
+                    continue;
+                };
+
+                tokio::spawn(handle_connection(
+                    stream,
+                    slot,
+                    inbound.clone(),
+                    codec.clone(),
+                    Arc::clone(&routes),
+                    node_addresses.clone(),
+                    cluster_id.clone(),
+                    local_node_id,
+                    max_frame_bytes,
+                    Arc::clone(&shutdown),
+                    shutdown_signal.subscribe(),
+                ));
+            }
+        }
+    }
+
+    shutdown.store(true, Ordering::Release);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection(
+    mut stream: TokioTcpStream,
+    _slot: tokio::sync::OwnedSemaphorePermit,
     inbound: InboundSenders,
     codec: ByteEnvelopeCodec,
     routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
@@ -1750,107 +1807,106 @@ fn connection_worker(
     local_node_id: NodeId,
     max_frame_bytes: usize,
     shutdown: Arc<AtomicBool>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    while !shutdown.load(Ordering::Acquire) {
-        let stream = {
-            let receiver = connections
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            receiver.recv_timeout(Duration::from_millis(100))
-        };
-
-        let Ok(stream) = stream else {
-            continue;
-        };
-
-        if let Err(error) = handle_connection(
-            stream,
-            inbound.clone(),
-            codec.clone(),
-            routes.clone(),
-            &node_addresses,
-            cluster_id.as_deref(),
-            local_node_id,
-            max_frame_bytes,
-            Arc::clone(&shutdown),
-        ) {
-            tracing::debug!(
-                error = %error,
-                "MultiRaft connection closed with error",
-            );
-        }
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(error = %error, "MultiRaft evented connection setup failed");
+        return;
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn handle_connection(
-    mut stream: TcpStream,
-    inbound: InboundSenders,
-    codec: ByteEnvelopeCodec,
-    routes: Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
-    node_addresses: &BTreeMap<NodeId, SocketAddr>,
-    cluster_id: Option<&str>,
-    local_node_id: NodeId,
-    max_frame_bytes: usize,
-    shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
-    let remote_node_id = read_handshake(&mut stream, local_node_id, node_addresses, cluster_id)?;
+    let remote_node_id = match tokio::select! {
+        _ = shutdown_rx.changed() => return,
+        handshake = timeout(
+            CONNECTION_READ_TIMEOUT,
+            read_handshake(
+                &mut stream,
+                local_node_id,
+                &node_addresses,
+                cluster_id.as_deref(),
+            ),
+        ) => handshake,
+    } {
+        Ok(Ok(remote_node_id)) => remote_node_id,
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "MultiRaft connection handshake failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("MultiRaft connection handshake timed out");
+            return;
+        }
+    };
+
+    // The connection owns this scratch buffer for its entire lifetime. A
+    // frame is moved out for decoding and moved back after admission, so the
+    // next read can reuse the same allocation without retaining decoded
+    // application objects in the transport layer.
+    let mut read_buffer = Vec::new();
 
     loop {
-        let payload = match read_frame(&mut stream, max_frame_bytes) {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return Ok(()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if shutdown.load(Ordering::Acquire) {
-                    return Ok(());
+        let payload = tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            frame = read_frame(&mut stream, max_frame_bytes, &mut read_buffer) => match frame {
+                Ok(Some(payload)) => payload,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::debug!(error = %error, "MultiRaft evented connection read failed");
+                    return;
                 }
-                continue;
-            }
-            Err(error) => return Err(error),
+            },
         };
 
-        match payload.get(1).copied() {
-            Some(MULTIRAFT_RAFT_MESSAGE_TYPE) => {
-                let message = decode_routed_message(&codec, &payload)?;
-                validate_authenticated_raft_message(&routes, remote_node_id, &message)?;
-                queue_raft_message(&inbound, message, payload.len())?;
-            }
-            Some(MULTIRAFT_HEARTBEAT_BATCH_TYPE) => {
-                // Decode and authenticate every item before admitting any of
-                // them. A malformed later item must not leave an earlier
-                // group partially interpreted as belonging to another route.
-                let messages = decode_heartbeat_batch(&codec, &payload, max_frame_bytes)?;
-                for item in &messages {
-                    validate_authenticated_raft_message(&routes, remote_node_id, &item.message)?;
+        let result = (|| -> io::Result<()> {
+            match payload.get(1).copied() {
+                Some(MULTIRAFT_RAFT_MESSAGE_TYPE) => {
+                    let message = decode_routed_message(&codec, &payload)?;
+                    validate_authenticated_raft_message(&routes, remote_node_id, &message)?;
+                    queue_raft_message(&inbound, message, payload.len())
                 }
-                for item in messages {
-                    queue_raft_message(&inbound, item.message, item.wire_bytes)?;
+                Some(MULTIRAFT_HEARTBEAT_BATCH_TYPE) => {
+                    // Decode and authenticate every item before admitting any of
+                    // them. A malformed later item must not leave an earlier
+                    // group partially interpreted as belonging to another route.
+                    let messages = decode_heartbeat_batch(&codec, &payload, max_frame_bytes)?;
+                    for item in &messages {
+                        validate_authenticated_raft_message(
+                            &routes,
+                            remote_node_id,
+                            &item.message,
+                        )?;
+                    }
+                    for item in messages {
+                        queue_raft_message(&inbound, item.message, item.wire_bytes)?;
+                    }
+                    Ok(())
                 }
-            }
-            Some(_) => {
-                let frame = decode_rpc_frame(&payload, max_frame_bytes)?;
-                inbound.try_send_rpc(
-                    RoutedRpcMessage {
-                        source_node_id: remote_node_id,
-                        frame,
-                    },
-                    payload.len(),
-                )?;
-            }
-            None => {
-                return Err(io::Error::new(
+                Some(_) => {
+                    let frame = decode_rpc_frame(&payload, max_frame_bytes)?;
+                    inbound.try_send_rpc(
+                        RoutedRpcMessage {
+                            source_node_id: remote_node_id,
+                            frame,
+                        },
+                        payload.len(),
+                    )
+                }
+                None => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "MultiRaft frame is missing its message type",
-                ));
+                )),
             }
+        })();
+
+        if let Err(error) = result {
+            tracing::debug!(error = %error, "MultiRaft evented connection rejected a frame");
+            return;
         }
+
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        read_buffer = payload;
     }
 }
 
@@ -1898,8 +1954,8 @@ fn queue_raft_message(
     Ok(())
 }
 
-fn write_handshake(
-    stream: &mut TcpStream,
+async fn write_handshake(
+    stream: &mut TokioTcpStream,
     local_node_id: NodeId,
     cluster_id: Option<&str>,
 ) -> io::Result<()> {
@@ -1917,18 +1973,17 @@ fn write_handshake(
     handshake.extend_from_slice(&local_node_id.0.to_le_bytes());
     handshake.extend_from_slice(&cluster_length.to_le_bytes());
     handshake.extend_from_slice(cluster_id);
-    stream.write_all(&handshake)?;
-    stream.flush()
+    stream.write_all(&handshake).await
 }
 
-fn read_handshake(
-    stream: &mut TcpStream,
+async fn read_handshake(
+    stream: &mut TokioTcpStream,
     local_node_id: NodeId,
     node_addresses: &BTreeMap<NodeId, SocketAddr>,
     cluster_id: Option<&str>,
 ) -> io::Result<NodeId> {
     let mut fixed = [0_u8; HANDSHAKE_FIXED_BYTES];
-    stream.read_exact(&mut fixed)?;
+    stream.read_exact(&mut fixed).await?;
 
     if &fixed[..HANDSHAKE_MAGIC.len()] != HANDSHAKE_MAGIC {
         return Err(io::Error::new(
@@ -1967,7 +2022,7 @@ fn read_handshake(
             .expect("fixed-size handshake cluster length slice"),
     ) as usize;
     let mut received_cluster = vec![0_u8; cluster_length];
-    stream.read_exact(&mut received_cluster)?;
+    stream.read_exact(&mut received_cluster).await?;
     if received_cluster != cluster_id.unwrap_or_default().as_bytes() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1978,28 +2033,54 @@ fn read_handshake(
     Ok(remote_node_id)
 }
 
-fn outbound_worker(peer: Arc<OutboundPeer>) {
-    let mut stream = None;
+async fn outbound_worker(peer: Arc<OutboundPeer>) {
+    let mut stream: Option<TokioTcpStream> = None;
+    let mut write_buffer = Vec::new();
 
-    while let Some(message) = peer.next() {
-        let result = (|| -> io::Result<()> {
+    while let Some(message) = peer.next().await {
+        // Queue admission owns the encoded payload until the message is
+        // released. Copying into this worker-local buffer keeps the socket
+        // write allocation reusable across frames while the queue's ownership
+        // and byte accounting remain unchanged.
+        write_buffer.clear();
+        write_buffer.extend_from_slice(&message.payload);
+        let result = async {
             if stream.is_none() {
-                let mut connected = TcpStream::connect_timeout(&peer.address, CONNECT_TIMEOUT)?;
+                let mut connected = timeout(CONNECT_TIMEOUT, TokioTcpStream::connect(peer.address))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "MultiRaft outbound connection timed out",
+                        )
+                    })??;
                 connected.set_nodelay(true)?;
-                connected.set_write_timeout(Some(OUTBOUND_WRITE_TIMEOUT))?;
                 write_handshake(
                     &mut connected,
                     peer.local_node_id,
                     peer.cluster_id.as_deref(),
-                )?;
+                )
+                .await?;
                 stream = Some(connected);
             }
 
             let connected = stream.as_mut().expect("outbound stream is initialized");
-            write_frame(connected, &message.payload, peer.max_frame_bytes)?;
-            connected.flush()
-        })();
+            timeout(
+                OUTBOUND_WRITE_TIMEOUT,
+                write_frame(connected, &write_buffer, peer.max_frame_bytes),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "MultiRaft outbound write timed out",
+                )
+            })??;
+            Ok::<(), io::Error>(())
+        }
+        .await;
 
+        write_buffer.clear();
         peer.finish(message.wire_bytes);
 
         if let Err(error) = result {
@@ -2015,7 +2096,11 @@ fn outbound_worker(peer: Arc<OutboundPeer>) {
     }
 }
 
-fn write_frame(stream: &mut TcpStream, payload: &[u8], max_frame_bytes: usize) -> io::Result<()> {
+async fn write_frame(
+    stream: &mut TokioTcpStream,
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> io::Result<()> {
     if payload.len() < MULTIRAFT_FRAME_HEADER_BYTES
         || payload.len() - MULTIRAFT_FRAME_HEADER_BYTES > max_frame_bytes
     {
@@ -2025,16 +2110,20 @@ fn write_frame(stream: &mut TcpStream, payload: &[u8], max_frame_bytes: usize) -
         ));
     }
 
-    stream.write_all(payload)?;
+    stream.write_all(payload).await?;
 
     Ok(())
 }
 
-fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+async fn read_frame(
+    stream: &mut TokioTcpStream,
+    max_frame_bytes: usize,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0_u8; MULTIRAFT_FRAME_HEADER_BYTES];
 
-    match stream.read_exact(&mut header) {
-        Ok(()) => {}
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
 
         Err(error)
             if matches!(
@@ -2076,12 +2165,14 @@ fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Opti
         ));
     }
 
-    let mut payload = Vec::with_capacity(MULTIRAFT_FRAME_HEADER_BYTES + length);
-    payload.extend_from_slice(&header);
-    payload.resize(MULTIRAFT_FRAME_HEADER_BYTES + length, 0);
-    stream.read_exact(&mut payload[MULTIRAFT_FRAME_HEADER_BYTES..])?;
+    buffer.clear();
+    buffer.extend_from_slice(&header);
+    buffer.resize(MULTIRAFT_FRAME_HEADER_BYTES + length, 0);
+    stream
+        .read_exact(&mut buffer[MULTIRAFT_FRAME_HEADER_BYTES..])
+        .await?;
 
-    Ok(Some(payload))
+    Ok(Some(std::mem::take(buffer)))
 }
 
 #[cfg(test)]
@@ -2179,7 +2270,7 @@ mod tests {
             max_frame_bytes: 64 * 1024,
             shutdown: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(OutboundPeerState::default()),
-            wake: Condvar::new(),
+            wake: Arc::new(Notify::new()),
         };
 
         peer.try_send(
@@ -2197,7 +2288,7 @@ mod tests {
         )
         .unwrap();
 
-        let frame = peer.next().expect("queued heartbeat frame");
+        let frame = peer.pop_next().expect("queued heartbeat frame");
         assert_eq!(
             frame.payload[1], 0x0B,
             "queued heartbeat records should use the batch wire discriminator"

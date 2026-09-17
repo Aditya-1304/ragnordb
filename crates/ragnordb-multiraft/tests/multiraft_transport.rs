@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::TcpListener,
+    io::Write,
+    net::{TcpListener, TcpStream},
     time::Duration,
 };
 
@@ -21,6 +22,15 @@ use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRaftTransportConfig};
 fn unused_address() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap()
+}
+
+fn write_idle_connection_handshake(stream: &mut TcpStream, node_id: u64) {
+    let mut handshake = Vec::with_capacity(19);
+    handshake.extend_from_slice(b"RAGNOMR1");
+    handshake.push(1);
+    handshake.extend_from_slice(&node_id.to_le_bytes());
+    handshake.extend_from_slice(&0_u16.to_le_bytes());
+    stream.write_all(&handshake).unwrap();
 }
 
 fn bootstrap(group: u64) -> RaftGroupBootstrap {
@@ -96,6 +106,58 @@ fn wire_demultiplexes_same_replica_ids_across_groups() {
         .recv_timeout(Duration::from_secs(2))
         .unwrap();
     assert_eq!(received.raft_group_id, RaftGroupId(10));
+    assert_eq!(received.envelope, envelope);
+}
+
+#[test]
+/// Catches the fixed-worker head-of-line bug: an authenticated but idle TCP
+/// connection must not prevent a later connection from delivering Raft work.
+fn idle_connection_does_not_block_a_later_connection() {
+    let node_1_addr = unused_address();
+    let node_2_addr = unused_address();
+    let config = NodeRaftTransportConfig {
+        inbound_connection_capacity: 4,
+        inbound_connection_workers: 1,
+        ..NodeRaftTransportConfig::default()
+    };
+
+    let endpoint_2 = NodeRaftTransport::bind_with_config(
+        NodeId(2),
+        node_2_addr,
+        BTreeMap::from([(NodeId(1), node_1_addr)]),
+        config,
+    )
+    .unwrap();
+    let endpoint_1 = NodeRaftTransport::bind(
+        NodeId(1),
+        node_1_addr,
+        BTreeMap::from([(NodeId(2), node_2_addr)]),
+    )
+    .unwrap();
+
+    let group = bootstrap(21);
+    endpoint_2.transport.register_group(&group).unwrap();
+    let sender = endpoint_1.transport.register_group(&group).unwrap();
+
+    let mut idle_connection = TcpStream::connect(endpoint_2.local_addr).unwrap();
+    write_idle_connection_handshake(&mut idle_connection, 1);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let envelope = Envelope {
+        from: CoreReplicaId::must(101),
+        to: CoreReplicaId::must(202),
+        msg: Message::PreVoteResponse(PreVoteResponse {
+            term: 7,
+            vote_granted: true,
+        }),
+    };
+    sender.try_send(envelope.clone()).unwrap();
+
+    let received = endpoint_2
+        .inbound
+        .recv_timeout(Duration::from_secs(1))
+        .expect("evented transport should service the later connection");
+    assert_eq!(received.raft_group_id, group.raft_group_id);
     assert_eq!(received.envelope, envelope);
 }
 
