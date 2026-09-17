@@ -177,6 +177,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
             "state": summary.state.as_str(),
             "pending_message_count": summary.pending_message_count,
             "pending_message_bytes": summary.pending_message_bytes,
+            "pending_persistence_groups": summary.pending_persistence_groups,
+            "pending_persistence_records": summary.pending_persistence_records,
+            "pending_persistence_bytes": summary.pending_persistence_bytes,
             "group_count": summary.group_count,
             "leader_count": summary.leader_count,
             "candidate_count": summary.candidate_count,
@@ -282,6 +285,9 @@ fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
         "state": status.state.as_str(),
         "pending_message_count": status.pending_message_count,
         "pending_message_bytes": status.pending_message_bytes,
+        "pending_persistence_groups": status.pending_persistence_groups,
+        "pending_persistence_records": status.pending_persistence_records,
+        "pending_persistence_bytes": status.pending_persistence_bytes,
         "groups": groups,
     })
 }

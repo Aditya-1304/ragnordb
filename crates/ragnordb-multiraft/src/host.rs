@@ -3,8 +3,9 @@
 //! The host owns the cross-group admission boundary. It schedules bounded group
 //! operations, keeps inbound work tagged by group, and preserves the per-group
 //! Ready ordering delegated to each [`HostedRaftGroup`]. Prepared Ready records
-//! are coalesced into one shared A-WAL sync when a scheduler turn has multiple
-//! eligible groups. Shared A-WAL uncertainty still fences every local replica.
+//! enter one bounded persistence service, which coalesces eligible groups into
+//! an ordered shared A-WAL sync. Shared A-WAL uncertainty still fences every
+//! local replica.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -116,6 +117,15 @@ pub struct MultiRaftHostConfig {
     pub max_pending_group_messages: usize,
     pub max_pending_group_message_bytes: usize,
     pub max_proposal_bytes: usize,
+    /// Maximum number of prepared Ready generations retained by the
+    /// node-local persistence service before the next group is deferred.
+    pub max_pending_persistence_groups: usize,
+    /// Maximum number of A-WAL records retained by the persistence service
+    /// while a cross-group batch is being assembled.
+    pub max_pending_persistence_records: usize,
+    /// Maximum encoded payload bytes retained by the persistence service while
+    /// a cross-group batch is being assembled.
+    pub max_pending_persistence_bytes: usize,
 }
 
 impl Default for MultiRaftHostConfig {
@@ -126,6 +136,9 @@ impl Default for MultiRaftHostConfig {
             max_pending_group_messages: 2 * 1024,
             max_pending_group_message_bytes: 16 * 1024 * 1024,
             max_proposal_bytes: 16 * 1024 * 1024,
+            max_pending_persistence_groups: 64,
+            max_pending_persistence_records: 4096,
+            max_pending_persistence_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -137,6 +150,9 @@ impl MultiRaftHostConfig {
             || self.max_pending_group_messages == 0
             || self.max_pending_group_message_bytes == 0
             || self.max_proposal_bytes == 0
+            || self.max_pending_persistence_groups == 0
+            || self.max_pending_persistence_records == 0
+            || self.max_pending_persistence_bytes == 0
         {
             return Err(MultiRaftHostError::InvalidConfiguration(
                 "MultiRaft host limits must be non-zero".to_string(),
@@ -255,6 +271,9 @@ pub struct MultiRaftHostStatus {
     pub state: MultiRaftHostState,
     pub pending_message_count: usize,
     pub pending_message_bytes: usize,
+    pub pending_persistence_groups: usize,
+    pub pending_persistence_records: usize,
+    pub pending_persistence_bytes: usize,
     pub groups: Vec<MultiRaftGroupStatus>,
 }
 
@@ -276,6 +295,9 @@ pub struct MultiRaftHostSummary {
     pub state: MultiRaftHostState,
     pub pending_message_count: usize,
     pub pending_message_bytes: usize,
+    pub pending_persistence_groups: usize,
+    pub pending_persistence_records: usize,
+    pub pending_persistence_bytes: usize,
     pub group_count: usize,
     pub leader_count: usize,
     pub candidate_count: usize,
@@ -319,6 +341,9 @@ impl MultiRaftHostStatus {
             state: self.state,
             pending_message_count: self.pending_message_count,
             pending_message_bytes: self.pending_message_bytes,
+            pending_persistence_groups: self.pending_persistence_groups,
+            pending_persistence_records: self.pending_persistence_records,
+            pending_persistence_bytes: self.pending_persistence_bytes,
             group_count: self.groups.len(),
             leader_count: self
                 .groups
@@ -361,10 +386,59 @@ pub struct HostedGroupTurn {
     pub(crate) persistence: Option<HostedPersistenceBatch>,
 }
 
+/// Bounded persistence pressure reported by the node-local A-WAL service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MultiRaftPersistenceStatus {
+    pub pending_groups: usize,
+    pub pending_records: usize,
+    pub pending_bytes: usize,
+}
+
 /// One group's encoded Ready records awaiting the node-wide WAL boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Payloads are converted to owned boxed slices at the service boundary. The
+/// service never re-encodes or mutates these buffers; the corresponding group
+/// keeps its prevalidated logical successor until the exact returned extent
+/// range is committed.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct HostedPersistenceBatch {
-    pub(crate) records: Vec<(RecordType, Vec<u8>)>,
+    records: Box<[HostedPersistenceRecord]>,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HostedPersistenceRecord {
+    record_type: RecordType,
+    payload: Box<[u8]>,
+}
+
+impl HostedPersistenceBatch {
+    fn new(records: Vec<(RecordType, Vec<u8>)>) -> Self {
+        let encoded_bytes = records.iter().fold(0_usize, |total, (_, payload)| {
+            total.saturating_add(payload.len())
+        });
+        let records = records
+            .into_iter()
+            .map(|(record_type, payload)| HostedPersistenceRecord {
+                record_type,
+                payload: payload.into_boxed_slice(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Self {
+            records,
+            encoded_bytes,
+        }
+    }
+
+    fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
 }
 
 /// Result of one bounded host turn.
@@ -538,6 +612,7 @@ struct PendingMessage {
     wire_bytes: usize,
 }
 
+#[derive(Debug)]
 struct PendingPersistenceGroup {
     raft_group_id: RaftGroupId,
     timer_due: bool,
@@ -549,6 +624,152 @@ struct PendingPersistenceGroup {
     /// Read states are held with the Ready batch so a custom adapter cannot
     /// publish a read result before the batch's persistence/apply boundary.
     read_states: Vec<ReadState>,
+}
+
+/// Admission failure from the node-local persistence service.
+#[derive(Debug)]
+enum PersistenceAdmissionError {
+    /// The request is valid but cannot fit in the bounded staging window yet.
+    Capacity(PendingPersistenceGroup),
+    /// A single request exceeds the configured service limit and cannot make
+    /// progress without an operator-selected configuration change.
+    RequestTooLarge {
+        pending: PendingPersistenceGroup,
+        record_count: usize,
+        encoded_bytes: usize,
+    },
+}
+
+/// The single host-owned service which stages prepared Ready generations and
+/// submits their immutable records to the node-wide A-WAL in FIFO order.
+///
+/// This is intentionally an in-process service rather than an additional OS
+/// thread. The current Ready contract does not allow a group to expose its
+/// next generation until the previous one is acknowledged, so the useful
+/// overlap is preparation by other groups while this service performs one
+/// ordered append-and-sync operation.
+struct PersistenceService<W>
+where
+    W: RaftWal,
+{
+    node_wal: NodeRaftWal<W>,
+    max_pending_groups: usize,
+    max_pending_records: usize,
+    max_pending_bytes: usize,
+    pending: VecDeque<PendingPersistenceGroup>,
+    pending_records: usize,
+    pending_bytes: usize,
+}
+
+impl<W> PersistenceService<W>
+where
+    W: RaftWal,
+{
+    fn new(node_wal: NodeRaftWal<W>, config: MultiRaftHostConfig) -> Self {
+        Self {
+            node_wal,
+            max_pending_groups: config.max_pending_persistence_groups,
+            max_pending_records: config.max_pending_persistence_records,
+            max_pending_bytes: config.max_pending_persistence_bytes,
+            pending: VecDeque::new(),
+            pending_records: 0,
+            pending_bytes: 0,
+        }
+    }
+
+    fn status(&self) -> MultiRaftPersistenceStatus {
+        MultiRaftPersistenceStatus {
+            pending_groups: self.pending.len(),
+            pending_records: self.pending_records,
+            pending_bytes: self.pending_bytes,
+        }
+    }
+
+    fn try_submit(
+        &mut self,
+        pending: PendingPersistenceGroup,
+    ) -> Result<(), PersistenceAdmissionError> {
+        let record_count = pending.batch.record_count();
+        let encoded_bytes = pending.batch.encoded_bytes();
+        if record_count > self.max_pending_records || encoded_bytes > self.max_pending_bytes {
+            return Err(PersistenceAdmissionError::RequestTooLarge {
+                pending,
+                record_count,
+                encoded_bytes,
+            });
+        }
+
+        if self.pending.len() >= self.max_pending_groups
+            || self.pending_records.saturating_add(record_count) > self.max_pending_records
+            || self.pending_bytes.saturating_add(encoded_bytes) > self.max_pending_bytes
+        {
+            return Err(PersistenceAdmissionError::Capacity(pending));
+        }
+
+        self.pending_records = self.pending_records.saturating_add(record_count);
+        self.pending_bytes = self.pending_bytes.saturating_add(encoded_bytes);
+        self.pending.push_back(pending);
+        Ok(())
+    }
+
+    /// Drain the currently admitted requests as one ordered A-WAL operation.
+    ///
+    /// The service consumes its queue before calling A-WAL so no caller can
+    /// append a later group past an unresolved sync. The returned request list
+    /// remains paired with the exact extent ranges for completion callbacks.
+    fn flush(&mut self) -> Option<PersistenceServiceBatch> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        let groups = self.pending.drain(..).collect::<Vec<_>>();
+        self.pending_records = 0;
+        self.pending_bytes = 0;
+
+        let total_records = groups.iter().fold(0_usize, |total, pending| {
+            total.saturating_add(pending.batch.record_count())
+        });
+        let records: Vec<_> = groups
+            .iter()
+            .flat_map(|pending| pending.batch.records.iter())
+            // A-WAL remains the checksum and LSN authority. Passing these
+            // exact borrowed payloads avoids a second encoding or checksum
+            // interpretation between preparation and the durable boundary.
+            .map(|record| (record.record_type, record.payload.as_ref()))
+            .collect();
+
+        let mut outcome = if records.is_empty() {
+            Ok(BatchAppendResult {
+                record_extents: Vec::new(),
+                final_end_lsn: wal::lsn::Lsn::ZERO,
+            })
+        } else {
+            self.node_wal.append_batch_and_sync(&records)
+        };
+
+        if let Ok(batch_result) = &outcome
+            && (batch_result.record_extents.len() != total_records
+                || (total_records > 0
+                    && batch_result
+                        .record_extents
+                        .last()
+                        .is_none_or(|extent| extent.end_lsn != batch_result.final_end_lsn)))
+        {
+            self.node_wal
+                .require_recovery("shared A-WAL returned an invalid cross-group batch frontier");
+            outcome = Err(BatchAppendFailure::OutcomeUnknown {
+                result: batch_result.clone(),
+                source: wal::error::WalError::BrokenDurabilityContract,
+            });
+        }
+
+        Some(PersistenceServiceBatch { groups, outcome })
+    }
+}
+
+struct PersistenceServiceBatch {
+    groups: Vec<PendingPersistenceGroup>,
+    outcome: Result<BatchAppendResult, BatchAppendFailure>,
 }
 
 impl PendingGroupMessages {
@@ -982,9 +1203,9 @@ where
                 ready_generations: progress.ready_generations,
                 apply_entries: 0,
                 snapshot_bytes: progress.snapshot_bytes,
-                persistence: progress.request.map(|request| HostedPersistenceBatch {
-                    records: request.records,
-                }),
+                persistence: progress
+                    .request
+                    .map(|request| HostedPersistenceBatch::new(request.records)),
             });
         }
 
@@ -1011,9 +1232,9 @@ where
                     ready_generations: progress.ready_generations,
                     apply_entries: 0,
                     snapshot_bytes: progress.snapshot_bytes,
-                    persistence: progress.request.map(|request| HostedPersistenceBatch {
-                        records: request.records,
-                    }),
+                    persistence: progress
+                        .request
+                        .map(|request| HostedPersistenceBatch::new(request.records)),
                 });
             }
 
@@ -1031,9 +1252,9 @@ where
             ready_generations: progress.ready_generations,
             apply_entries: 0,
             snapshot_bytes: progress.snapshot_bytes,
-            persistence: progress.request.map(|request| HostedPersistenceBatch {
-                records: request.records,
-            }),
+            persistence: progress
+                .request
+                .map(|request| HostedPersistenceBatch::new(request.records)),
         })
     }
 }
@@ -1542,6 +1763,12 @@ where
     /// Raft groups. Shared-WAL uncertainty still moves the entire host into
     /// RecoveryRequired.
     quarantined: BTreeMap<RaftGroupId, String>,
+
+    /// The single bounded preparation queue used to assemble the next
+    /// cross-group A-WAL batch. It shares the node-wide WAL state with the
+    /// registration handle above but is the only host path that appends the
+    /// prepared cross-group batch.
+    persistence: PersistenceService<W>,
 }
 
 impl<W> MultiRaftHost<W>
@@ -1559,6 +1786,7 @@ where
         config: MultiRaftHostConfig,
     ) -> Result<Self, MultiRaftHostError> {
         config.validate()?;
+        let persistence = PersistenceService::new(node_wal.clone(), config);
 
         Ok(Self {
             node_id,
@@ -1577,6 +1805,7 @@ where
             issued_writers: BTreeSet::new(),
             tombstoned: BTreeSet::new(),
             quarantined: BTreeMap::new(),
+            persistence,
         })
     }
 
@@ -1601,6 +1830,7 @@ where
         config: MultiRaftHostConfig,
     ) -> Result<Self, MultiRaftHostError> {
         config.validate()?;
+        let persistence = PersistenceService::new(node_wal.clone(), config);
 
         Ok(Self {
             node_id,
@@ -1622,6 +1852,7 @@ where
             issued_writers: BTreeSet::new(),
             tombstoned: BTreeSet::new(),
             quarantined: BTreeMap::new(),
+            persistence,
         })
     }
 
@@ -1660,6 +1891,7 @@ where
             HostState::Active => MultiRaftHostState::Active,
             HostState::RecoveryRequired => MultiRaftHostState::RecoveryRequired,
         };
+        let persistence = self.persistence.status();
 
         let groups = self
             .groups
@@ -1679,6 +1911,9 @@ where
             state,
             pending_message_count: self.pending_message_count,
             pending_message_bytes: self.pending_message_bytes,
+            pending_persistence_groups: persistence.pending_groups,
+            pending_persistence_records: persistence.pending_records,
+            pending_persistence_bytes: persistence.pending_bytes,
             groups,
         }
     }
@@ -2120,7 +2355,7 @@ where
         self.timer_advance_pending = false;
 
         let mut result = MultiRaftTurnResult::default();
-        let mut persistence_groups = Vec::new();
+        let mut persistence_error = None;
 
         while result.groups_serviced < budget.max_groups {
             let Some(raft_group_id) = self.runnable.pop() else {
@@ -2275,13 +2510,49 @@ where
                     result.snapshot_bytes += turn.snapshot_bytes;
 
                     if let Some(batch) = turn.persistence {
-                        persistence_groups.push(PendingPersistenceGroup {
+                        let pending = PendingPersistenceGroup {
                             raft_group_id,
                             timer_due: rearm_timer,
                             batch,
                             outbound: turn.outbound,
                             read_states: turn.read_states,
-                        });
+                        };
+
+                        match self.persistence.try_submit(pending) {
+                            Ok(()) => {}
+                            Err(PersistenceAdmissionError::Capacity(pending)) => {
+                                // The concrete Ready adapter keeps all
+                                // persistence-dependent output in the Ready
+                                // itself until completion. A custom adapter
+                                // must preserve that same contract.
+                                self.ensure_persistence_output_invariant(&pending)?;
+                                self.reschedule_after_turn(
+                                    pending.raft_group_id,
+                                    pending.timer_due,
+                                );
+                                break;
+                            }
+                            Err(PersistenceAdmissionError::RequestTooLarge {
+                                pending,
+                                record_count,
+                                encoded_bytes,
+                            }) => {
+                                self.ensure_persistence_output_invariant(&pending)?;
+                                self.reschedule_after_turn(
+                                    pending.raft_group_id,
+                                    pending.timer_due,
+                                );
+                                persistence_error =
+                                    Some(MultiRaftHostError::PersistenceRequestTooLarge {
+                                        raft_group_id: pending.raft_group_id,
+                                        record_count,
+                                        encoded_bytes,
+                                        max_records: self.persistence.max_pending_records,
+                                        max_bytes: self.persistence.max_pending_bytes,
+                                    });
+                                break;
+                            }
+                        }
                     } else {
                         result.read_states.extend(
                             turn.read_states
@@ -2349,49 +2620,14 @@ where
             }
         }
 
-        if !persistence_groups.is_empty() {
-            let total_records = persistence_groups
-                .iter()
-                .map(|pending| pending.batch.records.len())
-                .sum::<usize>();
-            let records: Vec<_> = persistence_groups
-                .iter()
-                .flat_map(|pending| pending.batch.records.iter())
-                .map(|(record_type, payload)| (*record_type, payload.as_slice()))
-                .collect();
-
-            let mut shared_outcome = if records.is_empty() {
-                Ok(BatchAppendResult {
-                    record_extents: Vec::new(),
-                    final_end_lsn: wal::lsn::Lsn::ZERO,
-                })
-            } else {
-                self.node_wal.append_batch_and_sync(&records)
-            };
-
-            if let Ok(batch_result) = &shared_outcome
-                && (batch_result.record_extents.len() != total_records
-                    || (total_records > 0
-                        && batch_result
-                            .record_extents
-                            .last()
-                            .is_none_or(|extent| extent.end_lsn != batch_result.final_end_lsn)))
-            {
-                self.node_wal.require_recovery(
-                    "shared A-WAL returned an invalid cross-group batch frontier",
-                );
-                shared_outcome = Err(BatchAppendFailure::OutcomeUnknown {
-                    result: batch_result.clone(),
-                    source: wal::error::WalError::BrokenDurabilityContract,
-                });
-            }
-
+        if let Some(service_batch) = self.persistence.flush() {
+            let shared_outcome = service_batch.outcome;
             let mut extent_offset = 0;
             let mut recovery_required = false;
 
-            for pending in persistence_groups {
+            for pending in service_batch.groups {
                 let raft_group_id = pending.raft_group_id;
-                let record_count = pending.batch.records.len();
+                let record_count = pending.batch.record_count();
                 let group_outcome = match &shared_outcome {
                     Ok(batch_result) => {
                         let extents = batch_result
@@ -2473,6 +2709,10 @@ where
             }
         }
 
+        if let Some(error) = persistence_error {
+            return Err(error);
+        }
+
         Ok(result)
     }
 
@@ -2511,6 +2751,21 @@ where
         }
 
         Ok(())
+    }
+
+    fn ensure_persistence_output_invariant(
+        &mut self,
+        pending: &PendingPersistenceGroup,
+    ) -> Result<(), MultiRaftHostError> {
+        if pending.outbound.is_empty() && pending.read_states.is_empty() {
+            return Ok(());
+        }
+
+        self.node_wal.require_recovery(
+            "a hosted group exposed persistence-dependent output before A-WAL admission",
+        );
+        self.state = HostState::RecoveryRequired;
+        Err(MultiRaftHostError::RecoveryRequired)
     }
 
     fn ensure_schedulable_group(
@@ -3103,6 +3358,16 @@ pub enum MultiRaftHostError {
         max_bytes: usize,
     },
     #[error(
+        "prepared persistence request for group {raft_group_id:?} exceeds the service limit: {record_count} records and {encoded_bytes} bytes (maximum {max_records} records and {max_bytes} bytes)"
+    )]
+    PersistenceRequestTooLarge {
+        raft_group_id: RaftGroupId,
+        record_count: usize,
+        encoded_bytes: usize,
+        max_records: usize,
+        max_bytes: usize,
+    },
+    #[error(
         "Raft envelope for group {raft_group_id:?} targets replica {received:?}, not local replica {expected:?}"
     )]
     RecipientMismatch {
@@ -3390,9 +3655,7 @@ mod tests {
             self.pending = true;
             Ok(HostedGroupTurn {
                 ready_generations: 1,
-                persistence: Some(HostedPersistenceBatch {
-                    records: self.records.clone(),
-                }),
+                persistence: Some(HostedPersistenceBatch::new(self.records.clone())),
                 ..HostedGroupTurn::default()
             })
         }
@@ -3832,6 +4095,139 @@ mod tests {
         );
     }
 
+    /// Realistic bug caught: a burst of independent Ready generations must not
+    /// turn the host's cross-group WAL staging area into an unbounded queue.
+    /// The deferred group's Ready remains unacknowledged and is completed by a
+    /// later host turn, preserving both FIFO WAL order and per-group fencing.
+    #[test]
+    fn persistence_service_defers_ready_when_group_bound_is_full() {
+        let (wal, wal_state) = BatchWal::new(false);
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let first_completions = Arc::new(Mutex::new(Vec::new()));
+        let second_completions = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut host = MultiRaftHost::new_with_config(
+            NodeId(7),
+            NodeRaftWal::new(wal),
+            MultiRaftHostConfig {
+                max_pending_persistence_groups: 1,
+                max_pending_persistence_records: 3,
+                max_pending_persistence_bytes: 128,
+                ..MultiRaftHostConfig::default()
+            },
+        )
+        .unwrap();
+
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: first_identity,
+            records: vec![
+                (RecordType::new(101), b"first-entry".to_vec()),
+                (RecordType::new(102), b"first-hard-state".to_vec()),
+            ],
+            pending: false,
+            completions: Arc::clone(&first_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: second_identity,
+            records: vec![(RecordType::new(201), b"second-entry".to_vec())],
+            pending: false,
+            completions: Arc::clone(&second_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_now(first_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(second_identity.raft_group_id)
+            .unwrap();
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 2,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        };
+
+        host.run_turn(0, budget).unwrap();
+        assert_eq!(wal_state.lock().unwrap().append_calls, 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(first_completions.lock().unwrap().len(), 1);
+        assert!(second_completions.lock().unwrap().is_empty());
+
+        host.run_turn(0, budget).unwrap();
+        assert_eq!(wal_state.lock().unwrap().append_calls, 2);
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(second_completions.lock().unwrap().len(), 1);
+    }
+
+    /// Realistic bug caught: limiting only the number of prepared groups still
+    /// permits a few large Ready generations to exhaust memory. Record and
+    /// encoded-byte accounting must reject the next request before A-WAL is
+    /// called, while retaining the accepted request's exact payloads.
+    #[test]
+    fn persistence_service_bounds_records_and_encoded_bytes() {
+        let (wal, wal_state) = BatchWal::new(false);
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let mut service = PersistenceService::new(
+            NodeRaftWal::new(wal),
+            MultiRaftHostConfig {
+                max_pending_persistence_groups: 2,
+                max_pending_persistence_records: 2,
+                max_pending_persistence_bytes: 27,
+                ..MultiRaftHostConfig::default()
+            },
+        );
+
+        service
+            .try_submit(PendingPersistenceGroup {
+                raft_group_id: first_identity.raft_group_id,
+                timer_due: false,
+                batch: HostedPersistenceBatch::new(vec![
+                    (RecordType::new(101), b"first-entry".to_vec()),
+                    (RecordType::new(102), b"first-hard-state".to_vec()),
+                ]),
+                outbound: Vec::new(),
+                read_states: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            service.status(),
+            MultiRaftPersistenceStatus {
+                pending_groups: 1,
+                pending_records: 2,
+                pending_bytes: 27,
+            }
+        );
+
+        assert!(matches!(
+            service.try_submit(PendingPersistenceGroup {
+                raft_group_id: second_identity.raft_group_id,
+                timer_due: false,
+                batch: HostedPersistenceBatch::new(vec![(
+                    RecordType::new(201),
+                    b"second-entry".to_vec(),
+                )]),
+                outbound: Vec::new(),
+                read_states: Vec::new(),
+            }),
+            Err(PersistenceAdmissionError::Capacity(_))
+        ));
+        assert_eq!(wal_state.lock().unwrap().append_calls, 0);
+
+        let flushed = service.flush().expect("the first request was admitted");
+        assert_eq!(flushed.groups.len(), 1);
+        assert_eq!(service.status(), MultiRaftPersistenceStatus::default());
+        assert_eq!(wal_state.lock().unwrap().append_calls, 1);
+    }
+
     #[test]
     fn unknown_cross_group_wal_outcome_is_fanned_out_before_host_fences() {
         let (wal, wal_state) = BatchWal::new(true);
@@ -4236,6 +4632,9 @@ mod tests {
             state: MultiRaftHostState::Active,
             pending_message_count: 528,
             pending_message_bytes: 5280,
+            pending_persistence_groups: 0,
+            pending_persistence_records: 0,
+            pending_persistence_bytes: 0,
             groups: Vec::new(),
         };
         for index in 0..32 {

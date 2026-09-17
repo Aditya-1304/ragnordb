@@ -473,6 +473,9 @@ mod tests {
             state: ragnordb_multiraft::host::MultiRaftHostState::Active,
             pending_message_count: 0,
             pending_message_bytes: 0,
+            pending_persistence_groups: 0,
+            pending_persistence_records: 0,
+            pending_persistence_bytes: 0,
             groups: vec![MultiRaftGroupStatus {
                 identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity {
                     raft_group_id: RaftGroupId(23),

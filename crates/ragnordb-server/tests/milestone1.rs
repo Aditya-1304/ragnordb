@@ -92,6 +92,9 @@ async fn admin_status_returns_json() {
         state: MultiRaftHostState::Active,
         pending_message_count: 0,
         pending_message_bytes: 0,
+        pending_persistence_groups: 0,
+        pending_persistence_records: 0,
+        pending_persistence_bytes: 0,
         groups: vec![
             MultiRaftGroupStatus {
                 identity: ragnordb_multiraft::storage::codec::RaftReplicaIdentity::new(
