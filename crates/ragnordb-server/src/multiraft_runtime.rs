@@ -3325,7 +3325,6 @@ impl MultiRaftRuntime {
             tablet_handles,
             metadata_handle.clone(),
             metadata_request_tx,
-            database.clone(),
             join_request_tx,
             shutdown.clone(),
         );

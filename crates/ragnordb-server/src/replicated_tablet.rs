@@ -184,6 +184,25 @@ pub struct ReplicatedTabletStatus {
     pub snapshot_install_pending: bool,
 }
 
+/// Completion payload published by a tablet reactor for a node-to-node RPC.
+///
+/// The request token, source node, and transport attempt remain owned by the
+/// RPC dispatcher. The reactor publishes only the operation result after the
+/// same validation, Raft ordering, and apply boundary used by local callers.
+pub(crate) enum TabletRpcCompletion {
+    Command(Result<TabletCommandApplyOutcome>),
+    Read(Result<Option<Vec<u8>>>),
+    Scan(Result<TabletScanBatch>),
+    Outcome(Result<Option<CachedTabletCommandOutcome>>),
+}
+
+/// Non-blocking completion publication boundary between a tablet reactor and
+/// the node RPC dispatcher. Implementations must not wait for network I/O or
+/// a caller; the dispatcher owns response emission and transport backpressure.
+pub(crate) trait TabletRpcCompletionSink: Send + Sync {
+    fn publish(&self, token: u64, completion: TabletRpcCompletion);
+}
+
 enum HostRequest {
     Commit {
         commit: SingleNodeTxnCommit,
@@ -196,7 +215,7 @@ enum HostRequest {
         deadline: Instant,
     },
     Barrier {
-        reply: mpsc::SyncSender<Result<()>>,
+        reply: ClientReply,
         deadline: Instant,
     },
     Command {
@@ -219,10 +238,34 @@ enum HostRequest {
         reply: mpsc::SyncSender<Result<Option<CachedTabletCommandOutcome>>>,
         deadline: Instant,
     },
+    RpcCommand {
+        request: TabletCommandRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
+    RpcReadPoint {
+        request: TabletReadRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
+    RpcScan {
+        request: TabletScanRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
+    RpcOutcomeQuery {
+        request: TabletOutcomeQueryRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
 }
 
 struct PendingReadBarrierWaiter {
-    reply: mpsc::SyncSender<Result<()>>,
+    reply: ClientReply,
     deadline: Instant,
 }
 
@@ -462,6 +505,13 @@ impl MailboxSized for HostRequest {
             Self::ReadPoint { request, .. } => request.to_proto().encoded_len(),
             Self::Scan { request, .. } => request.to_proto().encoded_len(),
             Self::OutcomeQuery { request, .. } => request.to_proto().encoded_len(),
+            Self::RpcCommand { request, .. } => request
+                .to_proto()
+                .map(|encoded| encoded.encoded_len())
+                .unwrap_or_else(|_| std::mem::size_of_val(request)),
+            Self::RpcReadPoint { request, .. } => request.to_proto().encoded_len(),
+            Self::RpcScan { request, .. } => request.to_proto().encoded_len(),
+            Self::RpcOutcomeQuery { request, .. } => request.to_proto().encoded_len(),
         };
         std::mem::size_of_val(self).saturating_add(payload_bytes)
     }
@@ -562,6 +612,23 @@ enum ClientReply {
     Catalog(mpsc::SyncSender<Result<CatalogLogExtent>>),
     Barrier(mpsc::SyncSender<Result<()>>),
     Command(mpsc::SyncSender<Result<TabletCommandApplyOutcome>>),
+    RpcCommand {
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        remote_commit: Option<SingleShardCommitCommand>,
+    },
+    RpcReadPoint {
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        request: TabletReadRequest,
+        deadline: Instant,
+    },
+    RpcScan {
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        request: TabletScanRequest,
+        deadline: Instant,
+    },
 }
 
 struct PendingClient {
@@ -1280,6 +1347,10 @@ impl ReplicatedTabletHandle {
             .clone()
     }
 
+    pub(crate) fn status_shared(&self) -> Arc<RwLock<ReplicatedTabletStatus>> {
+        self.status.clone()
+    }
+
     /// Establish an applied current-term ordering point before a latest read.
     pub fn read_barrier(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now()
@@ -1300,7 +1371,10 @@ impl ReplicatedTabletHandle {
         }
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
-            .try_send(HostRequest::Barrier { reply, deadline })
+            .try_send(HostRequest::Barrier {
+                reply: ClientReply::Barrier(reply),
+                deadline,
+            })
             .map_err(|error| Error::ProposalUnavailable {
                 reason: match error {
                     mpsc::TrySendError::Full(_) => {
@@ -1316,6 +1390,142 @@ impl ReplicatedTabletHandle {
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "read barrier deadline elapsed before apply".to_string(),
             })?
+    }
+
+    /// Enqueue a node-to-node command without waiting for the proposal or
+    /// apply result. The owning reactor publishes the result through the
+    /// supplied token sink after the durable Raft/apply boundary is crossed.
+    pub(crate) fn enqueue_rpc_command(
+        &self,
+        request: TabletCommandRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet command deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcCommand {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet command admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
+    }
+
+    /// Enqueue a point read without waiting on the reactor. Linearizability
+    /// is preserved because the reactor performs the existing ReadIndex or
+    /// fallback barrier before evaluating the read.
+    pub(crate) fn enqueue_rpc_read_point(
+        &self,
+        request: TabletReadRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet read deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcReadPoint {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet read admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
+    }
+
+    /// Enqueue one bounded scan page without waiting on the reactor. The
+    /// scan remains a single tablet-owner operation, so snapshot/epoch and
+    /// MVCC checks cannot race a concurrent state-machine transition.
+    pub(crate) fn enqueue_rpc_scan(
+        &self,
+        request: TabletScanRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet scan deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcScan {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet scan admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
+    }
+
+    /// Enqueue an outcome lookup without waiting on the reactor. This lookup
+    /// is read-only and does not bypass the tablet owner's epoch or leader
+    /// validation.
+    pub(crate) fn enqueue_rpc_outcome_query(
+        &self,
+        request: TabletOutcomeQueryRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet outcome query deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcOutcomeQuery {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet outcome query admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
     }
 
     /// Submit one already-routed command to this tablet's Raft leader.
@@ -3120,6 +3330,9 @@ where
 
         process_pending_read_states(
             &ready_loop,
+            &tablet,
+            serving_leader,
+            &identity,
             &mut pending_read_states,
             &mut pending_read_barriers,
             Instant::now(),
@@ -3182,6 +3395,67 @@ where
                     reply,
                     deadline,
                 ),
+                HostRequest::RpcReadPoint {
+                    request,
+                    completion,
+                    token,
+                    deadline,
+                } => admit_read_barrier(
+                    ClientReply::RpcReadPoint {
+                        token,
+                        completion,
+                        request,
+                        deadline,
+                    },
+                    deadline,
+                    &mut ready_loop,
+                    &tablet,
+                    &mut registry,
+                    &mut clients,
+                    serving_leader,
+                    &mut internal_barrier_allocator,
+                    &identity,
+                    &mut pending_read_barriers,
+                    &mut next_read_index_context,
+                ),
+                HostRequest::RpcScan {
+                    request,
+                    completion,
+                    token,
+                    deadline,
+                } => admit_read_barrier(
+                    ClientReply::RpcScan {
+                        token,
+                        completion,
+                        request,
+                        deadline,
+                    },
+                    deadline,
+                    &mut ready_loop,
+                    &tablet,
+                    &mut registry,
+                    &mut clients,
+                    serving_leader,
+                    &mut internal_barrier_allocator,
+                    &identity,
+                    &mut pending_read_barriers,
+                    &mut next_read_index_context,
+                ),
+                HostRequest::RpcOutcomeQuery {
+                    request,
+                    completion,
+                    token,
+                    deadline,
+                } => admit_rpc_outcome_query(
+                    request,
+                    &tablet,
+                    serving_leader,
+                    ready_loop.raft().leader_id().map(|id| id.get()),
+                    &identity,
+                    completion,
+                    token,
+                    deadline,
+                ),
                 HostRequest::Barrier { reply, deadline } => admit_read_barrier(
                     reply,
                     deadline,
@@ -3234,6 +3508,9 @@ where
 
         process_pending_read_states(
             &ready_loop,
+            &tablet,
+            serving_leader,
+            &identity,
             &mut pending_read_states,
             &mut pending_read_barriers,
             Instant::now(),
@@ -3253,7 +3530,6 @@ where
             );
         }
         *was_leader = is_leader;
-        forward_completions(&mut clients);
         let serving_leader = is_leader
             && leader_activation.is_some_and(|activation| {
                 activation.term == ready_loop.raft().hard_state().current_term
@@ -3261,6 +3537,14 @@ where
                         .applied_frontier()
                         .is_some_and(|frontier| frontier.index >= activation.index)
             });
+        forward_completions(
+            &mut clients,
+            &tablet,
+            &database,
+            serving_leader,
+            ready_loop.raft().leader_id().map(|id| id.get()),
+            &identity,
+        );
         if serving_leader {
             match maybe_publish_snapshot(
                 &mut ready_loop,
@@ -3417,6 +3701,69 @@ fn admit_outcome_query(
         .cloned()));
 }
 
+fn evaluate_rpc_outcome_query(
+    request: TabletOutcomeQueryRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) -> Result<Option<CachedTabletCommandOutcome>> {
+    if deadline <= Instant::now() {
+        return Err(Error::ProposalUnavailable {
+            reason: "tablet outcome query deadline elapsed before admission".to_string(),
+        });
+    }
+    if !serving_leader {
+        return Err(Error::NotLeader { leader_id });
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        return Err(Error::InvalidArgument(
+            "tablet outcome query targets a different Raft group".to_string(),
+        ));
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        return Err(Error::InvalidArgument(
+            "tablet outcome query targets a different tablet".to_string(),
+        ));
+    }
+    if request.tablet_epoch != tablet.state_machine().epoch() {
+        return Err(Error::StaleTabletEpoch {
+            current_epoch: tablet.state_machine().epoch(),
+            expected_epoch: request.tablet_epoch,
+        });
+    }
+
+    Ok(tablet
+        .state_machine()
+        .logical_command_outcome(&request.logical_command_id)
+        .cloned())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_rpc_outcome_query(
+    request: TabletOutcomeQueryRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    completion: Arc<dyn TabletRpcCompletionSink>,
+    token: u64,
+    deadline: Instant,
+) {
+    completion.publish(
+        token,
+        TabletRpcCompletion::Outcome(evaluate_rpc_outcome_query(
+            request,
+            tablet,
+            serving_leader,
+            leader_id,
+            identity,
+            deadline,
+        )),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_request<W, LS, SS>(
     request: HostRequest,
@@ -3475,9 +3822,12 @@ fn admit_request<W, LS, SS>(
             ) {
                 Ok(request_id) => request_id,
                 Err(source) => {
-                    let _ = reply.send(Err(Error::RecoveryRequired {
-                        reason: source.to_string(),
-                    }));
+                    send_client_error(
+                        reply,
+                        Error::RecoveryRequired {
+                            reason: source.to_string(),
+                        },
+                    );
                     return;
                 }
             };
@@ -3489,14 +3839,9 @@ fn admit_request<W, LS, SS>(
             )
             .map_err(|source| Error::InvalidArgument(source.to_string()));
             match envelope {
-                Ok(envelope) => (
-                    envelope,
-                    deadline,
-                    ClientReply::Barrier(reply),
-                    Some(request_id.sequence),
-                ),
+                Ok(envelope) => (envelope, deadline, reply, Some(request_id.sequence)),
                 Err(error) => {
-                    let _ = reply.send(Err(error));
+                    send_client_error(reply, error);
                     return;
                 }
             }
@@ -3532,6 +3877,56 @@ fn admit_request<W, LS, SS>(
                 }
             }
         }
+        HostRequest::RpcCommand {
+            request,
+            completion,
+            token,
+            deadline,
+        } => {
+            let remote_commit = match &request.command {
+                TabletCommand::SingleShardCommit(command) => Some(command.clone()),
+                _ => None,
+            };
+            let envelope = match request.logical_command_id {
+                Some(logical_command_id) => {
+                    TabletCommandEnvelope::new_with_logical_command_id_and_ack(
+                        request.request_id,
+                        logical_command_id,
+                        request.tablet_id,
+                        request.tablet_epoch,
+                        request.acknowledged_through,
+                        request.command,
+                    )
+                }
+                None => TabletCommandEnvelope::new(
+                    request.request_id,
+                    request.tablet_id,
+                    request.tablet_epoch,
+                    request.command,
+                ),
+            };
+            match envelope {
+                Ok(envelope) => (
+                    envelope,
+                    deadline,
+                    ClientReply::RpcCommand {
+                        token,
+                        completion,
+                        remote_commit,
+                    },
+                    None,
+                ),
+                Err(source) => {
+                    completion.publish(
+                        token,
+                        TabletRpcCompletion::Command(Err(Error::InvalidArgument(
+                            source.to_string(),
+                        ))),
+                    );
+                    return;
+                }
+            }
+        }
         HostRequest::ReadPoint { reply, .. } => {
             let _ = reply.send(Err(Error::InvalidArgument(
                 "tablet reads must use the read admission path".to_string(),
@@ -3549,6 +3944,11 @@ fn admit_request<W, LS, SS>(
                 "tablet outcome queries must use the outcome admission path".to_string(),
             )));
             return;
+        }
+        HostRequest::RpcReadPoint { .. }
+        | HostRequest::RpcScan { .. }
+        | HostRequest::RpcOutcomeQuery { .. } => {
+            unreachable!("RPC read requests use their dedicated admission paths")
         }
     };
 
@@ -3618,7 +4018,7 @@ fn read_index_context(group_id: RaftGroupId, term: u64, sequence: u64) -> Vec<u8
 
 #[allow(clippy::too_many_arguments)]
 fn admit_read_barrier<W, LS, SS>(
-    reply: mpsc::SyncSender<Result<()>>,
+    reply: ClientReply,
     deadline: Instant,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     tablet: &TabletCommandApplier,
@@ -3635,15 +4035,18 @@ fn admit_read_barrier<W, LS, SS>(
     SS: StableStore,
 {
     if deadline <= Instant::now() {
-        let _ = reply.send(Err(Error::ProposalUnavailable {
-            reason: "read barrier deadline elapsed before admission".to_string(),
-        }));
+        send_client_error(
+            reply,
+            Error::ProposalUnavailable {
+                reason: "read barrier deadline elapsed before admission".to_string(),
+            },
+        );
         return;
     }
 
     let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
     if !serving_leader {
-        let _ = reply.send(Err(Error::NotLeader { leader_id }));
+        send_client_error(reply, Error::NotLeader { leader_id });
         return;
     }
 
@@ -3654,9 +4057,12 @@ fn admit_read_barrier<W, LS, SS>(
 
     if pending_read_barrier_waiter_count(pending_read_barriers) >= MAX_PENDING_READ_BARRIER_WAITERS
     {
-        let _ = reply.send(Err(Error::ProposalUnavailable {
-            reason: "latest-read admission limit reached while awaiting quorum".to_string(),
-        }));
+        send_client_error(
+            reply,
+            Error::ProposalUnavailable {
+                reason: "latest-read admission limit reached while awaiting quorum".to_string(),
+            },
+        );
         return;
     }
 
@@ -3675,9 +4081,12 @@ fn admit_read_barrier<W, LS, SS>(
     *next_read_index_context = match sequence.checked_add(1) {
         Some(next) => next,
         None => {
-            let _ = reply.send(Err(Error::RecoveryRequired {
-                reason: "ReadIndex context sequence exhausted".to_string(),
-            }));
+            send_client_error(
+                reply,
+                Error::RecoveryRequired {
+                    reason: "ReadIndex context sequence exhausted".to_string(),
+                },
+            );
             return;
         }
     };
@@ -3691,12 +4100,15 @@ fn admit_read_barrier<W, LS, SS>(
             waiters: vec![PendingReadBarrierWaiter { reply, deadline }],
         }),
         Err(ReadyLoopError::ReadIndex(ReadIndexError::NotLeader)) => {
-            let _ = reply.send(Err(Error::NotLeader { leader_id }));
+            send_client_error(reply, Error::NotLeader { leader_id });
         }
         Err(ReadyLoopError::ReadIndex(ReadIndexError::RecoveryRequired)) => {
-            let _ = reply.send(Err(Error::RecoveryRequired {
-                reason: "Raft ReadIndex requires recovery".to_string(),
-            }));
+            send_client_error(
+                reply,
+                Error::RecoveryRequired {
+                    reason: "Raft ReadIndex requires recovery".to_string(),
+                },
+            );
         }
         Err(ReadyLoopError::ReadIndex(
             ReadIndexError::NotActivated { .. }
@@ -3724,9 +4136,12 @@ fn admit_read_barrier<W, LS, SS>(
             );
         }
         Err(error) => {
-            let _ = reply.send(Err(Error::ProposalUnavailable {
-                reason: error.to_string(),
-            }));
+            send_client_error(
+                reply,
+                Error::ProposalUnavailable {
+                    reason: error.to_string(),
+                },
+            );
         }
     }
 }
@@ -3738,8 +4153,70 @@ fn pending_read_barrier_waiter_count(pending_read_barriers: &[PendingReadBarrier
         .fold(0, usize::saturating_add)
 }
 
+fn complete_read_barrier_reply(
+    reply: ClientReply,
+    barrier_result: Result<()>,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) {
+    match reply {
+        ClientReply::Barrier(sender) => {
+            let _ = sender.send(barrier_result);
+        }
+        ClientReply::RpcReadPoint {
+            token,
+            completion,
+            request,
+            ..
+        } => {
+            let result = barrier_result.and_then(|()| {
+                evaluate_point_read(
+                    request,
+                    tablet,
+                    serving_leader,
+                    leader_replica_id,
+                    identity,
+                    deadline,
+                )
+            });
+            completion.publish(token, TabletRpcCompletion::Read(result));
+        }
+        ClientReply::RpcScan {
+            token,
+            completion,
+            request,
+            ..
+        } => {
+            let result = barrier_result.and_then(|()| {
+                evaluate_scan_request(
+                    request,
+                    tablet,
+                    serving_leader,
+                    leader_replica_id,
+                    identity,
+                    deadline,
+                )
+            });
+            completion.publish(token, TabletRpcCompletion::Scan(result));
+        }
+        other => {
+            if let Err(error) = barrier_result {
+                send_client_error(other, error);
+            } else {
+                unreachable!("only read replies may wait on a read barrier")
+            }
+        }
+    }
+}
+
 fn process_pending_read_states<W, LS, SS>(
     ready_loop: &RaftReadyLoop<W, LS, SS>,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    identity: &TabletRuntimeIdentity,
     read_states: &mut Vec<ReadState>,
     pending_read_barriers: &mut Vec<PendingReadBarrier>,
     now: Instant,
@@ -3770,9 +4247,18 @@ fn process_pending_read_states<W, LS, SS>(
         if leader_id != Some(local_id) || state.term != term || state.index == 0 {
             let pending = pending_read_barriers.remove(position);
             for waiter in pending.waiters {
-                let _ = waiter.reply.send(Err(Error::NotLeader {
-                    leader_id: leader_id.map(|id| id.get()),
-                }));
+                let PendingReadBarrierWaiter { reply, deadline } = waiter;
+                complete_read_barrier_reply(
+                    reply,
+                    Err(Error::NotLeader {
+                        leader_id: leader_id.map(|id| id.get()),
+                    }),
+                    tablet,
+                    serving_leader,
+                    leader_id.map(|id| id.get()),
+                    identity,
+                    deadline,
+                );
             }
             continue;
         }
@@ -3784,7 +4270,8 @@ fn process_pending_read_states<W, LS, SS>(
 
         let pending = pending_read_barriers.remove(position);
         for waiter in pending.waiters {
-            let result = if waiter.deadline <= now {
+            let PendingReadBarrierWaiter { reply, deadline } = waiter;
+            let result = if deadline <= now {
                 Err(Error::ProposalUnavailable {
                     reason: "read barrier deadline elapsed before ReadIndex confirmation"
                         .to_string(),
@@ -3792,7 +4279,15 @@ fn process_pending_read_states<W, LS, SS>(
             } else {
                 Ok(())
             };
-            let _ = waiter.reply.send(result);
+            complete_read_barrier_reply(
+                reply,
+                result,
+                tablet,
+                serving_leader,
+                leader_id.map(|id| id.get()),
+                identity,
+                deadline,
+            );
         }
     }
 }
@@ -3805,7 +4300,7 @@ fn reject_pending_read_barriers(
     pending_read_states.clear();
     for pending in pending_read_barriers.drain(..) {
         for waiter in pending.waiters {
-            let _ = waiter.reply.send(Err(Error::NotLeader { leader_id }));
+            send_client_error(waiter.reply, Error::NotLeader { leader_id });
         }
     }
 }
@@ -3849,10 +4344,13 @@ fn fallback_pending_read_barriers<W, LS, SS>(
         let mut active_waiters = Vec::with_capacity(pending.waiters.len());
         for waiter in pending.waiters.drain(..) {
             if waiter.deadline <= now {
-                let _ = waiter.reply.send(Err(Error::ProposalUnavailable {
-                    reason: "read barrier deadline elapsed before ReadIndex confirmation"
-                        .to_string(),
-                }));
+                send_client_error(
+                    waiter.reply,
+                    Error::ProposalUnavailable {
+                        reason: "read barrier deadline elapsed before ReadIndex confirmation"
+                            .to_string(),
+                    },
+                );
             } else {
                 active_waiters.push(waiter);
             }
@@ -3885,6 +4383,167 @@ fn fallback_pending_read_barriers<W, LS, SS>(
             );
         }
     }
+}
+
+fn evaluate_point_read(
+    request: TabletReadRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) -> Result<Option<Vec<u8>>> {
+    if deadline <= Instant::now() {
+        return Err(Error::ProposalUnavailable {
+            reason: "tablet read deadline elapsed before admission".to_string(),
+        });
+    }
+    if !serving_leader {
+        return Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        });
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        return Err(Error::InvalidArgument(
+            "tablet read request targets a different Raft group".to_string(),
+        ));
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        return Err(Error::InvalidArgument(
+            "tablet read request targets a different tablet".to_string(),
+        ));
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        return Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        });
+    }
+    if request.read_timestamp.0 == 0
+        || request.request_id.client_id == 0
+        || request.request_id.sequence == 0
+    {
+        return Err(Error::InvalidArgument(
+            "tablet read request contains a reserved zero value".to_string(),
+        ));
+    }
+
+    let row_key = request.row_key;
+    let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
+    let transaction = ragnordb_txn::Transaction::new(transaction_id, request.read_timestamp)?;
+    if row_key.table_id != identity.target.table_id {
+        return Err(Error::InvalidArgument(
+            "tablet read row key targets a different table".to_string(),
+        ));
+    }
+
+    tablet
+        .state_machine()
+        .tablet()
+        .get(&transaction, &row_key)
+        .and_then(|row| row.map(|row| encode_row(&row)).transpose())
+}
+
+fn evaluate_scan_request(
+    request: TabletScanRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) -> Result<TabletScanBatch> {
+    if deadline <= Instant::now() {
+        return Err(Error::ProposalUnavailable {
+            reason: "tablet scan deadline elapsed before admission".to_string(),
+        });
+    }
+    if !serving_leader {
+        return Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        });
+    }
+    request
+        .validate()
+        .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        return Err(Error::InvalidArgument(
+            "tablet scan request targets a different Raft group".to_string(),
+        ));
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        return Err(Error::InvalidArgument(
+            "tablet scan request targets a different tablet".to_string(),
+        ));
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        return Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        });
+    }
+
+    let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
+    let transaction = ragnordb_txn::Transaction::new(transaction_id, request.read_timestamp)?;
+    let table_id = identity.target.table_id;
+    let start = request
+        .start_key
+        .as_ref()
+        .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+            table_id,
+            primary_key_bytes: primary_key_bytes.clone(),
+        });
+    let end = request
+        .end_key
+        .as_ref()
+        .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+            table_id,
+            primary_key_bytes: primary_key_bytes.clone(),
+        });
+    let resume_after =
+        request
+            .resume_after
+            .as_ref()
+            .map(|primary_key_bytes| ragnordb_common::ids::RowKey {
+                table_id,
+                primary_key_bytes: primary_key_bytes.clone(),
+            });
+
+    tablet
+        .state_machine()
+        .tablet()
+        .scan_page(
+            &transaction,
+            start.as_ref(),
+            end.as_ref(),
+            resume_after.as_ref(),
+            request.max_rows as usize,
+            request.max_bytes as usize,
+        )
+        .and_then(|page| {
+            let rows = page
+                .rows
+                .into_iter()
+                .map(|(key, row)| {
+                    Ok(TabletScanRow {
+                        key: key.primary_key_bytes,
+                        row: encode_row(&row)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let next_resume_after = page
+                .has_more
+                .then(|| rows.last().map(|row| row.key.clone()))
+                .flatten();
+            let batch = TabletScanBatch {
+                rows,
+                next_resume_after,
+                exhausted: !page.has_more,
+            };
+            batch
+                .validate_for(&request)
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            Ok(batch)
+        })
 }
 
 /// Execute a point read after the Ready owner has drained all committed work
@@ -4774,11 +5433,26 @@ fn send_messages(
     }
 }
 
-fn forward_completions(clients: &mut Vec<PendingClient>) {
+fn forward_completions(
+    clients: &mut Vec<PendingClient>,
+    tablet: &TabletCommandApplier,
+    database: &SharedLocalDatabase,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+) {
     let mut pending = Vec::with_capacity(clients.len());
     for client in clients.drain(..) {
         match client.ticket.try_recv() {
-            Ok(completion) => forward_completion(client.reply, completion),
+            Ok(completion) => forward_completion(
+                client.reply,
+                completion,
+                tablet,
+                database,
+                serving_leader,
+                leader_replica_id,
+                identity,
+            ),
             Err(mpsc::TryRecvError::Empty) => pending.push(client),
             Err(mpsc::TryRecvError::Disconnected) => send_client_error(
                 client.reply,
@@ -4791,8 +5465,16 @@ fn forward_completions(clients: &mut Vec<PendingClient>) {
     *clients = pending;
 }
 
-fn forward_completion(reply: ClientReply, completion: Completion) {
-    let error = match completion {
+fn forward_completion(
+    reply: ClientReply,
+    completion: Completion,
+    tablet: &TabletCommandApplier,
+    database: &SharedLocalDatabase,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+) {
+    match completion {
         ProposalCompletion::Applied {
             position, result, ..
         } => match reply {
@@ -4801,30 +5483,82 @@ fn forward_completion(reply: ClientReply, completion: Completion) {
                     position.index,
                     position.index.saturating_add(1),
                 )));
-                return;
             }
             ClientReply::Barrier(sender) => {
                 let _ = sender.send(Ok(()));
-                return;
             }
             ClientReply::Catalog(sender) => {
                 let _ = sender.send(Ok(CatalogLogExtent {
                     start_lsn: position.index,
                     end_lsn: position.index.saturating_add(1),
                 }));
-                return;
             }
             ClientReply::Command(sender) => {
                 let _ = sender.send(Ok(result));
-                return;
+            }
+            ClientReply::RpcCommand {
+                token,
+                completion,
+                remote_commit,
+            } => {
+                let result = match remote_commit {
+                    Some(command) => database
+                        .blocking_lock()
+                        .observe_replicated_commit_high_water(&command)
+                        .map(|()| result),
+                    None => Ok(result),
+                };
+                completion.publish(token, TabletRpcCompletion::Command(result));
+            }
+            ClientReply::RpcReadPoint {
+                token,
+                completion,
+                request,
+                deadline,
+            } => {
+                completion.publish(
+                    token,
+                    TabletRpcCompletion::Read(evaluate_point_read(
+                        request,
+                        tablet,
+                        serving_leader,
+                        leader_replica_id,
+                        identity,
+                        deadline,
+                    )),
+                );
+            }
+            ClientReply::RpcScan {
+                token,
+                completion,
+                request,
+                deadline,
+            } => {
+                completion.publish(
+                    token,
+                    TabletRpcCompletion::Scan(evaluate_scan_request(
+                        request,
+                        tablet,
+                        serving_leader,
+                        leader_replica_id,
+                        identity,
+                        deadline,
+                    )),
+                );
             }
         },
-        ProposalCompletion::Rejected { rejection, .. } => map_tablet_rejection(rejection),
-        ProposalCompletion::Retryable { failure, .. } => Error::ProposalUnavailable {
-            reason: format!("{failure:?}"),
-        },
-    };
-    send_client_error(reply, error);
+        ProposalCompletion::Rejected { rejection, .. } => {
+            send_client_error(reply, map_tablet_rejection(rejection));
+        }
+        ProposalCompletion::Retryable { failure, .. } => {
+            send_client_error(
+                reply,
+                Error::ProposalUnavailable {
+                    reason: format!("{failure:?}"),
+                },
+            );
+        }
+    }
 }
 
 fn map_tablet_rejection(rejection: TabletCommandApplyError) -> Error {
@@ -4855,7 +5589,7 @@ fn reply_error(request: HostRequest, error: Error) {
             let _ = reply.send(Err(error));
         }
         HostRequest::Barrier { reply, .. } => {
-            let _ = reply.send(Err(error));
+            send_client_error(reply, error);
         }
         HostRequest::Catalog { reply, .. } => {
             let _ = reply.send(Err(error));
@@ -4872,6 +5606,18 @@ fn reply_error(request: HostRequest, error: Error) {
         HostRequest::OutcomeQuery { reply, .. } => {
             let _ = reply.send(Err(error));
         }
+        HostRequest::RpcCommand {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::Command(Err(error))),
+        HostRequest::RpcReadPoint {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::Read(Err(error))),
+        HostRequest::RpcScan {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::Scan(Err(error))),
+        HostRequest::RpcOutcomeQuery {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::Outcome(Err(error))),
     }
 }
 
@@ -4889,6 +5635,15 @@ fn send_client_error(reply: ClientReply, error: Error) {
         ClientReply::Command(sender) => {
             let _ = sender.send(Err(error));
         }
+        ClientReply::RpcCommand {
+            token, completion, ..
+        } => completion.publish(token, TabletRpcCompletion::Command(Err(error))),
+        ClientReply::RpcReadPoint {
+            token, completion, ..
+        } => completion.publish(token, TabletRpcCompletion::Read(Err(error))),
+        ClientReply::RpcScan {
+            token, completion, ..
+        } => completion.publish(token, TabletRpcCompletion::Scan(Err(error))),
     }
 }
 
@@ -5119,7 +5874,7 @@ mod tests {
             ByteBoundedMailbox::pair(2, Arc::new(MailboxBudget::new(1_024)), wake);
         let (reply, _response) = mpsc::sync_channel(1);
         let item = HostRequest::Barrier {
-            reply,
+            reply: ClientReply::Barrier(reply),
             deadline: Instant::now() + Duration::from_secs(1),
         };
         let item_bytes = item.mailbox_bytes().max(MAILBOX_ITEM_OVERHEAD);
@@ -5197,7 +5952,7 @@ mod tests {
         let (queued_reply, _queued_response) = mpsc::sync_channel(1);
         request_tx
             .send(HostRequest::Barrier {
-                reply: queued_reply,
+                reply: ClientReply::Barrier(queued_reply),
                 deadline: Instant::now() + Duration::from_secs(1),
             })
             .expect("the saturation fixture must fill the request queue");
@@ -5252,7 +6007,7 @@ mod tests {
         let (queued_reply, _queued_response) = mpsc::sync_channel(1);
         request_tx
             .send(HostRequest::Barrier {
-                reply: queued_reply,
+                reply: ClientReply::Barrier(queued_reply),
                 deadline: Instant::now() + Duration::from_secs(1),
             })
             .expect("the saturation fixture must fill the request queue");
@@ -5786,7 +6541,7 @@ mod tests {
             fallback_at: deadline,
             waiters: (0..MAX_PENDING_READ_BARRIER_WAITERS)
                 .map(|_| PendingReadBarrierWaiter {
-                    reply: reply.clone(),
+                    reply: ClientReply::Barrier(reply.clone()),
                     deadline,
                 })
                 .collect(),

@@ -193,9 +193,19 @@ pub struct NodeRaftInbound {
 /// ownership of the decoded message.
 pub struct NodeRpcInbound {
     receiver: InboundRpcQueueReceiver,
+    wake: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 impl NodeRpcInbound {
+    /// Register the dispatcher thread so physical frame arrival can wake it
+    /// without requiring a polling sleep or a per-request worker.
+    pub fn bind_current_thread(&self) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
     pub fn try_recv(&self) -> Result<RoutedRpcMessage, TryRecvError> {
         self.receiver.try_recv()
     }
@@ -283,6 +293,7 @@ struct InboundRpcQueueSender {
     sender: SyncSender<QueuedRpcInbound>,
     available_bytes: Arc<std::sync::atomic::AtomicUsize>,
     max_bytes: usize,
+    wake: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 struct InboundRpcQueueReceiver {
@@ -402,7 +413,18 @@ impl InboundRpcQueueSender {
             message,
             wire_bytes,
         }) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(dispatcher) = self
+                    .wake
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .cloned()
+                {
+                    dispatcher.unpark();
+                }
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 release_bytes(&self.available_bytes, wire_bytes);
                 Err(io::Error::new(
@@ -484,6 +506,7 @@ fn inbound_queues(
     ));
     let bulk_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
     let rpc_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
+    let rpc_wake = Arc::new(Mutex::new(None));
 
     (
         InboundSenders {
@@ -501,6 +524,7 @@ fn inbound_queues(
                 sender: rpc_sender,
                 available_bytes: Arc::clone(&rpc_bytes),
                 max_bytes: config.bulk_queue_bytes,
+                wake: rpc_wake.clone(),
             },
         },
         NodeRaftInbound {
@@ -518,6 +542,7 @@ fn inbound_queues(
                 receiver: rpc_receiver,
                 available_bytes: rpc_bytes,
             },
+            wake: rpc_wake,
         },
     )
 }

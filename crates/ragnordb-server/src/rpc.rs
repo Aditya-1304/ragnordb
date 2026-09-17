@@ -40,9 +40,9 @@ use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResu
 use ragnordb_tablet::{ScanSpan, TabletRouter};
 
 use crate::bootstrap::METADATA_RAFT_GROUP_ID;
-use crate::database::SharedLocalDatabase;
 use crate::multiraft_runtime::MetadataHostRequest;
 use crate::replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletStatus};
+use crate::replicated_tablet::{TabletRpcCompletion, TabletRpcCompletionSink};
 
 /// Group-qualified handles published by the lifecycle owner after a tablet
 /// runtime has crossed its activation boundary.
@@ -60,10 +60,28 @@ struct PendingResponse {
     sender: mpsc::Sender<PendingResponseMessage>,
 }
 
+const MAX_PENDING_INBOUND_TABLET_RPCS: usize = 4_096;
+const INBOUND_TABLET_RPC_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const INBOUND_TABLET_RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_DISPATCH_MESSAGE_BUDGET: usize = 256;
+
+struct PendingTabletRpc {
+    source: NodeId,
+    group_id: RaftGroupId,
+    attempt_id: Option<u64>,
+    request_id: RequestId,
+    status: Arc<RwLock<ReplicatedTabletStatus>>,
+    deadline: Instant,
+    completion: Option<TabletRpcCompletion>,
+}
+
 #[derive(Clone)]
 pub(crate) struct RpcState {
     pending: Arc<Mutex<BTreeMap<u64, PendingResponse>>>,
     next_attempt: Arc<AtomicU64>,
+    inbound_tablet: Arc<Mutex<BTreeMap<u64, PendingTabletRpc>>>,
+    next_tablet_token: Arc<AtomicU64>,
+    dispatcher_wake: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 #[derive(Clone)]
@@ -304,6 +322,9 @@ impl RpcState {
         Self {
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             next_attempt: Arc::new(AtomicU64::new(1)),
+            inbound_tablet: Arc::new(Mutex::new(BTreeMap::new())),
+            next_tablet_token: Arc::new(AtomicU64::new(1)),
+            dispatcher_wake: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -315,6 +336,89 @@ impl RpcState {
             });
         }
         Ok(attempt_id)
+    }
+
+    fn bind_dispatcher(&self) {
+        *self
+            .dispatcher_wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
+    fn wake_dispatcher(&self) {
+        if let Some(dispatcher) = self
+            .dispatcher_wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            dispatcher.unpark();
+        }
+    }
+
+    fn reserve_tablet_rpc(&self, pending: PendingTabletRpc) -> Result<u64> {
+        let token = self.next_tablet_token.fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet RPC completion token identity exhausted".to_string(),
+            });
+        }
+        let mut pending_requests = self
+            .inbound_tablet
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending_requests.len() >= MAX_PENDING_INBOUND_TABLET_RPCS {
+            return Err(Error::ProposalUnavailable {
+                reason: "tablet RPC completion capacity is full".to_string(),
+            });
+        }
+        pending_requests.insert(token, pending);
+        Ok(token)
+    }
+
+    fn cancel_tablet_rpc(&self, token: u64) {
+        self.inbound_tablet
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&token);
+    }
+
+    fn take_ready_tablet_rpcs(&self, now: Instant) -> Vec<PendingTabletRpc> {
+        let mut pending_requests = self
+            .inbound_tablet
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready_tokens = pending_requests
+            .iter()
+            .filter(|(_, pending)| pending.completion.is_some() || pending.deadline <= now)
+            .map(|(token, _)| *token)
+            .take(256)
+            .collect::<Vec<_>>();
+        ready_tokens
+            .into_iter()
+            .filter_map(|token| pending_requests.remove(&token))
+            .collect()
+    }
+
+    fn publish_tablet_completion(&self, token: u64, completion: TabletRpcCompletion) {
+        let mut pending_requests = self
+            .inbound_tablet
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pending) = pending_requests.get_mut(&token)
+            && pending.completion.is_none()
+        {
+            pending.completion = Some(completion);
+            drop(pending_requests);
+            self.wake_dispatcher();
+        }
+    }
+}
+
+impl TabletRpcCompletionSink for RpcState {
+    fn publish(&self, token: u64, completion: TabletRpcCompletion) {
+        self.publish_tablet_completion(token, completion);
     }
 }
 
@@ -1461,7 +1565,6 @@ pub(crate) fn spawn_dispatcher(
     handles: SharedTabletHandleRegistry,
     metadata: MetadataRuntimeHandle,
     metadata_requests: mpsc::SyncSender<MetadataHostRequest>,
-    database: SharedLocalDatabase,
     join_requests: mpsc::SyncSender<ReplicaJoinAdmission>,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
@@ -1474,24 +1577,167 @@ pub(crate) fn spawn_dispatcher(
     let worker = thread::Builder::new()
         .name("ragnordb-tablet-rpc".to_string())
         .spawn(move || {
+            inbound.bind_current_thread();
+            rpc_state.bind_dispatcher();
             while !shutdown.load(Ordering::Acquire) {
-                let Ok(message) = inbound.recv_timeout(Duration::from_millis(50)) else {
-                    continue;
-                };
-                dispatch_message(
-                    &transport,
-                    &handles,
-                    &rpc_state,
-                    &database,
-                    &metadata_requests,
-                    &join_requests,
-                    message.source_node_id,
-                    message.frame,
-                );
+                let mut made_progress = false;
+                drain_tablet_rpc_completions(&transport, &rpc_state);
+
+                for _ in 0..RPC_DISPATCH_MESSAGE_BUDGET {
+                    let Ok(message) = inbound.try_recv() else {
+                        break;
+                    };
+                    made_progress = true;
+                    dispatch_message(
+                        &transport,
+                        &handles,
+                        &rpc_state,
+                        &metadata_requests,
+                        &join_requests,
+                        message.source_node_id,
+                        message.frame,
+                    );
+                    drain_tablet_rpc_completions(&transport, &rpc_state);
+                }
+
+                if !made_progress {
+                    // Both the physical RPC queue and the reactor completion
+                    // registry are event sources. The transport queue has no
+                    // shared select primitive, so the dispatcher parks for a
+                    // short bounded interval; reactor completion publication
+                    // unparks it immediately and avoids response HOL waiting.
+                    thread::park_timeout(INBOUND_TABLET_RPC_POLL_INTERVAL);
+                }
             }
+            drain_tablet_rpc_completions(&transport, &rpc_state);
         })
         .expect("tablet RPC dispatcher thread creation must succeed");
     (client, worker)
+}
+
+fn drain_tablet_rpc_completions(transport: &NodeRaftTransport, rpc_state: &RpcState) {
+    let now = Instant::now();
+    for mut pending in rpc_state.take_ready_tablet_rpcs(now) {
+        if pending.deadline <= now {
+            send_response(
+                transport,
+                pending.source,
+                pending.group_id,
+                pending.attempt_id,
+                error_response(
+                    pending.request_id,
+                    Error::ProposalUnavailable {
+                        reason: "tablet RPC deadline elapsed before completion".to_string(),
+                    },
+                ),
+            );
+            continue;
+        }
+
+        let Some(completion) = pending.completion.take() else {
+            continue;
+        };
+        let response = tablet_rpc_response(&pending, completion);
+        send_response(
+            transport,
+            pending.source,
+            pending.group_id,
+            pending.attempt_id,
+            response,
+        );
+    }
+}
+
+fn tablet_rpc_response(
+    pending: &PendingTabletRpc,
+    completion: TabletRpcCompletion,
+) -> TabletCommandResponse {
+    let leader_replica_id = pending
+        .status
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .leader_replica_id
+        .map(ReplicaId);
+    match completion {
+        TabletRpcCompletion::Command(result) => match result {
+            Ok(outcome) => TabletCommandResponse {
+                request_id: pending.request_id.clone(),
+                success: true,
+                error_message: String::new(),
+                error_code: String::new(),
+                retryable: false,
+                result_data: encode_command_outcome(outcome),
+                found: false,
+                leader_replica_id,
+                current_tablet_epoch: None,
+                expected_tablet_epoch: None,
+            },
+            Err(error) => error_response(pending.request_id.clone(), error),
+        },
+        TabletRpcCompletion::Read(result) => match result {
+            Ok(row) => TabletCommandResponse {
+                request_id: pending.request_id.clone(),
+                success: true,
+                error_message: String::new(),
+                error_code: String::new(),
+                retryable: false,
+                found: row.is_some(),
+                result_data: row.unwrap_or_default(),
+                leader_replica_id,
+                current_tablet_epoch: None,
+                expected_tablet_epoch: None,
+            },
+            Err(error) => error_response(pending.request_id.clone(), error),
+        },
+        TabletRpcCompletion::Scan(result) => match result {
+            Ok(batch) => TabletCommandResponse {
+                request_id: pending.request_id.clone(),
+                success: true,
+                error_message: String::new(),
+                error_code: String::new(),
+                retryable: false,
+                found: !batch.rows.is_empty(),
+                result_data: batch.to_proto().encode_to_vec(),
+                leader_replica_id,
+                current_tablet_epoch: None,
+                expected_tablet_epoch: None,
+            },
+            Err(error) => error_response(pending.request_id.clone(), error),
+        },
+        TabletRpcCompletion::Outcome(result) => match result {
+            Ok(Some(outcome)) => match outcome.encode_for_outcome_query() {
+                Ok(result_data) => TabletCommandResponse {
+                    request_id: pending.request_id.clone(),
+                    success: true,
+                    error_message: String::new(),
+                    error_code: String::new(),
+                    retryable: false,
+                    result_data,
+                    found: true,
+                    leader_replica_id,
+                    current_tablet_epoch: None,
+                    expected_tablet_epoch: None,
+                },
+                Err(error) => error_response(
+                    pending.request_id.clone(),
+                    Error::CorruptData(error.to_string()),
+                ),
+            },
+            Ok(None) => TabletCommandResponse {
+                request_id: pending.request_id.clone(),
+                success: true,
+                error_message: String::new(),
+                error_code: String::new(),
+                retryable: false,
+                result_data: Vec::new(),
+                found: false,
+                leader_replica_id,
+                current_tablet_epoch: None,
+                expected_tablet_epoch: None,
+            },
+            Err(error) => error_response(pending.request_id.clone(), error),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1499,7 +1745,6 @@ fn dispatch_message(
     transport: &NodeRaftTransport,
     handles: &SharedTabletHandleRegistry,
     rpc_state: &RpcState,
-    database: &SharedLocalDatabase,
     metadata_requests: &mpsc::SyncSender<MetadataHostRequest>,
     join_requests: &mpsc::SyncSender<ReplicaJoinAdmission>,
     source: NodeId,
@@ -1564,46 +1809,74 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
-            let remote_commit = match &request.command {
-                TabletCommand::SingleShardCommit(command) => Some(command.clone()),
-                _ => None,
-            };
-            let response = match handles
+            if request_id.raft_group_id != frame.raft_group_id {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::InvalidArgument(
+                            "tablet command request group does not match its frame".to_string(),
+                        ),
+                    ),
+                );
+                return;
+            }
+            let Some(handle) = handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&frame.raft_group_id)
                 .cloned()
-            {
-                Some(handle) => match handle.submit_command(request, Duration::from_secs(30)) {
-                    Ok(outcome) => match remote_commit.as_ref().map(|command| {
-                        database
-                            .blocking_lock()
-                            .observe_replicated_commit_high_water(command)
-                    }) {
-                        Some(Err(error)) => error_response(request_id, error),
-                        _ => TabletCommandResponse {
-                            request_id,
-                            success: true,
-                            error_message: String::new(),
-                            error_code: String::new(),
-                            retryable: false,
-                            result_data: encode_command_outcome(outcome),
-                            found: false,
-                            leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
-                            current_tablet_epoch: None,
-                            expected_tablet_epoch: None,
+            else {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::ProposalUnavailable {
+                            reason: "tablet Raft group is not hosted on this node".to_string(),
                         },
-                    },
-                    Err(error) => error_response(request_id, error),
-                },
-                None => error_response(
-                    request_id,
-                    Error::ProposalUnavailable {
-                        reason: "tablet Raft group is not hosted on this node".to_string(),
-                    },
-                ),
+                    ),
+                );
+                return;
             };
-            send_response(transport, source, frame.raft_group_id, attempt_id, response);
+            let deadline = Instant::now() + INBOUND_TABLET_RPC_DEFAULT_TIMEOUT;
+            let token = match rpc_state.reserve_tablet_rpc(PendingTabletRpc {
+                source,
+                group_id: frame.raft_group_id,
+                attempt_id,
+                request_id: request_id.clone(),
+                status: handle.status_shared(),
+                deadline,
+                completion: None,
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
+            let completion: Arc<dyn TabletRpcCompletionSink> = Arc::new(rpc_state.clone());
+            if let Err(error) = handle.enqueue_rpc_command(request, deadline, token, completion) {
+                rpc_state.cancel_tablet_rpc(token);
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
+                );
+            }
         }
         MessageType::TabletReadRequest => {
             let Ok(proto) = rpc::TabletReadRequest::decode(frame.payload.as_slice()) else {
@@ -1614,6 +1887,21 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
+            if request_id.raft_group_id != frame.raft_group_id {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::InvalidArgument(
+                            "tablet read request group does not match its frame".to_string(),
+                        ),
+                    ),
+                );
+                return;
+            }
             let deadline = match remote_read_deadline(request.deadline_remaining_ms) {
                 Ok(deadline) => deadline,
                 Err(error) => {
@@ -1627,38 +1915,59 @@ fn dispatch_message(
                     return;
                 }
             };
-            let response = match handles
+            let Some(handle) = handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&frame.raft_group_id)
                 .cloned()
-            {
-                Some(handle) => match handle
-                    .read_barrier_until(deadline)
-                    .and_then(|()| handle.read_point_until(request, deadline))
-                {
-                    Ok(row) => TabletCommandResponse {
+            else {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
                         request_id,
-                        success: true,
-                        error_message: String::new(),
-                        error_code: String::new(),
-                        retryable: false,
-                        found: row.is_some(),
-                        result_data: row.unwrap_or_default(),
-                        leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
-                        current_tablet_epoch: None,
-                        expected_tablet_epoch: None,
-                    },
-                    Err(error) => error_response(request_id, error),
-                },
-                None => error_response(
-                    request_id,
-                    Error::ProposalUnavailable {
-                        reason: "tablet Raft group is not hosted on this node".to_string(),
-                    },
-                ),
+                        Error::ProposalUnavailable {
+                            reason: "tablet Raft group is not hosted on this node".to_string(),
+                        },
+                    ),
+                );
+                return;
             };
-            send_response(transport, source, frame.raft_group_id, attempt_id, response);
+            let token = match rpc_state.reserve_tablet_rpc(PendingTabletRpc {
+                source,
+                group_id: frame.raft_group_id,
+                attempt_id,
+                request_id: request_id.clone(),
+                status: handle.status_shared(),
+                deadline,
+                completion: None,
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
+            let completion: Arc<dyn TabletRpcCompletionSink> = Arc::new(rpc_state.clone());
+            if let Err(error) = handle.enqueue_rpc_read_point(request, deadline, token, completion)
+            {
+                rpc_state.cancel_tablet_rpc(token);
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
+                );
+            }
         }
         MessageType::TabletScanRequest => {
             let Ok(proto) = rpc::TabletScanRequest::decode(frame.payload.as_slice()) else {
@@ -1669,6 +1978,21 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
+            if request_id.raft_group_id != frame.raft_group_id {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::InvalidArgument(
+                            "tablet scan request group does not match its frame".to_string(),
+                        ),
+                    ),
+                );
+                return;
+            }
             let deadline = match remote_read_deadline(request.deadline_remaining_ms) {
                 Ok(deadline) => deadline,
                 Err(error) => {
@@ -1682,38 +2006,58 @@ fn dispatch_message(
                     return;
                 }
             };
-            let response = match handles
+            let Some(handle) = handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&frame.raft_group_id)
                 .cloned()
-            {
-                Some(handle) => match handle
-                    .read_barrier_until(deadline)
-                    .and_then(|()| handle.scan_page_until(request, deadline))
-                {
-                    Ok(batch) => TabletCommandResponse {
+            else {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
                         request_id,
-                        success: true,
-                        error_message: String::new(),
-                        error_code: String::new(),
-                        retryable: false,
-                        found: !batch.rows.is_empty(),
-                        result_data: batch.to_proto().encode_to_vec(),
-                        leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
-                        current_tablet_epoch: None,
-                        expected_tablet_epoch: None,
-                    },
-                    Err(error) => error_response(request_id, error),
-                },
-                None => error_response(
-                    request_id,
-                    Error::ProposalUnavailable {
-                        reason: "tablet Raft group is not hosted on this node".to_string(),
-                    },
-                ),
+                        Error::ProposalUnavailable {
+                            reason: "tablet Raft group is not hosted on this node".to_string(),
+                        },
+                    ),
+                );
+                return;
             };
-            send_response(transport, source, frame.raft_group_id, attempt_id, response);
+            let token = match rpc_state.reserve_tablet_rpc(PendingTabletRpc {
+                source,
+                group_id: frame.raft_group_id,
+                attempt_id,
+                request_id: request_id.clone(),
+                status: handle.status_shared(),
+                deadline,
+                completion: None,
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
+            let completion: Arc<dyn TabletRpcCompletionSink> = Arc::new(rpc_state.clone());
+            if let Err(error) = handle.enqueue_rpc_scan(request, deadline, token, completion) {
+                rpc_state.cancel_tablet_rpc(token);
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
+                );
+            }
         }
         MessageType::TabletOutcomeQueryRequest => {
             let Ok(proto) = rpc::TabletOutcomeQueryRequest::decode(frame.payload.as_slice()) else {
@@ -1724,56 +2068,76 @@ fn dispatch_message(
                 return;
             };
             let request_id = request.request_id.clone();
-            let response = match handles
+            if request_id.raft_group_id != frame.raft_group_id {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::InvalidArgument(
+                            "tablet outcome query group does not match its frame".to_string(),
+                        ),
+                    ),
+                );
+                return;
+            }
+            let Some(handle) = handles
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&frame.raft_group_id)
                 .cloned()
-            {
-                Some(handle) => match handle
-                    .query_original_outcome(request, Duration::from_secs(30))
-                {
-                    Ok(outcome) => match outcome {
-                        Some(outcome) => match outcome.encode_for_outcome_query() {
-                            Ok(result_data) => TabletCommandResponse {
-                                request_id,
-                                success: true,
-                                error_message: String::new(),
-                                error_code: String::new(),
-                                retryable: false,
-                                result_data,
-                                found: true,
-                                leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
-                                current_tablet_epoch: None,
-                                expected_tablet_epoch: None,
-                            },
-                            Err(error) => {
-                                error_response(request_id, Error::CorruptData(error.to_string()))
-                            }
+            else {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(
+                        request_id,
+                        Error::ProposalUnavailable {
+                            reason: "tablet Raft group is not hosted on this node".to_string(),
                         },
-                        None => TabletCommandResponse {
-                            request_id,
-                            success: true,
-                            error_message: String::new(),
-                            error_code: String::new(),
-                            retryable: false,
-                            result_data: Vec::new(),
-                            found: false,
-                            leader_replica_id: handle.status().leader_replica_id.map(ReplicaId),
-                            current_tablet_epoch: None,
-                            expected_tablet_epoch: None,
-                        },
-                    },
-                    Err(error) => error_response(request_id, error),
-                },
-                None => error_response(
-                    request_id,
-                    Error::ProposalUnavailable {
-                        reason: "tablet Raft group is not hosted on this node".to_string(),
-                    },
-                ),
+                    ),
+                );
+                return;
             };
-            send_response(transport, source, frame.raft_group_id, attempt_id, response);
+            let deadline = Instant::now() + INBOUND_TABLET_RPC_DEFAULT_TIMEOUT;
+            let token = match rpc_state.reserve_tablet_rpc(PendingTabletRpc {
+                source,
+                group_id: frame.raft_group_id,
+                attempt_id,
+                request_id: request_id.clone(),
+                status: handle.status_shared(),
+                deadline,
+                completion: None,
+            }) {
+                Ok(token) => token,
+                Err(error) => {
+                    send_response(
+                        transport,
+                        source,
+                        frame.raft_group_id,
+                        attempt_id,
+                        error_response(request_id, error),
+                    );
+                    return;
+                }
+            };
+            let completion: Arc<dyn TabletRpcCompletionSink> = Arc::new(rpc_state.clone());
+            if let Err(error) =
+                handle.enqueue_rpc_outcome_query(request, deadline, token, completion)
+            {
+                rpc_state.cancel_tablet_rpc(token);
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
+                );
+            }
         }
         MessageType::TabletCommandResponse => {
             let Ok(proto) = rpc::TabletCommandResponse::decode(frame.payload.as_slice()) else {
@@ -2578,6 +2942,82 @@ mod tests {
         assert!(new_receiver.try_recv().is_err());
         drop(old_receiver);
         drop(new_receiver);
+    }
+
+    /// Realistic bug caught: a completion queue ordered by request admission
+    /// would make a fast tablet wait behind an earlier slow tablet. Completion
+    /// tokens must therefore be independently drainable and must not require
+    /// the dispatcher to wait for the oldest request first.
+    #[test]
+    fn tablet_rpc_completion_tokens_are_drained_independently() {
+        let state = RpcState::new();
+        let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
+        let first = state
+            .reserve_tablet_rpc(PendingTabletRpc {
+                source: NodeId(2),
+                group_id: RaftGroupId(7),
+                attempt_id: Some(41),
+                request_id: RequestId {
+                    client_id: 1,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(7),
+                },
+                status: status.clone(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                completion: None,
+            })
+            .unwrap();
+        let second = state
+            .reserve_tablet_rpc(PendingTabletRpc {
+                source: NodeId(2),
+                group_id: RaftGroupId(8),
+                attempt_id: Some(42),
+                request_id: RequestId {
+                    client_id: 2,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(8),
+                },
+                status,
+                deadline: Instant::now() + Duration::from_secs(1),
+                completion: None,
+            })
+            .unwrap();
+
+        state.publish_tablet_completion(second, TabletRpcCompletion::Outcome(Ok(None)));
+        let ready = state.take_ready_tablet_rpcs(Instant::now());
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].request_id.client_id, 2);
+        assert!(state.inbound_tablet.lock().unwrap().contains_key(&first));
+    }
+
+    /// Realistic bug caught: a timed-out inbound RPC could retain its token
+    /// forever and later emit a stale response after the caller had cancelled
+    /// the attempt. Cancellation removes the token, making late completion a
+    /// harmless no-op.
+    #[test]
+    fn cancelled_tablet_rpc_ignores_late_completion() {
+        let state = RpcState::new();
+        let token = state
+            .reserve_tablet_rpc(PendingTabletRpc {
+                source: NodeId(2),
+                group_id: RaftGroupId(7),
+                attempt_id: Some(41),
+                request_id: RequestId {
+                    client_id: 1,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(7),
+                },
+                status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
+                deadline: Instant::now() + Duration::from_secs(1),
+                completion: None,
+            })
+            .unwrap();
+
+        state.cancel_tablet_rpc(token);
+        state.publish_tablet_completion(token, TabletRpcCompletion::Outcome(Ok(None)));
+
+        assert!(state.take_ready_tablet_rpcs(Instant::now()).is_empty());
     }
 
     #[test]
