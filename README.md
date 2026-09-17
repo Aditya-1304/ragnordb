@@ -1628,6 +1628,8 @@ data_dir = "./data/n1"
 listen_addr = "127.0.0.1:7101"
 admin_addr = "127.0.0.1:7201"
 max_connections = 100
+# Fixed number of ownership reactors; benchmark this per deployment topology.
+reactor_count = 1
 ```
 
 ```bash
@@ -1640,8 +1642,9 @@ static seed-node fields. They are validated now so the same configuration
 format can bootstrap the metadata group later.
 
 Unknown fields, duplicate seed identities, duplicate addresses, zero node IDs,
-empty cluster identities, invalid port derivation, and zero connection limits
-are rejected.
+empty cluster identities, invalid port derivation, zero connection limits, and
+zero reactor counts are rejected. Replicated tablet state is assigned to this
+fixed reactor set and is not moved live between reactors.
 
 ---
 

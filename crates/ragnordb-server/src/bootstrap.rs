@@ -391,6 +391,7 @@ mod tests {
             snapshot_min_elapsed_ms: 300_000,
             max_snapshot_file_bytes: 512 * 1024 * 1024,
             snapshot_chunk_bytes: 1024 * 1024,
+            reactor_count: 1,
         }
     }
 

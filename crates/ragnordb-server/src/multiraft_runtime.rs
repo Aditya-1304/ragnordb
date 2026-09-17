@@ -73,7 +73,7 @@ use crate::{
         DurableFrontier, InitialReplicaConfiguration, LocalReplicaKey, LocalReplicaRecord,
         LocalReplicaRegistry, ReplicaLifecycle,
     },
-    replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime},
+    replicated_tablet::{FixedReactorSet, ReplicatedTabletHandle, ReplicatedTabletRuntime},
     rpc::{
         MetadataRpcClient, ReplicaJoinAdmission, ReplicaJoinAdmissionResult, ReplicaJoinRpcClient,
         RpcState, SharedTabletHandleRegistry, TabletRpcClient, spawn_dispatcher,
@@ -131,7 +131,7 @@ struct PendingMetadataProposal {
     deadline: Instant,
 }
 
-/// Owns metadata-driven tablet workers for the lifetime of the node host.
+/// Owns metadata-driven tablet reactor registrations for the lifetime of the node host.
 ///
 /// The metadata Raft state machine is the placement authority; this controller
 /// only materializes replicas assigned to the local physical node. Every
@@ -139,7 +139,7 @@ struct PendingMetadataProposal {
 /// are promoted to `Active` after their Ready owner is registered; a fresh
 /// group can remain `Creating` until it has emitted a recovery-visible WAL
 /// frontier. The map of runtime guards is also the in-process idempotency
-/// fence: a committed metadata replay cannot spawn a second worker for the
+/// fence: a committed metadata replay cannot spawn a second reactor owner for the
 /// same replica lifetime.
 struct TabletLifecycleManager {
     config: NodeConfig,
@@ -153,6 +153,7 @@ struct TabletLifecycleManager {
     joins: JoiningReplicaRegistry,
     recovered: RecoveredRaftStorage,
     start_gate: Arc<AtomicBool>,
+    reactors: Arc<FixedReactorSet>,
     runtimes: BTreeMap<RaftReplicaIdentity, ReplicatedTabletRuntime>,
     /// Retention handles outlive a detached runtime until its safe WAL floor
     /// has been published. Keeping them here also makes interrupted cleanup
@@ -180,6 +181,7 @@ impl TabletLifecycleManager {
         joins: JoiningReplicaRegistry,
         recovered: RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
+        reactors: Arc<FixedReactorSet>,
         tablet_handles: SharedTabletHandleRegistry,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.as_deref().ok_or_else(|| {
@@ -199,6 +201,7 @@ impl TabletLifecycleManager {
             joins,
             recovered,
             start_gate,
+            reactors,
             runtimes: BTreeMap::new(),
             writers: BTreeMap::new(),
             tablet_handles,
@@ -468,7 +471,7 @@ impl TabletLifecycleManager {
             }
 
             // SQL executes CREATE TABLE while holding the database owner lock
-            // and waits for metadata apply. Do not start a tablet worker from
+            // and waits for metadata apply. Do not start a tablet reactor from
             // that same critical section: a non-blocking probe lets the
             // metadata response complete, after which the next host turn can
             // safely install the local storage mirror.
@@ -547,6 +550,7 @@ impl TabletLifecycleManager {
                 snapshot_endpoint,
                 &self.recovered,
                 self.start_gate.clone(),
+                self.reactors.clone(),
                 false,
                 Some(durability_gate),
             )?;
@@ -1614,6 +1618,7 @@ impl TabletLifecycleManager {
             snapshot_endpoint,
             &self.recovered,
             self.start_gate.clone(),
+            self.reactors.clone(),
             Some(durability_gate),
         )?;
         let recovered = self.recovered.replica(identity).is_some();
@@ -1743,7 +1748,7 @@ impl TabletLifecycleManager {
 
             if active {
                 // This helper also covers the restart case where cleanup had
-                // already removed the in-memory worker and WAL handle.
+                // already removed the in-memory reactor and WAL handle.
                 self.ensure_tombstone_writer(host, identity, true)?;
                 self.cleanup_retired_replica(record, identity)?;
                 if self
@@ -1829,7 +1834,7 @@ impl TabletLifecycleManager {
             })?;
 
         // Detach the host proxy before dropping the runtime so no scheduler
-        // turn can race with worker shutdown.
+        // turn can race with reactor shutdown.
         drop(self.runtimes.remove(&identity));
         self.tablet_handles
             .write()
@@ -2844,6 +2849,10 @@ impl MetadataTableCreator for MetadataProposalClient {
 pub struct MultiRaftRuntime {
     tablet_runtime: Option<ReplicatedTabletRuntime>,
 
+    /// Fixed ownership reactors outlive every tablet runtime registered on
+    /// them and are dropped only after the host has stopped issuing work.
+    _reactors: Arc<FixedReactorSet>,
+
     metadata: MetadataRuntimeHandle,
 
     metadata_creator: SharedMetadataTableCreator,
@@ -3114,6 +3123,8 @@ impl MultiRaftRuntime {
 
         let node_wal = NodeRaftWal::with_durability_gate(wal.clone(), durability_gate);
 
+        let reactors = FixedReactorSet::new(config.reactor_count)?;
+
         let mut host = MultiRaftHost::from_recovered_with_config(
             config.node_id,
             node_wal,
@@ -3223,6 +3234,7 @@ impl MultiRaftRuntime {
             group_snapshot_endpoint,
             &recovered,
             Arc::clone(&start_gate),
+            reactors.clone(),
         )?;
 
         let hosted_group = Box::new(tablet_runtime.hosted_group());
@@ -3252,6 +3264,7 @@ impl MultiRaftRuntime {
             joins,
             recovered,
             Arc::clone(&start_gate),
+            reactors.clone(),
             tablet_handles.clone(),
         )?;
         tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
@@ -3280,7 +3293,7 @@ impl MultiRaftRuntime {
             })?
             .install_node_wal(host.node_wal())?;
 
-        // Tablet workers may now release any Ready-dependent messages.
+        // Tablet reactors may now release any Ready-dependent messages.
         start_gate.store(true, Ordering::Release);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3397,6 +3410,8 @@ impl MultiRaftRuntime {
         Ok(Self {
             tablet_runtime: Some(tablet_runtime),
 
+            _reactors: reactors,
+
             metadata: metadata_handle,
 
             metadata_creator,
@@ -3451,7 +3466,7 @@ impl MultiRaftRuntime {
     }
 
     /// Return the last published point-in-time status for every local Raft
-    /// group. The host worker remains the sole owner of mutable Raft state.
+    /// group. Each tablet reactor remains the sole owner of its mutable state.
     pub fn host_status(&self) -> MultiRaftHostStatus {
         self.host_status
             .read()

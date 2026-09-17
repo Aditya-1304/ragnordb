@@ -66,6 +66,12 @@ const fn default_snapshot_chunk_bytes() -> u64 {
     DEFAULT_SNAPSHOT_CHUNK_BYTES
 }
 
+fn default_reactor_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
 /// Static address information for one cluster seed node.
 ///
 /// Seed-node IDs and addresses must be stable across restarts. The metadata
@@ -144,6 +150,10 @@ pub struct NodeConfig {
 
     /// Maximum payload carried by one out-of-band snapshot transport chunk.
     pub snapshot_chunk_bytes: u64,
+
+    /// Number of fixed ownership reactors used for replicated tablet state.
+    /// Live groups are not moved between reactors after assignment.
+    pub reactor_count: usize,
 }
 
 /// Deserialization-only representation of the TOML file
@@ -188,6 +198,9 @@ struct NodeConfigFile {
     max_snapshot_file_bytes: u64,
     #[serde(default = "default_snapshot_chunk_bytes")]
     snapshot_chunk_bytes: u64,
+
+    #[serde(default = "default_reactor_count")]
+    reactor_count: usize,
 }
 
 const fn default_max_connections() -> u32 {
@@ -219,6 +232,7 @@ impl NodeConfig {
             snapshot_min_elapsed_ms: DEFAULT_SNAPSHOT_MIN_ELAPSED_MS,
             max_snapshot_file_bytes: DEFAULT_MAX_SNAPSHOT_FILE_BYTES,
             snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+            reactor_count: default_reactor_count(),
         };
 
         config.validate()?;
@@ -267,6 +281,7 @@ impl NodeConfig {
             snapshot_min_elapsed_ms: file.snapshot_min_elapsed_ms,
             max_snapshot_file_bytes: file.max_snapshot_file_bytes,
             snapshot_chunk_bytes: file.snapshot_chunk_bytes,
+            reactor_count: file.reactor_count,
         };
 
         config.validate()?;
@@ -332,6 +347,12 @@ impl NodeConfig {
         if self.shutdown_grace_period_ms == 0 {
             return Err(Error::Configuration(
                 "shutdown_grace_period_ms must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.reactor_count == 0 {
+            return Err(Error::Configuration(
+                "reactor_count must be greater than zero".to_string(),
             ));
         }
 
@@ -523,6 +544,7 @@ mod tests {
         assert_eq!(config.shutdown_grace_period_ms, 5_000);
         assert_eq!(config.statement_logging, StatementLogging::MetadataOnly);
         assert!(config.seed_nodes.is_empty());
+        assert!(config.reactor_count > 0);
     }
 
     #[test]
@@ -550,6 +572,7 @@ shutdown_grace_period_ms = 7000
 statement_logging = "redacted"
 cluster_id = "ragnordb-dev"
 bootstrap = true
+reactor_count = 3
 
 [[seed_nodes]]
 id = 1
@@ -583,6 +606,26 @@ admin_addr = "127.0.0.1:7203"
         assert_eq!(config.seed_nodes.len(), 3);
         assert_eq!(config.cluster_id.as_deref(), Some("ragnordb-dev"));
         assert!(config.bootstrap);
+        assert_eq!(config.reactor_count, 3);
+    }
+
+    #[test]
+    fn rejects_zero_reactor_count() {
+        let error = NodeConfig::from_toml_str(
+            r#"
+node_id = 1
+data_dir = "./data/n1"
+listen_addr = "127.0.0.1:7101"
+reactor_count = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reactor_count must be greater than zero")
+        );
     }
 
     #[test]

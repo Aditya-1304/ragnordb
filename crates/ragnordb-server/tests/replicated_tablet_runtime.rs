@@ -60,6 +60,7 @@ fn start_failover_test_node(
         snapshot_min_elapsed_ms: 300_000,
         max_snapshot_file_bytes: 512 * 1024 * 1024,
         snapshot_chunk_bytes: 1024 * 1024,
+        reactor_count: 1,
     };
     let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
 
@@ -181,6 +182,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
                     snapshot_min_elapsed_ms: 300_000,
                     max_snapshot_file_bytes: 512 * 1024 * 1024,
                     snapshot_chunk_bytes: 1024 * 1024,
+                    reactor_count: 1,
                 };
                 let data_directory_lock = DataDirectoryLock::acquire(&config.data_dir).unwrap();
 

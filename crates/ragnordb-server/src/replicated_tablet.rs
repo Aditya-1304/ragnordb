@@ -1,15 +1,15 @@
 //! Production Ready owner for one replicated tablet Raft group.
 //!
 //! The physical MultiRaft scheduler owns cross-group fairness. This module
-//! owns the tablet group's worker boundary: SQL, snapshot, and Ready state
-//! transitions remain serialized here while the scheduler interacts through a
-//! bounded, non-blocking control bridge.
+//! owns the tablet group's reactor boundary: SQL, snapshot, and Ready state
+//! transitions remain serialized here while the scheduler interacts through
+//! bounded, non-blocking mailboxes.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -73,6 +73,7 @@ use ragnordb_multiraft::{
     transport::GroupRaftTransport,
 };
 
+use prost::Message as ProstMessage;
 use ragnordb_storage::wal::{
     DurableCommitLog, DurableWalExtent, RagnorDbWalAdapter, SingleNodeTxnCommit, WalMutation,
 };
@@ -83,7 +84,7 @@ use ragnordb_tablet::{
         TabletSnapshotImage, TabletSnapshotInstallTarget, TabletSnapshotPointer,
     },
 };
-use tracing::{error, warn};
+use tracing::warn;
 use wal::{io::directory::FsSegmentDirectory, lsn::Lsn, wal::WalHandle};
 
 use crate::{
@@ -101,6 +102,9 @@ const HEARTBEAT_INTERVAL_TICKS: u64 = 3;
 const CHANNEL_CAPACITY: usize = 1_024;
 const TABLET_CONTROL_BUDGET: usize = 64;
 const TABLET_REQUEST_BUDGET: usize = 64;
+const REACTOR_REGISTRATION_CAPACITY: usize = 256;
+const REACTOR_TURN_GROUP_BUDGET: usize = 32;
+const REACTOR_IDLE_PARK: Duration = Duration::from_millis(1);
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 const READ_INDEX_CONTEXT_NAMESPACE: u64 = 0x5241_474e_4944_5801;
 const READ_INDEX_FALLBACK_GRACE: Duration = Duration::from_millis(5);
@@ -109,7 +113,7 @@ const READ_INDEX_FALLBACK_GRACE: Duration = Duration::from_millis(5);
 const MAX_PENDING_READ_BARRIER_WAITERS: usize = 1_024;
 
 /// Identity that must remain consistent across the Raft Ready owner and the
-/// tablet snapshot contract. Keeping these values together prevents a worker
+/// tablet snapshot contract. Keeping these values together prevents a reactor
 /// for a metadata-created tablet from accidentally publishing legacy group
 /// identifiers in proposals, snapshots, or replicated SQL storage.
 #[derive(Debug, Clone)]
@@ -171,6 +175,10 @@ pub struct ReplicatedTabletStatus {
     pub pending_conf_change_index: Option<u64>,
     pub last_conf_change: Option<(u64, u64)>,
     pub last_removed_replica: Option<(u64, u64, u64, u64)>,
+    /// Reactor assignment published with the same status snapshot as the
+    /// Raft frontier. A replacement lifetime must use a newer generation.
+    pub reactor_id: usize,
+    pub owner_generation: u64,
     /// True while an incoming or locally generated snapshot still owns a
     /// persistence boundary. Promotion must wait for this to clear.
     pub snapshot_install_pending: bool,
@@ -179,42 +187,42 @@ pub struct ReplicatedTabletStatus {
 enum HostRequest {
     Commit {
         commit: SingleNodeTxnCommit,
-        reply: mpsc::Sender<Result<DurableWalExtent>>,
+        reply: mpsc::SyncSender<Result<DurableWalExtent>>,
         deadline: Instant,
     },
     Catalog {
         update: CatalogLogRecord,
-        reply: mpsc::Sender<Result<CatalogLogExtent>>,
+        reply: mpsc::SyncSender<Result<CatalogLogExtent>>,
         deadline: Instant,
     },
     Barrier {
-        reply: mpsc::Sender<Result<()>>,
+        reply: mpsc::SyncSender<Result<()>>,
         deadline: Instant,
     },
     Command {
         request: TabletCommandRequest,
-        reply: mpsc::Sender<Result<TabletCommandApplyOutcome>>,
+        reply: mpsc::SyncSender<Result<TabletCommandApplyOutcome>>,
         deadline: Instant,
     },
     ReadPoint {
         request: TabletReadRequest,
-        reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+        reply: mpsc::SyncSender<Result<Option<Vec<u8>>>>,
         deadline: Instant,
     },
     Scan {
         request: TabletScanRequest,
-        reply: mpsc::Sender<Result<TabletScanBatch>>,
+        reply: mpsc::SyncSender<Result<TabletScanBatch>>,
         deadline: Instant,
     },
     OutcomeQuery {
         request: TabletOutcomeQueryRequest,
-        reply: mpsc::Sender<Result<Option<CachedTabletCommandOutcome>>>,
+        reply: mpsc::SyncSender<Result<Option<CachedTabletCommandOutcome>>>,
         deadline: Instant,
     },
 }
 
 struct PendingReadBarrierWaiter {
-    reply: mpsc::Sender<Result<()>>,
+    reply: mpsc::SyncSender<Result<()>>,
     deadline: Instant,
 }
 
@@ -238,30 +246,254 @@ enum RaftHostControlResult {
 enum RaftHostControl {
     Tick {
         ticks: u64,
-        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     Step {
         message: RaftMessageEnvelope,
-        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     Propose {
         command: Vec<u8>,
         encoded_len: usize,
-        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     ProposeConfChange {
         change: ConfChange,
-        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
     TransferLeadership {
         target: raft::types::NodeId,
         timeout_ticks: u64,
-        reply: mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+        reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
+}
+
+const REACTOR_MAILBOX_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const MAILBOX_ITEM_OVERHEAD: usize = 64;
+
+/// A queue item provides the number of bytes reserved before it enters a
+/// bounded mailbox. The size is carried by the item itself or derived from
+/// already-known encoded lengths; the queue never scans its contents to
+/// calculate occupancy.
+trait MailboxSized {
+    fn mailbox_bytes(&self) -> usize;
+}
+
+struct MailboxBudget {
+    capacity: usize,
+    used: AtomicUsize,
+}
+
+impl MailboxBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.capacity)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: usize) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+/// Sender half of a bounded reactor mailbox.
+///
+/// The underlying synchronous channel bounds item count. `MailboxBudget`
+/// independently bounds retained payload bytes, so a small number of large
+/// requests cannot bypass the memory limit and a large number of tiny
+/// requests cannot grow the queue past its count limit.
+struct ByteBoundedSender<T: MailboxSized> {
+    sender: SyncSender<MailboxEntry<T>>,
+    budget: Arc<MailboxBudget>,
+    wake: ReactorWake,
+}
+
+struct MailboxEntry<T> {
+    item: T,
+    bytes: usize,
+}
+
+impl<T: MailboxSized> Clone for ByteBoundedSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            budget: self.budget.clone(),
+            wake: self.wake.clone(),
+        }
+    }
+}
+
+impl<T: MailboxSized> ByteBoundedSender<T> {
+    fn try_send(&self, item: T) -> std::result::Result<(), mpsc::TrySendError<T>> {
+        let bytes = item.mailbox_bytes().max(MAILBOX_ITEM_OVERHEAD);
+        if !self.budget.reserve(bytes) {
+            return Err(mpsc::TrySendError::Full(item));
+        }
+
+        match self.sender.try_send(MailboxEntry { item, bytes }) {
+            Ok(()) => {
+                self.wake.wake();
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(entry)) => {
+                self.budget.release(entry.bytes);
+                Err(mpsc::TrySendError::Full(entry.item))
+            }
+            Err(mpsc::TrySendError::Disconnected(entry)) => {
+                self.budget.release(entry.bytes);
+                Err(mpsc::TrySendError::Disconnected(entry.item))
+            }
+        }
+    }
+
+    fn send(&self, item: T) -> std::result::Result<(), mpsc::SendError<T>> {
+        let bytes = item.mailbox_bytes().max(MAILBOX_ITEM_OVERHEAD);
+        if !self.budget.reserve(bytes) {
+            return Err(mpsc::SendError(item));
+        }
+
+        match self.sender.send(MailboxEntry { item, bytes }) {
+            Ok(()) => {
+                self.wake.wake();
+                Ok(())
+            }
+            Err(mpsc::SendError(entry)) => {
+                self.budget.release(entry.bytes);
+                Err(mpsc::SendError(entry.item))
+            }
+        }
+    }
+}
+
+struct ByteBoundedReceiver<T: MailboxSized> {
+    receiver: Receiver<MailboxEntry<T>>,
+    budget: Arc<MailboxBudget>,
+}
+
+impl<T: MailboxSized> ByteBoundedReceiver<T> {
+    fn try_recv(&self) -> std::result::Result<T, mpsc::TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(entry) => {
+                self.budget.release(entry.bytes);
+                Ok(entry.item)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<T, mpsc::RecvTimeoutError> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(entry) => {
+                self.budget.release(entry.bytes);
+                Ok(entry.item)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<T: MailboxSized> Drop for ByteBoundedReceiver<T> {
+    fn drop(&mut self) {
+        while let Ok(entry) = self.receiver.try_recv() {
+            self.budget.release(entry.bytes);
+        }
+    }
+}
+
+struct ByteBoundedMailbox<T: MailboxSized> {
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: MailboxSized> ByteBoundedMailbox<T> {
+    fn pair(
+        capacity: usize,
+        budget: Arc<MailboxBudget>,
+        wake: ReactorWake,
+    ) -> (ByteBoundedSender<T>, ByteBoundedReceiver<T>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        (
+            ByteBoundedSender {
+                sender,
+                budget: budget.clone(),
+                wake,
+            },
+            ByteBoundedReceiver { receiver, budget },
+        )
+    }
+}
+
+impl MailboxSized for HostRequest {
+    fn mailbox_bytes(&self) -> usize {
+        let payload_bytes = match self {
+            Self::Commit { commit, .. } => commit
+                .encode()
+                .map(|encoded| encoded.len())
+                .unwrap_or_else(|_| std::mem::size_of_val(commit)),
+            Self::Catalog { update, .. } => update.command.to_proto().encoded_len(),
+            Self::Barrier { .. } => 0,
+            Self::Command { request, .. } => request
+                .to_proto()
+                .map(|encoded| encoded.encoded_len())
+                .unwrap_or_else(|_| std::mem::size_of_val(request)),
+            Self::ReadPoint { request, .. } => request.to_proto().encoded_len(),
+            Self::Scan { request, .. } => request.to_proto().encoded_len(),
+            Self::OutcomeQuery { request, .. } => request.to_proto().encoded_len(),
+        };
+        std::mem::size_of_val(self).saturating_add(payload_bytes)
+    }
+}
+
+fn raft_envelope_mailbox_bytes(message: &RaftMessageEnvelope) -> usize {
+    let payload_bytes = match &message.msg {
+        Message::AppendEntries(request) => {
+            request.entries.iter().map(|entry| entry.encoded_len).sum()
+        }
+        Message::ReadIndex(request) => request.context.len(),
+        Message::ReadIndexResponse(response) => response.context.len(),
+        _ => 0,
+    };
+    std::mem::size_of_val(message).saturating_add(payload_bytes)
+}
+
+impl MailboxSized for RaftHostControl {
+    fn mailbox_bytes(&self) -> usize {
+        let payload_bytes = match self {
+            Self::Tick { .. } => 0,
+            Self::Step { message, .. } => raft_envelope_mailbox_bytes(message),
+            Self::Propose {
+                command,
+                encoded_len,
+                ..
+            } => command.len().max(*encoded_len),
+            Self::ProposeConfChange { change, .. } => std::mem::size_of_val(change),
+            Self::TransferLeadership { .. } => 0,
+        };
+        std::mem::size_of_val(self).saturating_add(payload_bytes)
+    }
 }
 
 /// Return a terminal runtime reason only for errors that cross a correctness
@@ -306,7 +538,10 @@ fn reply_snapshot_blocked_host_control(control: RaftHostControl, reason: &str) {
 ///
 /// Requests are answered instead of merely left queued so the synchronous
 /// node-level host remains free to service unrelated Raft groups.
-fn reject_snapshot_blocked_host_controls(host_control: &Receiver<RaftHostControl>, reason: &str) {
+fn reject_snapshot_blocked_host_controls(
+    host_control: &ByteBoundedReceiver<RaftHostControl>,
+    reason: &str,
+) {
     while let Ok(control) = host_control.try_recv() {
         reply_snapshot_blocked_host_control(control, reason);
     }
@@ -323,10 +558,10 @@ fn classify_snapshot_integration_error(error: TabletSnapshotIntegrationError) ->
 }
 
 enum ClientReply {
-    Commit(mpsc::Sender<Result<DurableWalExtent>>),
-    Catalog(mpsc::Sender<Result<CatalogLogExtent>>),
-    Barrier(mpsc::Sender<Result<()>>),
-    Command(mpsc::Sender<Result<TabletCommandApplyOutcome>>),
+    Commit(mpsc::SyncSender<Result<DurableWalExtent>>),
+    Catalog(mpsc::SyncSender<Result<CatalogLogExtent>>),
+    Barrier(mpsc::SyncSender<Result<()>>),
+    Command(mpsc::SyncSender<Result<TabletCommandApplyOutcome>>),
 }
 
 struct PendingClient {
@@ -373,6 +608,292 @@ fn snapshot_phase_blocks_host_control(phase: Option<IncomingSnapshotPhase>) -> b
     phase == Some(IncomingSnapshotPhase::ReadyPending)
 }
 
+/// Stable ownership assigned to one `(RaftGroupId, ReplicaId)` lifetime.
+///
+/// A generation is consumed for every registration, including a replacement
+/// lifetime after an earlier group is removed. This prevents a delayed
+/// shutdown or completion from being interpreted as work for a newer owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactorOwnership {
+    pub reactor_id: usize,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+struct ReactorWake {
+    thread: Arc<Mutex<Option<thread::Thread>>>,
+}
+
+impl ReactorWake {
+    fn new() -> Self {
+        Self {
+            thread: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn bind_current_thread(&self) {
+        *self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
+    fn wake(&self) {
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            thread.unpark();
+        }
+    }
+}
+
+trait ReactorGroup: Send {
+    fn identity(&self) -> RaftReplicaIdentity;
+    fn ownership(&self) -> ReactorOwnership;
+    fn is_shutdown(&self) -> bool;
+    fn turn(&mut self) -> std::result::Result<(), String>;
+    fn fail(&mut self, reason: String);
+}
+
+struct ReactorRegistration {
+    group: Box<dyn ReactorGroup>,
+    reply: mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+enum ReactorCommand {
+    Register(ReactorRegistration),
+}
+
+#[derive(Clone)]
+struct ReactorAssignment {
+    ownership: ReactorOwnership,
+    command: SyncSender<ReactorCommand>,
+    wake: ReactorWake,
+    mailbox_budget: Arc<MailboxBudget>,
+}
+
+/// Fixed-size reactor set for all local replicated tablet state machines.
+///
+/// Registration is round-robin and intentionally has no stealing or live
+/// migration path. A reactor owns every mutable field of its groups and runs
+/// each group for a bounded turn before servicing the next group. The only
+/// cross-thread data exposed by a group is its bounded request/control
+/// mailbox, immutable identity, and published status snapshot.
+pub(crate) struct FixedReactorSet {
+    slots: Vec<ReactorAssignment>,
+    next_reactor: AtomicUsize,
+    next_generation: AtomicU64,
+    shutdown: Arc<AtomicBool>,
+    ownerships: Mutex<BTreeMap<RaftReplicaIdentity, ReactorOwnership>>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+impl FixedReactorSet {
+    pub(crate) fn new(count: usize) -> Result<Arc<Self>> {
+        if count == 0 {
+            return Err(Error::Configuration(
+                "reactor_count must be greater than zero".to_string(),
+            ));
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mailbox_budget = Arc::new(MailboxBudget::new(REACTOR_MAILBOX_BYTE_CAPACITY));
+        let mut slots = Vec::with_capacity(count);
+        let mut receivers = Vec::with_capacity(count);
+        for reactor_id in 0..count {
+            let (command, receiver) = mpsc::sync_channel(REACTOR_REGISTRATION_CAPACITY);
+            let wake = ReactorWake::new();
+            slots.push(ReactorAssignment {
+                ownership: ReactorOwnership {
+                    reactor_id,
+                    generation: 0,
+                },
+                command,
+                wake,
+                mailbox_budget: mailbox_budget.clone(),
+            });
+            receivers.push(receiver);
+        }
+
+        let reactors = Arc::new(Self {
+            slots,
+            next_reactor: AtomicUsize::new(0),
+            next_generation: AtomicU64::new(1),
+            shutdown: Arc::clone(&shutdown),
+            ownerships: Mutex::new(BTreeMap::new()),
+            workers: Mutex::new(Vec::with_capacity(count)),
+        });
+
+        for (reactor_id, receiver) in receivers.into_iter().enumerate() {
+            let wake = reactors.slots[reactor_id].wake.clone();
+            let worker_shutdown = Arc::clone(&shutdown);
+            let worker = thread::Builder::new()
+                .name(format!("ragnordb-reactor-{reactor_id}"))
+                .spawn(move || run_fixed_reactor(receiver, wake, worker_shutdown))
+                .map_err(|source| {
+                    Error::Configuration(format!("spawn reactor {reactor_id}: {source}"))
+                })?;
+            reactors
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(worker);
+        }
+
+        Ok(reactors)
+    }
+
+    fn assign(&self) -> Result<ReactorAssignment> {
+        let reactor_id = self.next_reactor.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[reactor_id];
+        Ok(ReactorAssignment {
+            ownership: ReactorOwnership {
+                reactor_id,
+                generation,
+            },
+            command: slot.command.clone(),
+            wake: slot.wake.clone(),
+            mailbox_budget: slot.mailbox_budget.clone(),
+        })
+    }
+
+    fn register(&self, assignment: &ReactorAssignment, group: Box<dyn ReactorGroup>) -> Result<()> {
+        if group.ownership() != assignment.ownership {
+            return Err(Error::Configuration(
+                "reactor group registration ownership does not match its assignment".to_string(),
+            ));
+        }
+        let identity = group.identity();
+        {
+            let mut ownerships = self
+                .ownerships
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if ownerships.insert(identity, assignment.ownership).is_some() {
+                return Err(Error::Configuration(format!(
+                    "reactor ownership already exists for {identity:?}"
+                )));
+            }
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        let send_result = assignment
+            .command
+            .try_send(ReactorCommand::Register(ReactorRegistration {
+                group,
+                reply,
+            }))
+            .map_err(|error| {
+                Error::Configuration(match error {
+                    mpsc::TrySendError::Full(_) => "reactor registration queue is full".to_string(),
+                    mpsc::TrySendError::Disconnected(_) => "reactor set has stopped".to_string(),
+                })
+            });
+        if let Err(error) = send_result {
+            self.ownerships
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&identity);
+            return Err(error);
+        }
+        assignment.wake.wake();
+        let result = response
+            .recv()
+            .map_err(|_| {
+                Error::Configuration("reactor registration acknowledgement was lost".to_string())
+            })?
+            .map_err(Error::Configuration);
+        if let Err(error) = result {
+            self.ownerships
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&identity);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FixedReactorSet {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for slot in &self.slots {
+            slot.wake.wake();
+        }
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_fixed_reactor(
+    receiver: Receiver<ReactorCommand>,
+    wake: ReactorWake,
+    shutdown: Arc<AtomicBool>,
+) {
+    wake.bind_current_thread();
+    let mut groups = BTreeMap::<RaftReplicaIdentity, Box<dyn ReactorGroup>>::new();
+    let mut runnable = VecDeque::<RaftReplicaIdentity>::new();
+
+    while !shutdown.load(Ordering::Acquire) {
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                ReactorCommand::Register(registration) => {
+                    let identity = registration.group.identity();
+                    let result = if let std::collections::btree_map::Entry::Vacant(entry) =
+                        groups.entry(identity)
+                    {
+                        entry.insert(registration.group);
+                        runnable.push_back(identity);
+                        Ok(())
+                    } else {
+                        Err(format!("reactor already owns group {identity:?}"))
+                    };
+                    let _ = registration.reply.send(result);
+                }
+            }
+        }
+
+        let mut serviced = 0;
+        while serviced < REACTOR_TURN_GROUP_BUDGET {
+            let Some(identity) = runnable.pop_front() else {
+                break;
+            };
+            let Some(group) = groups.get_mut(&identity) else {
+                continue;
+            };
+            if group.is_shutdown() {
+                groups.remove(&identity);
+                continue;
+            }
+            serviced += 1;
+            if let Err(reason) = group.turn() {
+                group.fail(reason);
+            }
+            if groups
+                .get(&identity)
+                .is_some_and(|group| !group.is_shutdown())
+            {
+                runnable.push_back(identity);
+            }
+        }
+
+        if serviced == 0 || groups.is_empty() {
+            thread::park_timeout(REACTOR_IDLE_PARK);
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
 fn snapshot_boundary_hard_state(
     mut current: HardState,
     frontier: AppliedTabletFrontier,
@@ -407,14 +928,14 @@ struct PendingLocalSnapshotPublication {
 
 pub(crate) struct ReplicatedTabletGroupProxy {
     identity: RaftReplicaIdentity,
-    control: SyncSender<RaftHostControl>,
+    control: ByteBoundedSender<RaftHostControl>,
     status: Arc<RwLock<ReplicatedTabletStatus>>,
     pending: Option<mpsc::Receiver<std::result::Result<RaftHostControlResult, HostedGroupError>>>,
 }
 
 impl ReplicatedTabletGroupProxy {
     fn control_unavailable() -> HostedGroupError {
-        HostedGroupError::Group("replicated tablet worker has stopped".to_string())
+        HostedGroupError::Group("replicated tablet reactor has stopped".to_string())
     }
 
     fn poll_pending(&mut self) -> std::result::Result<Option<HostedGroupTurn>, HostedGroupError> {
@@ -438,14 +959,14 @@ impl ReplicatedTabletGroupProxy {
     fn submit_budgeted(
         &mut self,
         control: impl FnOnce(
-            mpsc::Sender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
+            mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
         ) -> RaftHostControl,
     ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
         if let Some(turn) = self.poll_pending()? {
             return Ok(turn);
         }
 
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         match self.control.try_send(control(reply)) {
             Ok(()) => {
                 self.pending = Some(response);
@@ -462,7 +983,7 @@ impl ReplicatedTabletGroupProxy {
         &self,
         control: RaftHostControl,
     ) -> std::result::Result<RaftHostControlResult, HostedGroupError> {
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         let control = match control {
             RaftHostControl::Tick { ticks, .. } => RaftHostControl::Tick { ticks, reply },
             RaftHostControl::Step { message, .. } => RaftHostControl::Step { message, reply },
@@ -490,8 +1011,13 @@ impl ReplicatedTabletGroupProxy {
         };
 
         self.control
-            .send(control)
-            .map_err(|_| Self::control_unavailable())?;
+            .try_send(control)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => HostedGroupError::Retryable(
+                    "replicated tablet host-control queue is full".to_string(),
+                ),
+                mpsc::TrySendError::Disconnected(_) => Self::control_unavailable(),
+            })?;
         response.recv().map_err(|_| Self::control_unavailable())?
     }
 }
@@ -556,10 +1082,10 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         }
         self.submit_direct(RaftHostControl::Tick {
             ticks,
-            reply: mpsc::channel().0,
+            reply: mpsc::sync_channel(1).0,
         })?;
 
-        // The tablet worker sends its Ready messages through its
+        // The tablet reactor sends its Ready messages through its
         // group-scoped view of the one physical node transport.
         Ok(Vec::new())
     }
@@ -575,7 +1101,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         }
         self.submit_direct(RaftHostControl::Step {
             message,
-            reply: mpsc::channel().0,
+            reply: mpsc::sync_channel(1).0,
         })?;
 
         Ok(Vec::new())
@@ -594,7 +1120,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         let result = self.submit_direct(RaftHostControl::Propose {
             command,
             encoded_len,
-            reply: mpsc::channel().0,
+            reply: mpsc::sync_channel(1).0,
         })?;
         let RaftHostControlResult::Proposed(index) = result else {
             return Err(HostedGroupError::Group(
@@ -616,7 +1142,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         }
         let result = self.submit_direct(RaftHostControl::ProposeConfChange {
             change,
-            reply: mpsc::channel().0,
+            reply: mpsc::sync_channel(1).0,
         })?;
         let RaftHostControlResult::Proposed(index) = result else {
             return Err(HostedGroupError::Group(
@@ -645,7 +1171,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         let result = self.submit_direct(RaftHostControl::TransferLeadership {
             target,
             timeout_ticks,
-            reply: mpsc::channel().0,
+            reply: mpsc::sync_channel(1).0,
         })?;
         let RaftHostControlResult::Transferred(status) = result else {
             return Err(HostedGroupError::Group(
@@ -676,7 +1202,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
     }
 }
 
-/// Durable catalog-cache boundary owned by the Ready worker.
+/// Durable catalog-cache boundary owned by the Ready reactor.
 ///
 /// Catalog cache publication is part of applying a committed catalog entry,
 /// not a SQL-side follow-up. Any uncertain cache append therefore fences the
@@ -727,11 +1253,20 @@ impl SnapshotPolicy {
 
 /// Cloneable SQL-side handle for one production tablet host.
 pub struct ReplicatedTabletHandle {
-    requests: SyncSender<HostRequest>,
+    requests: ByteBoundedSender<HostRequest>,
+    wake: ReactorWake,
+    ownership: ReactorOwnership,
     status: Arc<RwLock<ReplicatedTabletStatus>>,
 }
 
 impl ReplicatedTabletHandle {
+    /// Return the immutable owner assignment for this replica lifetime.
+    /// Ownership is never changed in place; a future handoff must publish a
+    /// new generation only after the old owner has quiesced and drained.
+    pub fn reactor_ownership(&self) -> ReactorOwnership {
+        self.ownership
+    }
+
     /// Return whether this process currently owns the leader lease implied by
     /// the Raft soft state. The proposal path performs the same check again.
     pub fn is_leader(&self) -> bool {
@@ -763,7 +1298,7 @@ impl ReplicatedTabletHandle {
                 reason: "read barrier deadline elapsed before admission".to_string(),
             });
         }
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .try_send(HostRequest::Barrier { reply, deadline })
             .map_err(|error| Error::ProposalUnavailable {
@@ -798,7 +1333,7 @@ impl ReplicatedTabletHandle {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("tablet request deadline overflowed".into()))?;
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(HostRequest::Command {
                 request,
@@ -843,7 +1378,7 @@ impl ReplicatedTabletHandle {
                 reason: "tablet read deadline elapsed before execution".to_string(),
             });
         }
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .try_send(HostRequest::ReadPoint {
                 request,
@@ -894,7 +1429,7 @@ impl ReplicatedTabletHandle {
                 reason: "tablet scan deadline elapsed before execution".to_string(),
             });
         }
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .try_send(HostRequest::Scan {
                 request,
@@ -928,7 +1463,7 @@ impl ReplicatedTabletHandle {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("outcome query deadline overflowed".into()))?;
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(HostRequest::OutcomeQuery {
                 request,
@@ -950,7 +1485,7 @@ impl DurableCommitLog for ReplicatedTabletHandle {
     fn append_single_node_commit(&self, commit: &SingleNodeTxnCommit) -> Result<DurableWalExtent> {
         let timeout = Duration::from_secs(30);
         let deadline = Instant::now() + timeout;
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(HostRequest::Commit {
                 commit: commit.clone(),
@@ -972,7 +1507,7 @@ impl DurableCatalogLog for ReplicatedTabletHandle {
     fn append_catalog_update(&self, update: &CatalogLogRecord) -> Result<CatalogLogExtent> {
         let timeout = Duration::from_secs(30);
         let deadline = Instant::now() + timeout;
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(HostRequest::Catalog {
                 update: update.clone(),
@@ -994,9 +1529,9 @@ impl DurableCatalogLog for ReplicatedTabletHandle {
 pub struct ReplicatedTabletRuntime {
     handle: Arc<ReplicatedTabletHandle>,
     identity: RaftReplicaIdentity,
-    host_control: SyncSender<RaftHostControl>,
+    host_control: ByteBoundedSender<RaftHostControl>,
     shutdown: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
+    _reactors: Arc<FixedReactorSet>,
 }
 
 impl ReplicatedTabletRuntime {
@@ -1060,7 +1595,7 @@ impl ReplicatedTabletRuntime {
         requested_bootstrap(config)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_borrow, clippy::too_many_arguments)]
     pub(crate) fn start_hosted_from_shared_recovery(
         config: &NodeConfig,
         wal: LocalWal,
@@ -1073,6 +1608,7 @@ impl ReplicatedTabletRuntime {
         snapshot_endpoint: GroupSnapshotEndpoint,
         recovered: &RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
+        reactors: Arc<FixedReactorSet>,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
@@ -1097,12 +1633,13 @@ impl ReplicatedTabletRuntime {
             snapshot_endpoint,
             recovered,
             start_gate,
+            reactors,
             true,
             None,
         )
     }
 
-    /// Start a tablet worker whose identity comes from metadata rather than
+    /// Start a tablet reactor-owned group whose identity comes from metadata rather than
     /// the legacy Milestone 4 constants. The bootstrap and snapshot target
     /// are checked together so a Raft group cannot be paired with another
     /// tablet's state machine or snapshot files.
@@ -1120,6 +1657,7 @@ impl ReplicatedTabletRuntime {
         snapshot_endpoint: GroupSnapshotEndpoint,
         recovered: &RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
+        reactors: Arc<FixedReactorSet>,
         install_sql_mirror: bool,
         provided_durability_gate: Option<DurabilityGate>,
     ) -> Result<Self> {
@@ -1159,6 +1697,7 @@ impl ReplicatedTabletRuntime {
 
         let raft_identity = RaftReplicaIdentity::new(bootstrap.raft_group_id, local_replica_id)
             .map_err(|source| Error::Configuration(source.to_string()))?;
+        let assignment = reactors.assign()?;
 
         let runtime_identity = TabletRuntimeIdentity::with_sql_mirror(target, install_sql_mirror);
 
@@ -1173,9 +1712,16 @@ impl ReplicatedTabletRuntime {
                 reason: source.to_string(),
             })?;
 
-        let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-
-        let (host_control_tx, host_control_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (request_tx, request_rx) = ByteBoundedMailbox::pair(
+            CHANNEL_CAPACITY,
+            assignment.mailbox_budget.clone(),
+            assignment.wake.clone(),
+        );
+        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair(
+            CHANNEL_CAPACITY,
+            assignment.mailbox_budget.clone(),
+            assignment.wake.clone(),
+        );
 
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
 
@@ -1190,6 +1736,8 @@ impl ReplicatedTabletRuntime {
 
         let handle = Arc::new(ReplicatedTabletHandle {
             requests: request_tx,
+            wake: assignment.wake.clone(),
+            ownership: assignment.ownership,
             status: status.clone(),
         });
 
@@ -1209,8 +1757,7 @@ impl ReplicatedTabletRuntime {
         });
 
         let worker_shutdown = shutdown.clone();
-
-        let worker = if recovered.replica(raft_identity).is_some() {
+        let owner: Box<dyn ReactorGroup> = if recovered.replica(raft_identity).is_some() {
             let durable_bootstrap = durable_bootstrap.ok_or_else(|| Error::RecoveryFailed {
                 reason: format!(
                     "Raft WAL contains {:?} state but its durable bootstrap is missing",
@@ -1256,7 +1803,7 @@ impl ReplicatedTabletRuntime {
                 )?;
             }
 
-            spawn_ready_owner(
+            Box::new(ReadyOwner::new(
                 recovered_replica.ready_loop,
                 recovered_replica.tablet,
                 None,
@@ -1274,7 +1821,8 @@ impl ReplicatedTabletRuntime {
                 runtime_identity.clone(),
                 catalog_cache,
                 snapshot_policy,
-            )
+                assignment.ownership,
+            )?)
         } else {
             let bootstrapped = bootstrap_tablet_replica(
                 &mut bootstrap_store,
@@ -1297,7 +1845,7 @@ impl ReplicatedTabletRuntime {
                 )?;
             }
 
-            spawn_ready_owner(
+            Box::new(ReadyOwner::new(
                 bootstrapped.ready_loop,
                 bootstrapped.tablet,
                 bootstrapped.initial_ready,
@@ -1315,15 +1863,18 @@ impl ReplicatedTabletRuntime {
                 runtime_identity.clone(),
                 catalog_cache,
                 snapshot_policy,
-            )
+                assignment.ownership,
+            )?)
         };
+
+        reactors.register(&assignment, owner)?;
 
         Ok(Self {
             handle,
             identity: raft_identity,
             host_control: host_control_tx,
             shutdown,
-            worker: Some(worker),
+            _reactors: reactors,
         })
     }
 
@@ -1352,6 +1903,7 @@ impl ReplicatedTabletRuntime {
         snapshot_endpoint: GroupSnapshotEndpoint,
         recovered: &RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
+        reactors: Arc<FixedReactorSet>,
         provided_durability_gate: Option<DurabilityGate>,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
@@ -1367,6 +1919,7 @@ impl ReplicatedTabletRuntime {
         })?;
         let identity = RaftReplicaIdentity::new(target.raft_group_id, local_replica_id)
             .map_err(|source| Error::Configuration(source.to_string()))?;
+        let assignment = reactors.assign()?;
         if witness.contains(
             local_replica_id
                 .to_raft()
@@ -1380,8 +1933,16 @@ impl ReplicatedTabletRuntime {
             });
         }
 
-        let (request_tx, request_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (host_control_tx, host_control_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (request_tx, request_rx) = ByteBoundedMailbox::pair(
+            CHANNEL_CAPACITY,
+            assignment.mailbox_budget.clone(),
+            assignment.wake.clone(),
+        );
+        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair(
+            CHANNEL_CAPACITY,
+            assignment.mailbox_budget.clone(),
+            assignment.wake.clone(),
+        );
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let snapshot_policy = SnapshotPolicy {
@@ -1392,6 +1953,8 @@ impl ReplicatedTabletRuntime {
         };
         let handle = Arc::new(ReplicatedTabletHandle {
             requests: request_tx,
+            wake: assignment.wake.clone(),
+            ownership: assignment.ownership,
             status: status.clone(),
         });
         let durability_gate = match provided_durability_gate {
@@ -1407,77 +1970,81 @@ impl ReplicatedTabletRuntime {
         });
         let worker_shutdown = shutdown.clone();
         let runtime_identity = TabletRuntimeIdentity::with_sql_mirror(target, false);
-        let worker = if let Some(recovered_replica) = recovered.replica(identity) {
-            let recovered = recover_joining_tablet_replica(
-                local_replica_id,
-                group_wal,
-                wal.durable_lsn(),
-                recovered_replica,
-                &snapshot_store,
-                &runtime_identity.target,
-                ELECTION_TIMEOUT_TICKS,
-                HEARTBEAT_INTERVAL_TICKS,
-            )
-            .map_err(|source| Error::RecoveryFailed {
-                reason: source.to_string(),
-            })?;
-            spawn_ready_owner(
-                recovered.ready_loop,
-                recovered.tablet,
-                None,
-                transport,
-                host_control_rx,
-                request_rx,
-                database,
-                status,
-                worker_shutdown,
-                start_gate,
-                snapshot_store,
-                snapshot_work,
-                snapshot_endpoint,
-                cluster_id,
-                runtime_identity,
-                catalog_cache,
-                snapshot_policy,
-            )
-        } else {
-            let bootstrapped = bootstrap_joining_tablet_replica(
-                local_replica_id,
-                witness,
-                group_wal,
-                &runtime_identity.target,
-                ELECTION_TIMEOUT_TICKS,
-                HEARTBEAT_INTERVAL_TICKS,
-            )
-            .map_err(|source| Error::RecoveryFailed {
-                reason: source.to_string(),
-            })?;
-            spawn_ready_owner(
-                bootstrapped.ready_loop,
-                bootstrapped.tablet,
-                bootstrapped.initial_ready,
-                transport,
-                host_control_rx,
-                request_rx,
-                database,
-                status,
-                worker_shutdown,
-                start_gate,
-                snapshot_store,
-                snapshot_work,
-                snapshot_endpoint,
-                cluster_id,
-                runtime_identity,
-                catalog_cache,
-                snapshot_policy,
-            )
-        };
+        let owner: Box<dyn ReactorGroup> =
+            if let Some(recovered_replica) = recovered.replica(identity) {
+                let recovered = recover_joining_tablet_replica(
+                    local_replica_id,
+                    group_wal,
+                    wal.durable_lsn(),
+                    recovered_replica,
+                    &snapshot_store,
+                    &runtime_identity.target,
+                    ELECTION_TIMEOUT_TICKS,
+                    HEARTBEAT_INTERVAL_TICKS,
+                )
+                .map_err(|source| Error::RecoveryFailed {
+                    reason: source.to_string(),
+                })?;
+                Box::new(ReadyOwner::new(
+                    recovered.ready_loop,
+                    recovered.tablet,
+                    None,
+                    transport,
+                    host_control_rx,
+                    request_rx,
+                    database,
+                    status,
+                    worker_shutdown,
+                    start_gate,
+                    snapshot_store,
+                    snapshot_work,
+                    snapshot_endpoint,
+                    cluster_id,
+                    runtime_identity,
+                    catalog_cache,
+                    snapshot_policy,
+                    assignment.ownership,
+                )?)
+            } else {
+                let bootstrapped = bootstrap_joining_tablet_replica(
+                    local_replica_id,
+                    witness,
+                    group_wal,
+                    &runtime_identity.target,
+                    ELECTION_TIMEOUT_TICKS,
+                    HEARTBEAT_INTERVAL_TICKS,
+                )
+                .map_err(|source| Error::RecoveryFailed {
+                    reason: source.to_string(),
+                })?;
+                Box::new(ReadyOwner::new(
+                    bootstrapped.ready_loop,
+                    bootstrapped.tablet,
+                    bootstrapped.initial_ready,
+                    transport,
+                    host_control_rx,
+                    request_rx,
+                    database,
+                    status,
+                    worker_shutdown,
+                    start_gate,
+                    snapshot_store,
+                    snapshot_work,
+                    snapshot_endpoint,
+                    cluster_id,
+                    runtime_identity,
+                    catalog_cache,
+                    snapshot_policy,
+                    assignment.ownership,
+                )?)
+            };
+        reactors.register(&assignment, owner)?;
         Ok(Self {
             handle,
             identity,
             host_control: host_control_tx,
             shutdown,
-            worker: Some(worker),
+            _reactors: reactors,
         })
     }
 }
@@ -1557,139 +2124,243 @@ fn install_recovered_catalog(
 impl Drop for ReplicatedTabletRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.handle.wake.wake();
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_ready_owner<W, LS, SS>(
-    ready_loop: RaftReadyLoop<W, LS, SS>,
-    tablet: TabletCommandApplier,
-    initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
-    transport: GroupRaftTransport,
-    host_control: Receiver<RaftHostControl>,
-    requests: Receiver<HostRequest>,
-    database: SharedLocalDatabase,
-    status: Arc<RwLock<ReplicatedTabletStatus>>,
-    shutdown: Arc<AtomicBool>,
-    start_gate: Arc<AtomicBool>,
-    snapshot_store: Arc<FileTabletSnapshotStore>,
-    snapshot_work: SnapshotWorkController,
-    snapshot_endpoint: GroupSnapshotEndpoint,
-    cluster_id: String,
-    identity: TabletRuntimeIdentity,
-    catalog_cache: Arc<dyn CatalogCacheWriter>,
-    snapshot_policy: SnapshotPolicy,
-) -> thread::JoinHandle<()>
-where
-    W: RaftWal + Send + 'static,
-    LS: LogStore<Vec<u8>> + Send + 'static,
-    SS: StableStore + Send + 'static,
-{
-    thread::Builder::new()
-        .name(format!("ragnordb-tablet-{}", identity.target.tablet_id.0))
-        .spawn(move || {
-            let failure_status = status.clone();
-            if let Err(source) = run_ready_owner(
-                ready_loop,
-                tablet,
-                initial_ready,
-                transport,
-                host_control,
-                requests,
-                database,
-                status,
-                shutdown,
-                start_gate,
-                snapshot_store,
-                snapshot_work,
-                snapshot_endpoint,
-                cluster_id,
-                identity,
-                catalog_cache,
-                snapshot_policy,
-            ) {
-                error!(error = %source, "replicated tablet runtime stopped");
-                failure_status
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .runtime_error = Some(source);
-            }
-        })
-        .expect("replicated tablet worker thread creation must succeed")
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_ready_owner<W, LS, SS>(
-    mut ready_loop: RaftReadyLoop<W, LS, SS>,
-    mut tablet: TabletCommandApplier,
-    initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
-    transport: GroupRaftTransport,
-    host_control: Receiver<RaftHostControl>,
-    requests: Receiver<HostRequest>,
-    database: SharedLocalDatabase,
-    status: Arc<RwLock<ReplicatedTabletStatus>>,
-    shutdown: Arc<AtomicBool>,
-    start_gate: Arc<AtomicBool>,
-    snapshot_store: Arc<FileTabletSnapshotStore>,
-    snapshot_work: SnapshotWorkController,
-    snapshot_endpoint: GroupSnapshotEndpoint,
-    cluster_id: String,
-    identity: TabletRuntimeIdentity,
-    catalog_cache: Arc<dyn CatalogCacheWriter>,
-    snapshot_policy: SnapshotPolicy,
-) -> std::result::Result<(), String>
+struct ReadyOwner<W, LS, SS>
 where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
     SS: StableStore,
 {
-    let mut registry = ProposalRegistry::new();
-    let mut clients = Vec::<PendingClient>::new();
-    let mut internal_barrier_allocator = InternalBarrierAllocator::default();
-    let mut was_leader = false;
-    let mut leader_activation = None::<ragnordb_multiraft::proposal::ProposalPosition>;
-    let mut pending_read_barriers = Vec::<PendingReadBarrier>::new();
-    let mut pending_read_states = Vec::<ReadState>::new();
-    let mut next_read_index_context = 0_u64;
-    let mut latest_snapshot = ready_loop
-        .persistence()
-        .snapshot()
-        .map(|pointer| snapshot_store.load_verified_by_name(&pointer.file_name))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let mut last_snapshot_index = latest_snapshot
-        .as_ref()
-        .map(|image| image.metadata.last_included_index)
-        .unwrap_or(0);
-    let mut last_snapshot_at = Instant::now();
-    let mut expected_snapshot_install: Option<SnapshotMetadata> = None;
-    let mut pending_snapshot_install: Option<PendingIncomingSnapshotInstall> = None;
-    let mut pending_local_snapshot: Option<PendingLocalSnapshotPublication> = None;
+    ready_loop: RaftReadyLoop<W, LS, SS>,
+    tablet: TabletCommandApplier,
+    initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
+    transport: GroupRaftTransport,
+    host_control: ByteBoundedReceiver<RaftHostControl>,
+    requests: ByteBoundedReceiver<HostRequest>,
+    database: SharedLocalDatabase,
+    status: Arc<RwLock<ReplicatedTabletStatus>>,
+    shutdown: Arc<AtomicBool>,
+    start_gate: Arc<AtomicBool>,
+    snapshot_store: Arc<FileTabletSnapshotStore>,
+    snapshot_work: SnapshotWorkController,
+    snapshot_endpoint: GroupSnapshotEndpoint,
+    cluster_id: String,
+    identity: TabletRuntimeIdentity,
+    catalog_cache: Arc<dyn CatalogCacheWriter>,
+    snapshot_policy: SnapshotPolicy,
+    ownership: ReactorOwnership,
+    registry: ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    clients: Vec<PendingClient>,
+    internal_barrier_allocator: InternalBarrierAllocator,
+    was_leader: bool,
+    leader_activation: Option<ragnordb_multiraft::proposal::ProposalPosition>,
+    pending_read_barriers: Vec<PendingReadBarrier>,
+    pending_read_states: Vec<ReadState>,
+    next_read_index_context: u64,
+    latest_snapshot: Option<TabletSnapshotImage>,
+    last_snapshot_index: u64,
+    last_snapshot_at: Instant,
+    expected_snapshot_install: Option<SnapshotMetadata>,
+    pending_snapshot_install: Option<PendingIncomingSnapshotInstall>,
+    pending_local_snapshot: Option<PendingLocalSnapshotPublication>,
+}
 
-    // Group construction may persist its bootstrap Ready before the physical
-    // host has completed recovery registration and sealed retention. Messages
-    // must remain private until MultiRaftHost::activate succeeds.
-    while !start_gate.load(Ordering::Acquire) {
+impl<W, LS, SS> ReadyOwner<W, LS, SS>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ready_loop: RaftReadyLoop<W, LS, SS>,
+        tablet: TabletCommandApplier,
+        initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
+        transport: GroupRaftTransport,
+        host_control: ByteBoundedReceiver<RaftHostControl>,
+        requests: ByteBoundedReceiver<HostRequest>,
+        database: SharedLocalDatabase,
+        status: Arc<RwLock<ReplicatedTabletStatus>>,
+        shutdown: Arc<AtomicBool>,
+        start_gate: Arc<AtomicBool>,
+        snapshot_store: Arc<FileTabletSnapshotStore>,
+        snapshot_work: SnapshotWorkController,
+        snapshot_endpoint: GroupSnapshotEndpoint,
+        cluster_id: String,
+        identity: TabletRuntimeIdentity,
+        catalog_cache: Arc<dyn CatalogCacheWriter>,
+        snapshot_policy: SnapshotPolicy,
+        ownership: ReactorOwnership,
+    ) -> Result<Self> {
+        let latest_snapshot = ready_loop
+            .persistence()
+            .snapshot()
+            .map(|pointer| snapshot_store.load_verified_by_name(&pointer.file_name))
+            .transpose()
+            .map_err(|error| Error::RecoveryFailed {
+                reason: error.to_string(),
+            })?;
+        let last_snapshot_index = latest_snapshot
+            .as_ref()
+            .map(|image| image.metadata.last_included_index)
+            .unwrap_or(0);
+
+        Ok(Self {
+            ready_loop,
+            tablet,
+            initial_ready,
+            transport,
+            host_control,
+            requests,
+            database,
+            status,
+            shutdown,
+            start_gate,
+            snapshot_store,
+            snapshot_work,
+            snapshot_endpoint,
+            cluster_id,
+            identity,
+            catalog_cache,
+            snapshot_policy,
+            ownership,
+            registry: ProposalRegistry::new(),
+            clients: Vec::new(),
+            internal_barrier_allocator: InternalBarrierAllocator::default(),
+            was_leader: false,
+            leader_activation: None,
+            pending_read_barriers: Vec::new(),
+            pending_read_states: Vec::new(),
+            next_read_index_context: 0,
+            latest_snapshot,
+            last_snapshot_index,
+            last_snapshot_at: Instant::now(),
+            expected_snapshot_install: None,
+            pending_snapshot_install: None,
+            pending_local_snapshot: None,
+        })
+    }
+
+    fn fail_with(&mut self, reason: String) {
+        self.shutdown.store(true, Ordering::Release);
+        self.status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .runtime_error = Some(reason);
+    }
+
+    fn turn(&mut self) -> std::result::Result<(), String> {
+        if !self.start_gate.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        if let Some(ready) = self.initial_ready.take() {
+            send_messages(
+                &self.transport,
+                &self.snapshot_endpoint,
+                &self.latest_snapshot,
+                ready.messages,
+            );
+        }
+
+        self.run_turn()
+    }
+}
+
+impl<W, LS, SS> ReactorGroup for ReadyOwner<W, LS, SS>
+where
+    W: RaftWal + Send + 'static,
+    LS: LogStore<Vec<u8>> + Send + 'static,
+    SS: StableStore + Send + 'static,
+{
+    fn identity(&self) -> RaftReplicaIdentity {
+        self.ready_loop.persistence().log_view().identity()
+    }
+
+    fn ownership(&self) -> ReactorOwnership {
+        self.ownership
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    fn turn(&mut self) -> std::result::Result<(), String> {
+        ReadyOwner::turn(self)
+    }
+
+    fn fail(&mut self, reason: String) {
+        self.fail_with(reason);
+    }
+}
+
+impl<W, LS, SS> ReadyOwner<W, LS, SS>
+where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    #[allow(clippy::needless_borrow, clippy::too_many_arguments)]
+    fn run_turn(&mut self) -> std::result::Result<(), String> {
+        let Self {
+            ready_loop,
+            tablet,
+            transport,
+            host_control,
+            requests,
+            database,
+            status,
+            shutdown,
+            start_gate: _,
+            snapshot_store,
+            snapshot_work,
+            snapshot_endpoint,
+            cluster_id,
+            identity,
+            catalog_cache,
+            snapshot_policy,
+            ownership,
+            registry,
+            clients,
+            internal_barrier_allocator,
+            was_leader,
+            leader_activation,
+            pending_read_barriers,
+            pending_read_states,
+            next_read_index_context,
+            latest_snapshot,
+            last_snapshot_index,
+            last_snapshot_at,
+            expected_snapshot_install,
+            pending_snapshot_install,
+            pending_local_snapshot,
+            initial_ready: _,
+        } = self;
+
+        // The destructuring above yields mutable references to the owner's fields.
+        // Rebinding the references as mutable locals permits repeated reborrows while
+        // preserving the single-reactor ownership boundary for the complete turn.
+        let mut ready_loop = ready_loop;
+        let mut tablet = tablet;
+        let mut registry = registry;
+        let mut clients = clients;
+        let mut internal_barrier_allocator = internal_barrier_allocator;
+        let mut leader_activation = leader_activation;
+        let mut pending_read_barriers = pending_read_barriers;
+        let mut pending_read_states = pending_read_states;
+        let mut next_read_index_context = next_read_index_context;
+        let mut latest_snapshot = latest_snapshot;
+        let mut last_snapshot_index = last_snapshot_index;
+        let mut last_snapshot_at = last_snapshot_at;
+        let mut pending_local_snapshot = pending_local_snapshot;
+
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    if let Some(ready) = initial_ready {
-        send_messages(
-            &transport,
-            &snapshot_endpoint,
-            &latest_snapshot,
-            ready.messages,
-        );
-    }
-
-    while !shutdown.load(Ordering::Acquire) {
         if pending_local_snapshot.is_some() {
             // This snapshot candidate owns a fixed state-machine frontier. Host
             // operations must not mutate the group until its boundary is resolved,
@@ -1742,8 +2413,7 @@ where
                         "retained local snapshot boundary remains retryable",
                     );
 
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
+                    return Ok(());
                 }
 
                 Err(error) => return Err(error.to_string()),
@@ -1789,8 +2459,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             if had_pending_ready {
                                 return Ok(());
@@ -1809,8 +2479,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             Ok(())
                         })(
@@ -1839,8 +2509,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             if had_pending_ready {
                                 return Err(HostedGroupError::Retryable(
@@ -1862,8 +2532,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             Ok(())
                         })(
@@ -1896,8 +2566,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             if had_pending_ready {
                                 return Err(HostedGroupError::Retryable(
@@ -1921,8 +2591,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             Ok(index)
                         })(
@@ -1951,8 +2621,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             if had_pending_ready {
                                 return Err(HostedGroupError::Retryable(
@@ -1980,8 +2650,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             Ok(index)
                         })(
@@ -2017,8 +2687,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             if had_pending_ready {
                                 return Err(HostedGroupError::Retryable(
@@ -2046,8 +2716,8 @@ where
                                 &identity,
                                 &mut pending_read_states,
                             )? {
-                                expected_snapshot_install = Some(metadata);
-                                pending_snapshot_install = None;
+                                *expected_snapshot_install = Some(metadata);
+                                *pending_snapshot_install = None;
                             }
                             Ok(status)
                         })();
@@ -2101,7 +2771,7 @@ where
             }
             if let Some(received) = inbound_valid {
                 let expected = expected_snapshot_install.clone().expect("validated");
-                pending_snapshot_install =
+                *pending_snapshot_install =
                     Some(PendingIncomingSnapshotInstall::Received { expected, received });
             }
         }
@@ -2114,10 +2784,9 @@ where
                 Ok(p) => p,
                 Err(SnapshotWorkError::LimitReached { .. }) => {
                     tracing::debug!("snapshot install backpressure: LimitReached, will retry");
-                    pending_snapshot_install =
+                    *pending_snapshot_install =
                         Some(PendingIncomingSnapshotInstall::Received { expected, received });
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
+                    return Ok(());
                 }
                 Err(error) => return Err(error.to_string()),
             };
@@ -2135,7 +2804,7 @@ where
                 install_permit,
             ) {
                 Ok(prepared) => {
-                    pending_snapshot_install =
+                    *pending_snapshot_install =
                         Some(PendingIncomingSnapshotInstall::BoundaryPending {
                             expected,
                             prepared,
@@ -2223,7 +2892,7 @@ where
                                         );
                                     }
                                 };
-                            pending_snapshot_install =
+                            *pending_snapshot_install =
                                 Some(PendingIncomingSnapshotInstall::ReadyPending {
                                     expected,
                                     prepared,
@@ -2239,13 +2908,12 @@ where
                                 }
                                 HostedGroupError::Retryable(reason) => {
                                     tracing::debug!(error = %reason, "complete_snapshot_install retryable");
-                                    pending_snapshot_install =
+                                    *pending_snapshot_install =
                                         Some(PendingIncomingSnapshotInstall::BoundaryPending {
                                             expected,
                                             prepared,
                                         });
-                                    thread::sleep(Duration::from_millis(2));
-                                    continue;
+                                    return Ok(());
                                 }
                                 HostedGroupError::Group(reason) => return Err(reason),
                                 HostedGroupError::Rejected(reason) => {
@@ -2262,13 +2930,12 @@ where
                         HostedGroupError::RecoveryRequired => return Err(classified.to_string()),
                         HostedGroupError::Retryable(reason) => {
                             tracing::debug!(error = %reason, "snapshot boundary persist retryable");
-                            pending_snapshot_install =
+                            *pending_snapshot_install =
                                 Some(PendingIncomingSnapshotInstall::BoundaryPending {
                                     expected,
                                     prepared,
                                 });
-                            thread::sleep(Duration::from_millis(2));
-                            continue;
+                            return Ok(());
                         }
                         HostedGroupError::Group(reason) => return Err(reason),
                         HostedGroupError::Rejected(reason) => {
@@ -2290,7 +2957,7 @@ where
                 Ok(Some(ready)) => {
                     let installed = prepared.into_installed();
                     // Finalize: install tablet, apply suffix, advance frontier, publish
-                    tablet = TabletCommandApplier::new(installed.state_machine);
+                    *tablet = TabletCommandApplier::new(installed.state_machine);
                     if identity.sql_mirror_enabled {
                         database
                             .blocking_lock()
@@ -2336,7 +3003,7 @@ where
                     ready_loop
                         .advance_applied_frontier(frontier)
                         .map_err(|e| e.to_string())?;
-                    latest_snapshot = Some(image.clone());
+                    *latest_snapshot = Some(image.clone());
                     snapshot_policy.reset();
                     send_messages(
                         &transport,
@@ -2348,12 +3015,12 @@ where
                     snapshot_store
                         .prune_older_snapshots(&installed.pointer)
                         .map_err(|e| e.to_string())?;
-                    expected_snapshot_install = None;
+                    *expected_snapshot_install = None;
                     internal_barrier_allocator.clear();
-                    last_snapshot_index = latest_snapshot
+                    *last_snapshot_index = latest_snapshot
                         .as_ref()
                         .map(|img| img.metadata.last_included_index)
-                        .unwrap_or(last_snapshot_index);
+                        .unwrap_or(*last_snapshot_index);
                 }
                 Ok(None) => {
                     return Err(
@@ -2366,15 +3033,14 @@ where
                         HostedGroupError::RecoveryRequired => return Err(classified.to_string()),
                         HostedGroupError::Retryable(reason) => {
                             tracing::debug!(error = %reason, "post-snapshot Ready persist retryable");
-                            pending_snapshot_install =
+                            *pending_snapshot_install =
                                 Some(PendingIncomingSnapshotInstall::ReadyPending {
                                     expected,
                                     prepared,
                                     image,
                                     raft_pointer,
                                 });
-                            thread::sleep(Duration::from_millis(2));
-                            continue;
+                            return Ok(());
                         }
                         other => return Err(other.to_string()),
                     }
@@ -2387,8 +3053,7 @@ where
             .as_ref()
             .is_some_and(|p| matches!(p, PendingIncomingSnapshotInstall::ReadyPending { .. }))
         {
-            thread::sleep(Duration::from_millis(2));
-            continue;
+            return Ok(());
         }
 
         match refresh_leader_activation(
@@ -2438,10 +3103,9 @@ where
             &mut pending_read_states,
         ) {
             Ok(Some(metadata)) => {
-                expected_snapshot_install = Some(metadata);
-                pending_snapshot_install = None;
-                thread::sleep(Duration::from_millis(2));
-                continue;
+                *expected_snapshot_install = Some(metadata);
+                *pending_snapshot_install = None;
+                return Ok(());
             }
             Ok(None) => {}
             Err(HostedGroupError::Retryable(error)) | Err(HostedGroupError::Rejected(error)) => {
@@ -2449,8 +3113,7 @@ where
                     error = %error,
                     "pending Ready remains blocked before client admission"
                 );
-                thread::sleep(Duration::from_millis(2));
-                continue;
+                return Ok(());
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -2579,9 +3242,9 @@ where
         let now = Instant::now();
         registry.expire_deadlines(now);
         let is_leader = ready_loop.raft().leader_id() == Some(ready_loop.raft().id());
-        if was_leader && !is_leader {
+        if *was_leader && !is_leader {
             registry.mark_leadership_lost(ready_loop.raft().hard_state().current_term);
-            leader_activation = None;
+            *leader_activation = None;
             internal_barrier_allocator.clear();
             reject_pending_read_barriers(
                 &mut pending_read_barriers,
@@ -2589,7 +3252,7 @@ where
                 ready_loop.raft().leader_id().map(|id| id.get()),
             );
         }
-        was_leader = is_leader;
+        *was_leader = is_leader;
         forward_completions(&mut clients);
         let serving_leader = is_leader
             && leader_activation.is_some_and(|activation| {
@@ -2642,12 +3305,11 @@ where
                 })
                 .unwrap_or((0, 0)),
             pending_snapshot_install.is_some() || pending_local_snapshot.is_some(),
+            *ownership,
             &status,
         );
-        thread::sleep(Duration::from_millis(2));
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Allocates no-op identities for read barriers owned by this local Raft host.
@@ -2731,7 +3393,7 @@ fn admit_outcome_query(
     tablet: &TabletCommandApplier,
     serving_leader: bool,
     leader_id: Option<u64>,
-    reply: mpsc::Sender<Result<Option<CachedTabletCommandOutcome>>>,
+    reply: mpsc::SyncSender<Result<Option<CachedTabletCommandOutcome>>>,
     _deadline: Instant,
 ) {
     if !serving_leader {
@@ -2956,7 +3618,7 @@ fn read_index_context(group_id: RaftGroupId, term: u64, sequence: u64) -> Vec<u8
 
 #[allow(clippy::too_many_arguments)]
 fn admit_read_barrier<W, LS, SS>(
-    reply: mpsc::Sender<Result<()>>,
+    reply: mpsc::SyncSender<Result<()>>,
     deadline: Instant,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     tablet: &TabletCommandApplier,
@@ -3233,7 +3895,7 @@ fn admit_read_request(
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
-    reply: mpsc::Sender<Result<Option<Vec<u8>>>>,
+    reply: mpsc::SyncSender<Result<Option<Vec<u8>>>>,
     deadline: Instant,
 ) {
     if deadline <= Instant::now() {
@@ -3310,7 +3972,7 @@ fn admit_scan_request(
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
-    reply: mpsc::Sender<Result<TabletScanBatch>>,
+    reply: mpsc::SyncSender<Result<TabletScanBatch>>,
     deadline: Instant,
 ) {
     if deadline <= Instant::now() {
@@ -4235,6 +4897,7 @@ fn publish_status<W, LS, SS>(
     serving_leader: bool,
     snapshot: (u64, u64),
     snapshot_install_pending: bool,
+    ownership: ReactorOwnership,
     status: &RwLock<ReplicatedTabletStatus>,
 ) where
     W: RaftWal,
@@ -4302,6 +4965,8 @@ fn publish_status<W, LS, SS>(
         .last_removed_replica()
         .map(|(replica_id, index, term, version)| (replica_id.get(), index, term, version));
     published.snapshot_install_pending = snapshot_install_pending;
+    published.reactor_id = ownership.reactor_id;
+    published.owner_generation = ownership.generation;
     let local_replica = ready_loop.raft().id();
     published.replica_in_conf_state = ready_loop
         .raft()
@@ -4319,6 +4984,150 @@ mod tests {
     };
     use ragnordb_multiraft::{proposal::ProposalPosition, tablet_apply::AppliedTabletCommand};
     use ragnordb_tablet::command::TabletCommandApplyResult;
+    use std::collections::HashMap;
+    use std::sync::Condvar;
+
+    type OwnershipObservations = Arc<(
+        Mutex<HashMap<RaftReplicaIdentity, (thread::ThreadId, bool)>>,
+        Condvar,
+    )>;
+
+    struct OwnershipProbe {
+        identity: RaftReplicaIdentity,
+        ownership: ReactorOwnership,
+        observations: OwnershipObservations,
+    }
+
+    impl ReactorGroup for OwnershipProbe {
+        fn identity(&self) -> RaftReplicaIdentity {
+            self.identity
+        }
+
+        fn ownership(&self) -> ReactorOwnership {
+            self.ownership
+        }
+
+        fn is_shutdown(&self) -> bool {
+            false
+        }
+
+        fn turn(&mut self) -> std::result::Result<(), String> {
+            let (owners, wake) = &*self.observations;
+            let mut owners = owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current_thread = thread::current().id();
+            if let Some((owner_thread, changed)) = owners.get_mut(&self.identity) {
+                if *owner_thread != current_thread {
+                    *changed = true;
+                }
+            } else {
+                owners.insert(self.identity, (current_thread, false));
+            }
+            wake.notify_all();
+            Ok(())
+        }
+
+        fn fail(&mut self, _reason: String) {}
+    }
+
+    #[test]
+    /// Realistic bug caught: a fixed reactor implementation could accidentally
+    /// spawn one execution thread per group or let one group execute on two
+    /// owners concurrently after registration.
+    fn fixed_reactors_keep_each_group_on_one_of_the_fixed_threads() {
+        let reactors = FixedReactorSet::new(2).expect("the fixed reactor set must start");
+        let group_count: usize = 10_000;
+        let observations = Arc::new((
+            Mutex::new(HashMap::<RaftReplicaIdentity, (thread::ThreadId, bool)>::new()),
+            Condvar::new(),
+        ));
+        let mut generations = BTreeSet::new();
+
+        for group_number in 0..group_count {
+            let identity =
+                RaftReplicaIdentity::new(RaftGroupId(100 + group_number as u64), ReplicaId(1))
+                    .expect("the probe identity must be valid");
+            let assignment = reactors.assign().expect("assignment must succeed");
+            assert!(assignment.ownership.reactor_id < 2);
+            assert!(generations.insert(assignment.ownership.generation));
+            reactors
+                .register(
+                    &assignment,
+                    Box::new(OwnershipProbe {
+                        identity,
+                        ownership: assignment.ownership,
+                        observations: observations.clone(),
+                    }),
+                )
+                .expect("registration must be acknowledged by the owner reactor");
+        }
+
+        let duplicate_assignment = reactors.assign().expect("assignment must succeed");
+        let duplicate_identity = RaftReplicaIdentity::new(RaftGroupId(100), ReplicaId(1))
+            .expect("the duplicate probe identity must be valid");
+        assert!(
+            reactors
+                .register(
+                    &duplicate_assignment,
+                    Box::new(OwnershipProbe {
+                        identity: duplicate_identity,
+                        ownership: duplicate_assignment.ownership,
+                        observations: observations.clone(),
+                    }),
+                )
+                .is_err(),
+            "one replica identity must not be registered on two reactors"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (owners, wake) = &*observations;
+        let mut owners = owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while owners.len() < group_count && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = wake
+                .wait_timeout(owners, remaining)
+                .expect("probe observation lock must not be poisoned");
+            owners = next;
+        }
+
+        assert_eq!(owners.len(), group_count);
+        assert_eq!(generations.len(), group_count);
+        assert!(owners.values().all(|(_, changed)| !changed));
+        let distinct_threads = owners
+            .values()
+            .map(|(thread_id, _)| thread_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            distinct_threads.len() <= 2,
+            "{} groups used {} execution threads",
+            group_count,
+            distinct_threads.len()
+        );
+        drop(owners);
+        drop(reactors);
+    }
+
+    #[test]
+    /// Realistic bug caught: byte reservations that are not released on pop
+    /// permanently reject later work even though the bounded queue is empty.
+    fn mailbox_byte_accounting_is_released_on_pop() {
+        let wake = ReactorWake::new();
+        let (sender, receiver) =
+            ByteBoundedMailbox::pair(2, Arc::new(MailboxBudget::new(1_024)), wake);
+        let (reply, _response) = mpsc::sync_channel(1);
+        let item = HostRequest::Barrier {
+            reply,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let item_bytes = item.mailbox_bytes().max(MAILBOX_ITEM_OVERHEAD);
+        assert!(sender.try_send(item).is_ok());
+        assert_eq!(sender.budget.used(), item_bytes);
+        let _ = receiver.try_recv().expect("the queued item must be popped");
+        assert_eq!(sender.budget.used(), 0);
+    }
 
     fn snapshot_state_blocks_normal_work(
         incoming_phase: Option<IncomingSnapshotPhase>,
@@ -4356,7 +5165,7 @@ mod tests {
             read_timestamp: Timestamp(10),
             deadline_remaining_ms: None,
         };
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
 
         admit_read_request(
             request,
@@ -4382,8 +5191,10 @@ mod tests {
     /// a latest-read caller wait in `SyncSender::send` after its deadline had
     /// already elapsed.
     fn latest_read_admission_does_not_block_on_a_full_request_queue() {
-        let (request_tx, request_rx) = mpsc::sync_channel(1);
-        let (queued_reply, _queued_response) = mpsc::channel();
+        let wake = ReactorWake::new();
+        let (request_tx, request_rx) =
+            ByteBoundedMailbox::pair(1, Arc::new(MailboxBudget::new(1_024)), wake.clone());
+        let (queued_reply, _queued_response) = mpsc::sync_channel(1);
         request_tx
             .send(HostRequest::Barrier {
                 reply: queued_reply,
@@ -4393,6 +5204,11 @@ mod tests {
 
         let handle = Arc::new(ReplicatedTabletHandle {
             requests: request_tx,
+            wake,
+            ownership: ReactorOwnership {
+                reactor_id: 0,
+                generation: 1,
+            },
             status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
         });
         let deadline = Instant::now() + Duration::from_millis(60);
@@ -4430,8 +5246,10 @@ mod tests {
     /// Realistic bug caught: an already-expired latest read must not enqueue
     /// work behind a saturated request queue or wait for the Ready owner.
     fn expired_latest_read_admission_is_rejected_before_queue_access() {
-        let (request_tx, request_rx) = mpsc::sync_channel(1);
-        let (queued_reply, _queued_response) = mpsc::channel();
+        let wake = ReactorWake::new();
+        let (request_tx, request_rx) =
+            ByteBoundedMailbox::pair(1, Arc::new(MailboxBudget::new(1_024)), wake.clone());
+        let (queued_reply, _queued_response) = mpsc::sync_channel(1);
         request_tx
             .send(HostRequest::Barrier {
                 reply: queued_reply,
@@ -4440,6 +5258,11 @@ mod tests {
             .expect("the saturation fixture must fill the request queue");
         let handle = ReplicatedTabletHandle {
             requests: request_tx,
+            wake,
+            ownership: ReactorOwnership {
+                reactor_id: 0,
+                generation: 1,
+            },
             status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
         };
         let deadline = Instant::now();
@@ -4513,8 +5336,10 @@ mod tests {
             IncomingSnapshotPhase::ReadyPending
         )));
 
-        let (control_tx, control_rx) = mpsc::sync_channel(1);
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let wake = ReactorWake::new();
+        let (control_tx, control_rx) =
+            ByteBoundedMailbox::pair(1, Arc::new(MailboxBudget::new(1_024)), wake);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         control_tx
             .send(RaftHostControl::Tick {
                 ticks: 1,
@@ -4886,13 +5711,15 @@ mod tests {
 
     #[test]
     fn snapshot_retry_returns_retryable_to_host_control() {
-        let (control_tx, control_rx) = mpsc::sync_channel(3);
+        let wake = ReactorWake::new();
+        let (control_tx, control_rx) =
+            ByteBoundedMailbox::pair(3, Arc::new(MailboxBudget::new(1_024)), wake);
 
-        let (tick_reply_tx, tick_reply_rx) = mpsc::channel();
+        let (tick_reply_tx, tick_reply_rx) = mpsc::sync_channel(1);
 
-        let (step_reply_tx, step_reply_rx) = mpsc::channel();
+        let (step_reply_tx, step_reply_rx) = mpsc::sync_channel(1);
 
-        let (propose_reply_tx, propose_reply_rx) = mpsc::channel();
+        let (propose_reply_tx, propose_reply_rx) = mpsc::sync_channel(1);
 
         control_tx
             .send(RaftHostControl::Tick {
@@ -4951,7 +5778,7 @@ mod tests {
     /// Catches unbounded reply-channel retention when a leader cannot obtain a
     /// ReadIndex quorum and many latest reads coalesce behind one context.
     fn coalesced_latest_read_waiters_have_a_hard_admission_bound() {
-        let (reply, _receiver) = mpsc::channel();
+        let (reply, _receiver) = mpsc::sync_channel(1);
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut pending = vec![PendingReadBarrier {
             context: b"coalesced".to_vec(),
