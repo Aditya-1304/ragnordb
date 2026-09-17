@@ -56,7 +56,7 @@ use ragnordb_multiraft::{
         bootstrap_joining_tablet_replica, bootstrap_tablet_replica, recover_joining_tablet_replica,
         recover_tablet_replica,
     },
-    runtime::{AppliedRaftFrontier, RaftReadyLoop, ReadyLoopError},
+    runtime::{AppliedRaftFrontier, RaftReadyLoop, ReadyLoopError, classify_ready_messages},
     snapshot::{
         PreparedIncomingTabletSnapshotInstall, SnapshotWorkController, SnapshotWorkError,
         SnapshotWorkKind, TabletSnapshotIntegrationError, TabletSnapshotTransfer,
@@ -162,6 +162,10 @@ pub struct ReplicatedTabletStatus {
     pub snapshot_term: u64,
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
+    pub apply_backlog_entries: usize,
+    pub apply_backlog_bytes: usize,
+    pub apply_backlog_age_ms: u64,
+    pub apply_backlog_generations: usize,
     pub serving_leader: bool,
     pub runtime_error: Option<String>,
     /// Whether the local replica is present in the latest durable ConfState.
@@ -1230,6 +1234,10 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
             snapshot_index: status.snapshot_index,
             uncommitted_bytes: status.uncommitted_bytes,
             replication_inflight_bytes: status.replication_inflight_bytes,
+            apply_backlog_entries: status.apply_backlog_entries,
+            apply_backlog_bytes: status.apply_backlog_bytes,
+            apply_backlog_age_ms: status.apply_backlog_age_ms,
+            apply_backlog_generations: status.apply_backlog_generations,
             pending_work: self.has_pending_work(),
             pending_messages: 0,
             pending_message_bytes: 0,
@@ -3312,6 +3320,13 @@ where
                             )
                             .map_err(|e| e.to_string())?;
                     }
+                    let classified_messages = classify_ready_messages(ready.messages);
+                    send_messages(
+                        &transport,
+                        &snapshot_endpoint,
+                        &latest_snapshot,
+                        classified_messages.persistence_safe,
+                    );
                     let mut frontier = AppliedRaftFrontier::new(
                         image.metadata.last_included_index,
                         image.metadata.last_included_term,
@@ -3354,7 +3369,7 @@ where
                         &transport,
                         &snapshot_endpoint,
                         &latest_snapshot,
-                        ready.messages,
+                        classified_messages.apply_dependent,
                     );
                     release_replica_retention(&mut ready_loop).map_err(|e| e.to_string())?;
                     snapshot_store
@@ -5197,6 +5212,13 @@ where
         .persist_ready_after_snapshot_boundary(&raft_pointer)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "completed snapshot install produced no Ready generation".to_string())?;
+    let classified_messages = classify_ready_messages(ready.messages);
+    send_messages(
+        transport,
+        snapshot_endpoint,
+        latest_snapshot,
+        classified_messages.persistence_safe,
+    );
 
     *tablet = TabletCommandApplier::new(durable.installed.state_machine);
     if identity.sql_mirror_enabled {
@@ -5249,7 +5271,7 @@ where
         transport,
         snapshot_endpoint,
         latest_snapshot,
-        ready.messages,
+        classified_messages.apply_dependent,
     );
     release_replica_retention(ready_loop)?;
     store
@@ -5469,6 +5491,14 @@ where
         return Ok(None);
     };
 
+    let classified_messages = classify_ready_messages(ready.messages);
+    send_messages(
+        transport,
+        snapshot_endpoint,
+        latest_snapshot,
+        classified_messages.persistence_safe,
+    );
+
     let mut frontier = None;
     for entry in &ready.committed_entries {
         frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
@@ -5513,7 +5543,7 @@ where
         transport,
         snapshot_endpoint,
         latest_snapshot,
-        ready.messages,
+        classified_messages.apply_dependent,
     );
     Ok(snapshot_install)
 }
@@ -5825,6 +5855,11 @@ fn publish_status<W, LS, SS>(
         .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
         .map(|progress| progress.inflight_bytes)
         .sum();
+    let apply_backlog = ready_loop.apply_backlog_status();
+    published.apply_backlog_entries = apply_backlog.entries;
+    published.apply_backlog_bytes = apply_backlog.bytes;
+    published.apply_backlog_age_ms = apply_backlog.age_ms;
+    published.apply_backlog_generations = apply_backlog.generations;
     let conf_state = ready_loop.raft().conf_state();
     published.conf_state_version = Some(conf_state.version);
     published.joining = ready_loop.raft().is_joining();

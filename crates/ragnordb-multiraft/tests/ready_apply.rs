@@ -2,7 +2,10 @@ use std::{fs, path::PathBuf, process};
 
 use raft::{
     core::node::RaftNode,
-    message::{Envelope, InstallSnapshotRequest, Message, ReadIndexResponse},
+    message::{
+        AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest, Message,
+        ReadIndexResponse,
+    },
     storage::mem::MemStorage,
     types::{ConfChange, ConfChangeKind, ConfState, Snapshot},
 };
@@ -75,6 +78,7 @@ impl RaftWal for TestWal {
 struct RecordingStateMachine {
     restored: Vec<u64>,
     applied: Vec<(u64, Vec<u8>)>,
+    fail_restore: bool,
     fail_apply: bool,
 }
 
@@ -82,6 +86,10 @@ impl RaftReadyStateMachine for RecordingStateMachine {
     type Error = &'static str;
 
     fn restore_snapshot(&mut self, snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+        if self.fail_restore {
+            return Err("snapshot restore failed");
+        }
+
         self.restored.push(snapshot.last_included_index);
         Ok(())
     }
@@ -150,6 +158,12 @@ fn identity() -> RaftReplicaIdentity {
 
 fn new_loop() -> TestLoop {
     let node: TestNode = RaftNode::new(1, Vec::new(), MemStorage::new(), MemStorage::new(), 5, 2);
+
+    RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()))
+}
+
+fn new_follower_loop() -> TestLoop {
+    let node: TestNode = RaftNode::new(1, vec![2], MemStorage::new(), MemStorage::new(), 5, 2);
 
     RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()))
 }
@@ -362,6 +376,9 @@ fn host_read_index_admission_delivers_the_group_tagged_read_state() {
         b"host-correlated-read".to_vec(),
     )
     .unwrap();
+
+    let first = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    assert!(first.read_states.is_empty());
 
     let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
 
@@ -608,6 +625,92 @@ fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
     assert_eq!(resumed.ready_generations, 1);
 }
 
+/// Catches a follower delaying a durable replication acknowledgement behind
+/// tablet/MVCC apply. The acknowledgement is safe after the exact A-WAL
+/// boundary, while the applied frontier must remain unchanged until the
+/// ordered state-machine turn runs.
+#[test]
+fn durable_append_ack_is_released_before_apply_budget_is_available() {
+    let mut loop_ = new_follower_loop();
+    loop_.persist_next_ready(None).unwrap();
+    loop_
+        .step(Envelope {
+            from: raft::types::ReplicaId::must(2),
+            to: raft::types::ReplicaId::must(1),
+            msg: Message::AppendEntries(AppendEntriesRequest {
+                term: 1,
+                leader_id: raft::types::ReplicaId::must(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![raft::entry::LogEntry::normal(1, 1, b"replicated".to_vec())],
+                leader_commit: 1,
+            }),
+        })
+        .unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(group_identity.raft_group_id)
+        .unwrap();
+
+    let persisted_only = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 0,
+                max_apply_bytes: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(persisted_only.apply_entries, 0);
+    assert_eq!(persisted_only.outbound.len(), 1);
+    assert!(matches!(
+        persisted_only.outbound[0].envelope.msg,
+        Message::AppendEntriesResponse(AppendEntriesResponse {
+            success: true,
+            match_index: Some(1),
+            ..
+        })
+    ));
+    assert_eq!(host.status().groups[0].applied_index, 0);
+    assert!(host.status().groups[0].pending_work);
+    assert_eq!(host.status().groups[0].apply_backlog_entries, 1);
+    assert!(host.status().groups[0].apply_backlog_bytes >= b"replicated".len());
+
+    let applied = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 1,
+                max_apply_bytes: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(applied.apply_entries, 1);
+    assert!(applied.outbound.is_empty());
+    assert_eq!(host.status().groups[0].applied_index, 1);
+    assert_eq!(host.status().groups[0].apply_backlog_entries, 0);
+    assert_eq!(host.status().groups[0].apply_backlog_bytes, 0);
+}
+
 /// Catches an application failure after WAL persistence from being treated as
 /// a retryable success.
 #[test]
@@ -672,6 +775,64 @@ fn snapshot_is_verified_restored_and_applied_before_ready_release() {
     assert_eq!(state_machine.restored, vec![5]);
     assert_eq!(loop_.raft().last_applied(), 5);
     assert_eq!(ready.snapshot.unwrap().last_included_index, 5);
+    assert!(
+        ready
+            .messages
+            .iter()
+            .any(|message| matches!(&message.msg, Message::InstallSnapshotResponse(_)))
+    );
+}
+
+/// Catches an InstallSnapshot success response crossing the shared-WAL
+/// boundary before the verified image has been restored into the state
+/// machine. A restore failure must therefore produce no outbound response.
+#[test]
+fn snapshot_install_response_waits_for_verified_restore() {
+    let snapshot = snapshot();
+    let mut node: TestNode = RaftNode::new(1, vec![2], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    node.step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+            3,
+            raft::types::ReplicaId::must(2),
+            snapshot.metadata(),
+        )),
+    });
+
+    let mut loop_ = RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()));
+    let mut store = MemorySnapshotStore::default();
+    let mut initial_state_machine = RecordingStateMachine::default();
+    loop_
+        .persist_and_apply_next_ready(&mut store, &mut initial_state_machine)
+        .unwrap();
+    loop_.complete_snapshot_install(snapshot).unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine {
+            fail_restore: true,
+            ..RecordingStateMachine::default()
+        },
+        store,
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(group_identity.raft_group_id)
+        .unwrap();
+
+    let first = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    assert!(first.outbound.is_empty());
+    assert!(host.status().groups[0].quarantine_reason.is_none());
+
+    let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+
+    assert!(result.outbound.is_empty());
+    assert!(host.status().groups[0].quarantine_reason.is_some());
 }
 
 /// Catches accepting a snapshot file after its contents changed since

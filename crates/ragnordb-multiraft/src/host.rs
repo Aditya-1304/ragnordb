@@ -197,6 +197,13 @@ pub struct MultiRaftGroupStatus {
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
     pub pending_work: bool,
+    /// Incrementally tracked state-machine work waiting behind the contiguous
+    /// applied frontier. These counters are diagnostic and also expose when
+    /// admission is being throttled by the apply boundary.
+    pub apply_backlog_entries: usize,
+    pub apply_backlog_bytes: usize,
+    pub apply_backlog_age_ms: u64,
+    pub apply_backlog_generations: usize,
     pub pending_messages: usize,
     pub pending_message_bytes: usize,
     pub quarantine_reason: Option<String>,
@@ -648,6 +655,10 @@ pub trait HostedRaftGroup: Send {
             uncommitted_bytes: 0,
             replication_inflight_bytes: 0,
             pending_work: self.has_pending_work(),
+            apply_backlog_entries: 0,
+            apply_backlog_bytes: 0,
+            apply_backlog_age_ms: 0,
+            apply_backlog_generations: 0,
             pending_messages: 0,
             pending_message_bytes: 0,
             quarantine_reason: None,
@@ -895,9 +906,10 @@ where
 
         Ok(HostedGroupTurn {
             outbound: progress
-                .ready
-                .map(|ready| ready.messages)
-                .unwrap_or_default(),
+                .persistence_safe_messages
+                .into_iter()
+                .chain(progress.apply_dependent_messages)
+                .collect(),
             read_states: progress.read_states,
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
@@ -925,9 +937,10 @@ where
 
         Ok(HostedGroupTurn {
             outbound: progress
-                .ready
-                .map(|ready| ready.messages)
-                .unwrap_or_default(),
+                .persistence_safe_messages
+                .into_iter()
+                .chain(progress.apply_dependent_messages)
+                .collect(),
             read_states: progress.read_states,
             ready_generations: progress.ready_generations,
             apply_entries: progress.apply_entries,
@@ -976,6 +989,34 @@ where
         }
 
         if self.ready_loop.has_pending_apply() {
+            if self.ready_loop.apply_backlog_full() {
+                return self.drain_ready_budgeted(budget);
+            }
+
+            let progress = match self
+                .ready_loop
+                .prepare_next_ready_for_batch(&mut self.snapshot_store, budget)
+            {
+                Ok(progress) => progress,
+                Err(ReadyApplyError::ApplyBacklogFull { .. }) => {
+                    return self.drain_ready_budgeted(budget);
+                }
+                Err(error) => return Err(classify_apply_error(error)),
+            };
+
+            if progress.request.is_some() {
+                return Ok(HostedGroupTurn {
+                    outbound: Vec::new(),
+                    read_states: Vec::new(),
+                    ready_generations: progress.ready_generations,
+                    apply_entries: 0,
+                    snapshot_bytes: progress.snapshot_bytes,
+                    persistence: progress.request.map(|request| HostedPersistenceBatch {
+                        records: request.records,
+                    }),
+                });
+            }
+
             return self.drain_ready_budgeted(budget);
         }
 
@@ -1019,6 +1060,7 @@ where
             .filter_map(|replica_id| raft.progress(replica_id))
             .map(|progress| progress.inflight_bytes)
             .sum();
+        let apply_backlog = self.ready_loop.apply_backlog_status();
 
         MultiRaftGroupStatus {
             identity,
@@ -1032,6 +1074,10 @@ where
             uncommitted_bytes: raft.uncommitted_bytes(),
             replication_inflight_bytes,
             pending_work: self.has_pending_work(),
+            apply_backlog_entries: apply_backlog.entries,
+            apply_backlog_bytes: apply_backlog.bytes,
+            apply_backlog_age_ms: apply_backlog.age_ms,
+            apply_backlog_generations: apply_backlog.generations,
             pending_messages: 0,
             pending_message_bytes: 0,
             quarantine_reason: None,
@@ -1355,9 +1401,10 @@ where
 
         Ok(HostedGroupTurn {
             outbound: progress
-                .ready
-                .map(|ready| ready.messages)
-                .unwrap_or_default(),
+                .persistence_safe_messages
+                .into_iter()
+                .chain(progress.apply_dependent_messages)
+                .collect(),
             read_states: progress.read_states,
             ready_generations: 0,
             apply_entries: progress.apply_entries,
@@ -1409,6 +1456,8 @@ pub fn classify_ready_error(error: ReadyLoopError) -> HostedGroupError {
 fn classify_apply_error(error: ReadyApplyError) -> HostedGroupError {
     match error {
         ReadyApplyError::Ready(error) => classify_ready_error(error),
+
+        ReadyApplyError::ApplyBacklogFull { .. } => HostedGroupError::Retryable(error.to_string()),
 
         // Snapshot verification/restoration, application, or committed-entry
         // ordering errors occur after a durable consensus boundary and isolate
@@ -4201,6 +4250,10 @@ mod tests {
                 uncommitted_bytes: 0,
                 replication_inflight_bytes: 0,
                 pending_work: false,
+                apply_backlog_entries: 0,
+                apply_backlog_bytes: 0,
+                apply_backlog_age_ms: 0,
+                apply_backlog_generations: 0,
                 pending_messages: index + 1,
                 pending_message_bytes: (index + 1) * 10,
                 quarantine_reason: None,

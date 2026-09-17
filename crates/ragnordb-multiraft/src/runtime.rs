@@ -22,12 +22,14 @@
 //! restart and reconstruct the group from the recovered durable prefix
 
 use std::{
+    collections::VecDeque,
     fmt::Display,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::PathBuf,
     process,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use raft::{
@@ -57,6 +59,51 @@ type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
 type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
 type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
 
+/// Conservative per-group limits for work waiting at the state-machine
+/// boundary. A single oversized Ready is admitted so recovery cannot deadlock
+/// on an already-created batch; subsequent Ready generations are held back
+/// until the older prefix drains below these limits.
+pub const MAX_APPLY_BACKLOG_ENTRIES: usize = 4_096;
+pub const MAX_APPLY_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_APPLY_BACKLOG_AGE_MS: u64 = 30_000;
+
+/// O(1) status for the ordered apply queue owned by one Raft group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyBacklogStatus {
+    pub entries: usize,
+    pub bytes: usize,
+    pub age_ms: u64,
+    pub generations: usize,
+}
+
+/// Outbound Ready messages split by the durability boundary they depend on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReadyOutboundMessages {
+    /// Messages whose only prerequisite is the exact durable Raft Ready.
+    pub persistence_safe: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    /// Messages which must remain behind snapshot restore or ordered apply.
+    pub apply_dependent: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+}
+
+/// Classifies Raft output without re-encoding it. Raft protocol messages carry
+/// no tablet result payload, so only snapshot-install responses advertise a
+/// restore boundary that must already be durable and applied. Treating all
+/// snapshot responses conservatively avoids acknowledging an unverified image.
+pub fn classify_ready_messages(messages: Vec<Envelope<Vec<u8>, Vec<u8>>>) -> ReadyOutboundMessages {
+    let mut classified = ReadyOutboundMessages::default();
+    for message in messages {
+        if matches!(
+            message.msg,
+            raft::message::Message::InstallSnapshotResponse(_)
+        ) {
+            classified.apply_dependent.push(message);
+        } else {
+            classified.persistence_safe.push(message);
+        }
+    }
+    classified
+}
+
 /// Progress returned by one bounded Ready/application turn.
 ///
 /// A Ready is returned only after all of its committed entries have been
@@ -74,6 +121,8 @@ pub(crate) struct ReadyApplyProgress {
     pub(crate) ready_generations: usize,
     pub(crate) apply_entries: usize,
     pub(crate) snapshot_bytes: usize,
+    pub(crate) persistence_safe_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    pub(crate) apply_dependent_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
 }
 
 /// Encoded records staged by one group before the node-wide shared-WAL append.
@@ -94,8 +143,12 @@ pub(crate) struct ReadyPersistenceProgress {
 struct PendingReadyApplication {
     ready: ReadyGeneration,
     next_entry: usize,
-    applied_through: LogIndex,
+    applied_through: Option<LogIndex>,
     applied_frontier: Option<AppliedRaftFrontier>,
+    verified_snapshot: Option<Snapshot<Vec<u8>>>,
+    snapshot_bytes: usize,
+    apply_dependent_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    started_at: Instant,
 }
 
 struct PendingReadyPersistence {
@@ -244,6 +297,11 @@ pub enum ReadyApplyError {
         expected: Box<SnapshotMetadata>,
         received: Box<SnapshotMetadata>,
     },
+
+    #[error(
+        "apply backlog is full: {entries} entries and {bytes} bytes are waiting for ordered apply"
+    )]
+    ApplyBacklogFull { entries: usize, bytes: usize },
 
     #[error("state-machine snapshot restore failed: {0}")]
     SnapshotRestore(String),
@@ -439,8 +497,11 @@ where
     persistence: RaftWalStorage<W>,
     state: RuntimeState,
     applied_frontier: Option<AppliedRaftFrontier>,
-    pending_apply: Option<PendingReadyApplication>,
+    pending_apply: VecDeque<PendingReadyApplication>,
     pending_persistence: Option<PendingReadyPersistence>,
+    apply_backlog_entries: usize,
+    apply_backlog_bytes: usize,
+    apply_backlog_started_at: Option<Instant>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -459,8 +520,11 @@ where
             persistence,
             state: RuntimeState::Active,
             applied_frontier: None,
-            pending_apply: None,
+            pending_apply: VecDeque::new(),
             pending_persistence: None,
+            apply_backlog_entries: 0,
+            apply_backlog_bytes: 0,
+            apply_backlog_started_at: None,
         }
     }
 
@@ -481,10 +545,35 @@ where
         self.applied_frontier
     }
 
+    /// Returns bounded aggregate apply pressure without walking every pending
+    /// entry. The age is measured from the oldest Ready generation currently
+    /// waiting for the contiguous apply frontier.
+    pub fn apply_backlog_status(&self) -> ApplyBacklogStatus {
+        ApplyBacklogStatus {
+            entries: self.apply_backlog_entries,
+            bytes: self.apply_backlog_bytes,
+            age_ms: self
+                .apply_backlog_started_at
+                .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            generations: self.pending_apply.len(),
+        }
+    }
+
+    pub(crate) fn apply_backlog_full(&self) -> bool {
+        let status = self.apply_backlog_status();
+        !self.pending_apply.is_empty()
+            && (status.entries >= MAX_APPLY_BACKLOG_ENTRIES
+                || status.bytes >= MAX_APPLY_BACKLOG_BYTES
+                || status.age_ms >= MAX_APPLY_BACKLOG_AGE_MS)
+    }
+
     /// Returns whether this group has a Ready generation or an applied Ready
     /// that must be resumed before another Raft mutation is admitted.
     pub fn has_pending_work(&self) -> bool {
-        self.pending_persistence.is_some() || self.pending_apply.is_some() || self.raft.has_ready()
+        self.pending_persistence.is_some()
+            || !self.pending_apply.is_empty()
+            || self.raft.has_ready()
     }
 
     pub(crate) fn has_pending_persistence(&self) -> bool {
@@ -492,7 +581,7 @@ where
     }
 
     pub(crate) fn has_pending_apply(&self) -> bool {
-        self.pending_apply.is_some()
+        !self.pending_apply.is_empty()
     }
 
     /// Release storage retention through the group lifecycle owner.
@@ -611,7 +700,7 @@ where
     ) -> ReadyLoopResult {
         self.ensure_active()?;
 
-        if self.pending_persistence.is_some() || self.pending_apply.is_some() {
+        if self.pending_persistence.is_some() {
             return Err(ReadyLoopError::PendingReady);
         }
 
@@ -703,10 +792,6 @@ where
     {
         self.ensure_active().map_err(ReadyApplyError::Ready)?;
 
-        if self.pending_apply.is_some() {
-            return Ok(ReadyPersistenceProgress::default());
-        }
-
         if let Some(pending) = &self.pending_persistence {
             return Ok(ReadyPersistenceProgress {
                 request: Some(ReadyPersistenceRequest {
@@ -725,11 +810,14 @@ where
             return Ok(ReadyPersistenceProgress::default());
         };
 
-        if budget.max_apply_entries == 0 && !ready.committed_entries.is_empty() {
-            return Ok(ReadyPersistenceProgress {
-                ready_generations: 1,
-                ..ReadyPersistenceProgress::default()
-            });
+        let ready_entries = ready.committed_entries.len();
+        let ready_bytes = ready_apply_bytes(&ready);
+        let entries = self.apply_backlog_entries.saturating_add(ready_entries);
+        let bytes = self.apply_backlog_bytes.saturating_add(ready_bytes);
+        if !self.pending_apply.is_empty()
+            && (entries > MAX_APPLY_BACKLOG_ENTRIES || bytes > MAX_APPLY_BACKLOG_BYTES)
+        {
+            return Err(ReadyApplyError::ApplyBacklogFull { entries, bytes });
         }
 
         let verified_snapshot = if let Some(snapshot) = ready.snapshot.as_ref() {
@@ -807,8 +895,8 @@ where
     pub(crate) fn complete_prepared_ready<SM>(
         &mut self,
         outcome: Result<BatchAppendResult, BatchAppendFailure>,
-        state_machine: &mut SM,
-        budget: crate::host::MultiRaftTurnBudget,
+        _state_machine: &mut SM,
+        _budget: crate::host::MultiRaftTurnBudget,
     ) -> Result<ReadyApplyProgress, ReadyApplyError>
     where
         SM: RaftReadyStateMachine,
@@ -880,49 +968,26 @@ where
                 ReadyApplyError::Ready(ReadyLoopError::Advance(error))
             })?;
 
-        let mut applied_through = self.raft.last_applied();
-        let mut applied_frontier = self.applied_frontier;
+        let classified = classify_ready_messages(pending.ready.messages.clone());
+        self.enqueue_apply_bundle(PendingReadyApplication {
+            ready: pending.ready,
+            next_entry: 0,
+            applied_through: None,
+            applied_frontier: self.applied_frontier,
+            verified_snapshot: pending.verified_snapshot,
+            snapshot_bytes: pending.snapshot_bytes,
+            apply_dependent_messages: classified.apply_dependent,
+            started_at: Instant::now(),
+        });
 
-        if let Some(snapshot) = pending.verified_snapshot {
-            if let Err(error) = state_machine.restore_snapshot(&snapshot) {
-                self.quarantine();
-                return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
-            }
-
-            self.raft.restore_snapshot(snapshot.clone());
-            applied_through = pending
-                .ready
-                .snapshot
-                .as_ref()
-                .expect("prepared snapshot must retain the Ready snapshot")
-                .last_included_index;
-            applied_frontier = Some(AppliedRaftFrontier::new(
-                pending
-                    .ready
-                    .snapshot
-                    .as_ref()
-                    .expect("prepared snapshot must retain the Ready snapshot")
-                    .last_included_index,
-                pending
-                    .ready
-                    .snapshot
-                    .as_ref()
-                    .expect("prepared snapshot must retain the Ready snapshot")
-                    .last_included_term,
-            ));
-        }
-
-        self.apply_ready_prefix(
-            PendingReadyApplication {
-                ready: pending.ready,
-                next_entry: 0,
-                applied_through,
-                applied_frontier,
-            },
-            state_machine,
-            budget,
-            pending.snapshot_bytes,
-        )
+        // Do not drain the state-machine queue in the persistence completion
+        // callback. The caller can publish these messages immediately after
+        // the exact A-WAL result while the ordered apply queue is scheduled as
+        // independent bounded work.
+        Ok(ReadyApplyProgress {
+            persistence_safe_messages: classified.persistence_safe,
+            ..ReadyApplyProgress::default()
+        })
     }
 
     /// completes an externally transferred snapshot after its image has been
@@ -1197,20 +1262,12 @@ where
             return Ok(ReadyApplyProgress::default());
         }
 
-        let pending_apply = if let Some(pending_apply) = self.pending_apply.take() {
+        let pending_apply = if let Some(pending_apply) = self.pending_apply.pop_front() {
             pending_apply
         } else {
             let Some(pending) = self.raft.ready() else {
                 return Ok(ReadyApplyProgress::default());
             };
-
-            if budget.max_apply_entries == 0 && !pending.committed_entries.is_empty() {
-                self.pending_apply = None;
-                return Ok(ReadyApplyProgress {
-                    ready_generations: 1,
-                    ..ReadyApplyProgress::default()
-                });
-            }
 
             if let Some(snapshot) = pending.snapshot.as_ref()
                 && snapshot.size_bytes > budget.max_snapshot_bytes as u64
@@ -1257,7 +1314,6 @@ where
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.size_bytes as usize)
                 .unwrap_or(0);
-
             let pointer = verified_snapshot
                 .as_ref()
                 .map(|(pointer, _)| pointer.clone());
@@ -1266,48 +1322,28 @@ where
                 .persist_next_ready(pointer)
                 .map_err(ReadyApplyError::Ready)?
                 .expect("the pending Ready was observed immediately before persistence");
-
-            let mut applied_through = self.raft.last_applied();
-            let mut applied_frontier = self.applied_frontier;
-
-            if let Some((_, snapshot)) = verified_snapshot {
-                if let Err(error) = state_machine.restore_snapshot(&snapshot) {
-                    self.quarantine();
-                    return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
-                }
-
-                self.raft.restore_snapshot(snapshot);
-
-                applied_through = ready
-                    .snapshot
-                    .as_ref()
-                    .expect("snapshot persistence must retain the Ready snapshot")
-                    .last_included_index;
-
-                let snapshot = ready
-                    .snapshot
-                    .as_ref()
-                    .expect("snapshot persistence must retain the Ready snapshot");
-                applied_frontier = Some(AppliedRaftFrontier::new(
-                    snapshot.last_included_index,
-                    snapshot.last_included_term,
-                ));
-            }
-
-            return self.apply_ready_prefix(
-                PendingReadyApplication {
-                    ready,
-                    next_entry: 0,
-                    applied_through,
-                    applied_frontier,
-                },
-                state_machine,
-                budget,
+            let classified = classify_ready_messages(ready.messages.clone());
+            self.enqueue_apply_bundle(PendingReadyApplication {
+                ready,
+                next_entry: 0,
+                applied_through: None,
+                applied_frontier: self.applied_frontier,
+                verified_snapshot: verified_snapshot.map(|(_, snapshot)| snapshot),
                 snapshot_bytes,
-            );
+                apply_dependent_messages: classified.apply_dependent,
+                started_at: Instant::now(),
+            });
+
+            let pending_apply = self
+                .pending_apply
+                .pop_front()
+                .expect("a persisted Ready must create one apply bundle");
+            let mut progress = self.apply_ready_prefix(pending_apply, state_machine, budget)?;
+            progress.persistence_safe_messages = classified.persistence_safe;
+            return Ok(progress);
         };
 
-        self.apply_ready_prefix(pending_apply, state_machine, budget, 0)
+        self.apply_ready_prefix(pending_apply, state_machine, budget)
     }
 
     /// Compatibility entry point for callers that intentionally drain one
@@ -1337,16 +1373,48 @@ where
         Ok(progress.ready)
     }
 
+    fn enqueue_apply_bundle(&mut self, pending: PendingReadyApplication) {
+        let entries = pending.ready.committed_entries.len();
+        let bytes = ready_apply_bytes(&pending.ready);
+        if self.apply_backlog_started_at.is_none() {
+            self.apply_backlog_started_at = Some(pending.started_at);
+        }
+        self.apply_backlog_entries = self.apply_backlog_entries.saturating_add(entries);
+        self.apply_backlog_bytes = self.apply_backlog_bytes.saturating_add(bytes);
+        self.pending_apply.push_back(pending);
+    }
+
     fn apply_ready_prefix<SM>(
         &mut self,
         mut pending: PendingReadyApplication,
         state_machine: &mut SM,
         budget: crate::host::MultiRaftTurnBudget,
-        snapshot_bytes: usize,
     ) -> Result<ReadyApplyProgress, ReadyApplyError>
     where
         SM: RaftReadyStateMachine,
     {
+        let snapshot_bytes = pending.snapshot_bytes;
+        pending.snapshot_bytes = 0;
+        if pending.applied_through.is_none() {
+            if let Some(snapshot) = pending.verified_snapshot.take() {
+                if let Err(error) = state_machine.restore_snapshot(&snapshot) {
+                    self.quarantine();
+                    return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
+                }
+                self.raft.restore_snapshot(snapshot.clone());
+                pending.applied_through = Some(snapshot.last_included_index);
+                pending.applied_frontier = Some(AppliedRaftFrontier::new(
+                    snapshot.last_included_index,
+                    snapshot.last_included_term,
+                ));
+                self.apply_backlog_bytes = self
+                    .apply_backlog_bytes
+                    .saturating_sub(snapshot.size_bytes as usize);
+            } else {
+                pending.applied_through = Some(self.raft.last_applied());
+            }
+        }
+
         let mut applied_entries = 0;
         let mut applied_bytes = 0_usize;
         while pending.next_entry < pending.ready.committed_entries.len()
@@ -1364,12 +1432,15 @@ where
             {
                 break;
             }
-            let expected_index = pending.applied_through.saturating_add(1);
+            let previous = pending
+                .applied_through
+                .expect("apply base is initialized before entry validation");
+            let expected_index = previous.saturating_add(1);
 
             if entry.index != expected_index {
                 self.quarantine();
                 return Err(ReadyApplyError::ApplyOrder {
-                    previous: pending.applied_through,
+                    previous,
                     received: entry.index,
                 });
             }
@@ -1384,15 +1455,17 @@ where
                 });
             }
 
-            pending.applied_through = entry.index;
+            pending.applied_through = Some(entry.index);
             pending.applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
             pending.next_entry += 1;
             applied_entries += 1;
             applied_bytes = applied_bytes.saturating_add(entry_bytes);
+            self.apply_backlog_entries = self.apply_backlog_entries.saturating_sub(1);
+            self.apply_backlog_bytes = self.apply_backlog_bytes.saturating_sub(entry_bytes);
         }
 
         if pending.next_entry < pending.ready.committed_entries.len() {
-            self.pending_apply = Some(pending);
+            self.pending_apply.push_front(pending);
             return Ok(ReadyApplyProgress {
                 ready_generations: 1,
                 apply_entries: applied_entries,
@@ -1401,8 +1474,11 @@ where
             });
         }
 
-        if pending.applied_through > self.raft.last_applied()
-            && let Err(error) = self.raft.advance_applied(pending.applied_through)
+        let applied_through = pending
+            .applied_through
+            .expect("apply base is initialized before frontier advancement");
+        if applied_through > self.raft.last_applied()
+            && let Err(error) = self.raft.advance_applied(applied_through)
         {
             self.quarantine();
             return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
@@ -1410,12 +1486,18 @@ where
 
         self.applied_frontier = pending.applied_frontier;
         let read_states = pending.ready.read_states.clone();
+        let apply_dependent_messages = pending.apply_dependent_messages;
+        if self.pending_apply.is_empty() {
+            self.apply_backlog_started_at = None;
+        }
         Ok(ReadyApplyProgress {
             ready: Some(pending.ready),
             read_states,
             ready_generations: 1,
             apply_entries: applied_entries,
             snapshot_bytes,
+            apply_dependent_messages,
+            ..ReadyApplyProgress::default()
         })
     }
 
@@ -1428,7 +1510,7 @@ where
     }
 
     fn ensure_no_pending_ready(&self) -> Result<(), ReadyLoopError> {
-        if self.has_pending_work() {
+        if self.pending_persistence.is_some() {
             return Err(ReadyLoopError::PendingReady);
         }
 
@@ -1470,6 +1552,24 @@ fn validate_snapshot_pointer(
     }
 
     Ok(())
+}
+
+fn ready_apply_bytes(ready: &ReadyGeneration) -> usize {
+    ready
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.size_bytes as usize)
+        .unwrap_or(0)
+        .saturating_add(
+            ready
+                .committed_entries
+                .iter()
+                .map(|entry| match &entry.payload {
+                    EntryPayload::Normal(command) => command.len(),
+                    EntryPayload::Configuration(_) => 0,
+                })
+                .sum::<usize>(),
+        )
 }
 
 #[cfg(test)]
