@@ -640,6 +640,7 @@ fn durable_append_ack_is_released_before_apply_budget_is_available() {
             msg: Message::AppendEntries(AppendEntriesRequest {
                 term: 1,
                 leader_id: raft::types::ReplicaId::must(2),
+                generation: 0,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![raft::entry::LogEntry::normal(1, 1, b"replicated".to_vec())],

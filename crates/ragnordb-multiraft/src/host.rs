@@ -4122,6 +4122,7 @@ mod tests {
                 msg: Message::AppendEntries(raft::message::AppendEntriesRequest {
                     term: 1,
                     leader_id: RaftReplicaId::must(1),
+                    generation: 0,
                     prev_log_index: 0,
                     prev_log_term: 0,
                     entries: vec![raft::entry::LogEntry::normal(1, 1, vec![1])],

@@ -117,6 +117,7 @@ fn local_transport_prioritizes_control_messages_over_bulk_appends() {
             msg: Message::AppendEntries(AppendEntriesRequest {
                 term: 1,
                 leader_id: CoreReplicaId::must(101),
+                generation: 0,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![raft::entry::LogEntry::normal(1, 1, vec![0; 8])],
@@ -163,6 +164,7 @@ fn local_transport_prioritizes_read_index_control_over_bulk_appends() {
             msg: Message::AppendEntries(AppendEntriesRequest {
                 term: 1,
                 leader_id: CoreReplicaId::must(101),
+                generation: 0,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![raft::entry::LogEntry::normal(1, 1, vec![0; 8])],
@@ -222,6 +224,7 @@ fn local_transport_rejects_bulk_work_when_the_byte_budget_is_full() {
             msg: Message::AppendEntries(AppendEntriesRequest {
                 term: 1,
                 leader_id: CoreReplicaId::must(101),
+                generation: 0,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![raft::entry::LogEntry::normal(1, 1, vec![0; 8])],

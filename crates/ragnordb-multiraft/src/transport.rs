@@ -2157,6 +2157,7 @@ mod tests {
                         msg: Message::AppendEntries(AppendEntriesRequest {
                             term: 4,
                             leader_id: raft::types::NodeId::must(from),
+                            generation: 0,
                             prev_log_index: commit,
                             prev_log_term: 4,
                             entries: Vec::new(),
@@ -2220,6 +2221,7 @@ mod tests {
                         msg: Message::AppendEntries(AppendEntriesRequest {
                             term: 4,
                             leader_id: raft::types::NodeId::must(from),
+                            generation: 0,
                             prev_log_index: 3,
                             prev_log_term: 4,
                             entries: Vec::new(),
@@ -2263,6 +2265,7 @@ mod tests {
                     msg: Message::AppendEntries(AppendEntriesRequest {
                         term: 4,
                         leader_id: raft::types::NodeId::must(11),
+                        generation: 0,
                         prev_log_index: 3,
                         prev_log_term: 4,
                         entries: Vec::new(),

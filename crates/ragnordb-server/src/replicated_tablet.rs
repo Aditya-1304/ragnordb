@@ -6660,6 +6660,7 @@ mod tests {
             msg: Message::AppendEntries(raft::message::AppendEntriesRequest {
                 term: 1,
                 leader_id: raft::types::ReplicaId::must(2),
+                generation: 0,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: Vec::new(),
