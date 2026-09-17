@@ -406,7 +406,9 @@ fn metadata_table_creation_survives_process_restart() {
         .map(|listener| listener.local_addr().unwrap())
         .collect::<Vec<_>>();
     let addresses = reserved
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| (chunk[0], chunk[1], chunk[2], chunk[3]))
         .collect::<Vec<_>>();
     drop(reservations);
@@ -547,7 +549,9 @@ fn routed_tablet_leader_failover_retries_stable_v2_write_and_catches_up() {
         .map(|listener| listener.local_addr().unwrap())
         .collect::<Vec<_>>();
     let addresses = reserved
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| (chunk[0], chunk[1], chunk[2], chunk[3]))
         .collect::<Vec<_>>();
     drop(reservations);

@@ -26,7 +26,7 @@ use admin::AdminState;
 use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
 use data_directory_lock::DataDirectoryLock;
-use database::{LocalDatabase, SharedLocalDatabase};
+use database::{LocalDatabase, SharedDatabaseServices, SharedLocalDatabase};
 use multiraft_runtime::MultiRaftRuntime;
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{
@@ -163,6 +163,11 @@ impl Server {
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
         let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
+        let database_services = if replicated_runtime.is_some() {
+            Some(database.lock().await.database_services())
+        } else {
+            None
+        };
         let metadata_creator = replicated_runtime
             .as_ref()
             .map(MultiRaftRuntime::metadata_table_creator);
@@ -248,6 +253,7 @@ impl Server {
                                         connection_semaphore.clone();
 
                                     let connection_database = database.clone();
+                                    let connection_database_services = database_services.clone();
                                     let connection_replicated = replicated_handle.clone();
                                     let connection_metadata_creator = metadata_creator.clone();
 
@@ -258,6 +264,7 @@ impl Server {
                                             handle_connection_with_policy(
                                                 stream,
                                                 connection_database,
+                                                connection_database_services,
                                                 connection_replicated,
                                                 connection_metadata_creator,
                                                 connection_shutdown,
@@ -391,10 +398,11 @@ impl Server {
 /// Handle one framed SQL client connection.
 ///
 /// Each connection owns one server session and processes at most one statement
-/// at a time. All connections share the same local database runtime.
+/// at a time. Single-node compatibility connections use the serialized local
+/// runtime; distributed connections use the split `DatabaseServices` owner.
 ///
-/// The database mutex is released before the response is written so a slow
-/// client cannot block SQL execution for every other connection.
+/// The compatibility database mutex is released before the response is written
+/// so a slow client cannot block SQL execution for every other connection.
 pub async fn handle_connection(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
@@ -402,6 +410,7 @@ pub async fn handle_connection(
     handle_connection_with_policy(
         stream,
         database,
+        None,
         None,
         None,
         CancellationToken::new(),
@@ -493,6 +502,7 @@ impl QueryResultSink for ChannelQuerySink {
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_request(
     database: SharedLocalDatabase,
+    database_services: Option<SharedDatabaseServices>,
     session: &mut Session,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     shutdown: &CancellationToken,
@@ -503,22 +513,36 @@ async fn handle_streaming_request(
     max_bytes: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let admission_timeout = Duration::from_millis(statement_timeout_ms);
-    let database_guard = match tokio::time::timeout(admission_timeout, database.lock_owned()).await
-    {
-        Ok(guard) => guard,
-        Err(_) => {
-            write_streaming_result_frame(
-                writer,
-                &streaming_error_frame(
-                    &Error::StatementTimeout {
-                        timeout_ms: statement_timeout_ms,
-                    },
-                    0,
-                ),
-            )
-            .await?;
-            return Ok(());
+    let database_guard = if database_services.is_none() {
+        match tokio::time::timeout(admission_timeout, database.lock_owned()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                write_streaming_result_frame(
+                    writer,
+                    &streaming_error_frame(
+                        &Error::StatementTimeout {
+                            timeout_ms: statement_timeout_ms,
+                        },
+                        0,
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
         }
+    } else {
+        None
+    };
+    let statement_permit = if let Some(services) = database_services.as_ref() {
+        match services.acquire_statement(admission_timeout).await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                write_streaming_result_frame(writer, &streaming_error_frame(&error, 0)).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
     };
     if shutdown.is_cancelled() {
         return Ok(());
@@ -542,24 +566,47 @@ async fn handle_streaming_request(
     let producer_deadline = Instant::now()
         .checked_add(admission_timeout)
         .ok_or("streaming statement deadline overflowed")?;
-    let producer = tokio::task::spawn_blocking(move || {
-        let mut sink = ChannelQuerySink {
-            sender,
-            cancelled: producer_cancelled,
-            deadline: producer_deadline,
-            max_rows: max_rows as usize,
-            max_bytes: max_bytes as usize,
-        };
-        let mut database = database_guard;
-        let result = database.execute_sql_streaming(
-            &mut sql_session,
-            &statement,
-            &mut sink,
-            max_rows as usize,
-            max_bytes as usize,
-        );
-        (sql_session, result)
-    });
+    let producer = if let Some(services) = database_services {
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelQuerySink {
+                sender,
+                cancelled: producer_cancelled,
+                deadline: producer_deadline,
+                max_rows: max_rows as usize,
+                max_bytes: max_bytes as usize,
+            };
+            let _statement_permit = statement_permit;
+            let result = services.execute_sql_streaming(
+                &mut sql_session,
+                &statement,
+                &mut sink,
+                max_rows as usize,
+                max_bytes as usize,
+            );
+            (sql_session, result)
+        })
+    } else {
+        let database_guard =
+            database_guard.expect("compatibility path acquired its database guard");
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelQuerySink {
+                sender,
+                cancelled: producer_cancelled,
+                deadline: producer_deadline,
+                max_rows: max_rows as usize,
+                max_bytes: max_bytes as usize,
+            };
+            let mut database = database_guard;
+            let result = database.execute_sql_streaming(
+                &mut sql_session,
+                &statement,
+                &mut sink,
+                max_rows as usize,
+                max_bytes as usize,
+            );
+            (sql_session, result)
+        })
+    };
 
     let mut rows_emitted = 0_u64;
     let mut write_failed = false;
@@ -639,9 +686,14 @@ fn streaming_error_frame(error: &Error, rows_emitted: u64) -> StreamingResultFra
     }
 }
 
+// Keep the compatibility database and split distributed services explicit at
+// this boundary: hiding either owner in a broad connection context would make
+// it easy to reacquire the node-global mutex around distributed execution.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_policy(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
+    database_services: Option<SharedDatabaseServices>,
     replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
     metadata_creator: Option<SharedMetadataTableCreator>,
     shutdown: CancellationToken,
@@ -723,6 +775,7 @@ async fn handle_connection_with_policy(
             let stream_timeout_ms = session.statement_timeout_ms;
             handle_streaming_request(
                 database.clone(),
+                database_services.clone(),
                 &mut session,
                 &mut writer,
                 &shutdown,
@@ -759,6 +812,69 @@ async fn handle_connection_with_policy(
         // blocking pool so Tokio workers remain available to network tasks.
         let execution = if let Some(error) = read_barrier_error {
             Err(error)
+        } else if let Some(services) = database_services.clone() {
+            match services
+                .acquire_statement(Duration::from_millis(session.statement_timeout_ms))
+                .await
+            {
+                Ok(statement_permit) if !shutdown.is_cancelled() => {
+                    let mut sql_session = std::mem::take(&mut session.sql);
+                    sql_session
+                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
+                    if let Some(root_sequence) = root_request_sequence {
+                        sql_session.set_client_request_identity_with_ack(
+                            session.client_id(),
+                            session.v2_session_epoch().ok_or(
+                                ragnordb_common::Error::ClientSessionExpired { session_epoch: 0 },
+                            )?,
+                            root_sequence,
+                            session.acknowledged_through(),
+                        )?;
+                    }
+                    let started = Instant::now();
+                    let statement = trimmed.clone();
+                    let (returned_session, result) = tokio::task::spawn_blocking(move || {
+                        let _statement_permit = statement_permit;
+                        let result = services.execute_sql(
+                            &mut sql_session,
+                            &statement,
+                            metadata_request_id,
+                            metadata_logical_request_id,
+                            Duration::from_millis(statement_timeout_ms),
+                        );
+                        (sql_session, result)
+                    })
+                    .await?;
+                    let status = database.lock().await.status();
+                    session.sql = returned_session;
+                    metrics::histogram_record(
+                        "ragnordb_statement_execution_seconds",
+                        started.elapsed().as_secs_f64(),
+                    );
+                    metrics::gauge_set("ragnordb_wal_durable_lsn", status.durable_lsn as f64);
+                    metrics::gauge_set(
+                        "ragnordb_wal_retained_bytes",
+                        status.wal_retained_bytes as f64,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_append_latency_seconds",
+                        status.wal_last_append_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_sync_latency_seconds",
+                        status.wal_last_sync_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::gauge_set(
+                        "ragnordb_wal_oldest_retention_pin",
+                        status.oldest_retention_pin_lsn.unwrap_or(0) as f64,
+                    );
+                    result
+                }
+                Ok(_) => Err(Error::Configuration(
+                    "database statement service is shutting down".to_string(),
+                )),
+                Err(error) => Err(error),
+            }
         } else {
             match tokio::time::timeout(
                 Duration::from_millis(session.statement_timeout_ms),
@@ -1036,6 +1152,7 @@ mod operational_tests {
                 handler_database,
                 None,
                 None,
+                None,
                 CancellationToken::new(),
                 20,
                 StatementLogging::Off,
@@ -1081,6 +1198,7 @@ mod operational_tests {
             handle_connection_with_policy(
                 stream,
                 handler_database,
+                None,
                 None,
                 None,
                 CancellationToken::new(),
@@ -1134,6 +1252,7 @@ mod operational_tests {
             handle_connection_with_policy(
                 stream,
                 handler_database,
+                None,
                 None,
                 None,
                 CancellationToken::new(),

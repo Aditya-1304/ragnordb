@@ -102,6 +102,97 @@ impl SqlSession {
         self.current_transaction.as_ref().map(Transaction::id)
     }
 
+    /// Begin an explicit transaction for the shared distributed SQL owner.
+    ///
+    /// The allocator is borrowed only for the identity allocation itself; the
+    /// returned transaction remains owned by this connection while later
+    /// tablet operations run outside the allocator lock.
+    pub fn begin_with_transaction_manager<M: TransactionManager>(
+        &mut self,
+        transaction_manager: &mut M,
+    ) -> Result<ExecutionResult> {
+        self.begin(transaction_manager)
+    }
+
+    /// Execute a data plan against this session's explicit transaction without
+    /// requiring mutable ownership of the shared executor.
+    pub fn execute_data_plan_with_shared_executor(
+        &mut self,
+        plan: Plan,
+        executor: &LocalExecutor,
+    ) -> Result<ExecutionResult> {
+        let transaction = self.current_transaction.as_mut().ok_or_else(|| {
+            Error::InvalidArgument(
+                "shared executor data execution requires an active transaction".to_string(),
+            )
+        })?;
+        executor.execute_data_plan_with_request_context(
+            plan,
+            transaction,
+            &mut self.tablet_request_context,
+        )
+    }
+
+    /// Stream an explicit transaction's SELECT through a shared executor. The
+    /// executor is borrowed immutably while the gateway performs remote page
+    /// reads, so unrelated sessions do not wait on a node-wide mutable owner.
+    pub fn execute_select_streaming_with_shared_executor(
+        &mut self,
+        plan: Plan,
+        executor: &LocalExecutor,
+        sink: &mut dyn QueryResultSink,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<QueryStreamSummary> {
+        let transaction = self.current_transaction.as_mut().ok_or_else(|| {
+            Error::InvalidArgument(
+                "shared executor streaming requires an active transaction".to_string(),
+            )
+        })?;
+        executor.execute_select_streaming(
+            plan,
+            transaction,
+            &mut self.tablet_request_context,
+            sink,
+            max_rows,
+            max_bytes,
+        )
+    }
+
+    /// Remove the explicit transaction before entering its commit boundary.
+    ///
+    /// Taking it first preserves the existing rule that a commit failure,
+    /// including an indeterminate remote outcome, cannot leave a half-usable
+    /// transaction attached to the connection.
+    pub fn take_transaction_for_commit(&mut self) -> Result<Transaction> {
+        self.current_transaction.take().ok_or_else(|| {
+            Error::InvalidArgument(
+                "COMMIT requires an active transaction; execute BEGIN first".to_string(),
+            )
+        })
+    }
+
+    /// Discard the active transaction without touching shared executor state.
+    pub fn rollback_current_transaction(&mut self) -> Result<ExecutionResult> {
+        let transaction = self.current_transaction.take().ok_or_else(|| {
+            Error::InvalidArgument(
+                "ROLLBACK requires an active transaction; execute BEGIN first".to_string(),
+            )
+        })?;
+
+        Ok(ExecutionResult::TransactionRolledBack {
+            transaction_id: transaction.id(),
+            discarded_writes: transaction.len(),
+        })
+    }
+
+    /// Return the request context used by the distributed database service.
+    /// The context remains connection-owned and is never shared between SQL
+    /// statements or connections.
+    pub fn request_context_mut(&mut self) -> &mut TabletRequestContext {
+        &mut self.tablet_request_context
+    }
+
     /// Parse, analyze, plan, and execute one SQL statement.
     ///
     /// Parse and analysis failures occur before an implicit transaction is

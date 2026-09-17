@@ -650,16 +650,32 @@ impl LocalExecutor {
         self.metadata_table_creator.is_some()
     }
 
+    /// Return whether a table is owned by the metadata-routed distributed
+    /// path. Replicated apply uses this read-only predicate to avoid taking a
+    /// catalog write lock for a command whose authoritative state lives in the
+    /// remote tablet.
+    pub fn is_metadata_table(&self, table_id: TableId) -> bool {
+        self.metadata_table_ids.contains(&table_id)
+    }
+
     /// Refresh the local SQL catalog cache from committed metadata state.
     ///
     /// Metadata-owned tables do not receive a local MVCC mirror. They remain
     /// visible to SQL schema analysis and `SHOW TABLES`, while point DML is
     /// routed to the assigned tablet through the installed gateway.
     pub fn refresh_metadata_catalog(&mut self) -> Result<()> {
+        self.refresh_metadata_catalog_changed().map(|_| ())
+    }
+
+    /// Refresh metadata and report whether the published schema/routing view
+    /// changed. The caller can use the change bit to advance its immutable view
+    /// generation without rebuilding routing structures on every statement.
+    pub fn refresh_metadata_catalog_changed(&mut self) -> Result<bool> {
         let Some(creator) = self.metadata_table_creator.clone() else {
-            return Ok(());
+            return Ok(false);
         };
 
+        let mut changed = false;
         for definition in creator.list_tables() {
             let table_id = TableId(definition.table_id);
             let descriptors = creator.table_descriptors(table_id)?;
@@ -677,17 +693,55 @@ impl LocalExecutor {
             } else {
                 self.catalog
                     .install_replicated_definition(definition.clone())?;
+                changed = true;
             }
 
             // The router is built from one complete, validated metadata
             // snapshot before replacing the cached view. Readers therefore
             // observe either the previous topology or the new gap-free cover;
             // they never observe a partially installed split or merge.
-            self.tablet_routers.insert(table_id, router);
-            self.metadata_table_ids.insert(table_id);
+            if self.tablet_routers.get(&table_id) != Some(&router) {
+                self.tablet_routers.insert(table_id, router);
+                changed = true;
+            }
+            if self.metadata_table_ids.insert(table_id) {
+                changed = true;
+            }
         }
 
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Execute a data plan against an already-owned transaction without taking
+    /// mutable ownership of the executor.
+    ///
+    /// Distributed SQL uses this boundary after the catalog and routing view
+    /// has been published. The executor may therefore be shared by unrelated
+    /// sessions while tablet RPCs run; the transaction remains session-local
+    /// and the tablet gateway owns the remote mutable state.
+    pub fn execute_data_plan_with_request_context(
+        &self,
+        plan: Plan,
+        transaction: &mut Transaction,
+        request_context: &mut TabletRequestContext,
+    ) -> Result<ExecutionResult> {
+        match plan {
+            Plan::Insert(plan) => self.execute_insert(plan, transaction, Some(request_context)),
+            Plan::Select(plan) => self.execute_select(plan, transaction, Some(request_context)),
+            Plan::Update(plan) => self.execute_update(plan, transaction, Some(request_context)),
+            Plan::Delete(plan) => self.execute_delete(plan, transaction, Some(request_context)),
+            _ => Err(Error::InvalidArgument(
+                "shared executor data path received a non-data plan".to_string(),
+            )),
+        }
+    }
+
+    /// Execute the catalog-only SHOW TABLES operation through the immutable
+    /// published view. This is intentionally separate from the compatibility
+    /// `execute` method, whose mutable receiver is retained for single-node
+    /// callers and DDL installation.
+    pub fn execute_show_tables_read_only(&self) -> Result<ExecutionResult> {
+        self.execute_show_tables()
     }
 
     /// Install a Raft-authoritative catalog command and its local SQL tablet.
@@ -752,6 +806,25 @@ impl LocalExecutor {
         logical_request_id: Option<ClientRequestId>,
         timeout: Duration,
     ) -> Result<ExecutionResult> {
+        let topology = self.prepare_create_table_with_metadata_and_identity(
+            plan,
+            request_id,
+            logical_request_id,
+            timeout,
+        )?;
+        self.install_metadata_table_topology(topology)
+    }
+
+    /// Submit metadata CREATE TABLE without holding mutable executor ownership
+    /// across the Raft/RPC wait. The returned topology is complete and
+    /// authoritative; callers publish it under a short catalog write section.
+    pub fn prepare_create_table_with_metadata_and_identity(
+        &self,
+        plan: CreateTablePlan,
+        request_id: ragnordb_common::ids::RequestId,
+        logical_request_id: Option<ClientRequestId>,
+        timeout: Duration,
+    ) -> Result<MetadataTableTopology> {
         let creator = self
             .metadata_table_creator
             .clone()
@@ -792,7 +865,7 @@ impl LocalExecutor {
             logical_request_id,
             timeout,
         )?;
-        let definition = topology.definition;
+        let definition = &topology.definition;
 
         if definition.table_id <= 1 {
             return Err(Error::CorruptData(format!(
@@ -812,14 +885,202 @@ impl LocalExecutor {
             ));
         }
 
-        let table_id = TableId(definition.table_id);
-        let router = self.build_metadata_router(&definition, &topology.tablets)?;
+        self.build_metadata_router(definition, &topology.tablets)?;
 
-        self.catalog.install_replicated_definition(definition)?;
+        Ok(topology)
+    }
+
+    /// Publish a previously-authoritative metadata topology under the executor
+    /// write boundary. No network, Raft, or filesystem operation is performed
+    /// by this method.
+    pub fn install_metadata_table_topology(
+        &mut self,
+        topology: MetadataTableTopology,
+    ) -> Result<ExecutionResult> {
+        let table_id = TableId(topology.definition.table_id);
+        let router = self.build_metadata_router(&topology.definition, &topology.tablets)?;
+
+        self.catalog
+            .install_replicated_definition(topology.definition)?;
         self.tablet_routers.insert(table_id, router);
         self.metadata_table_ids.insert(table_id);
 
         Ok(ExecutionResult::CreatedTable { table_id })
+    }
+
+    /// Return whether a transaction targets a locally materialized compatibility
+    /// tablet. Distributed sessions use this only to select the deliberately
+    /// serialized compatibility commit path; metadata-owned transactions use
+    /// the remote method below.
+    pub fn transaction_targets_local_table(&self, transaction: &Transaction) -> Result<bool> {
+        let Some(encoded_key) = transaction.write_set().keys().next() else {
+            return Ok(false);
+        };
+        let row_key = decode_row_key(encoded_key)?;
+        Ok(self.tablets.contains_key(&row_key.table_id))
+    }
+
+    /// Commit a transaction whose destination is metadata-owned without taking
+    /// mutable ownership of the executor. All mutable tablet state remains at
+    /// the gateway/replicated tablet owner; this method only prepares and
+    /// submits the typed command using the session's stable request identity.
+    pub fn commit_remote_transaction_outcome_with_timestamp(
+        &self,
+        transaction: Transaction,
+        commit_timestamp: Timestamp,
+        request_context: &mut TabletRequestContext,
+    ) -> Result<SingleNodeCommitOutcome> {
+        if transaction.is_empty() {
+            return Ok(SingleNodeCommitOutcome {
+                transaction_id: transaction.id(),
+                commit_timestamp: None,
+                committed_writes: 0,
+                wal_extent: None,
+            });
+        }
+
+        let mut table_ids = BTreeSet::new();
+        let mut tablet_ids = BTreeSet::new();
+        for encoded_key in transaction.write_set().keys() {
+            let row_key = decode_row_key(encoded_key)?;
+            if self
+                .catalog
+                .catalog()
+                .table_by_id(row_key.table_id)
+                .is_none()
+            {
+                return Err(Error::SchemaMismatch(format!(
+                    "transaction references unknown table ID {}",
+                    row_key.table_id.0
+                )));
+            }
+            table_ids.insert(row_key.table_id);
+            tablet_ids.insert(self.route_row_key(&row_key)?);
+        }
+
+        if table_ids.len() != 1 || tablet_ids.len() != 1 {
+            return Err(Error::UnsupportedSql(
+                "a distributed local transaction may write only one routed tablet".to_string(),
+            ));
+        }
+
+        let table_id = *table_ids
+            .first()
+            .expect("non-empty table-ID set was checked above");
+        let tablet_id = *tablet_ids
+            .first()
+            .expect("non-empty tablet-ID set was checked above");
+        if self.tablets.contains_key(&table_id) {
+            return Err(Error::UnsupportedSql(
+                "compatibility tablet commits require the serialized local path".to_string(),
+            ));
+        }
+
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql(format!(
+                "tablet {} for table {} is not installed on this SQL gateway",
+                tablet_id.0, table_id.0
+            ))
+        })?;
+        let first_key = transaction
+            .write_set()
+            .keys()
+            .next()
+            .expect("non-empty transaction has a first write key");
+        let first_row_key = decode_row_key(first_key)?;
+        let route = gateway
+            .lookup_tablet_route(first_row_key.table_id, &first_row_key.primary_key_bytes)?;
+        route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        if route.tablet_id != tablet_id {
+            return Err(Error::CorruptData(format!(
+                "gateway route selected tablet {}, but SQL plan selected tablet {}",
+                route.tablet_id.0, tablet_id.0
+            )));
+        }
+
+        let mut writes = Vec::with_capacity(transaction.write_set().len());
+        for (encoded_key, mutation) in transaction.write_set() {
+            let row_key = decode_row_key(encoded_key)?;
+            if row_key.table_id != table_id || self.route_row_key(&row_key)? != tablet_id {
+                return Err(Error::UnsupportedSql(
+                    "a remote single-tablet commit contains a foreign routed key".to_string(),
+                ));
+            }
+            let (op, row) = match mutation {
+                Mutation::Put(encoded_row) => (WriteKind::Put, Some(decode_row(encoded_row)?)),
+                Mutation::Delete => (WriteKind::Delete, None),
+            };
+            writes.push(WriteEntry {
+                key: encoded_key.clone(),
+                row,
+                op,
+            });
+        }
+
+        let command = TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: transaction.id(),
+            start_timestamp: transaction.start_ts(),
+            commit_timestamp,
+            writes,
+        });
+        let request_id = request_context.next_command_request_id(route.raft_group_id)?;
+        let logical_command_id =
+            request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
+        let outcome = match gateway.submit_command_with_identity_and_ack(
+            &route,
+            request_id.clone(),
+            logical_command_id,
+            request_context.acknowledged_through(),
+            command,
+            request_context.timeout(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error @ Error::RequestOutcomeUnknown { .. }) => {
+                match gateway.query_original_outcome(
+                    &route,
+                    request_id,
+                    logical_command_id,
+                    request_context.timeout(),
+                )? {
+                    Some(CachedTabletCommandOutcome::Applied(result)) => {
+                        TabletCommandApplyOutcome {
+                            result: result.into(),
+                            deduplicated: true,
+                        }
+                    }
+                    Some(CachedTabletCommandOutcome::Rejected(rejection)) => {
+                        return Err(match rejection.kind {
+                            CachedTabletCommandRejectionKind::WriteConflict => {
+                                Error::WriteConflict(rejection.reason)
+                            }
+                            CachedTabletCommandRejectionKind::InvalidCommand
+                            | CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                                Error::InvalidArgument(rejection.reason)
+                            }
+                        });
+                    }
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if !matches!(
+            outcome.result,
+            ragnordb_tablet::command::TabletCommandApplyResult::SingleShardCommit
+        ) {
+            return Err(Error::CorruptData(
+                "remote tablet returned a non-commit outcome for a commit command".to_string(),
+            ));
+        }
+
+        Ok(SingleNodeCommitOutcome {
+            transaction_id: transaction.id(),
+            commit_timestamp: Some(commit_timestamp),
+            committed_writes: transaction.len(),
+            wal_extent: None,
+        })
     }
 
     /// Apply a Raft-authoritative single-tablet commit to the SQL read mirror.

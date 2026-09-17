@@ -12,7 +12,10 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
@@ -34,6 +37,7 @@ use ragnordb_multiraft::storage::{
     codec::RaftReplicaIdentity, recovery::RecoveredRaftStorage,
     shared_recovery::recover_shared_storage_from_state,
 };
+use ragnordb_sql::{Plan, analyze, parse_one, plan};
 use ragnordb_storage::{
     checkpoint::{
         PublishedCheckpoint, cleanup_orphan_snapshot_files,
@@ -46,7 +50,7 @@ use ragnordb_storage::{
     wal::{CheckpointRetentionPin, RagnorDbWalAdapter},
 };
 use ragnordb_txn::{LocalTransactionManager, TransactionManager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use wal::{
     config::WalConfig,
     io::directory::FsSegmentDirectory,
@@ -61,6 +65,309 @@ type LocalWalAdapter = RagnorDbWalAdapter<FsSegmentDirectory, ()>;
 
 /// shared server-wide local database runtime
 pub type SharedLocalDatabase = Arc<Mutex<LocalDatabase>>;
+
+/// Shared distributed SQL services. The service owns independent boundaries
+/// for immutable executor/catalog reads, transaction identity allocation, and
+/// bounded statement admission. It deliberately does not expose the
+/// compatibility `LocalDatabase` mutex to request handlers.
+pub type SharedDatabaseServices = Arc<DatabaseServices>;
+
+/// Distributed SQL execution services split out of the serialized local
+/// compatibility runtime.
+pub struct DatabaseServices {
+    executor: Arc<RwLock<LocalExecutor>>,
+    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
+    durability_gate: DurabilityGate,
+    statement_permits: Arc<Semaphore>,
+    published_view_generation: AtomicU64,
+}
+
+impl fmt::Debug for DatabaseServices {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DatabaseServices")
+            .field(
+                "statement_permits",
+                &self.statement_permits.available_permits(),
+            )
+            .field(
+                "published_view_generation",
+                &self.published_view_generation.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseServices {
+    /// Acquire one bounded statement slot. The timeout is part of the
+    /// statement deadline, so overload is reported as a normal SQL timeout
+    /// instead of creating unbounded blocking-pool work.
+    pub async fn acquire_statement(
+        self: &Arc<Self>,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(timeout, self.statement_permits.clone().acquire_owned())
+            .await
+            .map_err(|_| Error::StatementTimeout {
+                timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            })?
+            .map_err(|_| Error::Configuration("database statement service is closed".to_string()))
+    }
+
+    fn refresh_metadata_catalog(&self) -> Result<()> {
+        match self.executor.try_write() {
+            Ok(mut executor) => {
+                if executor.refresh_metadata_catalog_changed()? {
+                    self.published_view_generation
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // An in-flight statement holds a stable read view. Deferring a
+                // metadata publication keeps unrelated tablet requests from
+                // waiting behind that statement; the next request retries the
+                // short refresh section.
+                Ok(())
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                if poisoned.into_inner().refresh_metadata_catalog_changed()? {
+                    self.published_view_generation
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Return the generation pinned by the next shared executor read section.
+    /// A generation changes only after a complete schema/routing publication.
+    pub fn published_view_generation(&self) -> u64 {
+        self.published_view_generation.load(Ordering::Acquire)
+    }
+
+    fn plan_statement(&self, sql: &str) -> Result<Plan> {
+        let executor = self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parsed = parse_one(sql)?;
+        let bound = analyze(&parsed, executor.catalog())?;
+        Ok(plan(bound))
+    }
+
+    /// Execute one distributed SQL statement after the frontend has acquired a
+    /// bounded statement permit.
+    ///
+    /// Catalog refresh/publication uses a short write section. Planning and
+    /// data execution use a shared immutable executor view; only the
+    /// compatibility local-table commit path takes mutable ownership. Remote
+    /// Raft/RPC waits therefore never hold the node-global `LocalDatabase`
+    /// mutex.
+    pub fn execute_sql(
+        &self,
+        session: &mut SqlSession,
+        sql: &str,
+        metadata_request_id: Option<RequestId>,
+        logical_request_id: Option<ragnordb_common::ids::ClientRequestId>,
+        metadata_timeout: std::time::Duration,
+    ) -> Result<ExecutionResult> {
+        self.durability_gate.ensure_healthy()?;
+        self.refresh_metadata_catalog()?;
+        let plan = self.plan_statement(sql)?;
+
+        let result = match plan {
+            Plan::Begin => {
+                let mut transaction_manager = self
+                    .transaction_manager
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.begin_with_transaction_manager(&mut *transaction_manager)
+            }
+            Plan::Rollback => session.rollback_current_transaction(),
+            Plan::ShowTables => {
+                let executor = self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                executor.execute_show_tables_read_only()
+            }
+            Plan::CreateTable(create_plan) => {
+                if session.has_active_transaction() {
+                    Err(Error::InvalidArgument(
+                        "CREATE TABLE is autocommit-only and must not receive a transaction context"
+                            .to_string(),
+                    ))
+                } else {
+                    let request_id = metadata_request_id.ok_or_else(|| {
+                        Error::InvalidArgument(
+                            "distributed CREATE TABLE requires a metadata request identity"
+                                .to_string(),
+                        )
+                    })?;
+                    let topology = {
+                        let executor = self
+                            .executor
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        executor.prepare_create_table_with_metadata_and_identity(
+                            create_plan,
+                            request_id,
+                            logical_request_id,
+                            metadata_timeout,
+                        )?
+                    };
+                    let mut executor = self
+                        .executor
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    executor.install_metadata_table_topology(topology)
+                }
+            }
+            Plan::Commit => {
+                let transaction = session.take_transaction_for_commit()?;
+                let outcome =
+                    self.commit_transaction(transaction, session.request_context_mut())?;
+                Ok(ExecutionResult::TransactionCommitted {
+                    transaction_id: outcome.transaction_id,
+                    commit_ts: outcome.commit_timestamp,
+                    committed_writes: outcome.committed_writes,
+                })
+            }
+            data_plan @ (Plan::Insert(_) | Plan::Select(_) | Plan::Update(_) | Plan::Delete(_)) => {
+                if session.has_active_transaction() {
+                    let executor = self
+                        .executor
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    session.execute_data_plan_with_shared_executor(data_plan, &executor)
+                } else {
+                    let mut transaction = {
+                        let mut transaction_manager = self
+                            .transaction_manager
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        transaction_manager.begin_transaction()?
+                    };
+                    let statement_result = {
+                        let executor = self
+                            .executor
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        executor.execute_data_plan_with_request_context(
+                            data_plan,
+                            &mut transaction,
+                            session.request_context_mut(),
+                        )
+                    }?;
+                    let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+                    Ok(statement_result)
+                }
+            }
+        };
+
+        if let Err(error) = &result {
+            self.durability_gate.observe_error(error);
+        }
+        result
+    }
+
+    fn commit_transaction(
+        &self,
+        transaction: ragnordb_txn::Transaction,
+        request_context: &mut ragnordb_exec::TabletRequestContext,
+    ) -> Result<ragnordb_txn::SingleNodeCommitOutcome> {
+        if transaction.is_empty() {
+            return Ok(ragnordb_txn::SingleNodeCommitOutcome {
+                transaction_id: transaction.id(),
+                commit_timestamp: None,
+                committed_writes: 0,
+                wal_extent: None,
+            });
+        }
+
+        let commit_timestamp = {
+            let mut transaction_manager = self
+                .transaction_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+        };
+
+        let executor = self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if executor.transaction_targets_local_table(&transaction)? {
+            drop(executor);
+            let mut executor = self
+                .executor
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            executor.commit_transaction_outcome(transaction, commit_timestamp)
+        } else {
+            executor.commit_remote_transaction_outcome_with_timestamp(
+                transaction,
+                commit_timestamp,
+                request_context,
+            )
+        }
+    }
+
+    /// Execute a bounded streaming SELECT through the same split ownership
+    /// contract as materialized statements.
+    pub fn execute_sql_streaming(
+        &self,
+        session: &mut SqlSession,
+        sql: &str,
+        sink: &mut dyn QueryResultSink,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<QueryStreamSummary> {
+        self.durability_gate.ensure_healthy()?;
+        self.refresh_metadata_catalog()?;
+        let plan = self.plan_statement(sql)?;
+        if !matches!(plan, Plan::Select(_)) {
+            return Err(Error::UnsupportedSql(
+                "streaming result mode currently supports SELECT only".to_string(),
+            ));
+        }
+
+        if session.has_active_transaction() {
+            let executor = self
+                .executor
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.execute_select_streaming_with_shared_executor(
+                plan, &executor, sink, max_rows, max_bytes,
+            )
+        } else {
+            let mut transaction = {
+                let mut transaction_manager = self
+                    .transaction_manager
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                transaction_manager.begin_transaction()?
+            };
+            let summary = {
+                let executor = self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                executor.execute_select_streaming(
+                    plan,
+                    &mut transaction,
+                    session.request_context_mut(),
+                    sink,
+                    max_rows,
+                    max_bytes,
+                )?
+            };
+            let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+            Ok(summary)
+        }
+    }
+}
 
 /// Point-in-time storage state exposed through administrative health endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +410,8 @@ pub struct LiveCheckpointPublication {
 /// permits later commits to proceed without allowing two checkpoints to publish
 /// out of order
 pub struct LocalDatabase {
-    executor: LocalExecutor,
-    transaction_manager: LocalTransactionManager,
+    executor: Arc<RwLock<LocalExecutor>>,
+    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
     next_snapshot_id: Option<u64>,
     data_dir: Option<PathBuf>,
     checkpoint_adapter: Option<Arc<LocalWalAdapter>>,
@@ -133,8 +440,8 @@ impl fmt::Debug for LocalDatabase {
 impl Default for LocalDatabase {
     fn default() -> Self {
         Self {
-            executor: LocalExecutor::default(),
-            transaction_manager: LocalTransactionManager::default(),
+            executor: Arc::new(RwLock::new(LocalExecutor::default())),
+            transaction_manager: Arc::new(StdMutex::new(LocalTransactionManager::default())),
             next_snapshot_id: Some(1),
             data_dir: None,
             checkpoint_adapter: None,
@@ -379,8 +686,8 @@ impl LocalDatabase {
 
         Ok((
             Self {
-                executor,
-                transaction_manager,
+                executor: Arc::new(RwLock::new(executor)),
+                transaction_manager: Arc::new(StdMutex::new(transaction_manager)),
                 next_snapshot_id: Some(floors.next_snapshot_id),
                 data_dir: Some(data_dir),
                 checkpoint_adapter: Some(adapter),
@@ -406,18 +713,46 @@ impl LocalDatabase {
         Arc::new(Mutex::new(self))
     }
 
+    /// Publish the split distributed SQL services for request handlers.
+    ///
+    /// The returned handles share the recovered executor and allocator with
+    /// lifecycle/recovery code, but statement execution no longer needs the
+    /// outer `SharedLocalDatabase` mutex. A fixed permit set bounds parsing,
+    /// planning, CPU operators, and blocking tablet waits as one admission
+    /// domain until dedicated query workers are introduced.
+    pub fn database_services(&self) -> SharedDatabaseServices {
+        let parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .max(1);
+
+        Arc::new(DatabaseServices {
+            executor: self.executor.clone(),
+            transaction_manager: self.transaction_manager.clone(),
+            durability_gate: self.durability_gate.clone(),
+            statement_permits: Arc::new(Semaphore::new(parallelism)),
+            published_view_generation: AtomicU64::new(0),
+        })
+    }
+
     /// Connect future SQL commits to the server-owned replicated tablet host.
     ///
     /// Catalog durability and checkpoint metadata remain on the shared A-WAL;
     /// only row-commit authority moves to Raft for the Milestone 4 replicated
     /// runtime.
     pub fn replace_commit_log(&mut self, commit_log: SharedCommitLog) {
-        self.executor.replace_commit_log(commit_log);
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace_commit_log(commit_log);
     }
 
     /// Connect future SQL catalog changes to the replicated tablet host.
     pub fn replace_catalog_log(&mut self, catalog_log: SharedCatalogLog) {
-        self.executor.replace_catalog_log(catalog_log);
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace_catalog_log(catalog_log);
     }
 
     /// Install the metadata-Raft authority used by replicated SQL CREATE TABLE.
@@ -426,14 +761,20 @@ impl LocalDatabase {
     /// but metadata-owned schema creation is routed through this boundary and
     /// therefore receives its identity only from the metadata state machine.
     pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
-        self.executor.replace_metadata_table_creator(creator);
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace_metadata_table_creator(creator);
     }
 
     /// Install the node-level gateway used when a metadata-routed tablet is not
     /// materialized in this process. Existing local-table compatibility paths
     /// remain unchanged and continue to use their direct coordinators.
     pub fn replace_tablet_gateway(&mut self, gateway: SharedTabletGateway) {
-        self.executor.replace_tablet_gateway(gateway);
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace_tablet_gateway(gateway);
     }
 
     /// Clone the serialized A-WAL handle for the Raft persistence owner.
@@ -472,9 +813,31 @@ impl LocalDatabase {
         command: &SingleShardCommitCommand,
     ) -> Result<usize> {
         self.durability_gate.ensure_healthy()?;
-        let result = self.executor.apply_replicated_commit(command);
+        let table_id = command
+            .writes
+            .first()
+            .and_then(|write| ragnordb_storage::key::decode_row_key(&write.key).ok())
+            .map(|row_key| row_key.table_id);
+        let result = if table_id.is_some_and(|table_id| {
+            self.executor
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_metadata_table(table_id)
+        }) {
+            // Metadata-owned row state is authoritative in the replicated
+            // tablet. The SQL gateway has no local MVCC mirror to publish, so
+            // a follower only advances its allocator high-water floor.
+            Ok(0)
+        } else {
+            self.executor
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .apply_replicated_commit(command)
+        };
         if result.is_ok() {
             self.transaction_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .observe_replicated_high_water(command.txn_id, command.commit_timestamp);
         }
         if let Err(error) = &result {
@@ -493,6 +856,8 @@ impl LocalDatabase {
     ) -> Result<()> {
         self.durability_gate.ensure_healthy()?;
         self.transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .observe_replicated_high_water(command.txn_id, command.commit_timestamp);
         Ok(())
     }
@@ -506,9 +871,13 @@ impl LocalDatabase {
         let (transaction_id, timestamp) = storage.allocator_high_water_marks();
         let installed = self
             .executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .install_replicated_storage(table_id, storage)?;
         if installed {
             self.transaction_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .observe_replicated_high_water(transaction_id, timestamp);
         }
         Ok(installed)
@@ -526,13 +895,27 @@ impl LocalDatabase {
         // The local catalog WAL is a derived recovery cache. Startup can see
         // the cached definition before replaying the still-retained Raft entry,
         // so repeated installation must be an exact no-op.
-        if self.executor.catalog().table_by_id(table_id).is_some() {
+        if self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .catalog()
+            .table_by_id(table_id)
+            .is_some()
+        {
             self.transaction_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .observe_replicated_high_water(ragnordb_common::ids::TxnId(0), update_timestamp);
             return Ok(());
         }
-        self.executor.apply_replicated_catalog(command)?;
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply_replicated_catalog(command)?;
         self.transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .observe_replicated_high_water(ragnordb_common::ids::TxnId(0), update_timestamp);
         Ok(())
     }
@@ -707,19 +1090,25 @@ impl LocalDatabase {
         metadata_timeout: std::time::Duration,
     ) -> Result<ExecutionResult> {
         self.durability_gate.ensure_healthy()?;
-        self.executor.refresh_metadata_catalog()?;
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refresh_metadata_catalog()?;
 
         let result = {
-            let Self {
-                executor,
-                transaction_manager,
-                ..
-            } = self;
+            let mut executor = self
+                .executor
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut transaction_manager = self
+                .transaction_manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             session.execute_sql_with_metadata_request_and_identity(
                 sql,
-                executor,
-                transaction_manager,
+                &mut executor,
+                &mut *transaction_manager,
                 metadata_request_id,
                 logical_request_id,
                 metadata_timeout,
@@ -745,11 +1134,22 @@ impl LocalDatabase {
         max_bytes: usize,
     ) -> Result<QueryStreamSummary> {
         self.durability_gate.ensure_healthy()?;
-        self.executor.refresh_metadata_catalog()?;
+        self.executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refresh_metadata_catalog()?;
+        let mut executor = self
+            .executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut transaction_manager = self
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = session.execute_sql_streaming(
             sql,
-            &mut self.executor,
-            &mut self.transaction_manager,
+            &mut executor,
+            &mut *transaction_manager,
             sink,
             max_rows,
             max_bytes,
@@ -773,13 +1173,23 @@ impl LocalDatabase {
             Error::Configuration("snapshot ID allocator is exhausted".to_string())
         })?;
 
-        let previous_timestamp = self.transaction_manager.last_allocated_timestamp();
+        let previous_timestamp = self
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_allocated_timestamp();
 
         let snapshot_timestamp = self
             .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .allocate_commit_timestamp(previous_timestamp)?;
 
-        let tables = self.executor.capture_snapshot_tables()?;
+        let tables = self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture_snapshot_tables()?;
         // durable runtimes use A-WAL's complete physical frontier. This includes
         // previously published checkpoint pointer and marker records, allowing
         // later checkpoints to make obsolete checkpoint metadata reclaimable
@@ -790,9 +1200,23 @@ impl LocalDatabase {
             .checkpoint_adapter
             .as_ref()
             .map(|adapter| adapter.durable_lsn().as_u64())
-            .unwrap_or_else(|| self.executor.replay_from_end_lsn());
-        let max_table_id = self.executor.catalog().table_id_high_water_mark();
-        let max_transaction_id = self.transaction_manager.last_allocated_transaction_id();
+            .unwrap_or_else(|| {
+                self.executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replay_from_end_lsn()
+            });
+        let max_table_id = self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .catalog()
+            .table_id_high_water_mark();
+        let max_transaction_id = self
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_allocated_transaction_id();
 
         self.next_snapshot_id = snapshot_id.checked_add(1);
 
@@ -840,8 +1264,16 @@ impl LocalDatabase {
                 }
             }
             None => DatabaseStatus {
-                durable_lsn: self.executor.replay_from_end_lsn(),
-                replay_frontier: self.executor.replay_from_end_lsn(),
+                durable_lsn: self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replay_from_end_lsn(),
+                replay_frontier: self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replay_from_end_lsn(),
                 latest_checkpoint_id: self.latest_checkpoint_id,
                 wal_retained_bytes: 0,
                 retention_pins_active: 0,
@@ -861,5 +1293,196 @@ impl LocalDatabase {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Barrier, Mutex as TestMutex};
+
+    use ragnordb_common::{
+        catalog_codec::{ColumnDefinition, DataType, TableDefinition},
+        ids::{RaftGroupId, ReplicaId, TableId, TabletId},
+        metadata_codec::{PartitionSpec, TabletDescriptor},
+        rpc_codec::{ReplicaRoute, TabletRoute},
+    };
+    use ragnordb_exec::{MetadataTableCreator, TabletGateway};
+
+    struct TestMetadata {
+        definitions: Vec<TableDefinition>,
+        descriptors: BTreeMap<TableId, Vec<TabletDescriptor>>,
+    }
+
+    impl MetadataTableCreator for TestMetadata {
+        fn create_table(
+            &self,
+            _request: ragnordb_common::metadata_codec::CreateTableRequest,
+            _request_id: RequestId,
+            _timeout: std::time::Duration,
+        ) -> Result<TableDefinition> {
+            Err(Error::NotImplemented("CREATE TABLE is unused by this test"))
+        }
+
+        fn table_descriptors(&self, table_id: TableId) -> Result<Vec<TabletDescriptor>> {
+            self.descriptors.get(&table_id).cloned().ok_or_else(|| {
+                Error::CorruptData(format!("missing test descriptors for table {}", table_id.0))
+            })
+        }
+
+        fn list_tables(&self) -> Vec<TableDefinition> {
+            self.definitions.clone()
+        }
+    }
+
+    struct BlockingGateway {
+        slow_table: TableId,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        reads: TestMutex<Vec<TableId>>,
+    }
+
+    impl BlockingGateway {
+        fn route(table_id: TableId) -> TabletRoute {
+            TabletRoute {
+                raft_group_id: RaftGroupId(table_id.0 + 1_000),
+                tablet_id: TabletId(table_id.0 + 100),
+                tablet_epoch: 1,
+                leader_replica_id: ReplicaId(1),
+                replicas: vec![ReplicaRoute {
+                    replica_id: ReplicaId(1),
+                    node_id: ragnordb_common::ids::NodeId(1),
+                }],
+            }
+        }
+    }
+
+    impl TabletGateway for BlockingGateway {
+        fn lookup_tablet_route(&self, table_id: TableId, _key: &[u8]) -> Result<TabletRoute> {
+            Ok(Self::route(table_id))
+        }
+
+        fn read_point(
+            &self,
+            route: &TabletRoute,
+            _request_id: RequestId,
+            _row_key: ragnordb_common::ids::RowKey,
+            _read_timestamp: ragnordb_common::ids::Timestamp,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            let table_id = TableId(route.tablet_id.0 - 100);
+            self.reads.lock().unwrap().push(table_id);
+            if table_id == self.slow_table {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(None)
+        }
+
+        fn submit_command(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            _command: ragnordb_common::command_codec::TabletCommand,
+            _timeout: std::time::Duration,
+        ) -> Result<ragnordb_tablet::command::TabletCommandApplyOutcome> {
+            Err(Error::NotImplemented("commands are unused by this test"))
+        }
+    }
+
+    fn test_table(table_id: u64, name: &str) -> (TableDefinition, TabletDescriptor) {
+        let table_id = TableId(table_id);
+        (
+            TableDefinition {
+                table_id: table_id.0,
+                name: name.to_string(),
+                columns: vec![ColumnDefinition {
+                    column_id: ragnordb_common::ids::ColumnId(1),
+                    name: "id".to_string(),
+                    ty: DataType::Int,
+                    nullable: false,
+                }],
+                primary_key_column_ids: vec![ragnordb_common::ids::ColumnId(1)],
+                schema_version: 1,
+                tablet_count: 1,
+            },
+            TabletDescriptor {
+                tablet_id: TabletId(table_id.0 + 100),
+                table_id,
+                raft_group_id: RaftGroupId(table_id.0 + 1_000),
+                tablet_epoch: 1,
+                partition: PartitionSpec::Hash {
+                    bucket: 0,
+                    bucket_count: 1,
+                },
+            },
+        )
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A slow remote read on one metadata-routed tablet used to retain the
+    /// node-global `LocalDatabase` mutex, so an unrelated tablet statement
+    /// could not even parse and route. This proves the distributed service
+    /// keeps the session and remote tablet wait outside that mutable owner.
+    #[test]
+    fn unrelated_metadata_table_reads_do_not_head_of_line_block() {
+        let (slow_definition, slow_descriptor) = test_table(42, "slow_table");
+        let (fast_definition, fast_descriptor) = test_table(43, "fast_table");
+        let definitions = vec![slow_definition, fast_definition];
+        let descriptors = BTreeMap::from([
+            (slow_descriptor.table_id, vec![slow_descriptor]),
+            (fast_descriptor.table_id, vec![fast_descriptor]),
+        ]);
+
+        let mut database = LocalDatabase::new();
+        database.replace_metadata_table_creator(Arc::new(TestMetadata {
+            definitions,
+            descriptors,
+        }));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        database.replace_tablet_gateway(Arc::new(BlockingGateway {
+            slow_table: TableId(42),
+            entered: entered.clone(),
+            release: release.clone(),
+            reads: TestMutex::new(Vec::new()),
+        }));
+        let services = database.database_services();
+
+        let slow_services = services.clone();
+        let slow = std::thread::spawn(move || {
+            let mut session = SqlSession::with_client_id(101);
+            slow_services.execute_sql(
+                &mut session,
+                "SELECT id FROM slow_table WHERE id = 1",
+                None,
+                None,
+                std::time::Duration::from_secs(1),
+            )
+        });
+
+        entered.wait();
+
+        let fast_services = services.clone();
+        let fast = std::thread::spawn(move || {
+            let mut session = SqlSession::with_client_id(102);
+            fast_services.execute_sql(
+                &mut session,
+                "SELECT id FROM fast_table WHERE id = 1",
+                None,
+                None,
+                std::time::Duration::from_secs(1),
+            )
+        });
+
+        let fast_result = fast.join().expect("fast statement thread panicked");
+        assert!(
+            fast_result.is_ok(),
+            "fast tablet statement was blocked: {fast_result:?}"
+        );
+
+        release.wait();
+        assert!(slow.join().expect("slow statement thread panicked").is_ok());
     }
 }
