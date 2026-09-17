@@ -24,6 +24,16 @@ pub struct TabletCommandEnvelope {
     #[prost(uint64, optional, tag = "7")]
     pub acknowledged_through: ::core::option::Option<u64>,
 }
+/// A bounded, deterministic group of already-routed mutation commands for one
+/// tablet. The individual envelopes remain complete so request identity,
+/// retry horizons, and tablet-generation validation survive batching.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletCommandBatchEnvelope {
+    #[prost(uint32, tag = "1")]
+    pub format_version: u32,
+    #[prost(message, repeated, tag = "2")]
+    pub commands: ::prost::alloc::vec::Vec<TabletCommandEnvelope>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommand {
     #[prost(oneof = "tablet_command::Command", tags = "1, 2, 3, 4, 5, 6, 7")]

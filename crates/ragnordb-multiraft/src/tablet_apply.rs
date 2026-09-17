@@ -6,7 +6,10 @@
 
 use raft::types::LogIndex;
 use ragnordb_common::{
-    command_codec::{TabletCommandEnvelope, TabletCommandEnvelopeError},
+    command_codec::{
+        TabletCommandBatchEnvelope, TabletCommandBatchEnvelopeError, TabletCommandEnvelope,
+        TabletCommandEnvelopeError,
+    },
     ids::RequestId,
 };
 use ragnordb_storage::mvcc::{InMemoryMvcc, MvccStorage};
@@ -73,6 +76,14 @@ pub enum CommittedTabletCommandDisposition {
     Rejected(RejectedTabletCommand),
 }
 
+/// Complete result for one committed Raft entry. A batch keeps the entry
+/// position common while exposing one disposition for every subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommittedTabletCommandEntry {
+    Single(CommittedTabletCommandDisposition),
+    Batch(Vec<CommittedTabletCommandDisposition>),
+}
+
 impl CommittedTabletCommandDisposition {
     /// resolve a leader-owned waiter while allowing follower-only apply events
     /// to be ignored by the higher-level runtime.
@@ -95,6 +106,9 @@ pub enum TabletApplyError {
 
     #[error("committed tablet command envelope is invalid: {0}")]
     InvalidEnvelope(#[from] TabletCommandEnvelopeError),
+
+    #[error("committed tablet command batch is invalid: {reason}")]
+    InvalidBatch { reason: String },
 
     #[error("tablet command apply encountered a fatal state-machine failure: {0}")]
     FatalApply(TabletCommandApplyError),
@@ -141,6 +155,72 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         }
 
         let envelope = TabletCommandEnvelope::decode(command)?;
+        self.apply_envelope(position, envelope)
+    }
+
+    /// Decode a committed entry that may be either a legacy single envelope or
+    /// a bounded multi-command envelope.
+    pub fn apply_committed_entry(
+        &mut self,
+        position: ProposalPosition,
+        command: &[u8],
+    ) -> Result<CommittedTabletCommandEntry, TabletApplyError> {
+        if position.term == 0 || position.index == 0 {
+            return Err(TabletApplyError::InvalidRaftPosition {
+                term: position.term,
+                index: position.index,
+            });
+        }
+
+        match TabletCommandEnvelope::decode(command) {
+            Ok(envelope) => Ok(CommittedTabletCommandEntry::Single(
+                self.apply_envelope(position, envelope)?,
+            )),
+            Err(single_error) => {
+                let batch = match TabletCommandBatchEnvelope::decode(command) {
+                    Ok(batch) => batch,
+                    Err(batch_error) => {
+                        if matches!(batch_error, TabletCommandBatchEnvelopeError::Decode(_)) {
+                            // Preserve the legacy error shape for bytes that
+                            // are not a batch, so existing corruption
+                            // diagnostics remain stable.
+                            return Err(TabletApplyError::InvalidEnvelope(single_error));
+                        }
+                        return Err(TabletApplyError::InvalidBatch {
+                            reason: batch_error.to_string(),
+                        });
+                    }
+                };
+
+                // Validate every subcommand before mutating the state machine.
+                // This prevents a malformed later command from turning a
+                // committed batch into a partially reinterpreted transition.
+                for (index, envelope) in batch.commands.iter().enumerate() {
+                    if let Err(source) = self.state_machine.validate_proposal(envelope)
+                        && !is_routing_rejection(&source)
+                    {
+                        return Err(TabletApplyError::InvalidBatch {
+                            reason: format!("subcommand {index}: {source}"),
+                        });
+                    }
+                }
+
+                let dispositions = batch
+                    .commands
+                    .into_iter()
+                    .map(|envelope| self.apply_envelope(position, envelope))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(CommittedTabletCommandEntry::Batch(dispositions))
+            }
+        }
+    }
+
+    fn apply_envelope(
+        &mut self,
+        position: ProposalPosition,
+        envelope: TabletCommandEnvelope,
+    ) -> Result<CommittedTabletCommandDisposition, TabletApplyError> {
         let request_id = envelope.request_id.clone();
         match self.state_machine.apply(envelope) {
             Ok(outcome) => Ok(CommittedTabletCommandDisposition::Applied(
@@ -162,6 +242,15 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
     }
 }
 
+fn is_routing_rejection(error: &TabletCommandApplyError) -> bool {
+    matches!(
+        error,
+        TabletCommandApplyError::RaftGroupMismatch { .. }
+            | TabletCommandApplyError::TabletIdMismatch { .. }
+            | TabletCommandApplyError::TabletEpochMismatch { .. }
+    )
+}
+
 /// Return whether a state-machine error is a normal deterministic result of a
 /// valid committed envelope rather than evidence that local replica state can
 /// no longer be trusted.
@@ -174,6 +263,8 @@ fn is_deterministic_rejection(error: &TabletCommandApplyError) -> bool {
             | TabletCommandApplyError::StaleRequestSequence { .. }
             | TabletCommandApplyError::RequestSequenceGap { .. }
             | TabletCommandApplyError::RequestSequenceExhausted { .. }
+            | TabletCommandApplyError::RequestIdExpired { .. }
+            | TabletCommandApplyError::AcknowledgementRegression { .. }
             | TabletCommandApplyError::InvalidCommand { .. }
             | TabletCommandApplyError::WriteConflict { .. }
             | TabletCommandApplyError::UnsupportedCommand { .. }

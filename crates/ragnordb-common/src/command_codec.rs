@@ -2,11 +2,21 @@ use super::catalog_codec::TableDefinition as TableDef;
 use super::codec::{Row, WriteKind};
 use crate::ids::{LogicalCommandId, RaftGroupId, RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::proto::command;
 /// the tablet command envelope format accepted
 pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 2;
+
+/// Version of the bounded multi-command proposal envelope.
+pub const TABLET_COMMAND_BATCH_ENVELOPE_VERSION: u32 = 1;
+
+/// Keep one batch small enough that one Raft proposal does not monopolize the
+/// owner reactor or turn a single malformed entry into a large recovery unit.
+pub const MAX_TABLET_COMMAND_BATCH_COMMANDS: usize = 32;
+
+/// Maximum encoded size accepted for a multi-command proposal.
+pub const MAX_TABLET_COMMAND_BATCH_BYTES: usize = 1024 * 1024;
 
 /// tablet state machine snapshot format
 pub const TABLET_STATE_MACHINE_SNAPSHOT_VERSION: u32 = 2;
@@ -235,6 +245,225 @@ pub enum TabletCommandEnvelopeError {
     InvalidCommand(&'static str),
 
     #[error("cannot decode tablet command envelope: {0}")]
+    Decode(String),
+}
+
+/// A validated batch of complete tablet command envelopes.
+///
+/// Batching is intentionally defined above the individual command envelope,
+/// rather than by concatenating protobuf payloads. This keeps recovery able to
+/// validate every subcommand and lets proposal correlation retain one
+/// topology-independent identity per subcommand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletCommandBatchEnvelope {
+    pub format_version: u32,
+    pub commands: Vec<TabletCommandEnvelope>,
+}
+
+impl TabletCommandBatchEnvelope {
+    pub fn new(
+        commands: Vec<TabletCommandEnvelope>,
+    ) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        let batch = Self {
+            format_version: TABLET_COMMAND_BATCH_ENVELOPE_VERSION,
+            commands,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    /// Validate all structural invariants before a batch enters Raft.
+    pub fn validate(&self) -> Result<(), TabletCommandBatchEnvelopeError> {
+        if self.format_version != TABLET_COMMAND_BATCH_ENVELOPE_VERSION {
+            return Err(TabletCommandBatchEnvelopeError::UnsupportedVersion(
+                self.format_version,
+            ));
+        }
+        if self.commands.len() < 2 {
+            return Err(TabletCommandBatchEnvelopeError::TooFewCommands(
+                self.commands.len(),
+            ));
+        }
+        if self.commands.len() > MAX_TABLET_COMMAND_BATCH_COMMANDS {
+            return Err(TabletCommandBatchEnvelopeError::TooManyCommands(
+                self.commands.len(),
+            ));
+        }
+
+        let first = self
+            .commands
+            .first()
+            .expect("minimum batch length was validated above");
+        let target_tablet = first.tablet_id;
+        let target_epoch = first.expected_epoch;
+        let target_group = first.request_id.raft_group_id;
+        let mut request_ids = BTreeSet::new();
+        let mut logical_command_ids = BTreeSet::new();
+
+        for (index, envelope) in self.commands.iter().enumerate() {
+            envelope.validate().map_err(|source| {
+                TabletCommandBatchEnvelopeError::InvalidEnvelope {
+                    index,
+                    reason: source.to_string(),
+                }
+            })?;
+
+            if envelope.tablet_id != target_tablet {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedTablet {
+                    expected: target_tablet,
+                    received: envelope.tablet_id,
+                });
+            }
+            if envelope.expected_epoch != target_epoch {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedEpoch {
+                    expected: target_epoch,
+                    received: envelope.expected_epoch,
+                });
+            }
+            if envelope.request_id.raft_group_id != target_group {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedRaftGroup {
+                    expected: target_group,
+                    received: envelope.request_id.raft_group_id,
+                });
+            }
+            if !envelope.command.is_batchable() {
+                return Err(TabletCommandBatchEnvelopeError::NonBatchableCommand {
+                    index,
+                    command: envelope.command.kind_name(),
+                });
+            }
+            if !request_ids.insert(envelope.request_id.clone()) {
+                return Err(TabletCommandBatchEnvelopeError::DuplicateRequestId(
+                    envelope.request_id.clone(),
+                ));
+            }
+            if let Some(logical_command_id) = envelope.logical_command_id
+                && !logical_command_ids.insert(logical_command_id)
+            {
+                return Err(TabletCommandBatchEnvelopeError::DuplicateLogicalCommandId(
+                    logical_command_id,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, TabletCommandBatchEnvelopeError> {
+        self.validate()?;
+        let encoded = self.to_proto().encode_to_vec();
+        if encoded.len() > MAX_TABLET_COMMAND_BATCH_BYTES {
+            return Err(TabletCommandBatchEnvelopeError::TooLarge {
+                encoded_bytes: encoded.len(),
+                max_bytes: MAX_TABLET_COMMAND_BATCH_BYTES,
+            });
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        if bytes.len() > MAX_TABLET_COMMAND_BATCH_BYTES {
+            return Err(TabletCommandBatchEnvelopeError::TooLarge {
+                encoded_bytes: bytes.len(),
+                max_bytes: MAX_TABLET_COMMAND_BATCH_BYTES,
+            });
+        }
+        let proto = command::TabletCommandBatchEnvelope::decode(bytes)
+            .map_err(|error| TabletCommandBatchEnvelopeError::Decode(error.to_string()))?;
+        if proto.commands.len() > MAX_TABLET_COMMAND_BATCH_COMMANDS {
+            return Err(TabletCommandBatchEnvelopeError::TooManyCommands(
+                proto.commands.len(),
+            ));
+        }
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> command::TabletCommandBatchEnvelope {
+        command::TabletCommandBatchEnvelope {
+            format_version: self.format_version,
+            commands: self
+                .commands
+                .iter()
+                .map(|command| {
+                    command
+                        .to_proto()
+                        .expect("validated batch contains valid command envelopes")
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(
+        proto: command::TabletCommandBatchEnvelope,
+    ) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        let commands = proto
+            .commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                TabletCommandEnvelope::from_proto(command).map_err(|source| {
+                    TabletCommandBatchEnvelopeError::InvalidEnvelope {
+                        index,
+                        reason: source.to_string(),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let batch = Self {
+            format_version: proto.format_version,
+            commands,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum TabletCommandBatchEnvelopeError {
+    #[error("unsupported tablet command batch envelope version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("tablet command batch must contain at least two commands, received {0}")]
+    TooFewCommands(usize),
+
+    #[error("tablet command batch contains too many commands: {0}")]
+    TooManyCommands(usize),
+
+    #[error("tablet command batch command {index} is invalid: {reason}")]
+    InvalidEnvelope { index: usize, reason: String },
+
+    #[error("tablet command batch targets tablet {received:?}, expected {expected:?}")]
+    MismatchedTablet {
+        expected: TabletId,
+        received: TabletId,
+    },
+
+    #[error("tablet command batch targets epoch {received}, expected {expected}")]
+    MismatchedEpoch { expected: u64, received: u64 },
+
+    #[error("tablet command batch targets Raft group {received:?}, expected {expected:?}")]
+    MismatchedRaftGroup {
+        expected: RaftGroupId,
+        received: RaftGroupId,
+    },
+
+    #[error("tablet command batch command {index} ({command}) cannot be batched")]
+    NonBatchableCommand { index: usize, command: &'static str },
+
+    #[error("tablet command batch repeats request ID {0:?}")]
+    DuplicateRequestId(RequestId),
+
+    #[error("tablet command batch repeats logical command ID {0:?}")]
+    DuplicateLogicalCommandId(LogicalCommandId),
+
+    #[error("tablet command batch encodes to {encoded_bytes} bytes, maximum is {max_bytes}")]
+    TooLarge {
+        encoded_bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("cannot decode tablet command batch envelope: {0}")]
     Decode(String),
 }
 
@@ -1332,6 +1561,32 @@ pub enum TabletCommand {
 }
 
 impl TabletCommand {
+    /// Return whether this command may share one Raft entry with adjacent
+    /// mutation commands for the same tablet. Catalog changes, barriers, and
+    /// other ordering boundaries intentionally remain standalone entries.
+    pub fn is_batchable(&self) -> bool {
+        matches!(
+            self,
+            TabletCommand::Prewrite(_)
+                | TabletCommand::Commit(_)
+                | TabletCommand::Rollback(_)
+                | TabletCommand::SingleShardCommit(_)
+                | TabletCommand::ResolveIntent(_)
+        )
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            TabletCommand::Prewrite(_) => "prewrite",
+            TabletCommand::Commit(_) => "commit",
+            TabletCommand::Rollback(_) => "rollback",
+            TabletCommand::SingleShardCommit(_) => "single-shard-commit",
+            TabletCommand::ResolveIntent(_) => "resolve-intent",
+            TabletCommand::Catalog(_) => "catalog",
+            TabletCommand::Noop(_) => "noop",
+        }
+    }
+
     pub fn to_proto(&self) -> Result<command::TabletCommand, &'static str> {
         let command = match self {
             TabletCommand::Prewrite(command) => Some(command::tablet_command::Command::Prewrite(

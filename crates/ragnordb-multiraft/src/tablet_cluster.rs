@@ -439,15 +439,15 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     term: entry.term,
                     index: entry.index,
                 };
-                let disposition = self.replicas[leader_index]
+                let dispositions = self.replicas[leader_index]
                     .tablet
-                    .apply_committed(position, command)
+                    .apply_committed_entry(position, command)
                     .map_err(|source| TabletClusterError::Apply {
                         node_id: leader_id,
                         index: entry.index,
                         source,
                     })?;
-                self.resolve_committed(disposition)?;
+                self.resolve_committed_entry(dispositions)?;
             }
         }
 
@@ -616,15 +616,15 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     term: entry.term,
                     index: entry.index,
                 };
-                let disposition = self.replicas[follower_index]
+                let dispositions = self.replicas[follower_index]
                     .tablet
-                    .apply_committed(position, command)
+                    .apply_committed_entry(position, command)
                     .map_err(|source| TabletClusterError::Apply {
                         node_id: follower_id,
                         index: entry.index,
                         source,
                     })?;
-                self.resolve_committed(disposition)?;
+                self.resolve_committed_entry(dispositions)?;
             }
         }
 
@@ -911,11 +911,11 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     index: entry.index,
                 };
 
-                let disposition = match self.replicas[replica_index]
+                let dispositions = match self.replicas[replica_index]
                     .tablet
-                    .apply_committed(position, command)
+                    .apply_committed_entry(position, command)
                 {
-                    Ok(applied) => applied,
+                    Ok(dispositions) => dispositions,
                     Err(source) => {
                         self.replicas[replica_index].raft.quarantine();
 
@@ -927,7 +927,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                     }
                 };
 
-                if let Err(error) = self.resolve_committed(disposition) {
+                if let Err(error) = self.resolve_committed_entry(dispositions) {
                     self.replicas[replica_index].raft.quarantine();
                     return Err(error);
                 }
@@ -977,6 +977,23 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             | Err(ProposalRegistryError::ResponseChannelClosed { .. }) => Ok(()),
 
             Err(error) => Err(TabletClusterError::Registry(error)),
+        }
+    }
+
+    fn resolve_committed_entry(
+        &mut self,
+        entry: crate::tablet_apply::CommittedTabletCommandEntry,
+    ) -> Result<(), TabletClusterError> {
+        match entry {
+            crate::tablet_apply::CommittedTabletCommandEntry::Single(disposition) => {
+                self.resolve_committed(disposition)
+            }
+            crate::tablet_apply::CommittedTabletCommandEntry::Batch(dispositions) => {
+                for disposition in dispositions {
+                    self.resolve_committed(disposition)?;
+                }
+                Ok(())
+            }
         }
     }
 

@@ -279,7 +279,7 @@ pub fn recover_tablet_replica<W: RaftWal>(
         }
 
         if let DurableRaftEntryPayload::Normal(command) = &entry.record.payload {
-            tablet.apply_committed(
+            tablet.apply_committed_entry(
                 crate::proposal::ProposalPosition {
                     term: entry.record.term,
                     index: entry.record.index,
@@ -421,7 +421,7 @@ pub fn recover_joining_tablet_replica<W: RaftWal>(
             });
         }
         if let DurableRaftEntryPayload::Normal(command) = &entry.record.payload {
-            tablet.apply_committed(
+            tablet.apply_committed_entry(
                 crate::proposal::ProposalPosition {
                     term: entry.record.term,
                     index: entry.record.index,

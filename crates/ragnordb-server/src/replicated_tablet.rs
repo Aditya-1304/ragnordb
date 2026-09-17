@@ -33,8 +33,9 @@ use ragnordb_common::{
     Error, Result,
     codec::WriteKind,
     command_codec::{
-        CachedTabletCommandOutcome, NoopCommand, SingleShardCommitCommand, TabletCommand,
-        TabletCommandEnvelope, WriteEntry,
+        CachedTabletCommandOutcome, MAX_TABLET_COMMAND_BATCH_BYTES,
+        MAX_TABLET_COMMAND_BATCH_COMMANDS, NoopCommand, SingleShardCommitCommand, TabletCommand,
+        TabletCommandBatchEnvelope, TabletCommandEnvelope, WriteEntry,
     },
     durability::DurabilityGate,
     encoding::{decode_row, encode_row},
@@ -69,7 +70,9 @@ use ragnordb_multiraft::{
         persistence::{NodeRaftWalHandle, RaftWal},
         recovery::RecoveredRaftStorage,
     },
-    tablet_apply::{CommittedTabletCommandDisposition, TabletCommandApplier},
+    tablet_apply::{
+        CommittedTabletCommandDisposition, CommittedTabletCommandEntry, TabletCommandApplier,
+    },
     transport::GroupRaftTransport,
 };
 
@@ -107,6 +110,14 @@ const REACTOR_TURN_GROUP_BUDGET: usize = 32;
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 const READ_INDEX_CONTEXT_NAMESPACE: u64 = 0x5241_474e_4944_5801;
 const READ_INDEX_FALLBACK_GRACE: Duration = Duration::from_millis(5);
+/// Do not spend an additional wait interval on a command whose deadline is
+/// already close. Batches are formed from work already queued in this owner
+/// turn, so the normal path remains immediate at low load.
+const TABLET_BATCH_DEADLINE_GRACE: Duration = Duration::from_millis(1);
+/// Batch formation never waits for a future request. This bound additionally
+/// limits time spent inspecting already-queued compatible requests in one
+/// owner turn when the queue is continuously busy.
+const TABLET_BATCH_MAX_DELAY: Duration = Duration::from_millis(1);
 /// Bound the number of caller reply channels retained while one coalesced
 /// ReadIndex request waits for quorum or its fallback barrier.
 const MAX_PENDING_READ_BARRIER_WAITERS: usize = 1_024;
@@ -692,6 +703,29 @@ enum ClientReply {
 struct PendingClient {
     ticket: ProposalTicket<TabletCommandApplyOutcome, TabletCommandApplyError>,
     reply: ClientReply,
+}
+
+/// One command prepared for admission but not yet assigned a Raft position.
+/// The reply remains beside the envelope so a later batch can share a log
+/// position without conflating per-request deadlines or RPC correlation.
+struct PreparedCommandRequest {
+    envelope: TabletCommandEnvelope,
+    deadline: Instant,
+    reply: ClientReply,
+}
+
+enum PendingTabletRequest {
+    Raw(Box<HostRequest>),
+    Prepared(Box<PreparedCommandRequest>),
+}
+
+impl PreparedCommandRequest {
+    fn compatible_with(&self, first: &Self) -> bool {
+        self.envelope.tablet_id == first.envelope.tablet_id
+            && self.envelope.expected_epoch == first.envelope.expected_epoch
+            && self.envelope.request_id.raft_group_id == first.envelope.request_id.raft_group_id
+            && self.envelope.command.is_batchable()
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2453,13 +2487,24 @@ fn install_recovered_catalog(
         else {
             continue;
         };
-        let envelope = TabletCommandEnvelope::decode(bytes)
-            .map_err(|source| Error::CorruptData(source.to_string()))?;
-        if let TabletCommand::Catalog(command) = envelope.command {
-            database.apply_replicated_catalog(
-                &command,
-                ragnordb_common::ids::Timestamp((envelope.request_id.client_id >> 64) as u64),
-            )?;
+        match TabletCommandEnvelope::decode(bytes) {
+            Ok(envelope) => {
+                if let TabletCommand::Catalog(command) = envelope.command {
+                    database.apply_replicated_catalog(
+                        &command,
+                        ragnordb_common::ids::Timestamp(
+                            (envelope.request_id.client_id >> 64) as u64,
+                        ),
+                    )?;
+                }
+            }
+            Err(single_error) => {
+                // Mutation batches never contain catalog entries, so they do
+                // not contribute to the startup SQL-catalog projection. They
+                // are replayed by the tablet state-machine recovery pass.
+                TabletCommandBatchEnvelope::decode(bytes)
+                    .map_err(|_| Error::CorruptData(single_error.to_string()))?;
+            }
         }
     }
     Ok(())
@@ -2498,6 +2543,7 @@ where
     ownership: ReactorOwnership,
     registry: ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: Vec<PendingClient>,
+    pending_requests: VecDeque<PendingTabletRequest>,
     internal_barrier_allocator: InternalBarrierAllocator,
     was_leader: bool,
     leader_activation: Option<ragnordb_multiraft::proposal::ProposalPosition>,
@@ -2573,6 +2619,7 @@ where
             ownership,
             registry: ProposalRegistry::new(),
             clients: Vec::new(),
+            pending_requests: VecDeque::new(),
             internal_barrier_allocator: InternalBarrierAllocator::default(),
             was_leader: false,
             leader_activation: None,
@@ -2617,6 +2664,7 @@ where
     fn should_run_again(&self) -> bool {
         self.host_control.has_pending()
             || self.requests.has_pending()
+            || !self.pending_requests.is_empty()
             || self.initial_ready.is_some()
             || self.pending_snapshot_install.is_some()
             || self.pending_local_snapshot.is_some()
@@ -2678,6 +2726,7 @@ where
             ownership,
             registry,
             clients,
+            pending_requests,
             internal_barrier_allocator,
             was_leader,
             leader_activation,
@@ -3336,11 +3385,8 @@ where
                         let EntryPayload::Normal(bytes) = &entry.payload else {
                             continue;
                         };
-                        let envelope =
-                            TabletCommandEnvelope::decode(bytes).map_err(|e| e.to_string())?;
-                        let locally_proposed = registry.is_pending(&envelope.request_id);
-                        let disposition = tablet
-                            .apply_committed(
+                        let dispositions = tablet
+                            .apply_committed_entry(
                                 ragnordb_multiraft::proposal::ProposalPosition {
                                     term: entry.term,
                                     index: entry.index,
@@ -3349,10 +3395,9 @@ where
                             )
                             .map_err(|e| e.to_string())?;
                         snapshot_policy.note_applied(bytes.len());
-                        publish_committed_command(
-                            &envelope,
-                            locally_proposed,
-                            disposition,
+                        publish_committed_entry(
+                            bytes,
+                            dispositions,
                             &mut registry,
                             &database,
                             catalog_cache.as_ref(),
@@ -3501,134 +3546,224 @@ where
 
         let mut admitted_requests = 0;
         while admitted_requests < TABLET_REQUEST_BUDGET {
-            let Ok(request) = requests.try_recv() else {
-                break;
+            let request = if let Some(request) = pending_requests.pop_front() {
+                request
+            } else {
+                let Ok(request) = requests.try_recv() else {
+                    break;
+                };
+                PendingTabletRequest::Raw(Box::new(request))
             };
             admitted_requests += 1;
 
+            let Some(request) = prepare_pending_request(
+                request,
+                &tablet,
+                serving_leader,
+                ready_loop.raft().leader_id().map(|id| id.get()),
+                ready_loop.raft().id().get(),
+                &identity,
+            ) else {
+                continue;
+            };
+
             match request {
-                HostRequest::ReadPoint {
-                    request,
-                    reply,
-                    deadline,
-                } => admit_read_request(
-                    request,
-                    &tablet,
-                    serving_leader,
-                    ready_loop.raft().leader_id().map(|id| id.get()),
-                    &identity,
-                    reply,
-                    deadline,
-                ),
-                HostRequest::Scan {
-                    request,
-                    reply,
-                    deadline,
-                } => admit_scan_request(
-                    request,
-                    &tablet,
-                    serving_leader,
-                    ready_loop.raft().leader_id().map(|id| id.get()),
-                    &identity,
-                    reply,
-                    deadline,
-                ),
-                HostRequest::OutcomeQuery {
-                    request,
-                    reply,
-                    deadline,
-                } => admit_outcome_query(
-                    request,
-                    &tablet,
-                    serving_leader,
-                    ready_loop.raft().leader_id().map(|id| id.get()),
-                    reply,
-                    deadline,
-                ),
-                HostRequest::RpcReadPoint {
-                    request,
-                    completion,
-                    token,
-                    deadline,
-                } => admit_read_barrier(
-                    ClientReply::RpcReadPoint {
-                        token,
-                        completion,
+                PendingTabletRequest::Prepared(first) => {
+                    let mut batch = vec![*first];
+                    let now = Instant::now();
+                    let batch_started = now;
+                    if batch[0].deadline > now + TABLET_BATCH_DEADLINE_GRACE {
+                        while batch.len() < MAX_TABLET_COMMAND_BATCH_COMMANDS
+                            && admitted_requests < TABLET_REQUEST_BUDGET
+                            && batch_started.elapsed() < TABLET_BATCH_MAX_DELAY
+                        {
+                            let next = if let Some(request) = pending_requests.pop_front() {
+                                Some(request)
+                            } else {
+                                requests
+                                    .try_recv()
+                                    .ok()
+                                    .map(|request| PendingTabletRequest::Raw(Box::new(request)))
+                            };
+                            let Some(next) = next else {
+                                break;
+                            };
+                            admitted_requests += 1;
+                            let Some(next) = prepare_pending_request(
+                                next,
+                                &tablet,
+                                serving_leader,
+                                ready_loop.raft().leader_id().map(|id| id.get()),
+                                ready_loop.raft().id().get(),
+                                &identity,
+                            ) else {
+                                continue;
+                            };
+
+                            let PendingTabletRequest::Prepared(next) = next else {
+                                pending_requests.push_front(next);
+                                break;
+                            };
+                            if !next.compatible_with(&batch[0])
+                                || next.deadline <= Instant::now() + TABLET_BATCH_DEADLINE_GRACE
+                            {
+                                pending_requests.push_front(PendingTabletRequest::Prepared(next));
+                                break;
+                            }
+
+                            let mut candidate_envelopes = batch
+                                .iter()
+                                .map(|request| request.envelope.clone())
+                                .collect::<Vec<_>>();
+                            candidate_envelopes.push(next.envelope.clone());
+                            let candidate_fits =
+                                TabletCommandBatchEnvelope::new(candidate_envelopes)
+                                    .and_then(|batch| batch.encode())
+                                    .is_ok();
+                            if !candidate_fits {
+                                pending_requests.push_front(PendingTabletRequest::Prepared(next));
+                                break;
+                            }
+                            batch.push(*next);
+                        }
+                    }
+
+                    if batch.len() == 1 {
+                        admit_prepared_command(
+                            batch.pop().expect("single batch item exists"),
+                            &mut ready_loop,
+                            &mut registry,
+                            &mut clients,
+                            serving_leader,
+                        );
+                    } else {
+                        admit_prepared_batch(batch, &mut ready_loop, &mut registry, &mut clients);
+                    }
+                }
+                PendingTabletRequest::Raw(request) => match *request {
+                    HostRequest::ReadPoint {
                         request,
+                        reply,
                         deadline,
-                    },
-                    deadline,
-                    &mut ready_loop,
-                    &tablet,
-                    &mut registry,
-                    &mut clients,
-                    serving_leader,
-                    &mut internal_barrier_allocator,
-                    &identity,
-                    &mut pending_read_barriers,
-                    &mut next_read_index_context,
-                ),
-                HostRequest::RpcScan {
-                    request,
-                    completion,
-                    token,
-                    deadline,
-                } => admit_read_barrier(
-                    ClientReply::RpcScan {
-                        token,
-                        completion,
+                    } => admit_read_request(
                         request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        &identity,
+                        reply,
                         deadline,
-                    },
-                    deadline,
-                    &mut ready_loop,
-                    &tablet,
-                    &mut registry,
-                    &mut clients,
-                    serving_leader,
-                    &mut internal_barrier_allocator,
-                    &identity,
-                    &mut pending_read_barriers,
-                    &mut next_read_index_context,
-                ),
-                HostRequest::RpcOutcomeQuery {
-                    request,
-                    completion,
-                    token,
-                    deadline,
-                } => admit_rpc_outcome_query(
-                    request,
-                    &tablet,
-                    serving_leader,
-                    ready_loop.raft().leader_id().map(|id| id.get()),
-                    &identity,
-                    completion,
-                    token,
-                    deadline,
-                ),
-                HostRequest::Barrier { reply, deadline } => admit_read_barrier(
-                    reply,
-                    deadline,
-                    &mut ready_loop,
-                    &tablet,
-                    &mut registry,
-                    &mut clients,
-                    serving_leader,
-                    &mut internal_barrier_allocator,
-                    &identity,
-                    &mut pending_read_barriers,
-                    &mut next_read_index_context,
-                ),
-                request => admit_request(
-                    request,
-                    &mut ready_loop,
-                    &tablet,
-                    &mut registry,
-                    &mut clients,
-                    serving_leader,
-                    &mut internal_barrier_allocator,
-                    &identity,
-                ),
+                    ),
+                    HostRequest::Scan {
+                        request,
+                        reply,
+                        deadline,
+                    } => admit_scan_request(
+                        request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        &identity,
+                        reply,
+                        deadline,
+                    ),
+                    HostRequest::OutcomeQuery {
+                        request,
+                        reply,
+                        deadline,
+                    } => admit_outcome_query(
+                        request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        reply,
+                        deadline,
+                    ),
+                    HostRequest::RpcReadPoint {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    } => admit_read_barrier(
+                        ClientReply::RpcReadPoint {
+                            token,
+                            completion,
+                            request,
+                            deadline,
+                        },
+                        deadline,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                        &mut pending_read_barriers,
+                        &mut next_read_index_context,
+                    ),
+                    HostRequest::RpcScan {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    } => admit_read_barrier(
+                        ClientReply::RpcScan {
+                            token,
+                            completion,
+                            request,
+                            deadline,
+                        },
+                        deadline,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                        &mut pending_read_barriers,
+                        &mut next_read_index_context,
+                    ),
+                    HostRequest::RpcOutcomeQuery {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    } => admit_rpc_outcome_query(
+                        request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        &identity,
+                        completion,
+                        token,
+                        deadline,
+                    ),
+                    HostRequest::Barrier { reply, deadline } => admit_read_barrier(
+                        reply,
+                        deadline,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                        &mut pending_read_barriers,
+                        &mut next_read_index_context,
+                    ),
+                    request => admit_request(
+                        request,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                    ),
+                },
             }
             match drain_ready(
                 &mut ready_loop,
@@ -3912,6 +4047,351 @@ fn admit_rpc_outcome_query(
             deadline,
         )),
     );
+}
+
+/// Convert only mutation requests into the prepared form used by the batch
+/// collector. Ordering boundaries such as catalog updates, no-op barriers,
+/// reads, and scans remain raw requests and therefore keep their existing
+/// admission paths.
+fn prepare_pending_request(
+    request: PendingTabletRequest,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+    local_id: u64,
+    identity: &TabletRuntimeIdentity,
+) -> Option<PendingTabletRequest> {
+    let PendingTabletRequest::Raw(request) = request else {
+        return Some(request);
+    };
+
+    match *request {
+        HostRequest::Commit {
+            commit,
+            reply,
+            deadline,
+        } => {
+            let reply = ClientReply::Commit(reply);
+            let envelope = envelope_from_commit_for_identity(local_id, commit, identity);
+            prepare_mutation_envelope(envelope, reply, deadline, tablet, serving_leader, leader_id)
+                .map(|prepared| PendingTabletRequest::Prepared(Box::new(prepared)))
+        }
+        HostRequest::Command {
+            request,
+            reply,
+            deadline,
+        } => {
+            if !request.command.is_batchable() {
+                return Some(PendingTabletRequest::Raw(Box::new(HostRequest::Command {
+                    request,
+                    reply,
+                    deadline,
+                })));
+            }
+            let reply = ClientReply::Command(reply);
+            prepare_mutation_request(request, reply, deadline, tablet, serving_leader, leader_id)
+                .map(|prepared| PendingTabletRequest::Prepared(Box::new(prepared)))
+        }
+        HostRequest::RpcCommand {
+            request,
+            completion,
+            token,
+            deadline,
+        } => {
+            if !request.command.is_batchable() {
+                return Some(PendingTabletRequest::Raw(Box::new(
+                    HostRequest::RpcCommand {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    },
+                )));
+            }
+            let remote_commit = match &request.command {
+                TabletCommand::SingleShardCommit(command) => Some(command.clone()),
+                _ => None,
+            };
+            let reply = ClientReply::RpcCommand {
+                token,
+                completion,
+                remote_commit,
+            };
+            prepare_mutation_request(request, reply, deadline, tablet, serving_leader, leader_id)
+                .map(|prepared| PendingTabletRequest::Prepared(Box::new(prepared)))
+        }
+        request => Some(PendingTabletRequest::Raw(Box::new(request))),
+    }
+}
+
+fn prepare_mutation_request(
+    request: TabletCommandRequest,
+    reply: ClientReply,
+    deadline: Instant,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+) -> Option<PreparedCommandRequest> {
+    let envelope = envelope_from_tablet_command_request(request)
+        .map_err(|source| Error::InvalidArgument(source.to_string()));
+    prepare_mutation_envelope(envelope, reply, deadline, tablet, serving_leader, leader_id)
+}
+
+fn prepare_mutation_envelope(
+    envelope: Result<TabletCommandEnvelope>,
+    reply: ClientReply,
+    deadline: Instant,
+    tablet: &TabletCommandApplier,
+    serving_leader: bool,
+    leader_id: Option<u64>,
+) -> Option<PreparedCommandRequest> {
+    if !serving_leader {
+        send_client_error(reply, Error::NotLeader { leader_id });
+        return None;
+    }
+    if deadline <= Instant::now() {
+        send_client_error(
+            reply,
+            Error::ProposalUnavailable {
+                reason: "tablet command deadline elapsed before admission".to_string(),
+            },
+        );
+        return None;
+    }
+
+    let envelope = match envelope {
+        Ok(envelope) => envelope,
+        Err(source) => {
+            send_client_error(reply, Error::InvalidArgument(source.to_string()));
+            return None;
+        }
+    };
+    if let Err(source) = tablet.state_machine().validate_proposal(&envelope) {
+        send_client_error(reply, map_tablet_rejection(source));
+        return None;
+    }
+
+    Some(PreparedCommandRequest {
+        envelope,
+        deadline,
+        reply,
+    })
+}
+
+fn envelope_from_tablet_command_request(
+    request: TabletCommandRequest,
+) -> std::result::Result<
+    TabletCommandEnvelope,
+    ragnordb_common::command_codec::TabletCommandEnvelopeError,
+> {
+    let TabletCommandRequest {
+        request_id,
+        logical_command_id,
+        acknowledged_through,
+        tablet_id,
+        tablet_epoch,
+        command,
+    } = request;
+
+    match logical_command_id {
+        Some(logical_command_id) => TabletCommandEnvelope::new_with_logical_command_id_and_ack(
+            request_id,
+            logical_command_id,
+            tablet_id,
+            tablet_epoch,
+            acknowledged_through,
+            command,
+        ),
+        None => TabletCommandEnvelope::new(request_id, tablet_id, tablet_epoch, command),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_prepared_command<W, LS, SS>(
+    prepared: PreparedCommandRequest,
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    clients: &mut Vec<PendingClient>,
+    serving_leader: bool,
+) where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let PreparedCommandRequest {
+        envelope,
+        deadline,
+        reply,
+    } = prepared;
+    let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
+    if !serving_leader || ready_loop.raft().leader_id() != Some(ready_loop.raft().id()) {
+        send_client_error(reply, Error::NotLeader { leader_id });
+        return;
+    }
+
+    let request_id = envelope.request_id.clone();
+    if registry.is_pending(&request_id) {
+        send_client_error(
+            reply,
+            Error::ProposalUnavailable {
+                reason: "an identical request is already awaiting tablet apply".to_string(),
+            },
+        );
+        return;
+    }
+    let bytes = match envelope.encode() {
+        Ok(bytes) => bytes,
+        Err(source) => {
+            send_client_error(reply, Error::InvalidArgument(source.to_string()));
+            return;
+        }
+    };
+    let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
+        Ok(index) => index,
+        Err(source) => {
+            send_client_error(
+                reply,
+                Error::ProposalUnavailable {
+                    reason: source.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let position = ragnordb_multiraft::proposal::ProposalPosition {
+        term: ready_loop.raft().hard_state().current_term,
+        index,
+    };
+    match registry.register(request_id, position, deadline) {
+        Ok(ticket) => clients.push(PendingClient { ticket, reply }),
+        Err(source) => send_client_error(
+            reply,
+            Error::ProposalUnavailable {
+                reason: source.to_string(),
+            },
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_prepared_batch<W, LS, SS>(
+    prepared: Vec<PreparedCommandRequest>,
+    ready_loop: &mut RaftReadyLoop<W, LS, SS>,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    clients: &mut Vec<PendingClient>,
+) where
+    W: RaftWal,
+    LS: LogStore<Vec<u8>>,
+    SS: StableStore,
+{
+    let mut prepared = prepared
+        .into_iter()
+        .filter_map(|request| {
+            if request.deadline <= Instant::now() {
+                send_client_error(
+                    request.reply,
+                    Error::ProposalUnavailable {
+                        reason: "tablet command deadline elapsed before admission".to_string(),
+                    },
+                );
+                return None;
+            }
+            if registry.is_pending(&request.envelope.request_id) {
+                send_client_error(
+                    request.reply,
+                    Error::ProposalUnavailable {
+                        reason: "an identical request is already awaiting tablet apply".to_string(),
+                    },
+                );
+                None
+            } else {
+                Some(request)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if prepared.is_empty() {
+        return;
+    }
+    if prepared.len() == 1 {
+        admit_prepared_command(
+            prepared.pop().expect("single prepared request exists"),
+            ready_loop,
+            registry,
+            clients,
+            true,
+        );
+        return;
+    }
+
+    let envelopes = prepared
+        .iter()
+        .map(|request| request.envelope.clone())
+        .collect::<Vec<_>>();
+    let batch = match TabletCommandBatchEnvelope::new(envelopes) {
+        Ok(batch) => batch,
+        Err(source) => {
+            for request in prepared {
+                send_client_error(request.reply, Error::InvalidArgument(source.to_string()));
+            }
+            return;
+        }
+    };
+    let bytes = match batch.encode() {
+        Ok(bytes) => bytes,
+        Err(source) => {
+            for request in prepared {
+                send_client_error(request.reply, Error::InvalidArgument(source.to_string()));
+            }
+            return;
+        }
+    };
+    if bytes.len() > MAX_TABLET_COMMAND_BATCH_BYTES {
+        for request in prepared {
+            send_client_error(
+                request.reply,
+                Error::InvalidArgument(
+                    "tablet command batch exceeds the encoded byte limit".to_string(),
+                ),
+            );
+        }
+        return;
+    }
+
+    let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
+        Ok(index) => index,
+        Err(source) => {
+            for request in prepared {
+                send_client_error(
+                    request.reply,
+                    Error::ProposalUnavailable {
+                        reason: source.to_string(),
+                    },
+                );
+            }
+            return;
+        }
+    };
+    let position = ragnordb_multiraft::proposal::ProposalPosition {
+        term: ready_loop.raft().hard_state().current_term,
+        index,
+    };
+
+    for request in prepared {
+        let request_id = request.envelope.request_id.clone();
+        match registry.register(request_id, position, request.deadline) {
+            Ok(ticket) => clients.push(PendingClient {
+                ticket,
+                reply: request.reply,
+            }),
+            Err(source) => send_client_error(
+                request.reply,
+                Error::ProposalUnavailable {
+                    reason: source.to_string(),
+                },
+            ),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5240,10 +5720,8 @@ where
         let EntryPayload::Normal(bytes) = &entry.payload else {
             continue;
         };
-        let envelope = TabletCommandEnvelope::decode(bytes).map_err(|error| error.to_string())?;
-        let locally_proposed = registry.is_pending(&envelope.request_id);
-        let disposition = tablet
-            .apply_committed(
+        let dispositions = tablet
+            .apply_committed_entry(
                 ragnordb_multiraft::proposal::ProposalPosition {
                     term: entry.term,
                     index: entry.index,
@@ -5252,10 +5730,9 @@ where
             )
             .map_err(|error| error.to_string())?;
         snapshot_policy.note_applied(bytes.len());
-        publish_committed_command(
-            &envelope,
-            locally_proposed,
-            disposition,
+        publish_committed_entry(
+            bytes,
+            dispositions,
             registry,
             database,
             catalog_cache,
@@ -5407,6 +5884,56 @@ fn envelope_from_catalog_for_identity(
 /// catalog cache before its proposal waiter can observe success. Returning an
 /// error leaves that waiter pending and prevents the caller from advancing the
 /// applied frontier or generating a snapshot past the missing cache record.
+fn publish_committed_entry(
+    bytes: &[u8],
+    entry: CommittedTabletCommandEntry,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+    database: &SharedLocalDatabase,
+    catalog_cache: &dyn CatalogCacheWriter,
+    identity: &TabletRuntimeIdentity,
+) -> std::result::Result<(), String> {
+    match entry {
+        CommittedTabletCommandEntry::Single(disposition) => {
+            let envelope =
+                TabletCommandEnvelope::decode(bytes).map_err(|error| error.to_string())?;
+            let locally_proposed = registry.is_pending(&envelope.request_id);
+            publish_committed_command(
+                &envelope,
+                locally_proposed,
+                disposition,
+                registry,
+                database,
+                catalog_cache,
+                identity,
+            )
+        }
+        CommittedTabletCommandEntry::Batch(dispositions) => {
+            let batch =
+                TabletCommandBatchEnvelope::decode(bytes).map_err(|error| error.to_string())?;
+            if batch.commands.len() != dispositions.len() {
+                return Err(format!(
+                    "committed batch produced {} dispositions for {} commands",
+                    dispositions.len(),
+                    batch.commands.len()
+                ));
+            }
+            for (envelope, disposition) in batch.commands.iter().zip(dispositions) {
+                let locally_proposed = registry.is_pending(&envelope.request_id);
+                publish_committed_command(
+                    envelope,
+                    locally_proposed,
+                    disposition,
+                    registry,
+                    database,
+                    catalog_cache,
+                    identity,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn publish_committed_command(
     envelope: &TabletCommandEnvelope,
     locally_proposed: bool,
@@ -5505,11 +6032,8 @@ where
         let EntryPayload::Normal(bytes) = &entry.payload else {
             continue;
         };
-        let envelope = TabletCommandEnvelope::decode(bytes)
-            .map_err(|error| HostedGroupError::Group(error.to_string()))?;
-        let locally_proposed = registry.is_pending(&envelope.request_id);
-        let disposition = tablet
-            .apply_committed(
+        let dispositions = tablet
+            .apply_committed_entry(
                 ragnordb_multiraft::proposal::ProposalPosition {
                     term: entry.term,
                     index: entry.index,
@@ -5518,10 +6042,9 @@ where
             )
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
         snapshot_policy.note_applied(bytes.len());
-        publish_committed_command(
-            &envelope,
-            locally_proposed,
-            disposition,
+        publish_committed_entry(
+            bytes,
+            dispositions,
             registry,
             database,
             catalog_cache,

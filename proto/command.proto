@@ -25,6 +25,14 @@ message TabletCommandEnvelope {
     optional uint64 acknowledged_through = 7;
 }
 
+// A bounded, deterministic group of already-routed mutation commands for one
+// tablet. The individual envelopes remain complete so request identity,
+// retry horizons, and tablet-generation validation survive batching.
+message TabletCommandBatchEnvelope {
+    uint32 format_version = 1;
+    repeated TabletCommandEnvelope commands = 2;
+}
+
 message TabletCommand {
     oneof command {
         PrewriteCommand prewrite = 1;
