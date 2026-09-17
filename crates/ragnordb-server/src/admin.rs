@@ -27,7 +27,7 @@ use crate::node_lifecycle::{
     NodeDrainBlocker, NodeDrainGroupStatus, NodeDrainStatus, compute_node_drain_status,
 };
 use crate::replicated_tablet::ReplicatedTabletHandle;
-use ragnordb_multiraft::host::SharedMultiRaftHostStatus;
+use ragnordb_multiraft::host::{MultiRaftHostStatus, SharedMultiRaftHostStatus};
 
 /// Thread-safe error type returned by administrative server tasks.
 ///
@@ -76,6 +76,7 @@ pub async fn serve_admin(
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/status", get(handle_status))
+        .route("/status/groups", get(handle_multiraft_groups_status))
         .route(
             "/node/lifecycle",
             get(handle_node_lifecycle_status).post(handle_node_lifecycle),
@@ -156,36 +157,31 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let groups = status
-            .groups
+        let summary = status.bounded_summary(8);
+        let top_groups = summary
+            .top_groups
             .iter()
             .map(|group| {
                 serde_json::json!({
                     "raft_group_id": group.identity.raft_group_id.0,
                     "replica_id": group.identity.replica_id.0,
                     "role": group.role.map(|role| role.as_str()),
-                    "leader_replica_id": group.leader_replica_id.map(|replica_id| replica_id.0),
-                    "term": group.term,
-                    "commit_index": group.commit_index,
-                    "last_log_index": group.last_log_index,
-                    "applied_index": group.applied_index,
-                    "snapshot_index": group.snapshot_index,
-                    "uncommitted_bytes": group.uncommitted_bytes,
-                    "replication_inflight_bytes": group.replication_inflight_bytes,
-                    "pending_work": group.pending_work,
                     "pending_messages": group.pending_messages,
                     "pending_message_bytes": group.pending_message_bytes,
-                    "quarantine_reason": group.quarantine_reason,
                 })
             })
             .collect::<Vec<_>>();
 
         serde_json::json!({
-            "node_id": status.node_id.0,
-            "state": status.state.as_str(),
-            "pending_message_count": status.pending_message_count,
-            "pending_message_bytes": status.pending_message_bytes,
-            "groups": groups,
+            "node_id": summary.node_id.0,
+            "state": summary.state.as_str(),
+            "pending_message_count": summary.pending_message_count,
+            "pending_message_bytes": summary.pending_message_bytes,
+            "group_count": summary.group_count,
+            "leader_count": summary.leader_count,
+            "candidate_count": summary.candidate_count,
+            "quarantined_group_count": summary.quarantined_group_count,
+            "top_groups": top_groups,
         })
     });
     let node_lifecycle = current_node_lifecycle_status(&state)
@@ -226,6 +222,68 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
             "oldest_retention_pin_lsn": storage.oldest_retention_pin_lsn,
         })),
     }))
+}
+
+/// Return detailed per-group diagnostics only when explicitly requested.
+///
+/// The ordinary /status endpoint deliberately publishes only aggregate and
+/// top-K queue pressure so its response size remains independent of tablet
+/// count. Lifecycle and failover tooling uses this on-demand endpoint when it
+/// needs full Raft progress vectors.
+async fn handle_multiraft_groups_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let Some(status_handle) = state.multiraft_status.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "MultiRaft status is unavailable",
+            })),
+        );
+    };
+    let status = status_handle
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "multiraft": multiraft_detail_json(&status),
+        })),
+    )
+}
+
+fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
+    let groups = status
+        .groups
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "raft_group_id": group.identity.raft_group_id.0,
+                "replica_id": group.identity.replica_id.0,
+                "role": group.role.map(|role| role.as_str()),
+                "leader_replica_id": group.leader_replica_id.map(|replica_id| replica_id.0),
+                "term": group.term,
+                "commit_index": group.commit_index,
+                "last_log_index": group.last_log_index,
+                "applied_index": group.applied_index,
+                "snapshot_index": group.snapshot_index,
+                "uncommitted_bytes": group.uncommitted_bytes,
+                "replication_inflight_bytes": group.replication_inflight_bytes,
+                "pending_work": group.pending_work,
+                "pending_messages": group.pending_messages,
+                "pending_message_bytes": group.pending_message_bytes,
+                "quarantine_reason": group.quarantine_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "node_id": status.node_id.0,
+        "state": status.state.as_str(),
+        "pending_message_count": status.pending_message_count,
+        "pending_message_bytes": status.pending_message_bytes,
+        "groups": groups,
+    })
 }
 
 async fn handle_node_lifecycle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {

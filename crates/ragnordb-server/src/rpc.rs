@@ -18,14 +18,14 @@ use std::{
 };
 
 use prost::Message;
-use ragnordb_catalog::{MetadataApplyOutcome, MetadataState};
+use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
 use ragnordb_common::{
     Error, Result,
     command_codec::{CachedTabletCommandOutcome, TabletCommand},
     ids::{
         LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp,
     },
-    metadata_codec::{DesiredReplicaRole, TabletDescriptor},
+    metadata_codec::DesiredReplicaRole,
     proto::rpc,
     rpc_codec::{
         MessageType, MetadataProposalRequest, MetadataRequest, MetadataResponse, ReplicaRoute,
@@ -429,7 +429,23 @@ pub struct TabletRpcClient {
     handles: SharedTabletHandleRegistry,
     rpc_state: RpcState,
     metadata: MetadataRuntimeHandle,
+    /// One validated routing table is published per committed metadata
+    /// generation. Request routing only clones this immutable view; it never
+    /// rebuilds partition boundaries or placement routes on the hot path.
+    routing_snapshot: Arc<RwLock<Arc<RoutingSnapshot>>>,
     route_cache: Arc<RwLock<TabletRouteCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct RoutingSnapshot {
+    generation: u64,
+    tables: BTreeMap<TableId, TableRoutingSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct TableRoutingSnapshot {
+    router: Arc<TabletRouter>,
+    routes_by_tablet: BTreeMap<ragnordb_common::ids::TabletId, TabletRoute>,
 }
 
 impl TabletRpcClient {
@@ -444,77 +460,62 @@ impl TabletRpcClient {
             handles,
             rpc_state,
             metadata,
+            routing_snapshot: Arc::new(RwLock::new(Arc::new(RoutingSnapshot {
+                generation: 0,
+                tables: BTreeMap::new(),
+            }))),
             route_cache: Arc::new(RwLock::new(TabletRouteCache::new())),
         }
     }
 
-    /// Resolve the current committed metadata route for one point key.
+    /// Load a complete routing snapshot, rebuilding it only after the
+    /// metadata publication generation changes.
     ///
-    /// Metadata placement is read-only here. The returned leader is only a
-    /// hint; a tablet response may refresh it after a leadership transition.
-    pub fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute> {
-        let state = self.metadata.state_snapshot();
-        state.table(table_id).ok_or_else(|| {
-            Error::SchemaMismatch(format!("metadata has no table {}", table_id.0))
-        })?;
-        let descriptors = state.tablets_for_table(table_id);
-        let router = TabletRouter::new(table_id, &descriptors).map_err(|error| {
-            Error::CorruptData(format!(
-                "metadata route for table {} is invalid: {error}",
-                table_id.0
-            ))
-        })?;
-        let tablet_id = router.route_point(key)?;
-        let descriptor = descriptors
-            .iter()
-            .find(|descriptor| descriptor.tablet_id == tablet_id)
-            .ok_or_else(|| {
-                Error::CorruptData("metadata route selected an unknown tablet".to_string())
-            })?;
-        let placement = state.desired_placement(tablet_id).ok_or_else(|| {
-            Error::CorruptData(format!("tablet {} has no desired placement", tablet_id.0))
-        })?;
-        let replicas = placement
-            .replicas
-            .iter()
-            .map(|replica| ReplicaRoute {
-                replica_id: replica.replica_id,
-                node_id: replica.node_id,
-            })
-            .collect::<Vec<_>>();
-        let placement_leader_replica_id = placement
-            .replicas
-            .iter()
-            .find(|replica| replica.role == DesiredReplicaRole::Voter)
-            .or_else(|| placement.replicas.first())
-            .map(|replica| replica.replica_id)
-            .ok_or_else(|| Error::CorruptData("tablet placement has no replicas".to_string()))?;
-        // Metadata records desired membership, not the current Raft leader.
-        // Prefer the local Ready owner's published leader whenever this node
-        // hosts the group; fall back to the canonical first voter only while
-        // that point-in-time status is still unknown during election/startup.
-        let published_leader_replica_id = self
+    /// The metadata state is immutable after publication. Building the
+    /// derived view is therefore safe outside the snapshot lock; the short
+    /// write section only swaps one Arc after all tables and routes have
+    /// passed validation.
+    fn routing_snapshot(&self) -> Result<Arc<RoutingSnapshot>> {
+        let (generation, state) = self.metadata.state_snapshot_with_generation();
+        {
+            let current = self
+                .routing_snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current.generation == generation {
+                return Ok(current.clone());
+            }
+        }
+
+        let replacement = Arc::new(build_routing_snapshot(generation, &state)?);
+        let mut current = self
+            .routing_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.generation < generation {
+            *current = replacement;
+        }
+        Ok(current.clone())
+    }
+
+    fn route_with_leader_hint(&self, base_route: &TabletRoute) -> Result<TabletRoute> {
+        let mut route = base_route.clone();
+        let published_leader = self
             .handles
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&descriptor.raft_group_id)
+            .get(&route.raft_group_id)
             .and_then(|handle| handle.status().leader_replica_id)
-            .map(ReplicaId);
-        let leader_replica_id = published_leader_replica_id
+            .map(ReplicaId)
             .filter(|leader| {
-                placement
+                route
                     .replicas
                     .iter()
                     .any(|replica| replica.replica_id == *leader)
-            })
-            .unwrap_or(placement_leader_replica_id);
-        let mut route = TabletRoute {
-            raft_group_id: descriptor.raft_group_id,
-            tablet_id: descriptor.tablet_id,
-            tablet_epoch: descriptor.tablet_epoch,
-            leader_replica_id,
-            replicas,
-        };
+            });
+        if let Some(leader) = published_leader {
+            route.leader_replica_id = leader;
+        }
         if let Some(cached_leader) = self.cached_leader_for(&route) {
             route.leader_replica_id = cached_leader;
         }
@@ -523,6 +524,22 @@ impl TabletRpcClient {
             .map_err(|error| Error::CorruptData(error.to_string()))?;
         self.cache_authoritative_route(&route);
         Ok(route)
+    }
+
+    /// Resolve the current committed metadata route for one point key.
+    ///
+    /// Metadata placement is read-only here. The returned leader is only a
+    /// hint; a tablet response may refresh it after a leadership transition.
+    pub fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute> {
+        let snapshot = self.routing_snapshot()?;
+        let table = snapshot.tables.get(&table_id).ok_or_else(|| {
+            Error::SchemaMismatch(format!("metadata has no table {}", table_id.0))
+        })?;
+        let tablet_id = table.router.route_point(key)?;
+        let route = table.routes_by_tablet.get(&tablet_id).ok_or_else(|| {
+            Error::CorruptData("metadata route selected an unknown tablet".to_string())
+        })?;
+        self.route_with_leader_hint(route)
     }
 
     /// Resolve one logical span against a single committed metadata snapshot.
@@ -535,93 +552,29 @@ impl TabletRpcClient {
         span: &ScanSpan,
     ) -> Result<Vec<TabletScanRoute>> {
         span.validate()?;
-        let state = self.metadata.state_snapshot();
-        state.table(table_id).ok_or_else(|| {
+        let snapshot = self.routing_snapshot()?;
+        let table = snapshot.tables.get(&table_id).ok_or_else(|| {
             Error::SchemaMismatch(format!("metadata has no table {}", table_id.0))
         })?;
-        let descriptors = state.tablets_for_table(table_id);
-        let router = TabletRouter::new(table_id, &descriptors).map_err(|error| {
-            Error::CorruptData(format!(
-                "metadata scan route for table {} is invalid: {error}",
-                table_id.0
-            ))
-        })?;
-        router
+        table
+            .router
             .route_scan_fragments(span)?
             .into_iter()
             .map(|fragment| {
-                let descriptor = descriptors
-                    .iter()
-                    .find(|descriptor| descriptor.tablet_id == fragment.tablet_id)
+                let route = table
+                    .routes_by_tablet
+                    .get(&fragment.tablet_id)
                     .ok_or_else(|| {
                         Error::CorruptData(
                             "metadata scan route selected an unknown tablet".to_string(),
                         )
                     })?;
                 Ok(TabletScanRoute {
-                    route: self.tablet_route_from_metadata(&state, descriptor)?,
+                    route: self.route_with_leader_hint(route)?,
                     span: fragment.span,
                 })
             })
             .collect()
-    }
-
-    fn tablet_route_from_metadata(
-        &self,
-        state: &MetadataState,
-        descriptor: &TabletDescriptor,
-    ) -> Result<TabletRoute> {
-        let placement = state
-            .desired_placement(descriptor.tablet_id)
-            .ok_or_else(|| {
-                Error::CorruptData(format!(
-                    "tablet {} has no desired placement",
-                    descriptor.tablet_id.0
-                ))
-            })?;
-        let replicas = placement
-            .replicas
-            .iter()
-            .map(|replica| ReplicaRoute {
-                replica_id: replica.replica_id,
-                node_id: replica.node_id,
-            })
-            .collect::<Vec<_>>();
-        let placement_leader = placement
-            .replicas
-            .iter()
-            .find(|replica| replica.role == DesiredReplicaRole::Voter)
-            .or_else(|| placement.replicas.first())
-            .map(|replica| replica.replica_id)
-            .ok_or_else(|| Error::CorruptData("tablet placement has no replicas".to_string()))?;
-        let published_leader = self
-            .handles
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&descriptor.raft_group_id)
-            .and_then(|handle| handle.status().leader_replica_id)
-            .map(ReplicaId)
-            .filter(|leader| {
-                placement
-                    .replicas
-                    .iter()
-                    .any(|replica| replica.replica_id == *leader)
-            });
-        let mut route = TabletRoute {
-            raft_group_id: descriptor.raft_group_id,
-            tablet_id: descriptor.tablet_id,
-            tablet_epoch: descriptor.tablet_epoch,
-            leader_replica_id: published_leader.unwrap_or(placement_leader),
-            replicas,
-        };
-        if let Some(cached_leader) = self.cached_leader_for(&route) {
-            route.leader_replica_id = cached_leader;
-        }
-        route
-            .validate()
-            .map_err(|error| Error::CorruptData(error.to_string()))?;
-        self.cache_authoritative_route(&route);
-        Ok(route)
     }
 
     /// Return the local tablet lifecycle status when this node hosts the
@@ -1438,6 +1391,78 @@ impl TabletRpcClient {
             }
         }
     }
+}
+
+fn build_routing_snapshot(generation: u64, state: &MetadataState) -> Result<RoutingSnapshot> {
+    let mut tables = BTreeMap::new();
+    for schema in state.list_tables() {
+        let table_id = schema.id;
+        let descriptors = state.tablets_for_table(table_id);
+        let router = TabletRouter::new(table_id, &descriptors).map_err(|error| {
+            Error::CorruptData(format!(
+                "metadata route for table {} is invalid: {error}",
+                table_id.0
+            ))
+        })?;
+
+        let mut routes_by_tablet = BTreeMap::new();
+        for descriptor in descriptors {
+            let placement = state
+                .desired_placement(descriptor.tablet_id)
+                .ok_or_else(|| {
+                    Error::CorruptData(format!(
+                        "tablet {} has no desired placement",
+                        descriptor.tablet_id.0
+                    ))
+                })?;
+            let replicas = placement
+                .replicas
+                .iter()
+                .map(|replica| ReplicaRoute {
+                    replica_id: replica.replica_id,
+                    node_id: replica.node_id,
+                })
+                .collect::<Vec<_>>();
+            let leader_replica_id = placement
+                .replicas
+                .iter()
+                .find(|replica| replica.role == DesiredReplicaRole::Voter)
+                .or_else(|| placement.replicas.first())
+                .map(|replica| replica.replica_id)
+                .ok_or_else(|| {
+                    Error::CorruptData("tablet placement has no replicas".to_string())
+                })?;
+            let route = TabletRoute {
+                raft_group_id: descriptor.raft_group_id,
+                tablet_id: descriptor.tablet_id,
+                tablet_epoch: descriptor.tablet_epoch,
+                leader_replica_id,
+                replicas,
+            };
+            route
+                .validate()
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            if routes_by_tablet
+                .insert(descriptor.tablet_id, route)
+                .is_some()
+            {
+                return Err(Error::CorruptData(format!(
+                    "metadata contains duplicate tablet {} in table {}",
+                    descriptor.tablet_id.0, table_id.0
+                )));
+            }
+        }
+
+        tables.insert(
+            table_id,
+            TableRoutingSnapshot {
+                router: Arc::new(router),
+                routes_by_tablet,
+            },
+        );
+    }
+
+    Ok(RoutingSnapshot { generation, tables })
 }
 
 impl TabletGateway for TabletRpcClient {

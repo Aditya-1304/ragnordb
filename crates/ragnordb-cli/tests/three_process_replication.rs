@@ -50,6 +50,25 @@ impl ProcessNode {
         let boundary = response.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
         serde_json::from_slice(&response[boundary..]).ok()
     }
+
+    fn detailed_status(&self) -> Option<Value> {
+        let mut stream =
+            TcpStream::connect_timeout(&self.admin_addr, Duration::from_millis(150)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+        stream.write_all(b"GET /status/groups HTTP/1.1").ok()?;
+        stream.write_all(&[13, 10]).ok()?;
+        stream.write_all(b"Host: localhost").ok()?;
+        stream.write_all(&[13, 10]).ok()?;
+        stream.write_all(b"Connection: close").ok()?;
+        stream.write_all(&[13, 10, 13, 10]).ok()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).ok()?;
+        let boundary = response
+            .windows(4)
+            .position(|bytes| bytes == [13, 10, 13, 10])?
+            + 4;
+        serde_json::from_slice(&response[boundary..]).ok()
+    }
 }
 
 impl Drop for ProcessNode {
@@ -264,7 +283,7 @@ fn wait_for_routed_tablet_group(nodes: &[ProcessNode]) -> u64 {
     loop {
         let group_id = nodes
             .iter()
-            .filter_map(ProcessNode::status)
+            .filter_map(ProcessNode::detailed_status)
             .find_map(|status| {
                 status["multiraft"]["groups"]
                     .as_array()?
@@ -317,7 +336,7 @@ fn wait_for_routed_tablet_leader(
                 continue;
             }
             let is_leader = node
-                .status()
+                .detailed_status()
                 .and_then(|status| tablet_group_progress(&status, group_id))
                 .is_some_and(|(replica_id, leader_replica_id, _, _, is_leader, _)| {
                     is_leader && leader_replica_id == Some(replica_id)
@@ -347,10 +366,10 @@ fn wait_for_routed_tablet_catch_up(
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let leader_progress = nodes[leader_index]
-            .status()
+            .detailed_status()
             .and_then(|status| tablet_group_progress(&status, group_id));
         let restarted_progress = nodes[restarted_index]
-            .status()
+            .detailed_status()
             .and_then(|status| tablet_group_progress(&status, group_id));
 
         if let (

@@ -117,10 +117,9 @@ impl DatabaseServices {
     fn refresh_metadata_catalog(&self) -> Result<()> {
         match self.executor.try_write() {
             Ok(mut executor) => {
-                if executor.refresh_metadata_catalog_changed()? {
-                    self.published_view_generation
-                        .fetch_add(1, Ordering::AcqRel);
-                }
+                let _ = executor.refresh_metadata_catalog_changed()?;
+                self.published_view_generation
+                    .store(executor.published_view().generation(), Ordering::Release);
                 Ok(())
             }
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -131,10 +130,10 @@ impl DatabaseServices {
                 Ok(())
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                if poisoned.into_inner().refresh_metadata_catalog_changed()? {
-                    self.published_view_generation
-                        .fetch_add(1, Ordering::AcqRel);
-                }
+                let mut executor = poisoned.into_inner();
+                let _ = executor.refresh_metadata_catalog_changed()?;
+                self.published_view_generation
+                    .store(executor.published_view().generation(), Ordering::Release);
                 Ok(())
             }
         }
@@ -151,8 +150,10 @@ impl DatabaseServices {
             .executor
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let schema = executor.schema_snapshot();
         let parsed = parse_one(sql)?;
-        let bound = analyze(&parsed, executor.catalog())?;
+        drop(executor);
+        let bound = analyze(&parsed, schema.as_ref())?;
         Ok(plan(bound))
     }
 
@@ -221,7 +222,12 @@ impl DatabaseServices {
                         .executor
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    executor.install_metadata_table_topology(topology)
+                    let result = executor.install_metadata_table_topology(topology);
+                    if result.is_ok() {
+                        self.published_view_generation
+                            .store(executor.published_view().generation(), Ordering::Release);
+                    }
+                    result
                 }
             }
             Plan::Commit => {

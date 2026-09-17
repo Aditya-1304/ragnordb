@@ -2788,6 +2788,10 @@ fn metadata_conf_change_response_to_result(
 }
 
 impl MetadataTableCreator for MetadataProposalClient {
+    fn metadata_generation(&self) -> Option<u64> {
+        Some(self.metadata.state_snapshot_with_generation().0)
+    }
+
     fn create_table(
         &self,
         request: CreateTableRequest,

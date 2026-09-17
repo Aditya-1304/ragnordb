@@ -69,31 +69,66 @@ pub struct AppliedMetadataCommand {
 /// startup code cannot bypass Raft by mutating metadata directly.
 #[derive(Clone, Default)]
 pub struct MetadataRuntimeHandle {
-    state: Arc<RwLock<MetadataState>>,
+    /// The state and generation share one publication lock so readers can
+    /// acquire a self-consistent immutable view without copying the complete
+    /// metadata projection or observing a generation from a different state.
+    published_state: Arc<RwLock<PublishedMetadataState>>,
 
     applied_results: Arc<Mutex<VecDeque<AppliedMetadataCommand>>>,
 }
 
+#[derive(Clone)]
+struct PublishedMetadataState {
+    generation: u64,
+    state: Arc<MetadataState>,
+}
+
+impl Default for PublishedMetadataState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: Arc::new(MetadataState::new()),
+        }
+    }
+}
+
 impl MetadataRuntimeHandle {
-    pub fn state_snapshot(&self) -> MetadataState {
-        self.state
+    /// Load the current committed metadata projection without cloning its
+    /// maps. The returned `Arc` pins one complete publication for the caller.
+    pub fn state_snapshot(&self) -> Arc<MetadataState> {
+        self.published_state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .state
             .clone()
     }
 
+    /// Load the immutable metadata projection together with the generation
+    /// that published it. Placement, tablet boundaries, and configuration
+    /// readers use this pair to rebuild derived views only after a committed
+    /// metadata publication.
+    pub fn state_snapshot_with_generation(&self) -> (u64, Arc<MetadataState>) {
+        let published = self
+            .published_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (published.generation, published.state.clone())
+    }
+
     pub fn cluster_id(&self) -> Option<String> {
-        self.state
+        self.published_state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .state
             .cluster_id()
             .map(str::to_string)
     }
 
     pub fn node(&self, node_id: NodeId) -> Option<NodeDescriptor> {
-        self.state
+        self.published_state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .state
             .node(node_id)
             .cloned()
     }
@@ -107,10 +142,12 @@ impl MetadataRuntimeHandle {
     }
 
     fn publish_state(&self, state: &MetadataState) {
-        *self
-            .state
+        let mut published = self
+            .published_state
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.clone();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        published.generation = published.generation.saturating_add(1);
+        published.state = Arc::new(state.clone());
     }
 
     fn publish_results(&self, results: impl IntoIterator<Item = AppliedMetadataCommand>) {
@@ -710,4 +747,24 @@ pub enum MetadataReconcileError {
 
     #[error("replica {0:?} no longer matches its recorded lifetime")]
     ReplicaLifetimeMismatch(ReplicaId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_runtime_reuses_published_arc_until_generation_changes() {
+        let runtime = MetadataRuntimeHandle::default();
+        let (initial_generation, initial_state) = runtime.state_snapshot_with_generation();
+        assert_eq!(initial_generation, 0);
+        assert!(Arc::ptr_eq(&initial_state, &runtime.state_snapshot()));
+
+        runtime.publish_state(&MetadataState::new());
+
+        let (published_generation, published_state) = runtime.state_snapshot_with_generation();
+        assert_eq!(published_generation, initial_generation + 1);
+        assert!(!Arc::ptr_eq(&initial_state, &published_state));
+        assert!(Arc::ptr_eq(&published_state, &runtime.state_snapshot()));
+    }
 }

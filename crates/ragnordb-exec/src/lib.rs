@@ -24,7 +24,7 @@ mod session;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -92,6 +92,14 @@ pub type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
 /// implementation must submit those semantics to metadata Raft and return the
 /// fully assigned definition only after the corresponding entry has applied.
 pub trait MetadataTableCreator: Send + Sync {
+    /// Return the committed metadata publication generation when the creator
+    /// has one. A generation lets the executor retain precompiled routing
+    /// boundaries across requests instead of reconstructing them merely to
+    /// discover that metadata is unchanged.
+    fn metadata_generation(&self) -> Option<u64> {
+        None
+    }
+
     fn create_table(
         &self,
         request: CreateTableRequest,
@@ -481,6 +489,77 @@ pub struct MetadataTableTopology {
 
 type LocalCatalog = DurableCatalog<SharedCatalogLog>;
 
+/// Immutable SQL schema view published after a complete catalog mutation.
+///
+/// The view owns a clone of the catalog indexes while retaining the catalog's
+/// immutable table-schema Arcs. Readers can therefore hold this value across
+/// planning and remote waits without holding the executor's mutation lock.
+#[derive(Debug, Clone)]
+pub struct SchemaSnapshot {
+    generation: u64,
+    catalog: Arc<MemoryCatalog>,
+}
+
+impl SchemaSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Catalog for SchemaSnapshot {
+    fn table_by_name(&self, name: &str) -> Option<Arc<TableSchema>> {
+        self.catalog.table_by_name(name)
+    }
+
+    fn table_by_id(&self, id: TableId) -> Option<Arc<TableSchema>> {
+        self.catalog.table_by_id(id)
+    }
+
+    fn list_tables(&self) -> Vec<Arc<TableSchema>> {
+        self.catalog.list_tables()
+    }
+}
+
+/// Immutable, precompiled tablet routing view for the local executor.
+#[derive(Debug, Clone)]
+pub struct RoutingSnapshot {
+    generation: u64,
+    routers: Arc<BTreeMap<TableId, Arc<TabletRouter>>>,
+}
+
+impl RoutingSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn router(&self, table_id: TableId) -> Option<Arc<TabletRouter>> {
+        self.routers.get(&table_id).cloned()
+    }
+}
+
+/// The schema and routing views are published as one Arc so a reader cannot
+/// combine a new schema with an old tablet map during a metadata refresh.
+#[derive(Debug, Clone)]
+pub struct ExecutorView {
+    generation: u64,
+    schema: Arc<SchemaSnapshot>,
+    routing: Arc<RoutingSnapshot>,
+}
+
+impl ExecutorView {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn schema(&self) -> Arc<SchemaSnapshot> {
+        self.schema.clone()
+    }
+
+    pub fn routing(&self) -> Arc<RoutingSnapshot> {
+        self.routing.clone()
+    }
+}
+
 /// Temporary materialized-result boundary until the client protocol streams.
 pub const MAX_MATERIALIZED_RESULT_ROWS: usize = 100_000;
 const TABLET_SCAN_PAGE_ROWS: u32 = 1_024;
@@ -558,7 +637,9 @@ pub struct LocalExecutor {
     catalog: LocalCatalog,
     tablets: BTreeMap<TableId, LocalTablet>,
     tablet_routers: BTreeMap<TableId, TabletRouter>,
+    published_view: Arc<RwLock<Arc<ExecutorView>>>,
     metadata_table_creator: Option<SharedMetadataTableCreator>,
+    metadata_generation: Option<u64>,
     tablet_gateway: Option<SharedTabletGateway>,
     metadata_table_ids: BTreeSet<TableId>,
     commit_log: SharedCommitLog,
@@ -603,17 +684,79 @@ impl LocalExecutor {
     }
 
     pub fn with_logs(commit_log: SharedCommitLog, catalog_log: SharedCatalogLog) -> Self {
-        Self {
+        let mut executor = Self {
             catalog: DurableCatalog::new(catalog_log),
             tablets: BTreeMap::new(),
             tablet_routers: BTreeMap::new(),
+            published_view: Arc::new(RwLock::new(Arc::new(ExecutorView {
+                generation: 0,
+                schema: Arc::new(SchemaSnapshot {
+                    generation: 0,
+                    catalog: Arc::new(MemoryCatalog::new()),
+                }),
+                routing: Arc::new(RoutingSnapshot {
+                    generation: 0,
+                    routers: Arc::new(BTreeMap::new()),
+                }),
+            }))),
             metadata_table_creator: None,
+            metadata_generation: None,
             tablet_gateway: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: 0,
             replay_from_end_lsn: 0,
-        }
+        };
+        executor.publish_view();
+        executor
+    }
+
+    fn publish_view(&mut self) {
+        let current_generation = self
+            .published_view
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation;
+        let generation = current_generation.saturating_add(1);
+        let schema = Arc::new(SchemaSnapshot {
+            generation,
+            catalog: Arc::new(self.catalog.catalog().clone()),
+        });
+        let routers = self
+            .tablet_routers
+            .iter()
+            .map(|(table_id, router)| (*table_id, Arc::new(router.clone())))
+            .collect();
+        let routing = Arc::new(RoutingSnapshot {
+            generation,
+            routers: Arc::new(routers),
+        });
+        let view = Arc::new(ExecutorView {
+            generation,
+            schema,
+            routing,
+        });
+        *self
+            .published_view
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
+    }
+
+    /// Load the latest complete schema/routing publication. The lock is held
+    /// only long enough to clone the immutable Arc, never across SQL work.
+    pub fn published_view(&self) -> Arc<ExecutorView> {
+        self.published_view
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn schema_snapshot(&self) -> Arc<SchemaSnapshot> {
+        self.published_view().schema()
+    }
+
+    pub fn routing_snapshot(&self) -> Arc<RoutingSnapshot> {
+        self.published_view().routing()
     }
 
     /// Route every future table commit through a new semantic durability sink.
@@ -636,6 +779,7 @@ impl LocalExecutor {
     /// Install the metadata Raft client used for replicated CREATE TABLE.
     pub fn replace_metadata_table_creator(&mut self, creator: SharedMetadataTableCreator) {
         self.metadata_table_creator = Some(creator);
+        self.metadata_generation = None;
     }
 
     /// Install the server-owned gateway used for metadata-routed tablet
@@ -674,6 +818,10 @@ impl LocalExecutor {
         let Some(creator) = self.metadata_table_creator.clone() else {
             return Ok(false);
         };
+        let creator_generation = creator.metadata_generation();
+        if creator_generation.is_some() && creator_generation == self.metadata_generation {
+            return Ok(false);
+        }
 
         let mut changed = false;
         for definition in creator.list_tables() {
@@ -709,6 +857,10 @@ impl LocalExecutor {
             }
         }
 
+        if changed {
+            self.publish_view();
+        }
+        self.metadata_generation = creator_generation;
         Ok(changed)
     }
 
@@ -781,6 +933,7 @@ impl LocalExecutor {
         }
 
         self.tablet_routers.entry(table_id).or_insert(router);
+        self.publish_view();
         Ok(())
     }
 
@@ -904,6 +1057,7 @@ impl LocalExecutor {
             .install_replicated_definition(topology.definition)?;
         self.tablet_routers.insert(table_id, router);
         self.metadata_table_ids.insert(table_id);
+        self.publish_view();
 
         Ok(ExecutionResult::CreatedTable { table_id })
     }
@@ -1257,17 +1411,31 @@ impl LocalExecutor {
             );
         }
 
-        Ok(Self {
+        let mut executor = Self {
             catalog: DurableCatalog::from_recovered(catalog, catalog_log),
             tablets,
             tablet_routers,
+            published_view: Arc::new(RwLock::new(Arc::new(ExecutorView {
+                generation: 0,
+                schema: Arc::new(SchemaSnapshot {
+                    generation: 0,
+                    catalog: Arc::new(MemoryCatalog::new()),
+                }),
+                routing: Arc::new(RoutingSnapshot {
+                    generation: 0,
+                    routers: Arc::new(BTreeMap::new()),
+                }),
+            }))),
             metadata_table_creator: None,
+            metadata_generation: None,
             tablet_gateway: None,
             metadata_table_ids: BTreeSet::new(),
             commit_log,
             next_local_catalog_timestamp: catalog_timestamp_high_water.0,
             replay_from_end_lsn,
-        })
+        };
+        executor.publish_view();
+        Ok(executor)
     }
 
     /// Return the catalog snapshot used by SQL analysis.
@@ -1850,8 +2018,7 @@ impl LocalExecutor {
 
     fn execute_show_tables(&self) -> Result<ExecutionResult> {
         let rows = self
-            .catalog
-            .catalog()
+            .schema_snapshot()
             .list_tables()
             .into_iter()
             .take(MAX_MATERIALIZED_RESULT_ROWS + 1)
@@ -2220,11 +2387,12 @@ impl LocalExecutor {
         }
 
         self.tablet_routers.insert(table_id, router);
+        self.publish_view();
         Ok(())
     }
 
-    fn router_for(&self, table_id: TableId) -> Result<&TabletRouter> {
-        self.tablet_routers.get(&table_id).ok_or_else(|| {
+    fn router_for(&self, table_id: TableId) -> Result<Arc<TabletRouter>> {
+        self.routing_snapshot().router(table_id).ok_or_else(|| {
             Error::CorruptData(format!(
                 "catalog table {} has no authoritative tablet routing map",
                 table_id.0
@@ -3425,6 +3593,24 @@ mod tests {
     use ragnordb_sql::{analyze, parse_one, plan};
     use ragnordb_tablet::command::TabletCommandApplyResult;
     use ragnordb_txn::{LocalTransactionManager, TransactionManager};
+
+    #[test]
+    fn ddl_publishes_coherent_schema_and_routing_snapshots() {
+        let mut executor = LocalExecutor::new();
+        let before = executor.published_view();
+        let parsed = parse_one("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+        let plan = plan(analyze(&parsed, executor.catalog()).unwrap());
+
+        executor.execute(plan, None).unwrap();
+
+        let after = executor.published_view();
+        assert!(after.generation() > before.generation());
+        assert_eq!(after.schema().generation(), after.generation());
+        assert_eq!(after.routing().generation(), after.generation());
+        assert!(after.schema().table_by_name("users").is_some());
+        assert!(after.routing().router(TableId(1)).is_some());
+        assert!(before.schema().table_by_name("users").is_none());
+    }
 
     struct StaticMetadata {
         definition: TableDefinition,

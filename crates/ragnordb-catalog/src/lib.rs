@@ -195,7 +195,7 @@ pub trait Catalog: Send + Sync {
 ///
 /// Table identifiers start at one. Zero remains reserved so a default protobuf
 /// scalar cannot accidentally refer to a valid table.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryCatalog {
     table_ids_by_name: HashMap<String, TableId>,
     tables_by_id: BTreeMap<TableId, Arc<TableSchema>>,

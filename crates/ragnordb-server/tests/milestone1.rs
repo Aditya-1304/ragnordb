@@ -185,7 +185,8 @@ async fn admin_status_returns_json() {
     assert_eq!(json["durability"]["state"], "healthy");
     assert_eq!(json["durability"]["recovery_required"], false);
     assert_eq!(json["multiraft"]["node_id"], 7);
-    assert_eq!(json["multiraft"]["groups"].as_array().unwrap().len(), 2);
+    assert_eq!(json["multiraft"]["group_count"], 2);
+    assert_eq!(json["multiraft"]["top_groups"].as_array().unwrap().len(), 0);
 
     shutdown.cancel();
     server_task.await.unwrap();

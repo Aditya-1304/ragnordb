@@ -251,6 +251,88 @@ pub struct MultiRaftHostStatus {
     pub groups: Vec<MultiRaftGroupStatus>,
 }
 
+/// Bounded per-group load information suitable for continuously published
+/// node metrics. Full group diagnostics remain available through
+/// MultiRaftHostStatus when an operator explicitly requests them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRaftGroupLoad {
+    pub identity: RaftReplicaIdentity,
+    pub role: Option<MultiRaftRole>,
+    pub pending_messages: usize,
+    pub pending_message_bytes: usize,
+}
+
+/// Aggregate host metrics with a bounded top-K view of queue pressure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRaftHostSummary {
+    pub node_id: NodeId,
+    pub state: MultiRaftHostState,
+    pub pending_message_count: usize,
+    pub pending_message_bytes: usize,
+    pub group_count: usize,
+    pub leader_count: usize,
+    pub candidate_count: usize,
+    pub quarantined_group_count: usize,
+    pub top_groups: Vec<MultiRaftGroupLoad>,
+}
+
+impl MultiRaftHostStatus {
+    /// Project detailed status into a bounded aggregate. The cap prevents a
+    /// continuously sampled admin/metrics response from scaling with the
+    /// number of hosted tablets.
+    pub fn bounded_summary(&self, max_top_groups: usize) -> MultiRaftHostSummary {
+        const MAX_TOP_GROUPS: usize = 16;
+        let mut top_groups = self
+            .groups
+            .iter()
+            .filter(|group| group.pending_messages != 0 || group.pending_message_bytes != 0)
+            .map(|group| MultiRaftGroupLoad {
+                identity: group.identity,
+                role: group.role,
+                pending_messages: group.pending_messages,
+                pending_message_bytes: group.pending_message_bytes,
+            })
+            .collect::<Vec<_>>();
+        top_groups.sort_by(|left, right| {
+            right
+                .pending_message_bytes
+                .cmp(&left.pending_message_bytes)
+                .then_with(|| right.pending_messages.cmp(&left.pending_messages))
+                .then_with(|| {
+                    left.identity
+                        .raft_group_id
+                        .cmp(&right.identity.raft_group_id)
+                })
+                .then_with(|| left.identity.replica_id.cmp(&right.identity.replica_id))
+        });
+        top_groups.truncate(max_top_groups.min(MAX_TOP_GROUPS));
+
+        MultiRaftHostSummary {
+            node_id: self.node_id,
+            state: self.state,
+            pending_message_count: self.pending_message_count,
+            pending_message_bytes: self.pending_message_bytes,
+            group_count: self.groups.len(),
+            leader_count: self
+                .groups
+                .iter()
+                .filter(|group| group.role == Some(MultiRaftRole::Leader))
+                .count(),
+            candidate_count: self
+                .groups
+                .iter()
+                .filter(|group| group.role == Some(MultiRaftRole::Candidate))
+                .count(),
+            quarantined_group_count: self
+                .groups
+                .iter()
+                .filter(|group| group.quarantine_reason.is_some())
+                .count(),
+            top_groups,
+        }
+    }
+}
+
 pub type SharedMultiRaftHostStatus = Arc<RwLock<MultiRaftHostStatus>>;
 
 /// Work performed by one hosted group operation.
@@ -437,8 +519,16 @@ impl GroupTimerScheduler {
 
 #[derive(Debug, Default)]
 struct PendingGroupMessages {
-    control: VecDeque<RoutedRaftMessage>,
-    bulk: VecDeque<RoutedRaftMessage>,
+    control: VecDeque<PendingMessage>,
+    bulk: VecDeque<PendingMessage>,
+    message_count: usize,
+    message_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMessage {
+    message: RoutedRaftMessage,
+    wire_bytes: usize,
 }
 
 struct PendingPersistenceGroup {
@@ -456,15 +546,11 @@ struct PendingPersistenceGroup {
 
 impl PendingGroupMessages {
     fn len(&self) -> usize {
-        self.control.len() + self.bulk.len()
+        self.message_count
     }
 
     fn wire_bytes(&self) -> usize {
-        self.control
-            .iter()
-            .chain(self.bulk.iter())
-            .map(|message| crate::transport::routed_message_wire_size(message).unwrap_or(0))
-            .sum()
+        self.message_bytes
     }
 
     fn is_empty(&self) -> bool {
@@ -475,24 +561,33 @@ impl PendingGroupMessages {
         !self.control.is_empty()
     }
 
-    fn pop(&mut self) -> Option<RoutedRaftMessage> {
-        self.control.pop_front().or_else(|| self.bulk.pop_front())
+    fn pop(&mut self) -> Option<PendingMessage> {
+        let message = self.control.pop_front().or_else(|| self.bulk.pop_front())?;
+        self.message_count = self.message_count.saturating_sub(1);
+        self.message_bytes = self.message_bytes.saturating_sub(message.wire_bytes);
+        Some(message)
     }
 
-    fn push_front(&mut self, message: RoutedRaftMessage) {
-        if is_control_message(&message.envelope) {
+    fn push_front(&mut self, message: PendingMessage) {
+        let wire_bytes = message.wire_bytes;
+        if is_control_message(&message.message.envelope) {
             self.control.push_front(message);
         } else {
             self.bulk.push_front(message);
         }
+        self.message_count = self.message_count.saturating_add(1);
+        self.message_bytes = self.message_bytes.saturating_add(wire_bytes);
     }
 
-    fn push_back(&mut self, message: RoutedRaftMessage) {
-        if is_control_message(&message.envelope) {
+    fn push_back(&mut self, message: PendingMessage) {
+        let wire_bytes = message.wire_bytes;
+        if is_control_message(&message.message.envelope) {
             self.control.push_back(message);
         } else {
             self.bulk.push_back(message);
         }
+        self.message_count = self.message_count.saturating_add(1);
+        self.message_bytes = self.message_bytes.saturating_add(wire_bytes);
     }
 }
 
@@ -1891,11 +1986,6 @@ where
         }
     }
 
-    fn message_wire_bytes(message: &RoutedRaftMessage) -> usize {
-        crate::transport::routed_message_wire_size(message)
-            .expect("a message admitted by the host must remain serializable")
-    }
-
     /// Queues a tagged inbound message for bounded processing by its group.
     ///
     /// Validation happens at admission so an unknown group or wrong recipient
@@ -1938,7 +2028,10 @@ where
         self.pending_messages
             .entry(raft_group_id)
             .or_default()
-            .push_back(message);
+            .push_back(PendingMessage {
+                message,
+                wire_bytes,
+            });
         self.account_pending_addition(wire_bytes);
         if control {
             self.runnable.enqueue_control(raft_group_id);
@@ -2008,7 +2101,7 @@ where
             };
             let had_message = pending_message.is_some();
             if let Some(message) = pending_message.as_ref() {
-                self.account_pending_removal(Self::message_wire_bytes(message));
+                self.account_pending_removal(message.wire_bytes);
             }
 
             if had_message && result.messages_processed >= budget.max_messages {
@@ -2016,14 +2109,16 @@ where
                     &pending_message
                         .as_ref()
                         .expect("message was checked above")
+                        .message
                         .envelope,
                 );
                 let message = pending_message.expect("message was checked above");
+                let wire_bytes = message.wire_bytes;
                 self.pending_messages
                     .get_mut(&raft_group_id)
                     .expect("popped message implies a group queue")
-                    .push_front(message.clone());
-                self.account_pending_addition(Self::message_wire_bytes(&message));
+                    .push_front(message);
+                self.account_pending_addition(wire_bytes);
                 if timer_due {
                     self.timer_due
                         .entry(raft_group_id)
@@ -2079,11 +2174,12 @@ where
 
             if had_message && !process_message {
                 let message = pending_message.take().expect("message was checked above");
+                let wire_bytes = message.wire_bytes;
                 self.pending_messages
                     .get_mut(&raft_group_id)
                     .expect("popped message implies a group queue")
-                    .push_front(message.clone());
-                self.account_pending_addition(Self::message_wire_bytes(&message));
+                    .push_front(message);
+                self.account_pending_addition(wire_bytes);
             }
 
             let group_budget = MultiRaftTurnBudget {
@@ -2109,7 +2205,7 @@ where
 
                 match (process_message, pending_message.take()) {
                     (true, Some(message)) => {
-                        group.step_and_prepare_budgeted(message.envelope, group_budget)
+                        group.step_and_prepare_budgeted(message.message.envelope, group_budget)
                     }
                     (false, None) | (false, Some(_)) => {
                         group.tick_and_prepare_budgeted(group_timer_ticks, group_budget)
@@ -2175,12 +2271,13 @@ where
                         return Err(MultiRaftHostError::RecoveryRequired);
                     }
                     if let Some(message) = retry_message {
-                        let control = is_control_message(&message.envelope);
+                        let control = is_control_message(&message.message.envelope);
+                        let wire_bytes = message.wire_bytes;
                         self.pending_messages
                             .get_mut(&raft_group_id)
                             .expect("retrying message implies a group queue")
-                            .push_front(message.clone());
-                        self.account_pending_addition(Self::message_wire_bytes(&message));
+                            .push_front(message);
+                        self.account_pending_addition(wire_bytes);
                         if control {
                             self.runnable.enqueue_control(raft_group_id);
                         } else {
@@ -4080,6 +4177,51 @@ mod tests {
             Some("injected group-local failure")
         );
         assert!(status.groups[1].quarantine_reason.is_none());
+    }
+
+    #[test]
+    fn bounded_summary_caps_top_groups_while_preserving_aggregates() {
+        let mut status = MultiRaftHostStatus {
+            node_id: NodeId(7),
+            state: MultiRaftHostState::Active,
+            pending_message_count: 528,
+            pending_message_bytes: 5280,
+            groups: Vec::new(),
+        };
+        for index in 0..32 {
+            status.groups.push(MultiRaftGroupStatus {
+                identity: identity(index as u64 + 10, index as u64 + 101),
+                role: None,
+                leader_replica_id: None,
+                term: 0,
+                commit_index: 0,
+                last_log_index: 0,
+                applied_index: 0,
+                snapshot_index: 0,
+                uncommitted_bytes: 0,
+                replication_inflight_bytes: 0,
+                pending_work: false,
+                pending_messages: index + 1,
+                pending_message_bytes: (index + 1) * 10,
+                quarantine_reason: None,
+                conf_state_version: None,
+                joining: false,
+                voters: Vec::new(),
+                learners: Vec::new(),
+                outgoing_voters: Vec::new(),
+                replica_match_indices: Vec::new(),
+                pending_conf_change_index: None,
+                last_conf_change: None,
+                last_removed_replica: None,
+            });
+        }
+
+        let summary = status.bounded_summary(8);
+        assert_eq!(summary.group_count, 32);
+        assert_eq!(summary.pending_message_count, 528);
+        assert_eq!(summary.top_groups.len(), 8);
+        assert_eq!(summary.top_groups[0].pending_message_bytes, 320);
+        assert_eq!(summary.top_groups[7].pending_message_bytes, 250);
     }
 
     /// Realistic bug caught: after local destruction, a delayed envelope must
