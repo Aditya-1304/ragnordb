@@ -112,6 +112,101 @@ const METADATA_REQUEST_BUDGET: usize = 64;
 
 const REPLICA_JOIN_REQUEST_CHANNEL_CAPACITY: usize = 128;
 
+/// Wake source shared by the host's local request producers. The host thread
+/// is bound after it starts; requests submitted before that point remain in
+/// bounded channels and are drained during the first turn.
+#[derive(Clone)]
+pub(crate) struct HostWake {
+    thread: Arc<Mutex<Option<thread::Thread>>>,
+}
+
+impl HostWake {
+    pub(crate) fn new() -> Self {
+        Self {
+            thread: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn bind_current_thread(&self) {
+        *self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            thread.unpark();
+        }
+    }
+}
+
+/// Converts elapsed wall time into the logical ticks expected by Raft while
+/// allowing the host thread to park until the next sparse deadline. The
+/// logical clock advances only in whole intervals, so a delayed wakeup may
+/// catch up several ticks but can never stretch a configured heartbeat or
+/// election timeout.
+struct SparseTickClock {
+    interval: Duration,
+    last_boundary: Instant,
+}
+
+impl SparseTickClock {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_boundary: Instant::now(),
+        }
+    }
+
+    fn take_elapsed_ticks(&mut self, now: Instant) -> u64 {
+        let interval_nanos = self.interval.as_nanos().max(1);
+        let elapsed_nanos = now.saturating_duration_since(self.last_boundary).as_nanos();
+        let ticks = elapsed_nanos / interval_nanos;
+        let ticks = u64::try_from(ticks).unwrap_or(u64::MAX);
+
+        if ticks == 0 {
+            return 0;
+        }
+
+        if ticks <= u64::from(u32::MAX)
+            && let Some(advance) = self.interval.checked_mul(ticks as u32)
+        {
+            self.last_boundary += advance;
+        } else {
+            // A process paused for more than u32::MAX intervals has already
+            // exceeded every configured Raft safety window. Dropping the
+            // unrepresentable remainder is preferable to overflowing the
+            // duration arithmetic; the next loop still advances normally.
+            self.last_boundary = now;
+        }
+
+        ticks
+    }
+
+    fn duration_until_ticks(&self, ticks: u64) -> Duration {
+        let elapsed = self.last_boundary.elapsed();
+        if ticks == 0 {
+            return Duration::ZERO;
+        }
+
+        let target = if ticks <= u64::from(u32::MAX) {
+            self.interval
+                .checked_mul(ticks as u32)
+                .unwrap_or(Duration::from_secs(1))
+        } else {
+            Duration::from_secs(1)
+        };
+        target.saturating_sub(elapsed)
+    }
+}
+
 pub(crate) enum MetadataHostRequest {
     Command {
         envelope: Box<MetadataCommandEnvelope>,
@@ -2223,6 +2318,7 @@ pub struct MetadataProposalClient {
     metadata_rpc: MetadataRpcClient,
     metadata_nodes: Vec<NodeId>,
     local_node_id: NodeId,
+    host_wake: HostWake,
     admin_client_id: u128,
     next_admin_sequence: Arc<AtomicU64>,
 }
@@ -2234,6 +2330,7 @@ impl MetadataProposalClient {
         metadata_rpc: MetadataRpcClient,
         metadata_nodes: Vec<NodeId>,
         local_node_id: NodeId,
+        host_wake: HostWake,
     ) -> Self {
         let process_nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2249,6 +2346,7 @@ impl MetadataProposalClient {
             metadata_rpc,
             metadata_nodes,
             local_node_id,
+            host_wake,
             admin_client_id,
             next_admin_sequence: Arc::new(AtomicU64::new(1)),
         }
@@ -2375,6 +2473,7 @@ impl MetadataProposalClient {
                     reason: "metadata Raft host is not running".to_string(),
                 },
             })?;
+        self.host_wake.wake();
         let remaining = deadline.saturating_duration_since(Instant::now());
         response
             .recv_timeout(remaining)
@@ -2572,6 +2671,7 @@ impl MetadataProposalClient {
                     reason: "metadata Raft host is not running".to_string(),
                 },
             })?;
+        self.host_wake.wake();
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         response
@@ -3295,8 +3395,10 @@ impl MultiRaftRuntime {
 
         // Tablet reactors may now release any Ready-dependent messages.
         start_gate.store(true, Ordering::Release);
+        reactors.wake_all();
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let host_wake = HostWake::new();
 
         let (metadata_request_tx, metadata_request_rx) =
             mpsc::sync_channel(METADATA_REQUEST_CHANNEL_CAPACITY);
@@ -3308,6 +3410,7 @@ impl MultiRaftRuntime {
             metadata_rpc,
             metadata_nodes.iter().map(|node| node.node_id).collect(),
             config.node_id,
+            host_wake.clone(),
         );
         tablet_lifecycle.install_metadata_control(metadata_proposal.clone());
         let metadata_creator: SharedMetadataTableCreator = Arc::new(metadata_proposal.clone());
@@ -3326,6 +3429,7 @@ impl MultiRaftRuntime {
             metadata_handle.clone(),
             metadata_request_tx,
             join_request_tx,
+            host_wake.clone(),
             shutdown.clone(),
         );
 
@@ -3352,6 +3456,7 @@ impl MultiRaftRuntime {
                     tablet_lifecycle,
                     join_request_rx,
                     replica_join_rpc,
+                    host_wake,
                 )
             })
             .map_err(|source| Error::Configuration(format!("spawn MultiRaft host: {source}")))?;
@@ -3494,8 +3599,11 @@ fn run_host(
     mut tablet_lifecycle: TabletLifecycleManager,
     join_requests: mpsc::Receiver<ReplicaJoinAdmission>,
     replica_join_rpc: ReplicaJoinRpcClient,
+    host_wake: HostWake,
 ) {
-    let mut next_tick = Instant::now() + TICK_INTERVAL;
+    host_wake.bind_current_thread();
+    inbound.bind_current_thread();
+    let mut timer_clock = SparseTickClock::new(TICK_INTERVAL);
 
     host.schedule_all_groups_after(1)
         .expect("active MultiRaft host must accept startup timer scheduling");
@@ -3610,8 +3718,9 @@ fn run_host(
             }
         }
 
+        let elapsed_ticks = timer_clock.take_elapsed_ticks(Instant::now());
         match host.run_turn(
-            0,
+            elapsed_ticks,
             MultiRaftTurnBudget {
                 max_groups: HOST_GROUP_BUDGET,
                 max_messages: HOST_MESSAGE_BUDGET,
@@ -3649,63 +3758,6 @@ fn run_host(
         }
 
         let now = Instant::now();
-
-        if now >= next_tick {
-            match host.schedule_due_ticks(1) {
-                Ok(()) => match host.run_turn(
-                    1,
-                    MultiRaftTurnBudget {
-                        max_groups: HOST_GROUP_BUDGET,
-                        max_messages: HOST_MESSAGE_BUDGET,
-                        ..MultiRaftTurnBudget::default()
-                    },
-                ) {
-                    Ok(turn) => send_outbound(&transport, turn.outbound),
-                    Err(MultiRaftHostError::RecoveryRequired) => {
-                        publish_host_status(&host_status, &host);
-                        signal_metadata_failure(
-                            &mut startup_sender,
-                            "shared Raft WAL requires node recovery".to_string(),
-                        );
-                        fail_pending_metadata(
-                            &mut pending_metadata,
-                            &mut pending_metadata_by_request,
-                            Error::RecoveryRequired {
-                                reason: "shared Raft WAL requires node recovery".to_string(),
-                            },
-                        );
-                        return;
-                    }
-                    Err(error) => tracing::warn!(error = %error, "scheduled MultiRaft turn failed"),
-                },
-
-                Err(MultiRaftHostError::RecoveryRequired) => {
-                    publish_host_status(&host_status, &host);
-                    signal_metadata_failure(
-                        &mut startup_sender,
-                        "shared Raft WAL requires node recovery".to_string(),
-                    );
-
-                    tracing::error!("shared Raft WAL requires node recovery");
-
-                    fail_pending_metadata(
-                        &mut pending_metadata,
-                        &mut pending_metadata_by_request,
-                        Error::RecoveryRequired {
-                            reason: "shared Raft WAL requires node recovery".to_string(),
-                        },
-                    );
-
-                    return;
-                }
-
-                Err(error) => {
-                    tracing::warn!(error = %error, "MultiRaft timer scheduling failed");
-                }
-            }
-
-            next_tick = now + TICK_INTERVAL;
-        }
 
         drain_metadata_results(
             &metadata,
@@ -3813,7 +3865,21 @@ fn run_host(
 
         publish_host_status(&host_status, &host);
 
-        thread::sleep(Duration::from_millis(2));
+        let wait = if host.has_runnable_work() {
+            Duration::ZERO
+        } else {
+            let timer_wait = host
+                .next_timer_delay_ticks()
+                .map(|ticks| timer_clock.duration_until_ticks(ticks.max(1)))
+                .unwrap_or_else(|| Duration::from_secs(1));
+            timer_wait.min(next_metadata_attempt.saturating_duration_since(now))
+        };
+
+        if wait.is_zero() {
+            thread::yield_now();
+        } else {
+            thread::park_timeout(wait);
+        }
     }
 
     graceful_leadership_handoff(
@@ -4049,7 +4115,7 @@ fn graceful_leadership_handoff(
     metadata_replica_to_node: &BTreeMap<ReplicaId, NodeId>,
 ) {
     let deadline = Instant::now() + SHUTDOWN_LEADERSHIP_TRANSFER_DEADLINE;
-    let mut next_tick = Instant::now();
+    let mut timer_clock = SparseTickClock::new(TICK_INTERVAL);
 
     loop {
         if let Err(error) = drain_shutdown_messages(host, inbound) {
@@ -4095,8 +4161,9 @@ fn graceful_leadership_handoff(
             }
         }
 
+        let elapsed_ticks = timer_clock.take_elapsed_ticks(Instant::now());
         match host.run_turn(
-            0,
+            elapsed_ticks,
             MultiRaftTurnBudget {
                 max_groups: HOST_GROUP_BUDGET,
                 max_messages: HOST_MESSAGE_BUDGET,
@@ -4108,25 +4175,24 @@ fn graceful_leadership_handoff(
         }
 
         let now = Instant::now();
-        if now >= next_tick {
-            match host.run_turn(
-                1,
-                MultiRaftTurnBudget {
-                    max_groups: HOST_GROUP_BUDGET,
-                    max_messages: HOST_MESSAGE_BUDGET,
-                    ..MultiRaftTurnBudget::default()
-                },
-            ) {
-                Ok(turn) => send_outbound(transport, turn.outbound),
-                Err(error) => tracing::debug!(error = %error, "shutdown Raft tick failed"),
-            }
-            next_tick = now + TICK_INTERVAL;
-        }
-
-        if Instant::now() >= deadline {
+        if now >= deadline {
             break;
         }
-        thread::sleep(Duration::from_millis(2));
+
+        let wait = if host.has_runnable_work() {
+            Duration::ZERO
+        } else {
+            let timer_wait = host
+                .next_timer_delay_ticks()
+                .map(|ticks| timer_clock.duration_until_ticks(ticks.max(1)))
+                .unwrap_or_else(|| Duration::from_secs(1));
+            timer_wait.min(deadline.saturating_duration_since(now))
+        };
+        if wait.is_zero() {
+            thread::yield_now();
+        } else {
+            thread::park_timeout(wait);
+        }
     }
 
     let remaining = host

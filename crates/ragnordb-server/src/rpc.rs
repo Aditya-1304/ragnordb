@@ -40,7 +40,7 @@ use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResu
 use ragnordb_tablet::{ScanSpan, TabletRouter};
 
 use crate::bootstrap::METADATA_RAFT_GROUP_ID;
-use crate::multiraft_runtime::MetadataHostRequest;
+use crate::multiraft_runtime::{HostWake, MetadataHostRequest};
 use crate::replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletStatus};
 use crate::replicated_tablet::{TabletRpcCompletion, TabletRpcCompletionSink};
 
@@ -1566,6 +1566,7 @@ pub(crate) fn spawn_dispatcher(
     metadata: MetadataRuntimeHandle,
     metadata_requests: mpsc::SyncSender<MetadataHostRequest>,
     join_requests: mpsc::SyncSender<ReplicaJoinAdmission>,
+    host_wake: HostWake,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
     let client = TabletRpcClient::new(
@@ -1594,6 +1595,7 @@ pub(crate) fn spawn_dispatcher(
                         &rpc_state,
                         &metadata_requests,
                         &join_requests,
+                        &host_wake,
                         message.source_node_id,
                         message.frame,
                     );
@@ -1747,6 +1749,7 @@ fn dispatch_message(
     rpc_state: &RpcState,
     metadata_requests: &mpsc::SyncSender<MetadataHostRequest>,
     join_requests: &mpsc::SyncSender<ReplicaJoinAdmission>,
+    host_wake: &HostWake,
     source: NodeId,
     frame: RpcFrame,
 ) {
@@ -1777,6 +1780,7 @@ fn dispatch_message(
                 );
                 return;
             }
+            host_wake.wake();
             // The lifecycle owner may wait on WAL/database ownership and must
             // not block this dispatcher: doing so would let one slow join
             // starve unrelated tablet and metadata RPCs. The admission queue
@@ -2222,6 +2226,7 @@ fn dispatch_message(
                     );
                     return;
                 }
+                host_wake.wake();
 
                 let transport = transport.clone();
                 let group_id = frame.raft_group_id;
@@ -2287,6 +2292,7 @@ fn dispatch_message(
                 );
                 return;
             }
+            host_wake.wake();
 
             let transport = transport.clone();
             let request_id_for_thread = request_id.clone();

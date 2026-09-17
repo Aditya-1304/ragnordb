@@ -104,7 +104,6 @@ const TABLET_CONTROL_BUDGET: usize = 64;
 const TABLET_REQUEST_BUDGET: usize = 64;
 const REACTOR_REGISTRATION_CAPACITY: usize = 256;
 const REACTOR_TURN_GROUP_BUDGET: usize = 32;
-const REACTOR_IDLE_PARK: Duration = Duration::from_millis(1);
 const INTERNAL_BARRIER_CLIENT_NAMESPACE: u64 = 0x5241_474e_4f52_4442;
 const READ_INDEX_CONTEXT_NAMESPACE: u64 = 0x5241_474e_4944_5801;
 const READ_INDEX_FALLBACK_GRACE: Duration = Duration::from_millis(5);
@@ -149,6 +148,10 @@ type Completion = ProposalCompletion<TabletCommandApplyOutcome, TabletCommandApp
 #[derive(Debug, Clone, Default)]
 pub struct ReplicatedTabletStatus {
     pub role: Option<MultiRaftRole>,
+    /// Current Raft election timeout in logical ticks. The host scheduler uses
+    /// this published value for follower and candidate deadlines so wall-clock
+    /// parking never changes the Raft core's abstract timing contract.
+    pub current_election_timeout_ticks: u64,
     pub leader_replica_id: Option<u64>,
     pub term: u64,
     pub commit_index: u64,
@@ -372,6 +375,8 @@ struct ByteBoundedSender<T: MailboxSized> {
     sender: SyncSender<MailboxEntry<T>>,
     budget: Arc<MailboxBudget>,
     wake: ReactorWake,
+    identity: Option<RaftReplicaIdentity>,
+    pending_items: Arc<AtomicUsize>,
 }
 
 struct MailboxEntry<T> {
@@ -385,6 +390,8 @@ impl<T: MailboxSized> Clone for ByteBoundedSender<T> {
             sender: self.sender.clone(),
             budget: self.budget.clone(),
             wake: self.wake.clone(),
+            identity: self.identity,
+            pending_items: self.pending_items.clone(),
         }
     }
 }
@@ -396,16 +403,23 @@ impl<T: MailboxSized> ByteBoundedSender<T> {
             return Err(mpsc::TrySendError::Full(item));
         }
 
+        self.pending_items.fetch_add(1, Ordering::Release);
         match self.sender.try_send(MailboxEntry { item, bytes }) {
             Ok(()) => {
-                self.wake.wake();
+                if let Some(identity) = self.identity {
+                    self.wake.wake_group(identity);
+                } else {
+                    self.wake.wake();
+                }
                 Ok(())
             }
             Err(mpsc::TrySendError::Full(entry)) => {
+                self.pending_items.fetch_sub(1, Ordering::Release);
                 self.budget.release(entry.bytes);
                 Err(mpsc::TrySendError::Full(entry.item))
             }
             Err(mpsc::TrySendError::Disconnected(entry)) => {
+                self.pending_items.fetch_sub(1, Ordering::Release);
                 self.budget.release(entry.bytes);
                 Err(mpsc::TrySendError::Disconnected(entry.item))
             }
@@ -418,12 +432,18 @@ impl<T: MailboxSized> ByteBoundedSender<T> {
             return Err(mpsc::SendError(item));
         }
 
+        self.pending_items.fetch_add(1, Ordering::Release);
         match self.sender.send(MailboxEntry { item, bytes }) {
             Ok(()) => {
-                self.wake.wake();
+                if let Some(identity) = self.identity {
+                    self.wake.wake_group(identity);
+                } else {
+                    self.wake.wake();
+                }
                 Ok(())
             }
             Err(mpsc::SendError(entry)) => {
+                self.pending_items.fetch_sub(1, Ordering::Release);
                 self.budget.release(entry.bytes);
                 Err(mpsc::SendError(entry.item))
             }
@@ -434,12 +454,14 @@ impl<T: MailboxSized> ByteBoundedSender<T> {
 struct ByteBoundedReceiver<T: MailboxSized> {
     receiver: Receiver<MailboxEntry<T>>,
     budget: Arc<MailboxBudget>,
+    pending_items: Arc<AtomicUsize>,
 }
 
 impl<T: MailboxSized> ByteBoundedReceiver<T> {
     fn try_recv(&self) -> std::result::Result<T, mpsc::TryRecvError> {
         match self.receiver.try_recv() {
             Ok(entry) => {
+                self.pending_items.fetch_sub(1, Ordering::Release);
                 self.budget.release(entry.bytes);
                 Ok(entry.item)
             }
@@ -447,10 +469,15 @@ impl<T: MailboxSized> ByteBoundedReceiver<T> {
         }
     }
 
+    fn has_pending(&self) -> bool {
+        self.pending_items.load(Ordering::Acquire) != 0
+    }
+
     #[cfg(test)]
     fn recv_timeout(&self, timeout: Duration) -> std::result::Result<T, mpsc::RecvTimeoutError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(entry) => {
+                self.pending_items.fetch_sub(1, Ordering::Release);
                 self.budget.release(entry.bytes);
                 Ok(entry.item)
             }
@@ -462,6 +489,7 @@ impl<T: MailboxSized> ByteBoundedReceiver<T> {
 impl<T: MailboxSized> Drop for ByteBoundedReceiver<T> {
     fn drop(&mut self) {
         while let Ok(entry) = self.receiver.try_recv() {
+            self.pending_items.fetch_sub(1, Ordering::Release);
             self.budget.release(entry.bytes);
         }
     }
@@ -472,19 +500,45 @@ struct ByteBoundedMailbox<T: MailboxSized> {
 }
 
 impl<T: MailboxSized> ByteBoundedMailbox<T> {
+    #[cfg(test)]
     fn pair(
         capacity: usize,
         budget: Arc<MailboxBudget>,
         wake: ReactorWake,
     ) -> (ByteBoundedSender<T>, ByteBoundedReceiver<T>) {
+        Self::pair_with_identity(capacity, budget, wake, None)
+    }
+
+    fn pair_for_group(
+        capacity: usize,
+        budget: Arc<MailboxBudget>,
+        wake: ReactorWake,
+        identity: RaftReplicaIdentity,
+    ) -> (ByteBoundedSender<T>, ByteBoundedReceiver<T>) {
+        Self::pair_with_identity(capacity, budget, wake, Some(identity))
+    }
+
+    fn pair_with_identity(
+        capacity: usize,
+        budget: Arc<MailboxBudget>,
+        wake: ReactorWake,
+        identity: Option<RaftReplicaIdentity>,
+    ) -> (ByteBoundedSender<T>, ByteBoundedReceiver<T>) {
         let (sender, receiver) = mpsc::sync_channel(capacity);
+        let pending_items = Arc::new(AtomicUsize::new(0));
         (
             ByteBoundedSender {
                 sender,
                 budget: budget.clone(),
                 wake,
+                identity,
+                pending_items: pending_items.clone(),
             },
-            ByteBoundedReceiver { receiver, budget },
+            ByteBoundedReceiver {
+                receiver,
+                budget,
+                pending_items,
+            },
         )
     }
 }
@@ -689,12 +743,14 @@ pub struct ReactorOwnership {
 #[derive(Clone)]
 struct ReactorWake {
     thread: Arc<Mutex<Option<thread::Thread>>>,
+    runnable: Arc<Mutex<BTreeSet<RaftReplicaIdentity>>>,
 }
 
 impl ReactorWake {
     fn new() -> Self {
         Self {
             thread: Arc::new(Mutex::new(None)),
+            runnable: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -716,13 +772,29 @@ impl ReactorWake {
             thread.unpark();
         }
     }
+
+    fn wake_group(&self, identity: RaftReplicaIdentity) {
+        self.runnable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        self.wake();
+    }
+
+    fn take_runnable(&self) -> Vec<RaftReplicaIdentity> {
+        let mut runnable = self
+            .runnable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *runnable).into_iter().collect()
+    }
 }
 
 trait ReactorGroup: Send {
     fn identity(&self) -> RaftReplicaIdentity;
     fn ownership(&self) -> ReactorOwnership;
     fn is_shutdown(&self) -> bool;
-    fn turn(&mut self) -> std::result::Result<(), String>;
+    fn turn(&mut self) -> std::result::Result<bool, String>;
     fn fail(&mut self, reason: String);
 }
 
@@ -883,6 +955,19 @@ impl FixedReactorSet {
         }
         Ok(())
     }
+
+    pub(crate) fn wake_all(&self) {
+        let identities = self
+            .ownerships
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(identity, ownership)| (*identity, ownership.reactor_id))
+            .collect::<Vec<_>>();
+        for (identity, reactor_id) in identities {
+            self.slots[reactor_id].wake.wake_group(identity);
+        }
+    }
 }
 
 impl Drop for FixedReactorSet {
@@ -909,8 +994,15 @@ fn run_fixed_reactor(
     wake.bind_current_thread();
     let mut groups = BTreeMap::<RaftReplicaIdentity, Box<dyn ReactorGroup>>::new();
     let mut runnable = VecDeque::<RaftReplicaIdentity>::new();
+    let mut queued = BTreeSet::<RaftReplicaIdentity>::new();
 
     while !shutdown.load(Ordering::Acquire) {
+        for identity in wake.take_runnable() {
+            if groups.contains_key(&identity) && queued.insert(identity) {
+                runnable.push_back(identity);
+            }
+        }
+
         while let Ok(command) = receiver.try_recv() {
             match command {
                 ReactorCommand::Register(registration) => {
@@ -919,7 +1011,9 @@ fn run_fixed_reactor(
                         groups.entry(identity)
                     {
                         entry.insert(registration.group);
-                        runnable.push_back(identity);
+                        if queued.insert(identity) {
+                            runnable.push_back(identity);
+                        }
                         Ok(())
                     } else {
                         Err(format!("reactor already owns group {identity:?}"))
@@ -934,6 +1028,7 @@ fn run_fixed_reactor(
             let Some(identity) = runnable.pop_front() else {
                 break;
             };
+            queued.remove(&identity);
             let Some(group) = groups.get_mut(&identity) else {
                 continue;
             };
@@ -942,19 +1037,22 @@ fn run_fixed_reactor(
                 continue;
             }
             serviced += 1;
-            if let Err(reason) = group.turn() {
-                group.fail(reason);
-            }
-            if groups
-                .get(&identity)
-                .is_some_and(|group| !group.is_shutdown())
-            {
-                runnable.push_back(identity);
+            match group.turn() {
+                Ok(true) => {
+                    if groups
+                        .get(&identity)
+                        .is_some_and(|group| !group.is_shutdown() && queued.insert(identity))
+                    {
+                        runnable.push_back(identity);
+                    }
+                }
+                Ok(false) => {}
+                Err(reason) => group.fail(reason),
             }
         }
 
         if serviced == 0 || groups.is_empty() {
-            thread::park_timeout(REACTOR_IDLE_PARK);
+            thread::park();
         } else {
             thread::yield_now();
         }
@@ -1003,6 +1101,26 @@ pub(crate) struct ReplicatedTabletGroupProxy {
 impl ReplicatedTabletGroupProxy {
     fn control_unavailable() -> HostedGroupError {
         HostedGroupError::Group("replicated tablet reactor has stopped".to_string())
+    }
+
+    fn next_timer_delay_ticks(&self) -> Option<u64> {
+        let status = self
+            .status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if status.joining {
+            return None;
+        }
+
+        let delay = match status.role {
+            Some(MultiRaftRole::Leader) => HEARTBEAT_INTERVAL_TICKS,
+            Some(MultiRaftRole::Follower | MultiRaftRole::Candidate) => {
+                status.current_election_timeout_ticks.max(1)
+            }
+            None => 1,
+        };
+        Some(delay)
     }
 
     fn poll_pending(&mut self) -> std::result::Result<Option<HostedGroupTurn>, HostedGroupError> {
@@ -1136,6 +1254,10 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
 
     fn has_pending_work(&self) -> bool {
         self.pending.is_some()
+    }
+
+    fn next_timer_delay_ticks(&self) -> Option<u64> {
+        Self::next_timer_delay_ticks(self)
     }
 
     fn tick_and_drain(
@@ -1922,15 +2044,17 @@ impl ReplicatedTabletRuntime {
                 reason: source.to_string(),
             })?;
 
-        let (request_tx, request_rx) = ByteBoundedMailbox::pair(
+        let (request_tx, request_rx) = ByteBoundedMailbox::pair_for_group(
             CHANNEL_CAPACITY,
             assignment.mailbox_budget.clone(),
             assignment.wake.clone(),
+            raft_identity,
         );
-        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair(
+        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair_for_group(
             CHANNEL_CAPACITY,
             assignment.mailbox_budget.clone(),
             assignment.wake.clone(),
+            raft_identity,
         );
 
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
@@ -2143,15 +2267,17 @@ impl ReplicatedTabletRuntime {
             });
         }
 
-        let (request_tx, request_rx) = ByteBoundedMailbox::pair(
+        let (request_tx, request_rx) = ByteBoundedMailbox::pair_for_group(
             CHANNEL_CAPACITY,
             assignment.mailbox_budget.clone(),
             assignment.wake.clone(),
+            identity,
         );
-        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair(
+        let (host_control_tx, host_control_rx) = ByteBoundedMailbox::pair_for_group(
             CHANNEL_CAPACITY,
             assignment.mailbox_budget.clone(),
             assignment.wake.clone(),
+            identity,
         );
         let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2334,7 +2460,7 @@ fn install_recovered_catalog(
 impl Drop for ReplicatedTabletRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.handle.wake.wake();
+        self.handle.wake.wake_group(self.identity);
     }
 }
 
@@ -2462,9 +2588,9 @@ where
             .runtime_error = Some(reason);
     }
 
-    fn turn(&mut self) -> std::result::Result<(), String> {
+    fn turn(&mut self) -> std::result::Result<bool, String> {
         if !self.start_gate.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
 
         if let Some(ready) = self.initial_ready.take() {
@@ -2476,7 +2602,16 @@ where
             );
         }
 
-        self.run_turn()
+        self.run_turn()?;
+        Ok(self.should_run_again())
+    }
+
+    fn should_run_again(&self) -> bool {
+        self.host_control.has_pending()
+            || self.requests.has_pending()
+            || self.initial_ready.is_some()
+            || self.pending_snapshot_install.is_some()
+            || self.pending_local_snapshot.is_some()
     }
 }
 
@@ -2498,7 +2633,7 @@ where
         self.shutdown.load(Ordering::Acquire)
     }
 
-    fn turn(&mut self) -> std::result::Result<(), String> {
+    fn turn(&mut self) -> std::result::Result<bool, String> {
         ReadyOwner::turn(self)
     }
 
@@ -5667,6 +5802,7 @@ fn publish_status<W, LS, SS>(
         .leader_id()
         .map(|replica_id| replica_id.get());
     published.role = Some((*ready_loop.raft().role()).into());
+    published.current_election_timeout_ticks = ready_loop.raft().current_election_timeout();
     published.term = ready_loop.raft().hard_state().current_term;
     published.commit_index = ready_loop.raft().hard_state().commit;
     published.last_log_index = ready_loop.raft().last_log_index();
@@ -5766,7 +5902,7 @@ mod tests {
             false
         }
 
-        fn turn(&mut self) -> std::result::Result<(), String> {
+        fn turn(&mut self) -> std::result::Result<bool, String> {
             let (owners, wake) = &*self.observations;
             let mut owners = owners
                 .lock()
@@ -5780,7 +5916,7 @@ mod tests {
                 owners.insert(self.identity, (current_thread, false));
             }
             wake.notify_all();
-            Ok(())
+            Ok(false)
         }
 
         fn fail(&mut self, _reason: String) {}

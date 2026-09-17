@@ -19,7 +19,7 @@ use std::{
 
 use prost::Message as ProstMessage;
 use raft::{
-    message::Envelope,
+    message::{Envelope, Message},
     runtime::transport_tcp::TcpEnvelopeCodec,
     storage::codec::{CommandCodec, SnapshotCodec},
 };
@@ -30,12 +30,16 @@ use ragnordb_common::{
     rpc_codec::{MessageType, RpcFrame},
 };
 
-use crate::host::RoutedRaftMessage;
+use crate::host::{RaftMessageEnvelope, RoutedRaftMessage};
 
 const MULTIRAFT_WIRE_VERSION: u8 = 1;
 const MULTIRAFT_RAFT_MESSAGE_TYPE: u8 = 0x01;
+const MULTIRAFT_HEARTBEAT_BATCH_TYPE: u8 = 0x0B;
 const MULTIRAFT_FRAME_HEADER_BYTES: usize = 14;
 const MAX_MULTIRAFT_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HEARTBEAT_BATCH_ITEMS: usize = 64;
+const HEARTBEAT_BATCH_COUNT_BYTES: usize = 4;
+const HEARTBEAT_BATCH_ITEM_LENGTH_BYTES: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -183,6 +187,18 @@ pub struct RoutedRpcMessage {
 pub struct NodeRaftInbound {
     control: InboundQueueReceiver,
     bulk: InboundQueueReceiver,
+    wake: Arc<Mutex<Option<thread::Thread>>>,
+}
+
+impl NodeRaftInbound {
+    /// Register the host thread so authenticated transport delivery wakes the
+    /// sparse scheduler immediately instead of waiting for a polling interval.
+    pub fn bind_current_thread(&self) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
 }
 
 /// Bounded receive side for gateway, tablet, and metadata RPC traffic.
@@ -276,6 +292,7 @@ struct InboundQueueSender {
     sender: SyncSender<QueuedInbound>,
     available_bytes: Arc<std::sync::atomic::AtomicUsize>,
     max_bytes: usize,
+    wake: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 struct InboundQueueReceiver {
@@ -337,7 +354,10 @@ impl InboundQueueSender {
             message,
             wire_bytes,
         }) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                wake_thread(&self.wake);
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 self.release(wire_bytes);
                 Err(io::Error::new(
@@ -494,6 +514,17 @@ fn release_bytes(available_bytes: &std::sync::atomic::AtomicUsize, wire_bytes: u
     available_bytes.fetch_add(wire_bytes, Ordering::Release);
 }
 
+fn wake_thread(wake: &Arc<Mutex<Option<thread::Thread>>>) {
+    if let Some(thread) = wake
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .cloned()
+    {
+        thread.unpark();
+    }
+}
+
 fn inbound_queues(
     config: &NodeRaftTransportConfig,
 ) -> (InboundSenders, NodeRaftInbound, NodeRpcInbound) {
@@ -507,6 +538,7 @@ fn inbound_queues(
     let bulk_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
     let rpc_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(config.bulk_queue_bytes));
     let rpc_wake = Arc::new(Mutex::new(None));
+    let raft_wake = Arc::new(Mutex::new(None));
 
     (
         InboundSenders {
@@ -514,11 +546,13 @@ fn inbound_queues(
                 sender: control_sender,
                 available_bytes: Arc::clone(&control_bytes),
                 max_bytes: config.control_queue_bytes,
+                wake: raft_wake.clone(),
             },
             bulk: InboundQueueSender {
                 sender: bulk_sender,
                 available_bytes: Arc::clone(&bulk_bytes),
                 max_bytes: config.bulk_queue_bytes,
+                wake: raft_wake.clone(),
             },
             rpc: InboundRpcQueueSender {
                 sender: rpc_sender,
@@ -536,6 +570,7 @@ fn inbound_queues(
                 receiver: bulk_receiver,
                 available_bytes: bulk_bytes,
             },
+            wake: raft_wake,
         },
         NodeRpcInbound {
             receiver: InboundRpcQueueReceiver {
@@ -552,6 +587,7 @@ struct QueuedOutbound {
     wire_bytes: usize,
     raft_group_id: RaftGroupId,
     class: OutboundClass,
+    coalescible_heartbeat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +624,7 @@ impl OutboundPeer {
         payload: Vec<u8>,
         raft_group_id: RaftGroupId,
         class: OutboundClass,
+        coalescible_heartbeat: bool,
     ) -> io::Result<()> {
         let wire_bytes = payload.len();
         let mut state = self
@@ -616,6 +653,7 @@ impl OutboundPeer {
             wire_bytes,
             raft_group_id,
             class,
+            coalescible_heartbeat,
         };
         match class {
             OutboundClass::RaftControl => state.control.push_back(queued),
@@ -640,7 +678,63 @@ impl OutboundPeer {
             }
 
             if let Some(message) = state.control.pop_front() {
-                return Some(message);
+                if !message.coalescible_heartbeat {
+                    return Some(message);
+                }
+
+                let mut messages = vec![message];
+                let mut encoded_bytes = messages[0].payload.len();
+                while messages.len() < MAX_HEARTBEAT_BATCH_ITEMS {
+                    let Some(next) = state.control.front() else {
+                        break;
+                    };
+                    if !next.coalescible_heartbeat {
+                        break;
+                    }
+
+                    let projected_body_bytes = HEARTBEAT_BATCH_COUNT_BYTES
+                        .saturating_add(
+                            messages
+                                .len()
+                                .saturating_add(1)
+                                .saturating_mul(HEARTBEAT_BATCH_ITEM_LENGTH_BYTES),
+                        )
+                        .saturating_add(encoded_bytes)
+                        .saturating_add(next.payload.len());
+                    if MULTIRAFT_FRAME_HEADER_BYTES.saturating_add(projected_body_bytes)
+                        > self.max_frame_bytes
+                    {
+                        break;
+                    }
+
+                    let next = state
+                        .control
+                        .pop_front()
+                        .expect("control queue front was checked above");
+                    encoded_bytes = encoded_bytes.saturating_add(next.payload.len());
+                    messages.push(next);
+                }
+
+                if messages.len() == 1 {
+                    return messages.pop();
+                }
+
+                let wire_bytes = messages.iter().map(|message| message.wire_bytes).sum();
+                let first = messages
+                    .first()
+                    .expect("heartbeat batch contains at least one item");
+                let payloads = messages
+                    .iter()
+                    .map(|message| message.payload.as_slice())
+                    .collect::<Vec<_>>();
+                return Some(QueuedOutbound {
+                    payload: encode_heartbeat_batch(&payloads, self.max_frame_bytes)
+                        .expect("admitted heartbeat records must fit the batch frame limit"),
+                    wire_bytes,
+                    raft_group_id: first.raft_group_id,
+                    class: first.class,
+                    coalescible_heartbeat: false,
+                });
             }
             if let Some(message) = state.rpc.pop_front() {
                 return Some(message);
@@ -1074,7 +1168,9 @@ impl NodeRaftTransport {
         } else {
             OutboundClass::RaftBulk
         };
-        peer.try_send(payload, message.raft_group_id, class)
+        let coalescible_heartbeat =
+            class == OutboundClass::RaftControl && is_coalescible_heartbeat(&message.envelope);
+        peer.try_send(payload, message.raft_group_id, class, coalescible_heartbeat)
     }
 
     /// Send one logical RPC frame to a physical node.
@@ -1123,7 +1219,7 @@ impl NodeRaftTransport {
                 ),
             )
         })?;
-        peer.try_send(payload, frame.raft_group_id, OutboundClass::Rpc)
+        peer.try_send(payload, frame.raft_group_id, OutboundClass::Rpc, false)
     }
 
     pub fn try_send_all(
@@ -1238,6 +1334,208 @@ fn encode_routed_message(
     payload.extend_from_slice(&inner);
 
     Ok(payload)
+}
+
+fn is_coalescible_heartbeat(envelope: &RaftMessageEnvelope) -> bool {
+    match &envelope.msg {
+        Message::AppendEntries(request) => request.entries.is_empty(),
+        Message::AppendEntriesResponse(_) => true,
+        _ => false,
+    }
+}
+
+fn encode_heartbeat_batch(items: &[&[u8]], max_frame_bytes: usize) -> io::Result<Vec<u8>> {
+    if items.is_empty() || items.len() > MAX_HEARTBEAT_BATCH_ITEMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heartbeat batch item count is outside the configured bound",
+        ));
+    }
+
+    let body_len = items.iter().try_fold(
+        HEARTBEAT_BATCH_COUNT_BYTES,
+        |body_len, item| -> io::Result<usize> {
+            if item.len() < MULTIRAFT_FRAME_HEADER_BYTES
+                || item[0] != MULTIRAFT_WIRE_VERSION
+                || item[1] != MULTIRAFT_RAFT_MESSAGE_TYPE
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "heartbeat batch contains a non-Raft item",
+                ));
+            }
+            body_len
+                .checked_add(HEARTBEAT_BATCH_ITEM_LENGTH_BYTES)
+                .and_then(|length| length.checked_add(item.len()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "heartbeat batch length overflowed",
+                    )
+                })
+        },
+    )?;
+    if MULTIRAFT_FRAME_HEADER_BYTES.saturating_add(body_len) > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heartbeat batch exceeds the configured frame limit",
+        ));
+    }
+
+    let item_count = u32::try_from(items.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heartbeat batch item count exceeds wire capacity",
+        )
+    })?;
+    let body_len_u32 = u32::try_from(body_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heartbeat batch length exceeds wire capacity",
+        )
+    })?;
+    let mut body = Vec::with_capacity(body_len);
+    body.extend_from_slice(&item_count.to_le_bytes());
+    for item in items {
+        let item_len = u32::try_from(item.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "heartbeat batch item length exceeds wire capacity",
+            )
+        })?;
+        body.extend_from_slice(&item_len.to_le_bytes());
+        body.extend_from_slice(item);
+    }
+
+    let mut payload = Vec::with_capacity(MULTIRAFT_FRAME_HEADER_BYTES + body.len());
+    payload.push(MULTIRAFT_WIRE_VERSION);
+    payload.push(MULTIRAFT_HEARTBEAT_BATCH_TYPE);
+    payload.extend_from_slice(&0_u64.to_le_bytes());
+    payload.extend_from_slice(&body_len_u32.to_le_bytes());
+    payload.extend_from_slice(&body);
+    Ok(payload)
+}
+
+#[derive(Debug)]
+struct DecodedHeartbeatItem {
+    message: RoutedRaftMessage,
+    wire_bytes: usize,
+}
+
+fn decode_heartbeat_batch(
+    codec: &ByteEnvelopeCodec,
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> io::Result<Vec<DecodedHeartbeatItem>> {
+    if payload.len() < MULTIRAFT_FRAME_HEADER_BYTES + HEARTBEAT_BATCH_COUNT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "heartbeat batch is shorter than its fixed body header",
+        ));
+    }
+    if payload[0] != MULTIRAFT_WIRE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported MultiRaft wire version {}", payload[0]),
+        ));
+    }
+    if payload[1] != MULTIRAFT_HEARTBEAT_BATCH_TYPE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload is not a heartbeat batch",
+        ));
+    }
+    if u64::from_le_bytes(
+        payload[2..10]
+            .try_into()
+            .expect("fixed-size group ID slice"),
+    ) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "heartbeat batch outer group identity must be zero",
+        ));
+    }
+
+    let declared_length = u32::from_le_bytes(
+        payload[10..14]
+            .try_into()
+            .expect("fixed-size payload length slice"),
+    ) as usize;
+    if declared_length != payload.len() - MULTIRAFT_FRAME_HEADER_BYTES
+        || payload.len() > max_frame_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "heartbeat batch payload length does not match its header",
+        ));
+    }
+
+    let body = &payload[MULTIRAFT_FRAME_HEADER_BYTES..];
+    let item_count = u32::from_le_bytes(
+        body[..HEARTBEAT_BATCH_COUNT_BYTES]
+            .try_into()
+            .expect("fixed-size heartbeat count slice"),
+    ) as usize;
+    if item_count == 0 || item_count > MAX_HEARTBEAT_BATCH_ITEMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "heartbeat batch item count is outside the configured bound",
+        ));
+    }
+
+    let mut offset = HEARTBEAT_BATCH_COUNT_BYTES;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let item_header_end = offset
+            .checked_add(HEARTBEAT_BATCH_ITEM_LENGTH_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "heartbeat batch overflow")
+            })?;
+        if item_header_end > body.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "heartbeat batch item length is truncated",
+            ));
+        }
+        let item_len = u32::from_le_bytes(
+            body[offset..item_header_end]
+                .try_into()
+                .expect("fixed-size heartbeat item length slice"),
+        ) as usize;
+        offset = item_header_end;
+        let item_end = offset.checked_add(item_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "heartbeat batch overflow")
+        })?;
+        if item_len < MULTIRAFT_FRAME_HEADER_BYTES || item_end > body.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "heartbeat batch item is truncated or empty",
+            ));
+        }
+
+        let item_payload = &body[offset..item_end];
+        let message = decode_routed_message(codec, item_payload)?;
+        if !is_coalescible_heartbeat(&message.envelope) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "heartbeat batch contains a non-heartbeat Raft message",
+            ));
+        }
+        items.push(DecodedHeartbeatItem {
+            message,
+            wire_bytes: item_len,
+        });
+        offset = item_end;
+    }
+
+    if offset != body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "heartbeat batch contains trailing bytes",
+        ));
+    }
+    Ok(items)
 }
 
 fn encode_rpc_frame(frame: &RpcFrame, max_frame_bytes: usize) -> io::Result<Vec<u8>> {
@@ -1521,36 +1819,20 @@ fn handle_connection(
         match payload.get(1).copied() {
             Some(MULTIRAFT_RAFT_MESSAGE_TYPE) => {
                 let message = decode_routed_message(&codec, &payload)?;
-
-                let source_replica_id = ReplicaId::from_raft(message.envelope.from);
-                let source_node_id = routes
-                    .read()
-                    .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?
-                    .get(&(message.raft_group_id, source_replica_id))
-                    .copied()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "unknown source replica {} for Raft group {}",
-                                source_replica_id.0, message.raft_group_id.0
-                            ),
-                        )
-                    })?;
-                if source_node_id != remote_node_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "Raft source replica is not assigned to the authenticated node",
-                    ));
+                validate_authenticated_raft_message(&routes, remote_node_id, &message)?;
+                queue_raft_message(&inbound, message, payload.len())?;
+            }
+            Some(MULTIRAFT_HEARTBEAT_BATCH_TYPE) => {
+                // Decode and authenticate every item before admitting any of
+                // them. A malformed later item must not leave an earlier
+                // group partially interpreted as belonging to another route.
+                let messages = decode_heartbeat_batch(&codec, &payload, max_frame_bytes)?;
+                for item in &messages {
+                    validate_authenticated_raft_message(&routes, remote_node_id, &item.message)?;
                 }
-
-                let control = crate::host::is_control_message(&message.envelope);
-                let queue = if control {
-                    &inbound.control
-                } else {
-                    &inbound.bulk
-                };
-                queue.try_send(message, payload.len())?;
+                for item in messages {
+                    queue_raft_message(&inbound, item.message, item.wire_bytes)?;
+                }
             }
             Some(_) => {
                 let frame = decode_rpc_frame(&payload, max_frame_bytes)?;
@@ -1570,6 +1852,50 @@ fn handle_connection(
             }
         }
     }
+}
+
+fn validate_authenticated_raft_message(
+    routes: &Arc<RwLock<BTreeMap<(RaftGroupId, ReplicaId), NodeId>>>,
+    remote_node_id: NodeId,
+    message: &RoutedRaftMessage,
+) -> io::Result<()> {
+    let source_replica_id = ReplicaId::from_raft(message.envelope.from);
+    let source_node_id = routes
+        .read()
+        .map_err(|_| io::Error::other("MultiRaft route registry lock is poisoned"))?
+        .get(&(message.raft_group_id, source_replica_id))
+        .copied()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "unknown source replica {} for Raft group {}",
+                    source_replica_id.0, message.raft_group_id.0
+                ),
+            )
+        })?;
+    if source_node_id != remote_node_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Raft source replica is not assigned to the authenticated node",
+        ));
+    }
+    Ok(())
+}
+
+fn queue_raft_message(
+    inbound: &InboundSenders,
+    message: RoutedRaftMessage,
+    wire_bytes: usize,
+) -> io::Result<()> {
+    let control = crate::host::is_control_message(&message.envelope);
+    let queue = if control {
+        &inbound.control
+    } else {
+        &inbound.bulk
+    };
+    queue.try_send(message, wire_bytes)?;
+    Ok(())
 }
 
 fn write_handshake(
@@ -1738,8 +2064,10 @@ fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Opti
     // Validate the discriminator while only the fixed header is resident.
     // This prevents an unknown message type from making the listener allocate
     // an attacker-controlled payload buffer.
-    MessageType::from_wire_value(header[1])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if header[1] != MULTIRAFT_HEARTBEAT_BATCH_TYPE {
+        MessageType::from_wire_value(header[1])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    }
 
     if length == 0 || length > max_frame_bytes {
         return Err(io::Error::new(
@@ -1759,6 +2087,7 @@ fn read_frame(stream: &mut TcpStream, max_frame_bytes: usize) -> io::Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raft::message::{AppendEntriesRequest, Message};
 
     #[test]
     fn rpc_decoder_rejects_unknown_message_type() {
@@ -1808,5 +2137,148 @@ mod tests {
         ];
         let error = decode_rpc_frame(&frame, 16).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Realistic bug caught: without transport-level coalescing, a node pair
+    /// emits one syscall-sized frame per idle Raft group heartbeat even when
+    /// those heartbeats are already queued together. The batch discriminator
+    /// must be emitted only for eligible heartbeat records.
+    #[test]
+    fn outbound_peer_coalesces_queued_heartbeat_frames() {
+        let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
+        let heartbeat = |group_id: u64, from: u64, to: u64, commit: u64| {
+            encode_routed_message(
+                &codec,
+                &RoutedRaftMessage {
+                    raft_group_id: RaftGroupId(group_id),
+                    envelope: Envelope {
+                        from: raft::types::NodeId::must(from),
+                        to: raft::types::NodeId::must(to),
+                        msg: Message::AppendEntries(AppendEntriesRequest {
+                            term: 4,
+                            leader_id: raft::types::NodeId::must(from),
+                            prev_log_index: commit,
+                            prev_log_term: 4,
+                            entries: Vec::new(),
+                            leader_commit: commit,
+                        }),
+                    },
+                },
+            )
+            .unwrap()
+        };
+
+        let peer = OutboundPeer {
+            target_node_id: NodeId(2),
+            address: "127.0.0.1:1".parse().unwrap(),
+            local_node_id: NodeId(1),
+            cluster_id: None,
+            max_queue_capacity: 8,
+            max_queue_bytes: 64 * 1024,
+            max_frame_bytes: 64 * 1024,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(OutboundPeerState::default()),
+            wake: Condvar::new(),
+        };
+
+        peer.try_send(
+            heartbeat(10, 11, 21, 7),
+            RaftGroupId(10),
+            OutboundClass::RaftControl,
+            true,
+        )
+        .unwrap();
+        peer.try_send(
+            heartbeat(11, 12, 22, 9),
+            RaftGroupId(11),
+            OutboundClass::RaftControl,
+            true,
+        )
+        .unwrap();
+
+        let frame = peer.next().expect("queued heartbeat frame");
+        assert_eq!(
+            frame.payload[1], 0x0B,
+            "queued heartbeat records should use the batch wire discriminator"
+        );
+    }
+
+    #[test]
+    /// Realistic bug caught: decoding a physical batch against its outer
+    /// placeholder group would deliver a valid heartbeat to the wrong Raft
+    /// core. Every embedded route must survive the framing optimization.
+    fn heartbeat_batch_roundtrip_preserves_group_identity() {
+        let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
+        let heartbeat = |group_id: u64, from: u64, to: u64| {
+            encode_routed_message(
+                &codec,
+                &RoutedRaftMessage {
+                    raft_group_id: RaftGroupId(group_id),
+                    envelope: Envelope {
+                        from: raft::types::NodeId::must(from),
+                        to: raft::types::NodeId::must(to),
+                        msg: Message::AppendEntries(AppendEntriesRequest {
+                            term: 4,
+                            leader_id: raft::types::NodeId::must(from),
+                            prev_log_index: 3,
+                            prev_log_term: 4,
+                            entries: Vec::new(),
+                            leader_commit: 3,
+                        }),
+                    },
+                },
+            )
+            .unwrap()
+        };
+        let first = heartbeat(10, 11, 21);
+        let second = heartbeat(11, 12, 22);
+        let batch =
+            encode_heartbeat_batch(&[first.as_slice(), second.as_slice()], 64 * 1024).unwrap();
+
+        let decoded = decode_heartbeat_batch(&codec, &batch, 64 * 1024).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|item| item.message.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![RaftGroupId(10), RaftGroupId(11)]
+        );
+        assert_eq!(decoded[0].message.envelope.from.get(), 11);
+        assert_eq!(decoded[1].message.envelope.to.get(), 22);
+    }
+
+    #[test]
+    /// Realistic bug caught: accepting a malformed later item after decoding
+    /// an earlier one could partially enqueue a batch and lose the sender's
+    /// intended group boundary.
+    fn heartbeat_batch_rejects_trailing_or_malformed_items() {
+        let codec = ByteEnvelopeCodec::new(BytesCodec, BytesCodec);
+        let heartbeat = encode_routed_message(
+            &codec,
+            &RoutedRaftMessage {
+                raft_group_id: RaftGroupId(10),
+                envelope: Envelope {
+                    from: raft::types::NodeId::must(11),
+                    to: raft::types::NodeId::must(21),
+                    msg: Message::AppendEntries(AppendEntriesRequest {
+                        term: 4,
+                        leader_id: raft::types::NodeId::must(11),
+                        prev_log_index: 3,
+                        prev_log_term: 4,
+                        entries: Vec::new(),
+                        leader_commit: 3,
+                    }),
+                },
+            },
+        )
+        .unwrap();
+        let mut batch = encode_heartbeat_batch(&[heartbeat.as_slice()], 64 * 1024).unwrap();
+        batch.extend_from_slice(&[0]);
+        let declared_length = (batch.len() - MULTIRAFT_FRAME_HEADER_BYTES) as u32;
+        batch[10..14].copy_from_slice(&declared_length.to_le_bytes());
+
+        let error = decode_heartbeat_batch(&codec, &batch, 64 * 1024).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("trailing"));
     }
 }

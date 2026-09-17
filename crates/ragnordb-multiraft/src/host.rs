@@ -332,13 +332,23 @@ impl RunnableGroupQueue {
         self.bulk.retain(|queued| *queued != raft_group_id);
         true
     }
+
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
 }
 
 #[derive(Debug, Default)]
 struct GroupTimerScheduler {
     now: u64,
     deadlines: BTreeMap<u64, BTreeSet<RaftGroupId>>,
-    scheduled: BTreeMap<RaftGroupId, u64>,
+    scheduled: BTreeMap<RaftGroupId, ScheduledDeadline>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScheduledDeadline {
+    deadline: u64,
+    scheduled_at: u64,
 }
 
 impl GroupTimerScheduler {
@@ -348,7 +358,7 @@ impl GroupTimerScheduler {
         if self
             .scheduled
             .get(&raft_group_id)
-            .is_some_and(|existing| *existing <= deadline)
+            .is_some_and(|existing| existing.deadline <= deadline)
         {
             return;
         }
@@ -358,10 +368,21 @@ impl GroupTimerScheduler {
             .entry(deadline)
             .or_default()
             .insert(raft_group_id);
-        self.scheduled.insert(raft_group_id, deadline);
+        self.scheduled.insert(
+            raft_group_id,
+            ScheduledDeadline {
+                deadline,
+                scheduled_at: self.now,
+            },
+        );
     }
 
-    fn advance(&mut self, ticks: u64) -> Vec<RaftGroupId> {
+    fn reschedule_after(&mut self, raft_group_id: RaftGroupId, delay: u64) {
+        self.remove(raft_group_id);
+        self.schedule_after(raft_group_id, delay);
+    }
+
+    fn advance(&mut self, ticks: u64) -> Vec<(RaftGroupId, u64)> {
         self.now = self.now.saturating_add(ticks);
         let due_deadlines: Vec<u64> = self
             .deadlines
@@ -373,8 +394,14 @@ impl GroupTimerScheduler {
         for deadline in due_deadlines {
             if let Some(groups) = self.deadlines.remove(&deadline) {
                 for raft_group_id in groups {
-                    self.scheduled.remove(&raft_group_id);
-                    due_groups.push(raft_group_id);
+                    let scheduled = self
+                        .scheduled
+                        .remove(&raft_group_id)
+                        .expect("every timer-wheel entry has a scheduled deadline");
+                    due_groups.push((
+                        raft_group_id,
+                        self.now.saturating_sub(scheduled.scheduled_at),
+                    ));
                 }
             }
         }
@@ -382,16 +409,28 @@ impl GroupTimerScheduler {
         due_groups
     }
 
+    fn next_deadline(&self) -> Option<u64> {
+        self.deadlines.keys().next().copied()
+    }
+
+    fn advance_clock(&mut self, ticks: u64) {
+        self.now = self.now.saturating_add(ticks);
+    }
+
     fn remove(&mut self, raft_group_id: RaftGroupId) {
-        let Some(deadline) = self.scheduled.remove(&raft_group_id) else {
+        let Some(scheduled) = self.scheduled.remove(&raft_group_id) else {
             return;
         };
 
-        if let Some(groups) = self.deadlines.get_mut(&deadline) {
+        if let Some(groups) = self.deadlines.get_mut(&scheduled.deadline) {
             groups.remove(&raft_group_id);
-            if groups.is_empty() {
-                self.deadlines.remove(&deadline);
-            }
+        }
+        if self
+            .deadlines
+            .get(&scheduled.deadline)
+            .is_some_and(BTreeSet::is_empty)
+        {
+            self.deadlines.remove(&scheduled.deadline);
         }
     }
 }
@@ -404,6 +443,7 @@ struct PendingGroupMessages {
 
 struct PendingPersistenceGroup {
     raft_group_id: RaftGroupId,
+    timer_due: bool,
     batch: HostedPersistenceBatch,
     /// Outbound envelopes are held until the group's Ready persistence has
     /// completed. This keeps custom group adapters subject to the same
@@ -533,6 +573,17 @@ pub trait HostedRaftGroup: Send {
     /// compatibility default because their operation is host-atomic.
     fn has_pending_work(&self) -> bool {
         false
+    }
+
+    /// Return the next logical timer delay for this group.
+    ///
+    /// The host owns the shared deadline scheduler, but the group owns the
+    /// Raft role-specific interval. A leader normally returns its heartbeat
+    /// interval, while a follower or candidate returns its current election
+    /// timeout. `None` is reserved for a passive replica that should only be
+    /// driven by inbound messages or explicit local work.
+    fn next_timer_delay_ticks(&self) -> Option<u64> {
+        None
     }
 
     /// Returns whether the only pending work is a compatibility-path
@@ -931,6 +982,18 @@ where
         self.ready_loop.has_pending_work() || !self.deferred_read_states.is_empty()
     }
 
+    fn next_timer_delay_ticks(&self) -> Option<u64> {
+        let raft = self.ready_loop.raft();
+        if raft.is_joining() {
+            return None;
+        }
+
+        Some(match raft.role() {
+            Role::Leader => 3,
+            Role::Follower | Role::Candidate => raft.current_election_timeout().max(1),
+        })
+    }
+
     fn has_only_deferred_read_states(&self) -> bool {
         !self.ready_loop.has_pending_work() && !self.deferred_read_states.is_empty()
     }
@@ -1300,6 +1363,12 @@ where
     /// the caller schedules due groups and then executes their bounded turn.
     timer_advance_pending: bool,
 
+    /// Timer work is tracked separately from ordinary queued messages. This
+    /// preserves the Raft clock event when a group also has inbound traffic;
+    /// a message must not accidentally consume the only turn for an expired
+    /// election or heartbeat deadline.
+    timer_due: BTreeMap<RaftGroupId, u64>,
+
     /// Inbound messages remain owned by their tagged group until that group is
     /// serviced. Control messages are kept ahead of bulk append traffic within
     /// the same group, but no message is acknowledged by merely queueing it.
@@ -1356,6 +1425,7 @@ where
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
             timer_advance_pending: false,
+            timer_due: BTreeMap::new(),
             pending_messages: BTreeMap::new(),
             pending_message_count: 0,
             pending_message_bytes: 0,
@@ -1397,6 +1467,7 @@ where
             runnable: RunnableGroupQueue::default(),
             timers: GroupTimerScheduler::default(),
             timer_advance_pending: false,
+            timer_due: BTreeMap::new(),
             pending_messages: BTreeMap::new(),
             pending_message_count: 0,
             pending_message_bytes: 0,
@@ -1668,6 +1739,7 @@ where
         self.groups.remove(&identity.raft_group_id);
         self.runnable.remove(identity.raft_group_id);
         self.timers.remove(identity.raft_group_id);
+        self.timer_due.remove(&identity.raft_group_id);
         self.remove_pending_group(identity.raft_group_id);
         self.quarantined.remove(&identity.raft_group_id);
         self.tombstoned.insert(identity);
@@ -1733,12 +1805,15 @@ where
     /// enumerating every registered group on every wall-clock tick.
     pub fn schedule_due_ticks(&mut self, ticks: u64) -> Result<(), MultiRaftHostError> {
         self.ensure_active()?;
-        for raft_group_id in self.timers.advance(ticks) {
+        for (raft_group_id, due_ticks) in self.timers.advance(ticks) {
             if self.groups.contains_key(&raft_group_id)
                 && !self.quarantined.contains_key(&raft_group_id)
             {
-                self.runnable.enqueue(raft_group_id);
-                self.timers.schedule_after(raft_group_id, 1);
+                self.timer_due
+                    .entry(raft_group_id)
+                    .and_modify(|pending| *pending = pending.saturating_add(due_ticks))
+                    .or_insert(due_ticks);
+                self.runnable.enqueue_control(raft_group_id);
             }
         }
         self.timer_advance_pending = true;
@@ -1888,11 +1963,15 @@ where
         self.ensure_active()?;
 
         if !self.timer_advance_pending {
-            for raft_group_id in self.timers.advance(ticks) {
+            for (raft_group_id, due_ticks) in self.timers.advance(ticks) {
                 if self.groups.contains_key(&raft_group_id)
                     && !self.quarantined.contains_key(&raft_group_id)
                 {
-                    self.runnable.enqueue(raft_group_id);
+                    self.timer_due
+                        .entry(raft_group_id)
+                        .and_modify(|pending| *pending = pending.saturating_add(due_ticks))
+                        .or_insert(due_ticks);
+                    self.runnable.enqueue_control(raft_group_id);
                 }
             }
         }
@@ -1907,9 +1986,14 @@ where
             };
 
             if self.quarantined.contains_key(&raft_group_id) {
+                self.timer_due.remove(&raft_group_id);
                 self.remove_pending_group(raft_group_id);
                 continue;
             }
+
+            let timer_due_ticks = self.timer_due.remove(&raft_group_id);
+            let timer_due = timer_due_ticks.is_some();
+            let group_timer_ticks = timer_due_ticks.unwrap_or(0);
 
             let has_queued_message = self
                 .pending_messages
@@ -1940,6 +2024,12 @@ where
                     .expect("popped message implies a group queue")
                     .push_front(message.clone());
                 self.account_pending_addition(Self::message_wire_bytes(&message));
+                if timer_due {
+                    self.timer_due
+                        .entry(raft_group_id)
+                        .and_modify(|pending| *pending = pending.saturating_add(group_timer_ticks))
+                        .or_insert(group_timer_ticks);
+                }
                 if control {
                     self.runnable.enqueue_control(raft_group_id);
                 } else {
@@ -1957,7 +2047,7 @@ where
                 .get(&raft_group_id)
                 .is_some_and(|group| group.has_only_deferred_read_states());
 
-            if has_queued_message && group_only_deferred_read_states && !had_message {
+            if has_queued_message && group_only_deferred_read_states && !had_message && !timer_due {
                 // A zero message budget leaves the control message queued.
                 // Do not publish a deferred ReadState while that message is
                 // waiting: it may carry a newer term which invalidates the
@@ -1976,8 +2066,10 @@ where
                 continue;
             }
 
-            let process_message =
-                had_message && (!group_has_pending_work || group_only_deferred_read_states);
+            let process_message = had_message
+                && !timer_due
+                && (!group_has_pending_work || group_only_deferred_read_states);
+            let rearm_timer = timer_due || process_message;
             let retry_message = process_message.then(|| {
                 pending_message
                     .as_ref()
@@ -2020,7 +2112,7 @@ where
                         group.step_and_prepare_budgeted(message.envelope, group_budget)
                     }
                     (false, None) | (false, Some(_)) => {
-                        group.tick_and_prepare_budgeted(ticks, group_budget)
+                        group.tick_and_prepare_budgeted(group_timer_ticks, group_budget)
                     }
                     (true, None) => unreachable!("message selection was checked above"),
                 }
@@ -2040,6 +2132,7 @@ where
                     if let Some(batch) = turn.persistence {
                         persistence_groups.push(PendingPersistenceGroup {
                             raft_group_id,
+                            timer_due: rearm_timer,
                             batch,
                             outbound: turn.outbound,
                             read_states: turn.read_states,
@@ -2058,7 +2151,7 @@ where
                             }));
 
                         self.ensure_shared_wal_healthy()?;
-                        self.reschedule_after_turn(raft_group_id);
+                        self.reschedule_after_turn(raft_group_id, rearm_timer);
                     }
                 }
 
@@ -2094,7 +2187,7 @@ where
                             self.runnable.enqueue(raft_group_id);
                         }
                     } else {
-                        self.reschedule_after_turn(raft_group_id);
+                        self.reschedule_after_turn(raft_group_id, rearm_timer);
                     }
                     let _ = reason;
                 }
@@ -2105,7 +2198,7 @@ where
                         return Err(MultiRaftHostError::RecoveryRequired);
                     }
                     let _ = reason;
-                    self.reschedule_after_turn(raft_group_id);
+                    self.reschedule_after_turn(raft_group_id, rearm_timer);
                 }
             }
         }
@@ -2171,6 +2264,7 @@ where
                     Err(error) => Err(error.clone()),
                 };
 
+                let rearm_timer = pending.timer_due;
                 let completion = {
                     let group = self
                         .groups
@@ -2204,7 +2298,7 @@ where
                         if self.node_wal.recovery_required() {
                             recovery_required = true;
                         } else {
-                            self.reschedule_after_turn(raft_group_id);
+                            self.reschedule_after_turn(raft_group_id, rearm_timer);
                         }
                     }
                     Err(HostedGroupError::RecoveryRequired) => {
@@ -2219,10 +2313,10 @@ where
                         }
                     }
                     Err(HostedGroupError::Retryable(_reason)) => {
-                        self.reschedule_after_turn(raft_group_id);
+                        self.reschedule_after_turn(raft_group_id, rearm_timer);
                     }
                     Err(HostedGroupError::Rejected(_reason)) => {
-                        self.reschedule_after_turn(raft_group_id);
+                        self.reschedule_after_turn(raft_group_id, rearm_timer);
                     }
                 }
             }
@@ -2291,7 +2385,19 @@ where
         Ok(())
     }
 
-    fn reschedule_after_turn(&mut self, raft_group_id: RaftGroupId) {
+    fn reschedule_after_turn(&mut self, raft_group_id: RaftGroupId, rearm_timer: bool) {
+        if rearm_timer {
+            if let Some(delay) = self
+                .groups
+                .get(&raft_group_id)
+                .and_then(|group| group.next_timer_delay_ticks())
+            {
+                self.timers.reschedule_after(raft_group_id, delay.max(1));
+            } else {
+                self.timers.remove(raft_group_id);
+            }
+        }
+
         let has_messages = self
             .pending_messages
             .get(&raft_group_id)
@@ -2312,6 +2418,22 @@ where
                 self.runnable.enqueue(raft_group_id);
             }
         }
+    }
+
+    /// Return the number of logical ticks until the earliest group deadline.
+    ///
+    /// A zero result means the deadline is already due and the caller should
+    /// run the host immediately. The method intentionally exposes no group
+    /// identity: placement and timer ownership remain inside the host.
+    pub fn next_timer_delay_ticks(&self) -> Option<u64> {
+        self.timers
+            .next_deadline()
+            .map(|deadline| deadline.saturating_sub(self.timers.now))
+    }
+
+    /// Whether the host has work that should be serviced without parking.
+    pub fn has_runnable_work(&self) -> bool {
+        !self.runnable.is_empty()
     }
 
     /// Delivers an inbound group-tagged Raft message through the legacy direct
@@ -2379,14 +2501,26 @@ where
 
         let group_ids: Vec<_> = self.groups.keys().copied().collect();
 
+        // This compatibility API deliberately retains the old "tick every
+        // group" contract used by standalone host callers and tests. Advance
+        // the shared clock without consuming sparse deadlines, then mark each
+        // healthy group with the exact tick delta it must receive. The
+        // production runtime uses `run_turn` directly and never takes this
+        // all-groups path.
+        self.timers.advance_clock(ticks);
+
         for raft_group_id in group_ids.iter().copied() {
             if !self.quarantined.contains_key(&raft_group_id) {
+                self.timer_due
+                    .entry(raft_group_id)
+                    .and_modify(|pending| *pending = pending.saturating_add(ticks))
+                    .or_insert(ticks);
                 self.runnable.enqueue(raft_group_id);
             }
         }
 
         self.run_turn(
-            ticks,
+            0,
             MultiRaftTurnBudget {
                 max_groups: group_ids.len(),
                 max_messages: 0,
@@ -2548,7 +2682,7 @@ where
         };
 
         self.ensure_shared_wal_healthy()?;
-        self.reschedule_after_turn(raft_group_id);
+        self.reschedule_after_turn(raft_group_id, false);
 
         Ok(HostedLeadershipTransfer {
             status,
@@ -2692,7 +2826,7 @@ where
         };
 
         self.ensure_shared_wal_healthy()?;
-        self.reschedule_after_turn(raft_group_id);
+        self.reschedule_after_turn(raft_group_id, false);
 
         Ok(HostedProposal {
             index,
@@ -2714,7 +2848,7 @@ where
         match result {
             Ok(()) => {
                 self.ensure_shared_wal_healthy()?;
-                self.reschedule_after_turn(raft_group_id);
+                self.reschedule_after_turn(raft_group_id, false);
                 Ok(())
             }
 
@@ -2954,6 +3088,10 @@ mod tests {
     impl HostedRaftGroup for TestGroup {
         fn identity(&self) -> RaftReplicaIdentity {
             self.identity
+        }
+
+        fn next_timer_delay_ticks(&self) -> Option<u64> {
+            Some(1)
         }
 
         fn tick_and_drain(&mut self, _: u64) -> Result<Vec<RaftMessageEnvelope>, HostedGroupError> {
@@ -3680,6 +3818,38 @@ mod tests {
         assert_eq!(ticks.load(Ordering::SeqCst), 0);
         assert_eq!(host.run_turn(1, budget).unwrap().groups_serviced, 1);
         assert_eq!(ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /// Realistic bug caught: a sparse timer that is removed when it expires
+    /// but never rearmed causes a healthy Raft group to stop sending
+    /// heartbeats and eventually trigger avoidable elections.
+    fn expired_group_timer_is_rearmed_after_each_turn() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let group_identity = identity(10, 101);
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal));
+        let _writer = host.issue_group_writer(group_identity).unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: group_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_after(group_identity.raft_group_id, 1)
+            .unwrap();
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            ..MultiRaftTurnBudget::default()
+        };
+
+        assert_eq!(host.run_turn(1, budget).unwrap().groups_serviced, 1);
+        assert_eq!(host.run_turn(1, budget).unwrap().groups_serviced, 1);
+        assert_eq!(ticks.load(Ordering::SeqCst), 2);
     }
 
     #[test]
