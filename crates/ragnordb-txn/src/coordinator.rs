@@ -4,11 +4,14 @@
 //! Its mutable commit method forms the serialized correctness boundary from
 //! complete preflight through durable append and atomic MVCC application
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error, Result,
-    ids::{TableId, Timestamp, TxnId},
+    ids::{
+        ClientRequestId, CommandKind, ParticipantCommandPhase, RaftGroupId, TableId, TabletId,
+        Timestamp, TxnId,
+    },
 };
 use ragnordb_storage::{
     key::decode_row_key,
@@ -17,6 +20,294 @@ use ragnordb_storage::{
 };
 
 use crate::{CommitTimestampAllocator, Transaction};
+
+/// Canonical logical identity for one transaction mutation or read key.
+///
+/// The encoded row key is the logical identity; it is deliberately not a
+/// tablet ID, Raft group ID, or tablet epoch. Those physical values are route
+/// hints and may change after a split, merge, replica move, or leader change.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogicalMutationId(Vec<u8>);
+
+impl LogicalMutationId {
+    /// Construct an identity only from a canonical encoded row key.
+    pub fn from_key(key: &[u8]) -> Result<Self> {
+        decode_row_key(key).map_err(|error| {
+            Error::InvalidArgument(format!(
+                "logical transaction key is not a canonical row key: {error}"
+            ))
+        })?;
+
+        Ok(Self(key.to_vec()))
+    }
+
+    /// Return the canonical key represented by this logical identity.
+    pub fn as_key(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Current physical route hint for one logical transaction participant.
+///
+/// A route is intentionally replaceable. The coordinator never uses these
+/// fields as part of a participant command identity; they only select the
+/// current Raft destination and stale-epoch fence for dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ParticipantRoute {
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub raft_group_id: RaftGroupId,
+}
+
+impl ParticipantRoute {
+    pub fn new(tablet_id: TabletId, tablet_epoch: u64, raft_group_id: RaftGroupId) -> Result<Self> {
+        if tablet_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction participant tablet ID 0 is reserved".to_string(),
+            ));
+        }
+        if tablet_epoch == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction participant tablet epoch 0 is reserved".to_string(),
+            ));
+        }
+        if raft_group_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction participant Raft group ID 0 is reserved".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            tablet_id,
+            tablet_epoch,
+            raft_group_id,
+        })
+    }
+}
+
+/// Semantic location of a transaction's primary/status record.
+///
+/// The primary key is authoritative. The route is only a cacheable hint and
+/// is refreshed after topology changes, so a status lookup never depends on a
+/// tablet ID surviving a split or merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionStatusLocation {
+    primary_key: LogicalMutationId,
+    route: Option<ParticipantRoute>,
+}
+
+impl TransactionStatusLocation {
+    fn new(primary_key: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            primary_key: LogicalMutationId::from_key(&primary_key)?,
+            route: None,
+        })
+    }
+
+    pub fn primary_key(&self) -> &[u8] {
+        self.primary_key.as_key()
+    }
+
+    pub fn route(&self) -> Option<ParticipantRoute> {
+        self.route
+    }
+}
+
+/// Stable participant command identity for one logical mutation.
+///
+/// This identity is the coordinator's source of truth for retries. It is
+/// derived only from the transaction, phase, and logical key, never from the
+/// current tablet route. Slice 2 will adapt it to concrete command envelopes
+/// and transport request IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParticipantCommandId {
+    txn_id: TxnId,
+    phase: ParticipantCommandPhase,
+    logical_mutation_id: LogicalMutationId,
+}
+
+impl ParticipantCommandId {
+    fn new(
+        txn_id: TxnId,
+        phase: ParticipantCommandPhase,
+        logical_mutation_id: LogicalMutationId,
+    ) -> Self {
+        Self {
+            txn_id,
+            phase,
+            logical_mutation_id,
+        }
+    }
+
+    pub fn txn_id(&self) -> TxnId {
+        self.txn_id
+    }
+
+    pub fn phase(&self) -> ParticipantCommandPhase {
+        self.phase
+    }
+
+    pub fn logical_mutation_id(&self) -> &LogicalMutationId {
+        &self.logical_mutation_id
+    }
+
+    /// Map the transaction phase to the existing tablet command kind.
+    pub fn kind(&self) -> CommandKind {
+        match self.phase {
+            ParticipantCommandPhase::Prewrite => CommandKind::Prewrite,
+            ParticipantCommandPhase::Commit => CommandKind::Commit,
+            ParticipantCommandPhase::Rollback => CommandKind::Rollback,
+            ParticipantCommandPhase::ResolveIntent => CommandKind::ResolveIntent,
+        }
+    }
+}
+
+/// Transaction-local coordinator state for the Phase 6.2 identity boundary.
+///
+/// This type owns semantic transaction state and current route hints. It does
+/// not submit Raft commands or perform prewrite/commit yet; those dispatch
+/// responsibilities are deliberately reserved for the next slice so route
+/// refresh cannot accidentally become a second transaction authority.
+#[derive(Debug)]
+pub struct DistributedTransactionCoordinator {
+    transaction: Transaction,
+    root_request_id: ClientRequestId,
+    primary_key: LogicalMutationId,
+    read_set: BTreeSet<LogicalMutationId>,
+    participant_routes: BTreeMap<LogicalMutationId, ParticipantRoute>,
+    status_location: TransactionStatusLocation,
+}
+
+impl DistributedTransactionCoordinator {
+    /// Create coordinator state around one timestamped transaction.
+    pub fn new(
+        transaction: Transaction,
+        root_request_id: ClientRequestId,
+        primary_key: Vec<u8>,
+    ) -> Result<Self> {
+        root_request_id
+            .validate()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let primary_key = LogicalMutationId::from_key(&primary_key)?;
+        let status_location = TransactionStatusLocation::new(primary_key.as_key().to_vec())?;
+
+        Ok(Self {
+            transaction,
+            root_request_id,
+            primary_key,
+            read_set: BTreeSet::new(),
+            participant_routes: BTreeMap::new(),
+            status_location,
+        })
+    }
+
+    pub fn transaction_id(&self) -> TxnId {
+        self.transaction.id()
+    }
+
+    pub fn start_timestamp(&self) -> Timestamp {
+        self.transaction.start_ts()
+    }
+
+    /// The client identity retained for root-operation status and retry.
+    pub fn root_request_id(&self) -> ClientRequestId {
+        self.root_request_id
+    }
+
+    pub fn primary_key(&self) -> &[u8] {
+        self.primary_key.as_key()
+    }
+
+    pub fn transaction(&self) -> &Transaction {
+        &self.transaction
+    }
+
+    pub fn read_set(&self) -> &BTreeSet<LogicalMutationId> {
+        &self.read_set
+    }
+
+    pub fn write_set(&self) -> &BTreeMap<Vec<u8>, Mutation> {
+        self.transaction.write_set()
+    }
+
+    pub fn status_location(&self) -> &TransactionStatusLocation {
+        &self.status_location
+    }
+
+    /// Record one canonical logical read key exactly once.
+    pub fn record_read(&mut self, key: Vec<u8>) -> Result<()> {
+        self.read_set.insert(LogicalMutationId::from_key(&key)?);
+        Ok(())
+    }
+
+    /// Replace the current route hint for one write participant.
+    pub fn set_participant_route(&mut self, key: Vec<u8>, route: ParticipantRoute) -> Result<()> {
+        let logical_mutation_id = LogicalMutationId::from_key(&key)?;
+        if !self.transaction.write_set().contains_key(&key) {
+            return Err(Error::InvalidArgument(
+                "participant route requires a key in the transaction write set".to_string(),
+            ));
+        }
+
+        self.participant_routes.insert(logical_mutation_id, route);
+        Ok(())
+    }
+
+    pub fn participant_route(&self, key: &[u8]) -> Option<&ParticipantRoute> {
+        let logical_mutation_id = LogicalMutationId::from_key(key).ok()?;
+        self.participant_routes.get(&logical_mutation_id)
+    }
+
+    /// Return the current physical tablets represented by route hints.
+    pub fn participant_tablets(&self) -> BTreeSet<TabletId> {
+        self.participant_routes
+            .values()
+            .map(|route| route.tablet_id)
+            .collect()
+    }
+
+    pub fn participant_routes(&self) -> &BTreeMap<LogicalMutationId, ParticipantRoute> {
+        &self.participant_routes
+    }
+
+    /// Refresh the semantic status key's physical route hint.
+    pub fn set_status_route(&mut self, route: ParticipantRoute) -> Result<()> {
+        self.status_location.route = Some(route);
+        Ok(())
+    }
+
+    /// Derive a stable command identity for one transaction write key.
+    pub fn participant_command_id(
+        &self,
+        phase: ParticipantCommandPhase,
+        key: &[u8],
+    ) -> Result<ParticipantCommandId> {
+        let logical_mutation_id = LogicalMutationId::from_key(key)?;
+        self.participant_command_id_for_logical(phase, logical_mutation_id)
+    }
+
+    fn participant_command_id_for_logical(
+        &self,
+        phase: ParticipantCommandPhase,
+        logical_mutation_id: LogicalMutationId,
+    ) -> Result<ParticipantCommandId> {
+        if !self
+            .transaction
+            .write_set()
+            .contains_key(logical_mutation_id.as_key())
+        {
+            return Err(Error::InvalidArgument(
+                "participant command requires a key in the transaction write set".to_string(),
+            ));
+        }
+
+        Ok(ParticipantCommandId::new(
+            self.transaction.id(),
+            phase,
+            logical_mutation_id,
+        ))
+    }
+}
 
 /// storage participant controlled by the ordered commit coordinator
 ///

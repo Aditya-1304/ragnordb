@@ -5,14 +5,16 @@
 //! the tablet layer checks this write set first to provide
 //! read-your-writes
 //!
-//! Distributed participants, heartbeats, transaction status records and
-//! coordinator retry state belong to later implementation for now
+//! Distributed phase dispatch, heartbeats, transaction status records, and
+//! intent resolution remain later protocol slices. The coordinator module
+//! owns the current transaction state and topology-independent command IDs.
 mod coordinator;
 mod manager;
 
 pub use coordinator::{
-    OwnedMvccParticipant, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
-    SingleNodeCommitParticipant,
+    DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
+    ParticipantCommandId, ParticipantRoute, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
+    SingleNodeCommitParticipant, TransactionStatusLocation,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,
