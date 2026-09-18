@@ -3,14 +3,15 @@
 A distributed transactional SQL database, built from scratch in Rust.
 
 RagnorDB lowers SQL into typed logical plans, executes those plans against
-transaction-aware tablets, stores rows under ordered keys with MVCC, and is
-being extended toward a Raft-replicated, sharded database with Percolator-style
-distributed transactions.
+transaction-aware tablets, stores rows under ordered keys with MVCC, and
+routes replicated tablet commands through a bounded MultiRaft host.
 
-The working system today is a durable single-node SQL database: the server,
-wire protocol, SQL shell, parser, binder, planner, catalog, executor,
-transaction manager, tablet layer, in-memory MVCC engine, A-WAL commit path,
-checkpoint publication, and startup recovery are connected end to end.
+The working system includes the durable local SQL path and the replicated
+cluster path: SQL sessions, immutable schema and routing snapshots, metadata
+ownership, tablet routing, Raft proposal and apply, A-WAL persistence,
+snapshots, membership, leadership transfer, linearizable leader reads, request
+identity and deduplication, checkpoint recovery, and the TCP/admin surfaces are
+connected end to end.
 
 ---
 
@@ -18,22 +19,23 @@ checkpoint publication, and startup recovery are connected end to end.
 
 | Crate | Status | What it provides |
 |---|---|---|
-| `ragnordb-common` | working | Stable IDs, the canonical error model, V1 client framing, row/value types, deterministic storage encoding, and `prost` schemas for catalog, MVCC, tablet commands, RPC messages, database WAL records, and snapshots |
+| `ragnordb-common` | working | Stable IDs, canonical errors, V1 and V2 client framing, request identity, row/value types, deterministic storage encoding, and `prost` schemas for metadata, MVCC, tablet commands, RPC messages, Raft persistence, database WAL records, and snapshots |
 | `ragnordb-sql` | working | `sqlparser-rs` adapter, semantic analyzer, binder, typed expressions, wildcard expansion, unsupported-SQL rejection, and parser-independent logical planning |
-| `ragnordb-catalog` | working durably | Immutable schema snapshots, stable table and column identities, deterministic table enumeration, primary-key metadata, durable `CatalogUpdate` publication, and recovery-safe allocator restoration |
-| `ragnordb-txn` | working durably | Monotonic transaction IDs and timestamps, snapshot start timestamps, deterministic ordered write sets, complete commit preflight, serialized WAL-before-MVCC commit coordination, and recovery-restored allocator floors |
+| `ragnordb-catalog` | working durably | Immutable schema snapshots, stable table/column/node/tablet identities, deterministic table enumeration, primary-key metadata, metadata lifecycle publication, and recovery-safe allocator restoration |
+| `ragnordb-txn` | working durably | Monotonic local transaction IDs and timestamps, snapshot start timestamps, deterministic ordered write sets, complete commit preflight, serialized WAL-before-MVCC commit coordination, and recovery-restored allocator floors |
 | `ragnordb-storage` | working durably | Canonical ordered keys, in-memory MVCC, versioned database WAL records, A-WAL adapters, semantic replay, checksummed snapshot files, checkpoint publication, retention pins, and fail-closed recovery validation |
-| `ragnordb-tablet` | working durably | One-table ownership, point reads, ordered scans, read-your-writes overlays, statement-level mutation batches, and atomic single-tablet commits through the durable coordinator |
-| `ragnordb-exec` | working durably | Logical-plan execution, expression evaluation, access-path selection, typed results, autocommit and explicit transactions, and durable commit/failure integration |
-| `ragnordb-server` | working durably | Exclusive data-directory ownership, private startup recovery, shared database state, live checkpoint publication, framed SQL execution, connection limits, structured logging, `/status`, and `/metrics` |
+| `ragnordb-tablet` | working durably | Tablet ownership validation, point reads, ordered scans, read-your-writes overlays, statement-level mutation batches, replicated command/state-machine interfaces, snapshot state, and atomic local commits |
+| `ragnordb-exec` | working durably | Logical-plan execution, expression evaluation, local and routed tablet access paths, typed results, detached distributed execution views, autocommit and explicit transactions, and durable commit/failure integration |
+| `ragnordb-server` | working durably | Exclusive data-directory ownership, private startup recovery, SQL gateway, V1/V2 protocol handling, metadata bootstrap, MultiRaft runtime, immutable schema/routing publication, evented RPC dispatch, lifecycle control, `/status`, `/status/groups`, and `/metrics` |
 | `ragnordb-cli` | working | `node`, `sql`, `status`, and offline `inspect wal` commands, including an interactive request-response SQL shell and decoded database WAL diagnostics |
-| `ragnordb-multiraft` | scaffolded | The future process-level host for the metadata Raft group and many tablet Raft groups |
-| A-WAL | integrated | Exact append extents, append-and-sync, typed failure outcomes, segmented recovery, retention pins, and pruning are active in the single-node database durability path |
-| Raft | dependency proven | Node construction and real leader election are smoke-tested; SQL operations do not pass through Raft yet |
-| Bloom Bloom | dependency proven | Serialization and deserialization are smoke-tested; filters enter the database read path when immutable storage segments are introduced |
+| `ragnordb-multiraft` | working | Many Raft groups per process, fixed ownership reactors, fair group scheduling, sparse timers, bounded message/proposal/apply queues, shared A-WAL persistence, Ready ordering, snapshots, membership, ReadIndex, leadership transfer, status, and recovery fencing |
+| A-WAL | integrated | Exact append extents, append-and-sync, typed failure outcomes, segmented recovery, retention pins, pruning, and the shared persistence authority for local database and Raft records |
+| Raft | integrated | Election, replication, current-term commit, ReadIndex, ConfState, snapshots, leadership transfer, crash/restart recovery, and deterministic transport are hosted by RagnorDB's MultiRaft runtime |
+| Bloom Bloom | integrated dependency | Serialization and deserialization are smoke-tested; immutable-segment filtering is outside the current mutable MVCC path |
 
-The complete workspace test suite passes across unit, integration, TCP, MVCC,
-transaction, WAL, checkpoint, recovery, inspection, server, and external-
+The complete workspace test suite covers unit, integration, TCP, MVCC,
+transaction, WAL, checkpoint, recovery, inspection, metadata, replicated
+tablet, MultiRaft transport, snapshot, leadership, membership, and external-
 infrastructure smoke suites.
 
 The current functional validation is:
@@ -54,9 +56,10 @@ equivalent primitives and crash tests are implemented.
 
 ---
 
-## What RagnorDB Is Building
+## Current System
 
-The target is a row-oriented distributed OLTP database
+RagnorDB is a row-oriented distributed OLTP database with a durable local
+compatibility path and a replicated metadata/tablet path.
 
 A statement entering RagnorDB should eventually travel through every layer of
 the system:
@@ -77,18 +80,18 @@ SQL text
 
 That vertical path is the point of the project. The SQL frontend, transaction
 model, ordered encodings, tablet ownership, WAL integration, consensus runtime,
-and failure testing are designed as one system instead of unrelated demos.
+and failure testing are implemented as one system instead of unrelated demos.
 
-The long-term architecture belongs to the same broad family as CockroachDB and
-TiDB/TiKV:
+The architecture belongs to the same broad family as CockroachDB and TiDB/TiKV:
 
 - SQL is translated into operations over ordered keys;
 - tables are partitioned into independently owned tablets;
 - each tablet is replicated by its own Raft group;
 - metadata and timestamp allocation are themselves replicated;
 - transactions carry stable start and commit timestamps;
-- cross-tablet writes use explicit provisional state and durable transaction
-  decisions;
+- client requests carry stable logical identity across routes and retries;
+- cross-tablet transaction coordination is deliberately not advertised as a
+  current guarantee;
 - storage recovery and consensus recovery share one authoritative log model.
 
 The goal is not to imitate the surface syntax of those systems. The goal is to
@@ -164,7 +167,8 @@ RUST_LOG=info cargo run -p ragnordb-cli --bin ragnordb -- \
   --listen 127.0.0.1:7101
 ```
 
-The SQL listener runs on `127.0.0.1:7101`.
+This command starts the local compatibility path. The SQL listener runs on
+`127.0.0.1:7101`.
 
 Unless explicitly configured, the admin server derives its port by adding 100
 to the SQL port:
@@ -192,6 +196,19 @@ The live catalog and MVCC maps remain in memory for execution speed, but every
 acknowledged catalog change and data mutation is recoverable from A-WAL or from
 a validated checkpoint plus its WAL suffix.
 
+For a replicated cluster, start each configured node with its validated TOML
+file:
+
+```bash
+cargo run -p ragnordb-cli --bin ragnordb -- \
+  node --config ./node-1.toml
+```
+
+The cluster runtime bootstraps or recovers the metadata group, publishes
+schema and routing snapshots, hosts tablet groups through fixed reactors, and
+serves SQL through any available gateway. Raft traffic and snapshot streams
+use separate configured endpoints.
+
 ### Open the SQL shell
 
 In another terminal:
@@ -201,7 +218,8 @@ cargo run -p ragnordb-cli --bin ragnordb -- \
   sql --addr 127.0.0.1:7101
 ```
 
-The shell follows the V1 one-request-at-a-time protocol:
+The shell follows the V1 one-request-at-a-time protocol. V2-aware clients use
+the same SQL surface with stable request identity and retry metadata:
 
 ```text
 1. draw the prompt
@@ -454,6 +472,10 @@ panicking or wrapping.
 - Validation of duplicate names, duplicate IDs, missing keys, invalid
   nullability, and malformed durable definitions.
 - Idempotent installation of identical assigned metadata.
+- Stable node and replica identities.
+- Metadata-owned table, tablet, placement, schema, and node lifecycle records.
+- Immutable published schema snapshots and ordered tablet routing snapshots.
+- Tablet epochs and replica/leader hints for stale-route detection and refresh.
 
 ### Transactions
 
@@ -473,7 +495,9 @@ panicking or wrapping.
 
 ### Tablet and storage engine
 
-- One tablet per local table.
+- Local and replicated tablet ownership.
+- Half-open encoded-key ranges with table and tablet identity validation.
+- Tablet epochs, replica placement, leader hints, and stale-route rejection.
 - Tablet ownership validation for reads, writes, scan bounds, and commits.
 - Canonical ordered row keys.
 - Canonical versioned row encoding.
@@ -487,10 +511,15 @@ panicking or wrapping.
 - Atomic multi-key commit validation.
 - Corruption detection for broken write/default relationships.
 - Idempotent replay checks inside the MVCC batch interface.
+- Replicated command decoding and deterministic state-machine application.
+- Tablet snapshots with applied-index and identity validation.
+- Linearizable leader reads through Raft ReadIndex.
 
 ### Server and protocol
 
 - Length-prefixed TCP protocol.
+- V1 connection-scoped requests and V2 stable client request identity.
+- Session epochs, request sequences, acknowledgment floors, and deduplication.
 - One session per connection.
 - One in-flight statement per connection.
 - Configurable maximum connection count.
@@ -502,6 +531,12 @@ panicking or wrapping.
   `metadata-only` is the safe default.
 - Prometheus metrics.
 - JSON node status.
+- Bounded `/status` aggregate/top-K and complete `/status/groups` diagnostics.
+- Metadata-group bootstrap and recovery of durable cluster membership.
+- Evented bounded control/tablet RPC dispatch without one OS thread per request.
+- Detached distributed execution views that do not hold a node-global SQL lock
+  across remote waits.
+- Node lifecycle, drain, leadership transfer, and membership control surfaces.
 - Build information for RagnorDB and its infrastructure dependencies.
 - SIGINT/SIGTERM shutdown with connection draining and an explicit A-WAL clean
   shutdown witness.
@@ -510,6 +545,7 @@ panicking or wrapping.
 
 - Versioned `CatalogUpdate`, `SingleNodeTxnCommit`, `SnapshotPointer`, and
   `CheckpointMarker` protobuf records.
+- Versioned `RaftLogEntry`, `RaftHardState`, and `RaftSnapshotPointer` records.
 - Exact half-open A-WAL append extents `[start_lsn, end_lsn)`.
 - Commit acknowledgement only after synchronization through the exact
   `end_lsn`.
@@ -525,6 +561,9 @@ panicking or wrapping.
 - Matching pointer-and-marker checkpoint selection.
 - Live checkpoint publication with retention-pin and pruning ownership.
 - Explicit restart proof that an uncommitted transaction never appears.
+- Shared A-WAL persistence authority for database and Raft records.
+- FIFO `Ready` persistence, safe message release, commit advancement, and
+  ordered apply with recovery fencing.
 
 ### Operational storage safety
 
@@ -542,10 +581,11 @@ panicking or wrapping.
 
 ## Current Architecture
 
-Every connection owns its session, but every connection reaches the same local
-database runtime. The shared runtime owns the catalog, tablets, executor,
-transaction manager, live A-WAL adapter, checkpoint coordinator, and
-process-lifetime data-directory lock.
+Every connection owns its session. The server publishes immutable schema and
+routing views to the SQL frontend, while mutable metadata, tablet, and Raft
+state is owned by fixed reactors. The local compatibility path still uses a
+shared database lock; the distributed path does not hold a node-global SQL
+lock across RPC, persistence, Raft advancement, or tablet apply.
 
 ```mermaid
 flowchart TD
@@ -555,23 +595,41 @@ flowchart TD
         --> HANDLER["Server Connection Handler"]
 
     HANDLER --> SESSION["Connection Session<br/>SessionId + SqlSession"]
+    HANDLER --> FRONTEND["SQL Frontend<br/>parser + binder + planner"]
+    HANDLER --> V2["V2 identity / retry envelope"]
 
-    HANDLER --> SHARED_DB["SharedLocalDatabase<br/>Arc&lt;Mutex&lt;LocalDatabase&gt;&gt;"]
+    FRONTEND --> SCHEMA["Immutable SchemaSnapshot"]
+    FRONTEND --> ROUTING["Immutable RoutingSnapshot"]
+    SCHEMA --> DISPATCH["Local or routed dispatch"]
+    ROUTING --> DISPATCH
 
-    SHARED_DB --> TXN_MANAGER["LocalTransactionManager"]
-    SHARED_DB --> EXECUTOR["LocalExecutor"]
-    SHARED_DB --> CHECKPOINT["Live Checkpoint Coordinator"]
+    subgraph Local["Local compatibility path"]
+        SHARED_DB["SharedLocalDatabase<br/>Arc&lt;Mutex&lt;LocalDatabase&gt;&gt;"]
+        TXN_MANAGER["LocalTransactionManager"]
+        EXECUTOR["LocalExecutor"]
+        CHECKPOINT["Checkpoint Coordinator"]
+        SHARED_DB --> TXN_MANAGER
+        SHARED_DB --> EXECUTOR
+        SHARED_DB --> CHECKPOINT
+    end
 
-    SESSION --> PARSER["Parser"]
-    PARSER --> AST["sqlparser AST"]
-    AST --> ANALYZER["Analyzer / Binder"]
-    ANALYZER --> BOUND["BoundStatement"]
-    BOUND --> PLANNER["Logical Planner"]
-    PLANNER --> PLAN["Plan"]
+    subgraph Distributed["Distributed path"]
+        SERVICES["Detached DatabaseServices"]
+        RPC["Bounded evented RPC dispatcher"]
+        HOST["MultiRaftHost<br/>fixed ownership reactors"]
+        PERSIST["PersistenceService<br/>shared A-WAL authority"]
+        APPLY["Ordered committed apply"]
+        SERVICES --> RPC
+        RPC --> HOST
+        HOST --> PERSIST
+        HOST --> APPLY
+    end
 
-    EXECUTOR -. "catalog lookup" .-> ANALYZER
+    DISPATCH --> SHARED_DB
+    DISPATCH --> SERVICES
 
-    PLAN --> DISPATCH{"Transaction and<br/>Statement Dispatch"}
+    FRONTEND --> PLAN["Typed logical Plan"]
+    PLAN --> DISPATCH
 
     DISPATCH -->|"Autocommit"| IMPLICIT["Implicit Transaction"]
     DISPATCH -->|"BEGIN active"| EXPLICIT["Explicit Transaction"]
@@ -592,7 +650,7 @@ flowchart TD
     EXECUTOR --> CODEC["Row and Key Encoding"]
     EXECUTOR --> TABLETS["TableId → Local Tablet"]
 
-    TABLETS --> TABLET["Target Tablet<br/>One Per Table"]
+    TABLETS --> TABLET["Local Tablet<br/>or routed tablet owner"]
     TABLET --> PREFLIGHT["Complete MVCC Preflight"]
     PREFLIGHT --> COMMIT["Serialized Commit Coordinator"]
     COMMIT --> WAL_ADAPTER["RagnorDB WAL Adapter"]
@@ -606,10 +664,15 @@ flowchart TD
     CHECKPOINT --> SNAPSHOT["Checksummed Snapshot File"]
     SNAPSHOT --> WAL_ADAPTER
 
+    HOST --> RAFT["Raft proposal / Ready / commit"]
+    PERSIST --> AWAL
+    APPLY --> MVCC
+
     STARTUP["Server Startup"] --> RECOVERY["Private Recovery State"]
     AWAL --> RECOVERY
     SNAPSHOT --> RECOVERY
     RECOVERY --> SHARED_DB
+    RECOVERY --> HOST
 
     MVCC --> OUTCOME{"ExecutionResult<br/>or Error"}
     CATALOG --> OUTCOME
@@ -627,69 +690,65 @@ flowchart TD
     TCP_RES --> OUTPUT["CLI Output"]
 ```
 
-The runtime is protected by one asynchronous mutex. This serializes physical
-statement execution while still allowing explicit transactions from different
-connections to interleave between statements.
+In local compatibility mode, the asynchronous mutex serializes physical
+statement execution while allowing explicit transactions from different
+connections to interleave between statements. The mutex is released before
+response I/O and checkpoint file work.
 
-That is a deliberate single-node tradeoff. It makes catalog publication,
-tablet creation, transaction preflight, WAL ordering, MVCC application, and
-timestamp allocation deterministic without pretending that the local executor
-is already a concurrent distributed storage engine.
-
-The mutex is released before the server writes the response. A slow client
-cannot hold the entire database runtime merely because its socket is slow.
-
-Checkpoint capture briefly takes the same state barrier to freeze catalog,
-MVCC, allocator maxima, and the exact replay frontier as one consistent cut.
-The detached snapshot file is then written on Tokio's blocking pool after the
-database mutex is released, allowing later SQL commits to proceed while the
-immutable file is synchronized and published.
-
-Later, each tablet becomes an independently driven state machine and the
-process-level runtime routes operations between tablet actors instead of
-serializing the full database behind one guard.
+In distributed mode, the SQL frontend reads immutable published views and
+submits bounded requests to the owning reactor. The reactor owns the mutable
+tablet or metadata state, the persistence service owns the shared A-WAL
+ordering, and committed entries are applied in log order. Queue budgets,
+owner generations, and recovery fences prevent stale work from publishing
+after ownership or recovery changes.
 
 ---
 
-## Target Architecture
+## Replicated Cluster Architecture
 
 The distributed system keeps the same SQL, transaction, and tablet concepts but
-changes who owns state and how a mutation becomes committed.
+assigns each mutable state machine to one reactor and makes the replicated log
+the commit authority.
 
 ```mermaid
 flowchart TB
     Client["SQL client"]
     Gateway["SQL gateway<br/>session + coordinator"]
-    Metadata["Metadata Raft group<br/>catalog + placement + timestamps"]
-    Router["Tablet router<br/>encoded key -> tablet -> leader"]
+    Metadata["Metadata group<br/>catalog + placement + schema"]
+    Router["RoutingSnapshot<br/>encoded key -> tablet -> leader"]
+    Control["Bounded control / RPC lanes"]
 
     subgraph N1["Node 1"]
-        N1Gateway["SQL gateway"]
-        T1Leader["Tablet 1 leader"]
-        T2FollowerA["Tablet 2 follower"]
-        MetaFollowerA["Metadata follower"]
-        WalA["A-WAL"]
+        N1Gateway["SQL gateway + admin"]
+        T1Leader["Tablet owner reactor"]
+        T2FollowerA["Other group replica"]
+        MetaFollowerA["Metadata replica"]
+        PersistA["PersistenceService + A-WAL"]
     end
 
     subgraph N2["Node 2"]
-        N2Gateway["SQL gateway"]
-        T1FollowerA["Tablet 1 follower"]
-        T2Leader["Tablet 2 leader"]
-        MetaLeader["Metadata leader"]
-        WalB["A-WAL"]
+        N2Gateway["SQL gateway + admin"]
+        T1FollowerA["Tablet replica"]
+        T2Leader["Tablet owner reactor"]
+        MetaLeader["Metadata owner reactor"]
+        PersistB["PersistenceService"]
     end
 
     subgraph N3["Node 3"]
-        N3Gateway["SQL gateway"]
-        T1FollowerB["Tablet 1 follower"]
-        T2FollowerB["Tablet 2 follower"]
-        MetaFollowerB["Metadata follower"]
-        WalC["A-WAL"]
+        N3Gateway["SQL gateway + admin"]
+        T1FollowerB["Tablet replica"]
+        T2FollowerB["Tablet replica"]
+        MetaFollowerB["Metadata replica"]
+        PersistC["PersistenceService"]
     end
 
     Client --> Gateway
     Gateway --> Metadata
     Gateway --> Router
+    Gateway --> Control
+    Control --> N1Gateway
+    Control --> N2Gateway
+    Control --> N3Gateway
 
     Router --> T1Leader
     Router --> T2Leader
@@ -704,19 +763,29 @@ flowchart TB
     MetaLeader <-->|Raft| MetaFollowerA
     MetaLeader <-->|Raft| MetaFollowerB
 
-    T1Leader --> WalA
-    T2Leader --> WalB
-    MetaLeader --> WalB
+    N1Gateway --> PersistA
+    N2Gateway --> PersistB
+    N3Gateway --> PersistC
+    PersistA -. "one A-WAL authority" .-> N1Gateway
+    PersistB -. "one A-WAL authority" .-> N2Gateway
+    PersistC -. "one A-WAL authority" .-> N3Gateway
 ```
 
 Any node may accept a SQL request. The receiving node becomes the gateway for
-that request, obtains schema and placement metadata, encodes the affected keys,
-and forwards operations to the relevant tablet leaders.
+that request, reads the immutable schema and placement snapshots, encodes the
+affected keys, and forwards operations to the relevant tablet owner.
 
-The target architecture contains one metadata Raft group plus one Raft group
-per tablet. A process therefore hosts multiple independent consensus groups,
-which is why a MultiRaft runtime is required rather than one monolithic cluster
-log.
+The cluster contains one metadata Raft group plus one Raft group per tablet. A
+process hosts multiple independent groups through one bounded MultiRaft host;
+there is no OS thread or unbounded queue per group. Raft `Ready` records are
+persisted in FIFO order by the dedicated persistence service, then committed
+entries are applied in order to the owning tablet or metadata state machine.
+
+Metadata owns node, table, tablet, placement, schema, and lifecycle records.
+Routing updates publish a new immutable snapshot with an epoch. A stale route
+is rejected and refreshed rather than applied to the wrong tablet. The admin
+surface exposes bounded aggregate status at `/status` and detailed per-group
+status at `/status/groups`.
 
 ---
 
@@ -808,8 +877,8 @@ This matters because names can eventually change while existing rows, indexes,
 WAL records, and Raft commands still need stable references.
 
 Even before schema evolution exists, using stable IDs prevents the current
-executor from repeatedly resolving strings and makes the future metadata-cache
-boundary explicit.
+executor from repeatedly resolving strings and makes immutable metadata
+publication explicit.
 
 ### `SELECT *` is expanded during binding
 
@@ -871,9 +940,9 @@ the executor requires equality for both columns before selecting the point
 path. A predicate on only `tenant_id` is not silently treated as one exact key;
 it falls back to a scan and filter.
 
-This keeps the optimization correct before it is fast. Future range scans and
-secondary indexes can extend access-path selection without changing the bound
-expression model.
+This keeps the optimization correct before it is fast. Ordered range routing
+extends access-path selection without changing the bound expression model;
+secondary indexes remain outside the current SQL surface.
 
 ### Statements are prepared before transaction state changes
 
@@ -909,23 +978,23 @@ A transaction stores pending mutations as:
 canonical encoded row key -> Put(row bytes) or Delete
 ```
 
-A `BTreeMap` gives deterministic encoded-key order. This helps tests today and
-will matter for deadlock avoidance, command encoding, replay, and reproducible
-simulation later.
+A `BTreeMap` gives deterministic encoded-key order. This helps tests and matters
+for command encoding, replay, and reproducible scheduling.
 
 Writing the same key more than once replaces the previous pending mutation. The
 write set represents the transaction's final intended state, not an append-only
 history of every SQL assignment that produced it.
 
-The WAL and Raft command layers may later preserve operation history when
-needed. The transaction-local set exists to describe what should be committed.
+The WAL and Raft command layers may preserve operation history when required by
+their durable format. The transaction-local set exists to describe what should
+be committed.
 
-### One tablet owns one table today
+### Tablet ownership uses ordered ranges
 
-A local tablet currently owns exactly one `TableId`.
-
-This is not presented as distributed sharding. It is an ownership boundary that
-forces every row operation to prove it is reaching the correct storage owner.
+Each tablet owns a `TableId` and a half-open encoded-key range. The metadata
+group publishes the tablet identity, epoch, replica set, leader hint, and range
+in an immutable routing snapshot. A bootstrap table may begin with one full
+range; additional tablet assignments use the same ownership contract.
 
 The tablet validates ownership for:
 
@@ -939,12 +1008,13 @@ The tablet validates ownership for:
 - final commit batches.
 
 Without that validation, a transaction containing an encoded foreign-table key
-could be committed into the wrong tablet and only surface later as corrupted
+could be committed into the wrong tablet and surface as corrupted
 scan output.
 
-The future sharding milestone changes tablet ownership from “one complete table”
-to “one hash or range partition.” The same ownership checks remain; only the
-predicate becomes more specific.
+Every row operation proves that its key, scan bounds, mutation batch, replayed
+command, or snapshot belongs to the tablet's current range and epoch. Stale
+routes fail with a retryable routing error and cannot publish into the wrong
+owner.
 
 ### MVCC uses `default`, `lock`, and `write`
 
@@ -967,16 +1037,16 @@ Rollback records are not row deletions. They state that one transaction attempt
 was aborted, so the reader skips that record and continues searching older
 committed versions.
 
-The lock map already participates in the storage contract and conflict checks,
-but the current local commit path does not expose distributed prewrite. Durable
-lock creation, transaction status records, TTLs, heartbeats, and intent
-resolution belong to the distributed transaction milestone.
+The lock map participates in the storage contract and conflict checks. The
+current replicated SQL contract is single-tablet atomicity; durable distributed
+prewrite, transaction status records, TTLs, heartbeats, and intent resolution
+are not advertised.
 
 ### Rollback is stored at `start_ts`
 
 A rollback does not receive a successful transaction commit timestamp. It
 records the fact that the transaction identified by its start timestamp must
-not later be resurrected by delayed messages.
+not be resurrected by delayed messages.
 
 For that reason the rollback record is indexed at the aborted transaction's
 `start_ts`.
@@ -1002,8 +1072,8 @@ It performs:
 ```
 
 Separating the committed version index from row bytes makes uncommitted data and
-transaction decisions explicit. It also gives later intent resolution and MVCC
-garbage collection a concrete model to operate on.
+transaction decisions explicit. It gives intent resolution and MVCC garbage
+collection a concrete model to operate on.
 
 ### Missing payloads are corruption, not missing rows
 
@@ -1036,7 +1106,7 @@ timestamps for state changes that do not exist.
 ### Commit consumes the transaction
 
 A transaction is moved into the commit operation rather than borrowed for
-possible later reuse.
+reuse.
 
 After successful commit, reusing it would risk applying the same logical writes
 twice. After failed commit, reusing it would risk carrying a snapshot and write
@@ -1060,10 +1130,10 @@ not quietly invent one.
 - keep explicit transactions attached across statements;
 - clear them on `COMMIT` or `ROLLBACK`.
 
-This separation allows tests and future internal callers to use the executor
+This separation allows tests and internal callers to use the executor
 without inheriting SQL connection behavior.
 
-It also means a future protocol can implement a different session model while
+It also means another protocol can implement a different session model while
 reusing the same executor and tablet APIs.
 
 ### Explicit statement errors preserve the transaction
@@ -1091,8 +1161,8 @@ The current engine does not pretend to provide that protocol. `CREATE TABLE`
 runs only outside an explicit transaction and publishes its catalog entry and
 local tablet together.
 
-This is a deliberately narrow contract. Transactional schema changes belong to
-the metadata-Raft and schema-evolution milestones.
+This is a deliberately narrow contract. Transactional schema changes require
+metadata coordination and an explicit schema-evolution protocol.
 
 ### Cross-table writes fail before being claimed as atomic
 
@@ -1105,7 +1175,7 @@ the distributed design that means prewrite, transaction status, commit,
 rollback, retry, and crash recovery.
 
 Locally applying tablet A and then tablet B would create a partial-commit window
-and teach callers a guarantee the future distributed engine has not yet earned.
+and teach callers a guarantee the current distributed engine does not provide.
 The current engine returns a clear unsupported error instead.
 
 ### Ordered storage encoding is not protobuf encoding
@@ -1172,31 +1242,24 @@ Keeping JSON out of the execution engine means:
 
 - storage does not depend on a client serialization format;
 - transaction results can be reused by another protocol;
-- a future binary or PostgreSQL-compatible protocol does not require rewriting
+- another binary or PostgreSQL-compatible protocol does not require rewriting
   the executor;
 - internal types retain SQL-specific distinctions instead of collapsing into
   generic JSON values too early.
 
-### The global mutex is a temporary correctness boundary
+### Execution ownership has two explicit modes
 
-One `tokio::sync::Mutex` currently protects the local executor and transaction
-manager.
+The local compatibility path uses one `tokio::sync::Mutex` around the local
+executor and transaction manager. That boundary preserves one catalog, one
+tablet set, monotonic local allocators, and a coherent local statement view.
+The lock is released before response I/O and detached checkpoint file work.
 
-This is not the final concurrency architecture. It is the current ownership
-model that guarantees:
-
-- all sessions share one catalog;
-- all sessions share the same tablets;
-- transaction IDs are not reused between connections;
-- timestamps remain globally monotonic within the process;
-- a statement sees a coherent local runtime while executing.
-
-The server releases the lock before awaiting response I/O. The boundary is
-therefore “serialize database execution,” not “serialize clients until they
-finish reading.”
-
-MultiRaft and tablet actors eventually replace this global lock with per-tablet
-serialization and explicit routing.
+The distributed path uses `DatabaseServices` plus immutable published schema
+and routing snapshots. A routed request is sent through bounded evented RPC to
+the owning metadata or tablet reactor. No node-global SQL lock is held while
+waiting for a remote response, persisting a Raft `Ready`, or applying a
+committed command. Each mutable group has one owner generation, and stale
+completion work is rejected when that generation changes.
 
 ### A closed connection discards its transaction
 
@@ -1207,10 +1270,9 @@ transaction and its buffered write set. Because local pending writes have not
 been published into MVCC storage, no rollback record is necessary for this
 path.
 
-Distributed prewrite changes that rule. Once provisional records exist on
-remote tablets, connection loss cannot clean them up by dropping memory.
-Transaction status records, heartbeats, TTLs, and an intent cleaner become
-necessary at that milestone.
+If a distributed transaction protocol is introduced, provisional records
+would require durable transaction status, heartbeats, TTLs, and intent cleanup;
+the current implementation does not advertise cross-tablet atomicity.
 
 ### The error enum is semantic, not stringly typed
 
@@ -1246,20 +1308,20 @@ safe client-facing `INTERNAL_ERROR`.
 
 ### The one-log rule is non-negotiable
 
-In replicated mode, the Raft log will be the authoritative commit log.
+In replicated mode, the Raft log is the authoritative commit log.
 
 The forbidden path is:
 
 ```text
 mutate local tablet
   -> report success
-  -> attempt asynchronous replication later
+  -> attempt asynchronous replication
 ```
 
 That path cannot provide strong consistency. A leader failure after local
 success but before replication can lose an acknowledged write.
 
-The required path is:
+The implemented replicated path is:
 
 ```text
 propose command
@@ -1394,9 +1456,10 @@ At commit, every mutation is checked before any mutation is applied. If one key
 conflicts, the complete batch fails.
 
 The local model currently prevents conflicting concurrent writes. It does not
-yet track arbitrary read sets or predicate ranges, so it does not claim full
+track arbitrary read sets or predicate ranges, so it does not claim full
 serializable isolation. Write-skew anomalies remain possible under snapshot
-isolation until Milestone 7 introduces read and range validation.
+isolation; the current contract is explicit snapshot isolation with write
+conflict detection.
 
 ---
 
@@ -1432,8 +1495,10 @@ transaction cannot safely be reused.
 
 ## Wire Protocol
 
-V1 intentionally uses a small custom protocol instead of claiming PostgreSQL
-wire compatibility.
+RagnorDB supports a small length-prefixed SQL protocol. V1 is the simple
+connection-scoped form; V2 adds stable logical request identity so a client can
+retry after a route change, leader transition, or lost response without
+creating a second mutation.
 
 Request frame:
 
@@ -1445,6 +1510,47 @@ Response frame:
 
 ```text
 [len: u32 little-endian][UTF-8 JSON bytes]
+```
+
+V2 request metadata is represented by `ClientRequestV2`:
+
+```text
+protocol_version
+client_id
+client_session_epoch
+request_sequence
+acknowledged_through
+statement_timeout_ms
+sql
+```
+
+`client_id` and `request_sequence` identify the logical request independently
+of the gateway, tablet route, or Raft leader. Session renewal advances the
+epoch; the server rejects stale epochs and remembers the exact outcome for
+deduplicable requests. A timeout after admission is reported as
+`REQUEST_OUTCOME_UNKNOWN`, so clients do not blindly replay a non-idempotent
+mutation.
+
+The retry boundary is explicit:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G1 as Gateway A
+    participant M as Metadata / Router
+    participant L as Tablet leader
+    participant G2 as Gateway B
+
+    C->>G1: V2 request(client_id, epoch, sequence)
+    G1->>M: Resolve schema, tablet, epoch, leader
+    M->>L: Route command
+    L-->>G1: Applied outcome
+    G1--xC: Response lost
+    C->>G2: Retry same identity
+    G2->>M: Refresh route if required
+    G2->>L: Forward same identity
+    L-->>G2: Deduplicated original outcome
+    G2-->>C: Original result
 ```
 
 The maximum request and response frame size is 16 MiB. Oversized request frames
@@ -1461,6 +1567,7 @@ Protocol rules:
 - result rows use JSON arrays;
 - errors include a stable code and retryability flag;
 - transaction state remains attached to the TCP connection.
+- V2 retries preserve the same logical request identity and acknowledged floor.
 
 Success response:
 
@@ -1500,6 +1607,14 @@ Current client-visible codes:
 | `SQL_PARSE_ERROR` | no | The parser could not construct a valid statement |
 | `INVALID_ARGUMENT` | no | Session state or a logical request invariant is invalid |
 | `STATEMENT_TIMEOUT` | yes | The request expired before acquiring the serialized database execution owner; execution did not begin |
+| `REQUEST_OUTCOME_UNKNOWN` | no | A mutation was admitted but its final applied outcome was not observed; inspect or recover before retrying |
+| `STALE_TABLET_EPOCH` | yes | The route epoch no longer matches metadata; refresh the routing snapshot |
+| `NOT_LEADER` | yes | The selected tablet replica is not the current leader |
+| `LEADER_UNKNOWN` | yes | The tablet has no usable leader hint yet |
+| `TABLET_UNAVAILABLE` | yes | The selected tablet group is recovering, fenced, or overloaded |
+| `CLIENT_SESSION_EXPIRED` | yes | The V2 session epoch is no longer current; renew the session |
+| `REQUEST_ID_EXPIRED` | no | The request identity is outside the retained deduplication window |
+| `METADATA_UNAVAILABLE` | yes | The metadata group cannot currently serve the requested schema or route |
 | `CONNECTION_LIMIT` | yes | The server has no free connection permit |
 | `COMMIT_OUTCOME_UNKNOWN` | no | A commit acquired a WAL extent but recovery must determine whether it became durable |
 | `CATALOG_OUTCOME_UNKNOWN` | no | A catalog record acquired a WAL extent but recovery must determine its durable outcome |
@@ -1539,11 +1654,32 @@ The response reports:
 - Bloom Bloom version;
 - server start time;
 - active connections;
-- maximum connections.
+- maximum connections;
 - node-wide durability state and recovery-required reason;
 - durable WAL LSN and retained bytes;
 - latest checkpoint identity and replay frontier;
-- active retention-pin count.
+- active retention-pin count;
+- bounded MultiRaft summary, including group count, pending message bytes,
+  pending persistence bytes, and apply backlog totals;
+- node lifecycle and drain state.
+
+Detailed group diagnostics are available separately:
+
+```bash
+curl http://127.0.0.1:7201/status/groups
+```
+
+The group view includes role and leader, term, commit/applied/snapshot
+frontiers, owner generation, membership, pending messages, persistence state,
+apply-backlog entries/bytes/age, and quarantine or recovery state. The summary
+endpoint is bounded and top-K; the group endpoint is the complete diagnostic
+view.
+
+The node lifecycle endpoint supports explicit drain and restart coordination:
+
+```bash
+curl http://127.0.0.1:7201/node/lifecycle
+```
 
 ### Prometheus metrics
 
@@ -1628,28 +1764,69 @@ data_dir = "./data/n1"
 listen_addr = "127.0.0.1:7101"
 admin_addr = "127.0.0.1:7201"
 max_connections = 100
+# Fixed number of ownership reactors; benchmark this per deployment topology.
+reactor_count = 1
 ```
+
+A three-node cluster uses the same validated configuration shape on each node:
+
+```toml
+node_id = 1
+data_dir = "./data/n1"
+listen_addr = "127.0.0.1:7101"
+admin_addr = "127.0.0.1:7201"
+cluster_id = "ragnordb-dev"
+bootstrap = true
+reactor_count = 3
+
+[[seed_nodes]]
+id = 1
+raft_addr = "127.0.0.1:7001"
+snapshot_addr = "127.0.0.1:7051"
+sql_addr = "127.0.0.1:7101"
+admin_addr = "127.0.0.1:7201"
+
+[[seed_nodes]]
+id = 2
+raft_addr = "127.0.0.1:7002"
+snapshot_addr = "127.0.0.1:7052"
+sql_addr = "127.0.0.1:7102"
+admin_addr = "127.0.0.1:7202"
+
+[[seed_nodes]]
+id = 3
+raft_addr = "127.0.0.1:7003"
+snapshot_addr = "127.0.0.1:7053"
+sql_addr = "127.0.0.1:7103"
+admin_addr = "127.0.0.1:7203"
+```
+
+The other nodes use their own `node_id`, data directory, and local listener
+addresses while retaining the same `cluster_id` and seed list. Bootstrap is for
+the initial metadata membership; restarts recover durable membership and do not
+re-bootstrap an already initialized data directory.
 
 ```bash
 cargo run -p ragnordb-cli --bin ragnordb -- \
   node --config ./node.toml
 ```
 
-The configuration model already reserves cluster identity, bootstrap, and
-static seed-node fields. They are validated now so the same configuration
-format can bootstrap the metadata group later.
+The configuration model validates cluster identity, bootstrap, static seed
+membership, dedicated snapshot addresses, placement labels, connection limits,
+snapshot limits, and reactor counts before startup.
 
 Unknown fields, duplicate seed identities, duplicate addresses, zero node IDs,
-empty cluster identities, invalid port derivation, and zero connection limits
-are rejected.
+empty cluster identities, invalid port derivation, zero connection limits, and
+zero reactor counts are rejected. Replicated tablet state is assigned to this
+fixed reactor set and is not moved live between reactors.
 
 ---
 
 ## Infrastructure Projects
 
 RagnorDB builds on three independently developed systems components. Their APIs
-are imported today and their database integration occurs at explicit roadmap
-boundaries.
+are imported today and their integration contracts are kept explicit at the
+database boundaries.
 
 ### A-WAL
 
@@ -1671,7 +1848,8 @@ with:
 - fault injection, metrics, and benchmarks.
 
 
-RagnorDB now uses A-WAL as the authoritative single-node commit log. The public
+RagnorDB uses A-WAL as the authoritative local durability log for both the
+single-node database path and the MultiRaft persistence service. The public
 integration provides:
 
 - exact `AppendResult { start_lsn, end_lsn }` durability boundaries;
@@ -1707,9 +1885,10 @@ checkpoint validity, replay rules, and client-visible failure classification.
 - a real multi-process TCP runtime.
 
 
-RagnorDB currently smoke-tests node construction and successful leader
-election. Milestones 4 and 5 add A-WAL-backed Raft storage, a correct `Ready`
-loop, tablet state machines, and many groups per process.
+RagnorDB hosts Raft through `ragnordb-multiraft`: A-WAL-backed persistence, a
+correct `Ready` loop, tablet and metadata state machines, many groups per
+process, snapshots, membership, ReadIndex, leadership transfer, and bounded
+transport are integrated and covered by focused tests.
 
 ### Bloom Bloom
 
@@ -1724,8 +1903,9 @@ loop, tablet state machines, and many groups per process.
 - a branchless missing-heavy lookup path.
 
 
-Bloom filters do not belong in the current in-memory MVCC path. They become
-useful when Milestone 9 introduces immutable sorted segments.
+Bloom filters do not belong in the current in-memory MVCC path. They are
+available for immutable sorted-segment integration, while the live mutable
+state machine performs exact MVCC lookups.
 
 The intended read contract is:
 
@@ -1743,16 +1923,18 @@ A Bloom result is never proof that a row exists.
 ### Database durability today
 
 The execution state is memory-resident, but acknowledged catalog and MVCC
-changes are durable. Single-node mode uses A-WAL as the authoritative commit
-history and optional snapshot files as validated recovery accelerators.
+changes are durable. The local compatibility path uses database WAL records;
+the replicated path uses Raft log, hard-state, and snapshot records persisted
+through the same A-WAL authority.
 
-A successful mutating statement means:
+A successful mutating statement means one of two explicit contracts:
 
-- the complete operation passed deterministic catalog or MVCC validation;
-- its versioned database record acquired an exact A-WAL extent;
-- A-WAL synchronized through that extent's `end_lsn`;
-- the complete catalog change or mutation batch was published in memory;
-- the server returned success only after those boundaries completed.
+- local mode: the complete operation passed validation, its database record was
+  synchronized through the exact A-WAL `end_lsn`, and the complete mutation
+  batch was published in memory;
+- replicated mode: the command was proposed, persisted, replicated to the
+  required quorum, committed, applied in log order, and its applied result was
+  returned.
 
 Stopping and restarting the node preserves:
 
@@ -1762,14 +1944,13 @@ Stopping and restarting the node preserves:
 - table and snapshot allocator progress;
 - the exact replay frontier represented by a selected checkpoint.
 
-An explicit transaction that never reaches `COMMIT` remains only in its
-connection's `SqlSession`. It produces no `SingleNodeTxnCommit` and does not
-appear after restart.
+An explicit local transaction that never reaches `COMMIT` remains only in its
+connection's `SqlSession`. A replicated command that is not committed is not
+applied to the tablet state machine and is not acknowledged as successful.
 
 ### Database WAL records
 
-RagnorDB owns four versioned protobuf payloads above A-WAL's user-record
-boundary:
+RagnorDB owns versioned protobuf payloads above A-WAL's user-record boundary:
 
 | Record | Durable meaning |
 |---|---|
@@ -1777,11 +1958,15 @@ boundary:
 | `SingleNodeTxnCommit` | One transaction ID, start timestamp, commit timestamp, owning table ID, and the complete canonical put/delete mutation batch |
 | `SnapshotPointer` | One synchronized snapshot file, its portable relative path, identity, timestamp, length, covered tables, and WAL replay frontier |
 | `CheckpointMarker` | Durable confirmation that the exactly matching snapshot pointer is a published recovery point |
+| `RaftLogEntry` | One group-scoped replicated command or configuration change |
+| `RaftHardState` | A group's term, vote, commit frontier, and membership state required for restart |
+| `RaftSnapshotPointer` | The durable identity and frontier of a group snapshot |
 
 A-WAL owns the physical record header, checksum, logical LSN, alignment,
 segment rollover, segment seals, and durable frontier. RagnorDB's semantic
-recovery decoder maps only the four database record types above and treats an
-unknown user record type as corruption.
+recovery decoders validate database and Raft records, reject unknown or
+malformed payloads, and restore each group's exact persisted frontier before
+the group can serve requests.
 
 The WAL is not a SQL statement transcript. `SELECT`, `SHOW TABLES`, `BEGIN`,
 `ROLLBACK`, failed statements, read-only commits, and abandoned explicit
@@ -1854,9 +2039,10 @@ sequence:
 10. advance the WAL retention floor and prune eligible complete segments.
 
 Snapshot publication exists as a server-owned API. Automatic checkpoint
-scheduling and an admin command for requesting one have not been added yet.
+scheduling and an admin command for requesting one are outside the current
+admin surface.
 
-### Planned replicated commit path
+### Replicated commit path
 
 In replicated mode, the Raft log replaces the single-node transaction record as
 the authoritative commit decision.
@@ -1882,7 +2068,9 @@ sequenceDiagram
 ```
 
 The client receives success only after the leader has committed and applied the
-command according to the selected durability contract.
+command according to the selected durability contract. Lost responses do not
+change that boundary: V2 retry identity lets the server return the original
+outcome when the request is still retained.
 
 ---
 
@@ -1922,6 +2110,36 @@ from the same statement are not buffered.
 ### Write conflict
 
 The complete commit batch is rejected before storage applies any mutation.
+
+### Stale route or non-leader
+
+A tablet request carrying an old routing epoch is rejected before mutation. A
+request sent to a follower or a replica without a usable leader returns a
+retryable routing error; the gateway refreshes metadata and retries only with
+the same V2 request identity.
+
+### Timeout after admission
+
+A request that expires before ownership is acquired is retryable because
+execution did not begin. A request that expires after admission is
+`REQUEST_OUTCOME_UNKNOWN`; the server does not claim that the mutation failed
+and the client must use inspection or the retained request identity to resolve
+the outcome.
+
+### Quorum loss, recovery fencing, and backpressure
+
+A group that cannot make progress through its required persistence or quorum
+boundary does not acknowledge a mutation. Recovery-required and quarantined
+groups reject new work, while bounded message, persistence, RPC, and apply
+queues apply backpressure instead of growing without limit. Owner generations
+discard stale completions after recovery or ownership changes.
+
+### Leadership transfer and node drain
+
+Drain coordinates leadership transfer and replica removal before the node stops
+serving its owned groups. Membership changes require the corresponding
+configuration state and removal proof; a removed or draining owner does not
+accept new tablet work.
 
 ### Invalid storage bytes
 
@@ -1979,7 +2197,7 @@ differences.
 | TiDB/TiKV | Stateless SQL layer, Region-based MultiRaft storage, timestamp service, Percolator transactions | Closest reference for tablets, MultiRaft, timestamp allocation, and `default`/`lock`/`write` MVCC |
 | Cassandra | Partitioned wide-column store, tunable consistency, commit log, memtables, SSTables, compaction, Bloom filters | Storage mechanics, immutable segments, compaction, and negative-lookup acceleration |
 | FoundationDB | Ordered transactional KV substrate, higher-level data models, simulation-driven testing | Ordered-key layering and deterministic failure testing |
-| PostgreSQL | Mature SQL semantics, MVCC, WAL discipline, typed errors | SQL behavior, null semantics, recovery discipline, and future isolation work |
+| PostgreSQL | Mature SQL semantics, MVCC, WAL discipline, typed errors | SQL behavior, null semantics, recovery discipline, and explicit isolation boundaries |
 
 ### CockroachDB
 
@@ -1987,13 +2205,14 @@ CockroachDB lowers SQL into operations over a distributed transactional
 key-value layer. Its keyspace is split into ranges, each replicated by Raft.
 
 RagnorDB follows a similar separation between SQL, transaction, distribution,
-replication, and storage. The difference is current maturity: RagnorDB has
-completed the local SQL-to-tablet path but has not yet implemented distributed
-ranges, replicated SQL commits, or serializable transactions.
+replication, and storage. Its current implementation includes metadata-backed
+ordered tablet routing, replicated single-tablet commands, Raft quorum/apply,
+and retry-safe request identity; cross-tablet atomic transactions and
+serializable transactions are not claimed.
 
-The value of the comparison is structural. RagnorDB's `Tablet`, future router,
-metadata group, and one-log rule are designed so distribution extends the local
-engine instead of bypassing it.
+The value of the comparison is structural. RagnorDB's `Tablet`, router,
+metadata group, and one-log rule make distribution extend the local engine
+instead of bypassing it.
 
 ### TiDB and TiKV
 
@@ -2001,7 +2220,7 @@ TiDB provides the SQL layer while TiKV provides transactional distributed
 storage. TiKV divides data into Regions, hosts many Raft groups per process, and
 uses a Percolator-derived transaction protocol.
 
-This is the closest reference for RagnorDB's target transaction architecture.
+This is the closest reference for RagnorDB's transaction architecture.
 
 RagnorDB already implements the local form of:
 
@@ -2011,7 +2230,7 @@ lock/{key}
 write/{key}/{commit_ts}
 ```
 
-Later milestones add:
+The following distributed-transaction features are not current guarantees:
 
 - metadata-backed timestamps;
 - prewrite;
@@ -2037,8 +2256,8 @@ SSTables, compaction, and Bloom filters are proven tools for high-throughput
 storage.
 
 RagnorDB borrows those mechanics where they fit but not Cassandra's transaction
-or replication model. The target is transactional SQL with Raft-backed
-ownership and explicit cross-tablet atomicity.
+or replication model. The current system is transactional SQL with Raft-backed
+ownership and explicit single-tablet atomicity.
 
 ### FoundationDB
 
@@ -2051,15 +2270,14 @@ integration are all visible inside the project rather than delegated to an
 external database.
 
 FoundationDB's deterministic simulation work is also a major influence. The
-existing RagnorDB Raft simulator is intended to grow upward until transactions,
-routing, storage, and crash recovery can be explored under reproducible failure
-schedules.
+RagnorDB Raft simulator and integration tests exercise routing, storage, and
+crash-recovery behavior under reproducible failure schedules.
 
 ---
 
 ## What Makes RagnorDB Worth Following
 
-The project does not yet stand out by beating a mature database benchmark.
+The project does not claim to outperform a mature database benchmark.
 Publishing that claim without data would weaken the work.
 
 The current distinction is vertical systems ownership.
@@ -2096,7 +2314,7 @@ physical A-WAL recovery
   -> live database publication
 ```
 
-The next milestones extend the write trace:
+The replicated write trace now is:
 
 ```text
 tablet command
@@ -2104,7 +2322,7 @@ tablet command
   -> replicated commit
   -> deterministic apply
   -> tablet snapshot
-  -> distributed transaction decision
+  -> stable client outcome or explicit outcome-unknown error
 ```
 
 The project also owns the surrounding infrastructure instead of importing a
@@ -2119,7 +2337,7 @@ That gives RagnorDB several concrete engineering themes:
 - semantic errors rather than string inspection;
 - crash and corruption behavior as API contracts;
 - reproducible simulation rather than timing-dependent tests;
-- documentation that separates current proof from future ambition.
+- documentation that separates demonstrated guarantees from unsupported ones.
 
 ---
 
@@ -2129,46 +2347,53 @@ That gives RagnorDB several concrete engineering themes:
 
 | Property | Current guarantee |
 |---|---|
-| Request shape | Exactly one UTF-8 SQL statement per frame |
+| Request shape | V1 and V2 length-prefixed frames; exactly one UTF-8 SQL statement per frame |
 | SQL boundary | Parser AST types stop after semantic analysis |
-| Metadata | Stable nonzero table and column IDs |
+| Metadata | Stable table, column, node, tablet, replica, and schema identities |
+| Routing | Immutable schema/routing snapshots, ordered half-open tablet ranges, epochs, replica placement, and stale-route rejection |
 | Row encoding | Versioned, deterministic, and corruption-checked |
 | Primary-key encoding | Canonical and lexicographically order-preserving |
 | Snapshot reads | Stable within a local transaction |
 | Read-your-writes | Pending puts and deletes overlay point reads and scans |
 | Statement atomicity | A failing statement contributes no partial mutation batch |
 | Commit preflight | The complete batch is validated before timestamp allocation or WAL append |
-| Commit durability | Success requires A-WAL durability through the commit record's exact `end_lsn` |
-| Commit atomicity | One local tablet durably records and applies the complete batch or none |
+| Local commit durability | Success requires A-WAL durability through the commit record's exact `end_lsn` |
+| Replicated commit durability | Success requires Raft persistence, quorum commit, ordered apply, and the applied result |
+| Commit atomicity | One local or replicated tablet durably records and applies the complete batch or none |
 | Conflict detection | Newer committed writes reject stale conflicting commits |
 | Unknown outcome | Post-staging I/O uncertainty is non-retryable and fail-stops writes until recovery |
-| Catalog durability | A table becomes visible only after its `CatalogUpdate` is synchronized |
+| Catalog durability | Metadata changes become visible only after the metadata command is committed and applied |
 | Autocommit | Successful standalone writes commit durably; failed ones rollback |
 | Explicit transactions | `BEGIN`, durable `COMMIT`, and `ROLLBACK` maintain connection-local state |
 | Restart recovery | Committed catalog and row state survives; uncommitted explicit writes do not appear |
-| Replay | Catalog and transaction records are decoded, validated, ordered, and applied idempotently |
+| Replay | Database and Raft records are decoded, validated, ordered, and applied idempotently |
 | Allocators | Recovered transaction, timestamp, table, and snapshot identities are never reused |
 | Active-tail recovery | Only a repairable newest WAL suffix may be truncated intentionally |
 | Sealed history | Historical WAL corruption fails recovery and is never hidden |
 | Checkpoint files | Snapshot envelopes are versioned, length-checked, and checksummed |
 | Checkpoint publication | Retention advances only after a durable snapshot and matching pointer-marker pair |
 | Checkpoint restore | Recovery validates the selected snapshot and replays only its exact WAL suffix |
+| Raft groups | Many bounded groups share fixed reactors, one persistence service, and fair scheduling |
+| Ready ordering | Raft persistence, safe message release, commit advancement, and apply preserve the required order |
+| Replicated reads | Leader reads use ReadIndex and do not serve from an unconfirmed stale leader |
+| Membership | ConfState, learner promotion, removal proofs, drain, and leadership transfer are explicit |
+| Retry identity | V2 client identity, session epochs, request sequences, acknowledgment floors, and deduplication survive route changes |
+| Backpressure | RPC, message, proposal, persistence, and apply queues enforce byte and count budgets |
+| Status | `/status` is bounded aggregate/top-K; `/status/groups` exposes complete per-group diagnostics |
 | Storage ownership | One live server or offline inspector exclusively owns a data directory |
 | WAL inspection | Physical diagnostics and decoded database records are available through a read-only offline CLI |
 | Error protocol | Stable semantic code, message, and retryability |
 | Connection sharing | Sessions share catalog, tablets, IDs, and timestamps |
 | Internal safety | Corruption details are not exposed through client JSON |
 
-### Explicitly not claimed yet
+### Explicitly not claimed
 
-- Raft-replicated SQL writes;
-- automatic leader routing;
 - cross-tablet atomic transactions;
 - serializable isolation;
 - strict serializability;
 - external consistency;
 - linearizable follower reads;
-- automatic sharding or rebalancing;
+- automatic range split, merge, or replica rebalancing;
 - secondary indexes;
 - online schema changes;
 - PostgreSQL wire compatibility;
@@ -2214,17 +2439,21 @@ quietly omitted part of the client's SQL.
 
 ## Performance and Benchmark Policy
 
-No RagnorDB database benchmark is published yet.
+RagnorDB publishes structural performance evidence for the implemented
+distributed runtime, not competitive database claims. The measured system keeps
+correctness, quorum durability, ordered apply, bounded queues, and recovery
+semantics enabled.
 
-The current global runtime mutex, synchronous per-commit WAL synchronization,
-and in-memory applied state are optimized for correctness and architectural
-validation, not for a credible comparison against CockroachDB, TiKV, Cassandra,
-or PostgreSQL.
+The current evidence covers MultiRaft group density, fair scheduling, SQL
+parallelism, real TCP transport head-of-line behavior, shared persistence and
+apply separation, independent-table throughput, overload/backpressure, route
+lookup, and restart/recovery paths. The harness records both work completed and
+the queue/status state observed during load.
 
 A performance number will be published only with enough context to reproduce
 it.
 
-Every future report must include:
+Every report must include:
 
 - exact Git commit;
 - release profile and feature flags;
@@ -2250,7 +2479,7 @@ Every future report must include:
 - maximum latency;
 - post-run correctness validation.
 
-Planned benchmark families:
+Measured workload families:
 
 | Workload | What it measures |
 |---|---|
@@ -2263,7 +2492,10 @@ Planned benchmark families:
 | Restart recovery | Snapshot load plus WAL replay |
 | Raft commit | Proposal-to-apply latency at different replication factors |
 | Leader failure | Election and client recovery interval |
-| Cross-tablet transaction | Prewrite and commit cost by participant count |
+| MultiRaft density | Group count, fair turns, timer density, and per-group progress |
+| TCP transport | Control-lane and SQL-lane head-of-line behavior under load |
+| Persistence/apply | FIFO A-WAL persistence, commit advancement, and apply backlog |
+| Overload | Bounded queue admission, backpressure, and recovery after saturation |
 | Immutable-segment lookup | Index and Bloom-filter effectiveness |
 | Compaction | Read, write, and space amplification |
 
@@ -2286,7 +2518,6 @@ ragnordb/
 ├── docs/
 │   ├── architecture.md
 │   ├── raft-integration.md
-│   ├── roadmap.md
 │   ├── storage-format.md
 │   ├── testing.md
 │   ├── transaction-model.md
@@ -2313,7 +2544,7 @@ ragnordb/
 │   └── ragnordb-cli/
 ```
 
-The crate boundaries are intended to survive later milestones.
+The crate boundaries are intended to survive continued implementation.
 
 SQL must not absorb transaction coordination. Tablets must not parse SQL.
 Consensus must not understand table syntax. WAL must not determine transaction
@@ -2324,7 +2555,7 @@ implementation directory.
 
 ## Contributing
 
-RagnorDB is pre-1.0 and roadmap-driven. Contributions are welcome, but changes
+RagnorDB is pre-1.0 and correctness-driven. Contributions are welcome, but changes
 must preserve the ownership boundaries and correctness contracts that allow the
 database to grow from a local engine into a distributed one.
 
@@ -2341,16 +2572,15 @@ Read:
 2. the public APIs of the crates involved;
 3. the corresponding tests;
 
-Confirm that the work belongs to the current milestone. Features from later
-milestones should not be pulled forward if they require guarantees the current
-storage or transaction model cannot provide.
+Confirm that the work belongs to a currently supported subsystem and does not
+require guarantees the current storage or transaction model cannot provide.
 
 For example:
 
 - secondary-index work belongs after distributed transaction foundations;
 - Bloom filters belong with immutable segments, not mutable MVCC maps;
 - distributed locks belong with durable transaction status;
-- Raft writes must wait for the replicated-tablet commit path;
+- Raft writes must wait for the replicated-tablet commit and apply path;
 - transactional DDL must wait for metadata coordination.
 
 ### Development setup
@@ -2498,7 +2728,7 @@ Ownership validation should occur before state mutation and should cover:
 
 A failed batch must not leave partially applied state.
 
-Future Raft application methods must be deterministic and replay-safe. They
+Raft application methods must be deterministic and replay-safe. They
 must not depend on wall-clock time, unordered iteration, network state, or
 process-local randomness.
 
@@ -2572,11 +2802,11 @@ Public types and functions should document:
 - ordering;
 - failure behavior;
 - thread-safety assumptions;
-- whether the contract is current or future-facing.
+- whether the contract is currently supported or explicitly unsupported.
 
 Update the README or relevant design document when a change modifies a public
 guarantee, storage format, transaction state transition, wire response, or
-roadmap status.
+operational behavior.
 
 ### Tests are part of the implementation
 
@@ -2620,13 +2850,13 @@ A good pull request description answers:
 - Does the durable or wire format change?
 - Does this change a current guarantee?
 - Which tests prove the behavior?
-- Which milestone does it belong to?
+- Which subsystem owns it?
 
 Avoid mixing:
 
 - mechanical formatting with transaction behavior;
 - unrelated refactors with format changes;
-- future distributed APIs with current local fixes;
+- replicated APIs with unrelated local fixes;
 - benchmark tuning with semantic changes;
 - dependency updates with storage migrations.
 
@@ -2634,7 +2864,7 @@ Avoid mixing:
 
 Before submitting:
 
-- [ ] The change belongs to the current roadmap scope.
+- [ ] The change belongs to the current supported system boundary.
 - [ ] Layer ownership is explicit.
 - [ ] Parser AST types do not escape the SQL frontend.
 - [ ] Durable and ordered formats remain versioned and canonical.
@@ -2677,11 +2907,11 @@ isolation models.
 
 ---
 
-## Longer-Term Scope
+## Unsupported Extensions
 
-Beyond the current roadmap, possible directions include:
+The following capabilities are outside the current implementation boundary:
 
-- range-based tablets and dynamic split/merge;
+- dynamic tablet split/merge;
 - automatic replica placement and rebalancing;
 - hybrid logical clocks;
 - closed timestamps;
@@ -2695,11 +2925,12 @@ Beyond the current roadmap, possible directions include:
 - backup and restore;
 - change-data capture;
 - multi-region placement policy;
-- agent-oriented database interfaces once the transactional core is proven.
+- agent-oriented database interfaces.
 
-These are not current promises. They describe directions that become meaningful
-only after replication, distributed transactions, immutable storage, and
-system-level testing are solid.
+They are intentionally not presented as current guarantees. The supported
+system boundary is the SQL frontend, metadata and ordered tablet routing,
+single-tablet MVCC transactions, replicated Raft apply, A-WAL durability,
+recovery, and bounded operational control described above.
 
 ---
 

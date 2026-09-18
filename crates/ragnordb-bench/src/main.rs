@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hdrhistogram::Histogram;
+use ragnordb_common::protocol::{ClientRequestV2, encode_client_request_v2};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -46,6 +47,12 @@ enum Command {
         #[arg(long)]
         addr: String,
 
+        /// SQL table identifier used by this load. Keeping the identifier
+        /// explicit lets the release gate exercise independent tablet groups
+        /// without changing the benchmark client's deterministic workload.
+        #[arg(long, default_value = "bench")]
+        table: String,
+
         #[arg(long, default_value_t = 100_000)]
         rows: u64,
 
@@ -60,12 +67,30 @@ enum Command {
 
         #[arg(long)]
         create_table: bool,
+
+        /// Wire protocol used for the load. V2 preserves client identity and
+        /// request ordering across the distributed SQL path.
+        #[arg(long, value_enum, default_value_t = Protocol::V1)]
+        protocol: Protocol,
+
+        /// Non-zero V2 client identity. Ignored by V1.
+        #[arg(long, default_value_t = 1)]
+        client_id: u128,
+
+        /// Non-zero V2 session epoch. Ignored by V1.
+        #[arg(long, default_value_t = 1)]
+        session_epoch: u64,
     },
 
     /// Run a closed-loop multi-client benchmark.
     Run {
         #[arg(long)]
         addr: String,
+
+        /// SQL table identifier used by all workers in this run. The value is
+        /// validated before interpolation into generated benchmark SQL.
+        #[arg(long, default_value = "bench")]
+        table: String,
 
         #[arg(long, value_enum)]
         workload: Workload,
@@ -105,6 +130,20 @@ enum Command {
         /// Optional TSV file containing the merged HDR histogram buckets.
         #[arg(long)]
         histogram_out: Option<PathBuf>,
+
+        /// Wire protocol used for the run. V2 is required for distributed
+        /// SQL routing and request deduplication measurements.
+        #[arg(long, value_enum, default_value_t = Protocol::V1)]
+        protocol: Protocol,
+
+        /// Base non-zero V2 client identity. Each worker receives a distinct
+        /// identity by adding its worker number.
+        #[arg(long, default_value_t = 1)]
+        client_id: u128,
+
+        /// Non-zero V2 session epoch shared by this benchmark invocation.
+        #[arg(long, default_value_t = 1)]
+        session_epoch: u64,
     },
 }
 
@@ -115,6 +154,13 @@ enum Workload {
     PointWrite,
     Mixed,
     RangeScan,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum Protocol {
+    V1,
+    V2,
 }
 
 struct SqlClient {
@@ -135,19 +181,9 @@ impl SqlClient {
         Ok(Self { stream, timeout })
     }
 
-    async fn execute(&mut self, sql: &str) -> Result<Value> {
-        let payload = sql.as_bytes();
-
-        if payload.len() > MAX_FRAME_SIZE {
-            bail!("SQL request exceeds the 16 MiB frame limit");
-        }
-
-        let length =
-            u32::try_from(payload.len()).context("SQL request length does not fit u32 framing")?;
-
+    async fn execute_frame_with_metrics(&mut self, frame: &[u8]) -> Result<(Value, usize, usize)> {
         let response = tokio::time::timeout(self.timeout, async {
-            self.stream.write_all(&length.to_le_bytes()).await?;
-            self.stream.write_all(payload).await?;
+            self.stream.write_all(frame).await?;
             self.stream.flush().await?;
 
             let mut header = [0_u8; 4];
@@ -170,12 +206,120 @@ impl SqlClient {
         .await
         .context("SQL operation timed out")??;
 
-        serde_json::from_slice(&response).context("server response was not valid JSON")
+        let response_bytes = 4_usize
+            .checked_add(response.len())
+            .context("response byte count overflowed")?;
+        let response =
+            serde_json::from_slice(&response).context("server response was not valid JSON")?;
+        Ok((response, frame.len(), response_bytes))
+    }
+
+    async fn execute_frame(&mut self, frame: &[u8]) -> Result<Value> {
+        self.execute_frame_with_metrics(frame)
+            .await
+            .map(|(response, _, _)| response)
+    }
+
+    async fn execute(&mut self, sql: &str) -> Result<Value> {
+        let payload = sql.as_bytes();
+
+        if payload.len() > MAX_FRAME_SIZE {
+            bail!("SQL request exceeds the 16 MiB frame limit");
+        }
+
+        let length =
+            u32::try_from(payload.len()).context("SQL request length does not fit u32 framing")?;
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&length.to_le_bytes());
+        frame.extend_from_slice(payload);
+        self.execute_frame(&frame).await
+    }
+
+    async fn execute_v2_with_metrics(
+        &mut self,
+        client_id: u128,
+        session_epoch: u64,
+        request_sequence: u64,
+        sql: &str,
+    ) -> Result<(Value, usize, usize)> {
+        let frame = encode_client_request_v2(&ClientRequestV2 {
+            protocol_version: 2,
+            client_id,
+            client_session_epoch: session_epoch,
+            request_sequence,
+            acknowledged_through: request_sequence.checked_sub(1),
+            statement_timeout_ms: self
+                .timeout
+                .as_millis()
+                .try_into()
+                .context("benchmark timeout does not fit the V2 request field")?,
+            sql: sql.to_owned(),
+        })
+        .map_err(|error| anyhow!("encode V2 benchmark request: {error}"))?;
+
+        self.execute_frame_with_metrics(&frame).await
+    }
+}
+
+async fn execute_benchmark_request(
+    client: &mut SqlClient,
+    protocol: Protocol,
+    client_id: u128,
+    session_epoch: u64,
+    request_sequence: u64,
+    sql: &str,
+) -> Result<Value> {
+    execute_benchmark_request_with_metrics(
+        client,
+        protocol,
+        client_id,
+        session_epoch,
+        request_sequence,
+        sql,
+    )
+    .await
+    .map(|(response, _, _)| response)
+}
+
+async fn execute_benchmark_request_with_metrics(
+    client: &mut SqlClient,
+    protocol: Protocol,
+    client_id: u128,
+    session_epoch: u64,
+    request_sequence: u64,
+    sql: &str,
+) -> Result<(Value, usize, usize)> {
+    match protocol {
+        Protocol::V1 => {
+            let payload = sql.as_bytes();
+            if payload.len() > MAX_FRAME_SIZE {
+                bail!("SQL request exceeds the 16 MiB frame limit");
+            }
+            let length = u32::try_from(payload.len())
+                .context("SQL request length does not fit u32 framing")?;
+            let mut frame = Vec::with_capacity(4 + payload.len());
+            frame.extend_from_slice(&length.to_le_bytes());
+            frame.extend_from_slice(payload);
+            client.execute_frame_with_metrics(&frame).await
+        }
+        Protocol::V2 => {
+            client
+                .execute_v2_with_metrics(client_id, session_epoch, request_sequence, sql)
+                .await
+        }
     }
 }
 
 fn response_is_success(response: &Value) -> bool {
     response.get("ok").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn response_is_retryable(response: &Value) -> bool {
+    response
+        .get("error")
+        .and_then(|error| error.get("retryable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn response_error_code(response: &Value) -> String {
@@ -203,21 +347,41 @@ impl SplitMix64 {
     }
 }
 
-fn point_read(row_id: u64) -> String {
-    format!("SELECT * FROM bench WHERE id = {row_id}")
+fn point_read(table: &str, row_id: u64) -> String {
+    format!("SELECT * FROM {table} WHERE id = {row_id}")
 }
 
-fn point_write(row_id: u64, value: &str) -> String {
-    format!("UPDATE bench SET value = '{value}' WHERE id = {row_id}")
+fn point_write(table: &str, row_id: u64, value: &str) -> String {
+    format!("UPDATE {table} SET value = '{value}' WHERE id = {row_id}")
 }
 
-fn range_scan(scan_rows: u64) -> String {
-    format!("SELECT * FROM bench WHERE id <= {scan_rows}")
+fn range_scan(table: &str, scan_rows: u64) -> String {
+    format!("SELECT * FROM {table} WHERE id <= {scan_rows}")
+}
+
+/// Validate the restricted SQL identifier grammar used by generated workload
+/// statements. The benchmark client intentionally accepts identifiers rather
+/// than arbitrary SQL fragments so parallel-table measurements cannot turn a
+/// command-line value into an injection or a second statement.
+fn validate_table_name(table: &str) -> Result<()> {
+    let mut characters = table.chars();
+    let Some(first) = characters.next() else {
+        bail!("table must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        bail!(
+            "table must be a simple SQL identifier containing ASCII letters, digits, and underscores"
+        );
+    }
+    Ok(())
 }
 
 fn workload_sql(
     workload: Workload,
     random: &mut SplitMix64,
+    table: &str,
     rows: u64,
     read_percent: u64,
     scan_rows: u64,
@@ -226,12 +390,12 @@ fn workload_sql(
     match workload {
         Workload::PointRead => {
             let row_id = random.next() % rows + 1;
-            point_read(row_id)
+            point_read(table, row_id)
         }
 
         Workload::PointWrite => {
             let row_id = random.next() % rows + 1;
-            point_write(row_id, write_value)
+            point_write(table, row_id, write_value)
         }
 
         Workload::Mixed => {
@@ -241,13 +405,13 @@ fn workload_sql(
             let operation_draw = random.next() % 100;
 
             if operation_draw < read_percent {
-                point_read(row_id)
+                point_read(table, row_id)
             } else {
-                point_write(row_id, write_value)
+                point_write(table, row_id, write_value)
             }
         }
 
-        Workload::RangeScan => range_scan(scan_rows),
+        Workload::RangeScan => range_scan(table, scan_rows),
     }
 }
 
@@ -257,6 +421,8 @@ struct WorkerStats {
     failed: u64,
     latency_us: Histogram<u64>,
     errors: BTreeMap<String, u64>,
+    request_bytes: u64,
+    response_bytes: u64,
 }
 
 impl WorkerStats {
@@ -267,6 +433,8 @@ impl WorkerStats {
             failed: 0,
             latency_us: Histogram::new(3).context("create HDR latency histogram")?,
             errors: BTreeMap::new(),
+            request_bytes: 0,
+            response_bytes: 0,
         })
     }
 
@@ -289,6 +457,7 @@ impl WorkerStats {
 #[derive(Clone)]
 struct RunOptions {
     addr: Arc<str>,
+    table: Arc<str>,
     workload: Workload,
     seconds: u64,
     rows: u64,
@@ -298,6 +467,9 @@ struct RunOptions {
     scan_rows: u64,
     timeout: Duration,
     seed: u64,
+    protocol: Protocol,
+    client_id: u128,
+    session_epoch: u64,
 }
 
 async fn run_worker(
@@ -318,6 +490,11 @@ async fn run_worker(
     let client_seed =
         options.seed ^ (u64::from(client_number) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut random = SplitMix64(client_seed);
+    let worker_client_id = options
+        .client_id
+        .checked_add(u128::from(client_number))
+        .context("V2 client identity range overflowed")?;
+    let mut request_sequence = 1_u64;
 
     // Keep the update payload at the configured benchmark size.
     // Different clients use a different ASCII byte, but every value has
@@ -331,13 +508,23 @@ async fn run_worker(
         let sql = workload_sql(
             options.workload,
             &mut random,
+            &options.table,
             options.rows,
             options.read_percent,
             options.scan_rows,
             &write_value,
         );
 
-        let response = match client.execute(&sql).await {
+        let response = match execute_benchmark_request(
+            &mut client,
+            options.protocol,
+            worker_client_id,
+            options.session_epoch,
+            request_sequence,
+            &sql,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 let message = format!(
@@ -347,6 +534,9 @@ async fn run_worker(
                 bail!(message);
             }
         };
+        request_sequence = request_sequence
+            .checked_add(1)
+            .context("benchmark request sequence exhausted during warmup")?;
 
         if !response_is_success(&response) {
             let message = format!(
@@ -378,6 +568,7 @@ async fn run_worker(
         let sql = workload_sql(
             options.workload,
             &mut random,
+            &options.table,
             options.rows,
             options.read_percent,
             options.scan_rows,
@@ -387,12 +578,35 @@ async fn run_worker(
         stats.attempted += 1;
         let operation_start = Instant::now();
 
-        match client.execute(&sql).await {
-            Ok(response) if response_is_success(&response) => {
+        match execute_benchmark_request_with_metrics(
+            &mut client,
+            options.protocol,
+            worker_client_id,
+            options.session_epoch,
+            request_sequence,
+            &sql,
+        )
+        .await
+        {
+            Ok((response, request_bytes, response_bytes)) if response_is_success(&response) => {
+                stats.request_bytes = stats.request_bytes.saturating_add(
+                    u64::try_from(request_bytes).context("request byte count does not fit u64")?,
+                );
+                stats.response_bytes = stats.response_bytes.saturating_add(
+                    u64::try_from(response_bytes)
+                        .context("response byte count does not fit u64")?,
+                );
                 stats.record_success(operation_start.elapsed())?;
             }
 
-            Ok(response) => {
+            Ok((response, request_bytes, response_bytes)) => {
+                stats.request_bytes = stats.request_bytes.saturating_add(
+                    u64::try_from(request_bytes).context("request byte count does not fit u64")?,
+                );
+                stats.response_bytes = stats.response_bytes.saturating_add(
+                    u64::try_from(response_bytes)
+                        .context("response byte count does not fit u64")?,
+                );
                 stats.record_failure(response_error_code(&response));
             }
 
@@ -404,6 +618,10 @@ async fn run_worker(
                 break;
             }
         }
+
+        request_sequence = request_sequence
+            .checked_add(1)
+            .context("benchmark request sequence exhausted")?;
     }
 
     Ok(stats)
@@ -414,6 +632,8 @@ struct RunReport {
     benchmark: &'static str,
     load_model: &'static str,
     addr: String,
+    table: String,
+    protocol: Protocol,
     workload: Workload,
     clients: u32,
     dataset_rows: u64,
@@ -428,6 +648,8 @@ struct RunReport {
     failed_operations: u64,
     attempted_ops_per_second: f64,
     successful_ops_per_second: f64,
+    measured_request_bytes: u64,
+    measured_response_bytes: u64,
     p50_us: Option<u64>,
     p95_us: Option<u64>,
     p99_us: Option<u64>,
@@ -477,29 +699,68 @@ async fn exec_one(addr: String, sql: String, timeout_ms: u64) -> Result<()> {
     Ok(())
 }
 
-async fn load_table(
+struct LoadConfig {
     addr: String,
+    table: String,
     rows: u64,
     value_bytes: usize,
     batch_size: u64,
     timeout_ms: u64,
     create_table: bool,
-) -> Result<()> {
+    protocol: Protocol,
+    client_id: u128,
+    session_epoch: u64,
+}
+
+async fn load_table(config: LoadConfig) -> Result<()> {
+    let LoadConfig {
+        addr,
+        table,
+        rows,
+        value_bytes,
+        batch_size,
+        timeout_ms,
+        create_table,
+        protocol,
+        client_id,
+        session_epoch,
+    } = config;
+
     if rows == 0 {
         bail!("rows must be greater than zero");
     }
+
+    validate_table_name(&table)?;
 
     if batch_size == 0 {
         bail!("batch-size must be greater than zero");
     }
 
+    if matches!(protocol, Protocol::V2) && client_id == 0 {
+        bail!("client-id must be non-zero for V2");
+    }
+
+    if matches!(protocol, Protocol::V2) && session_epoch == 0 {
+        bail!("session-epoch must be non-zero for V2");
+    }
+
     let timeout = Duration::from_millis(timeout_ms);
     let mut client = SqlClient::connect(&addr, timeout).await?;
+    let mut request_sequence = 1_u64;
 
     if create_table {
-        let response = client
-            .execute("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT NOT NULL)")
-            .await?;
+        let response = execute_benchmark_request(
+            &mut client,
+            protocol,
+            client_id,
+            session_epoch,
+            request_sequence,
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value TEXT NOT NULL)"),
+        )
+        .await?;
+        request_sequence = request_sequence
+            .checked_add(1)
+            .context("benchmark request sequence exhausted while creating table")?;
 
         if !response_is_success(&response) {
             bail!("creating benchmark table failed: {response}");
@@ -508,12 +769,13 @@ async fn load_table(
 
     let value = "x".repeat(value_bytes);
     let started = Instant::now();
+    let setup_retry_deadline = Instant::now() + Duration::from_secs(30);
 
     let mut first = 1_u64;
     while first <= rows {
         let last = first.saturating_add(batch_size - 1).min(rows);
 
-        let mut sql = String::from("INSERT INTO bench (id, value) VALUES ");
+        let mut sql = format!("INSERT INTO {table} (id, value) VALUES ");
 
         for row_id in first..=last {
             if row_id != first {
@@ -526,7 +788,35 @@ async fn load_table(
             sql.push_str("')");
         }
 
-        let response = client.execute(&sql).await?;
+        // Metadata publication and local tablet activation are separate
+        // committed transitions. Setup may therefore briefly return a
+        // retryable unavailability response even after CREATE TABLE succeeds.
+        // Reusing the same sequence is required: a retry is one logical V2
+        // request and must remain deduplicable after the tablet becomes ready.
+        let response = loop {
+            let response = execute_benchmark_request(
+                &mut client,
+                protocol,
+                client_id,
+                session_epoch,
+                request_sequence,
+                &sql,
+            )
+            .await?;
+
+            if response_is_success(&response) || !response_is_retryable(&response) {
+                break response;
+            }
+
+            if Instant::now() >= setup_retry_deadline {
+                break response;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        request_sequence = request_sequence
+            .checked_add(1)
+            .context("benchmark request sequence exhausted while loading table")?;
         if !response_is_success(&response) {
             bail!("load failed for rows {first}..={last}: {response}");
         }
@@ -549,6 +839,7 @@ async fn load_table(
 
 struct BenchmarkConfig {
     addr: String,
+    table: String,
     workload: Workload,
     clients: u32,
     seconds: u64,
@@ -560,11 +851,15 @@ struct BenchmarkConfig {
     timeout_ms: u64,
     seed: u64,
     histogram_out: Option<PathBuf>,
+    protocol: Protocol,
+    client_id: u128,
+    session_epoch: u64,
 }
 
 async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     let BenchmarkConfig {
         addr,
+        table,
         workload,
         clients,
         seconds,
@@ -576,10 +871,28 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         timeout_ms,
         seed,
         histogram_out,
+        protocol,
+        client_id,
+        session_epoch,
     } = config;
 
     if clients == 0 {
         bail!("clients must be greater than zero");
+    }
+
+    validate_table_name(&table)?;
+
+    if matches!(protocol, Protocol::V2) && client_id == 0 {
+        bail!("client-id must be non-zero for V2");
+    }
+
+    if matches!(protocol, Protocol::V2) && session_epoch == 0 {
+        bail!("session-epoch must be non-zero for V2");
+    }
+
+    if matches!(protocol, Protocol::V2) && client_id.checked_add(u128::from(clients - 1)).is_none()
+    {
+        bail!("client-id range overflows the V2 client identity field");
     }
 
     if clients > 1_024 {
@@ -598,8 +911,12 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         bail!("read-percent must be between 0 and 100");
     }
 
-    if scan_rows == 0 || scan_rows > rows {
-        bail!("scan-rows must be in 1..=rows");
+    if scan_rows == 0 {
+        bail!("scan-rows must be greater than zero");
+    }
+
+    if matches!(workload, Workload::RangeScan) && scan_rows > rows {
+        bail!("scan-rows must not exceed rows for a range-scan workload");
     }
 
     if matches!(workload, Workload::RangeScan) && scan_rows > 10_000 {
@@ -610,6 +927,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
 
     let options = RunOptions {
         addr: Arc::from(addr.as_str()),
+        table: Arc::from(table.as_str()),
         workload,
         seconds,
         rows,
@@ -619,6 +937,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         scan_rows,
         timeout: Duration::from_millis(timeout_ms),
         seed,
+        protocol,
+        client_id,
+        session_epoch,
     };
 
     let (ready_tx, mut ready_rx) =
@@ -669,6 +990,10 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         aggregate.attempted += worker.attempted;
         aggregate.successful += worker.successful;
         aggregate.failed += worker.failed;
+        aggregate.request_bytes = aggregate.request_bytes.saturating_add(worker.request_bytes);
+        aggregate.response_bytes = aggregate
+            .response_bytes
+            .saturating_add(worker.response_bytes);
 
         aggregate
             .latency_us
@@ -690,9 +1015,11 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     let has_success = aggregate.successful > 0;
 
     let report = RunReport {
-        benchmark: "RagnorDB Milestone 4",
+        benchmark: "RagnorDB SQL",
         load_model: "closed-loop",
         addr,
+        table,
+        protocol,
         workload,
         clients,
         dataset_rows: rows,
@@ -707,6 +1034,8 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         failed_operations: aggregate.failed,
         attempted_ops_per_second: aggregate.attempted as f64 / elapsed_seconds,
         successful_ops_per_second: aggregate.successful as f64 / elapsed_seconds,
+        measured_request_bytes: aggregate.request_bytes,
+        measured_response_bytes: aggregate.response_bytes,
         p50_us: has_success.then(|| aggregate.latency_us.value_at_quantile(0.50)),
         p95_us: has_success.then(|| aggregate.latency_us.value_at_quantile(0.95)),
         p99_us: has_success.then(|| aggregate.latency_us.value_at_quantile(0.99)),
@@ -738,25 +1067,34 @@ async fn main() -> Result<()> {
 
         Command::Load {
             addr,
+            table,
             rows,
             value_bytes,
             batch_size,
             timeout_ms,
             create_table,
+            protocol,
+            client_id,
+            session_epoch,
         } => {
-            load_table(
+            load_table(LoadConfig {
                 addr,
+                table,
                 rows,
                 value_bytes,
                 batch_size,
                 timeout_ms,
                 create_table,
-            )
+                protocol,
+                client_id,
+                session_epoch,
+            })
             .await
         }
 
         Command::Run {
             addr,
+            table,
             workload,
             clients,
             seconds,
@@ -768,9 +1106,13 @@ async fn main() -> Result<()> {
             timeout_ms,
             seed,
             histogram_out,
+            protocol,
+            client_id,
+            session_epoch,
         } => {
             run_benchmark(BenchmarkConfig {
                 addr,
+                table,
                 workload,
                 clients,
                 seconds,
@@ -782,6 +1124,9 @@ async fn main() -> Result<()> {
                 timeout_ms,
                 seed,
                 histogram_out,
+                protocol,
+                client_id,
+                session_epoch,
             })
             .await
         }

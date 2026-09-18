@@ -1497,12 +1497,14 @@ dependencies = [
  "clap",
  "criterion",
  "hdrhistogram",
+ "prost",
  "ragnordb-common",
  "ragnordb-multiraft",
  "ragnordb-storage",
  "ragnordb-tablet",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "wal",
 ]
@@ -1513,6 +1515,7 @@ version = "0.1.0"
 dependencies = [
  "ragnordb-common",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1568,11 +1571,14 @@ dependencies = [
  "blake3",
  "prost",
  "raft",
+ "ragnordb-catalog",
  "ragnordb-common",
  "ragnordb-storage",
  "ragnordb-tablet",
  "ragnordb-txn",
  "thiserror",
+ "tokio",
+ "tracing",
  "wal",
 ]
 
@@ -1583,6 +1589,7 @@ dependencies = [
  "axum",
  "metrics",
  "metrics-exporter-prometheus",
+ "prost",
  "raft",
  "ragnordb-catalog",
  "ragnordb-common",

@@ -10,7 +10,7 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError},
+    sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -135,7 +135,7 @@ impl<R, E> ProposalTicket<R, E> {
 struct PendingProposal<R, E> {
     position: ProposalPosition,
     deadline: Instant,
-    sender: Sender<ProposalCompletion<R, E>>,
+    sender: SyncSender<ProposalCompletion<R, E>>,
 }
 
 /// Tracks proposals admitted by one Raft group.
@@ -165,7 +165,7 @@ impl<R, E> ProposalRegistry<R, E> {
             return Err(ProposalRegistryError::DuplicateRequest { request_id });
         }
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
 
         self.pending.insert(
             request_id.clone(),

@@ -6,7 +6,7 @@
 use prost::Message;
 use raft::{
     entry::{EntryPayload, LogEntry},
-    types::{ConfChange, ConfChangeKind, ConfState, HardState},
+    types::{ConfChange, ConfChangeKind, ConfState, HardState, RemovalProof},
 };
 use ragnordb_common::{
     ids::{RaftGroupId, ReplicaId},
@@ -31,6 +31,7 @@ pub struct RaftSnapshotPointerRecord {
     pub last_included_term: u64,
     pub applied_index: u64,
     pub conf_state: ConfState,
+    pub last_removed_replica: Option<RemovalProof>,
     pub size_bytes: u64,
     pub checksum: [u8; 32],
     pub file_name: String,
@@ -51,6 +52,16 @@ impl RaftSnapshotPointerRecord {
             voters: encode_core_replicas(&self.conf_state.voters),
             learners: encode_core_replicas(&self.conf_state.learners),
             outgoing_voters: encode_core_replicas(&self.conf_state.outgoing_voters),
+            last_removed_replica_id: self
+                .last_removed_replica
+                .map(|proof| proof.0.get())
+                .unwrap_or(0),
+            last_removed_replica_index: self.last_removed_replica.map(|proof| proof.1).unwrap_or(0),
+            last_removed_replica_term: self.last_removed_replica.map(|proof| proof.2).unwrap_or(0),
+            last_removed_conf_state_version: self
+                .last_removed_replica
+                .map(|proof| proof.3)
+                .unwrap_or(0),
             size_bytes: self.size_bytes,
             checksum: self.checksum.to_vec(),
             file_name: self.file_name.clone(),
@@ -79,6 +90,12 @@ impl RaftSnapshotPointerRecord {
                 learners: decode_core_replicas("learners", proto.learners)?,
                 outgoing_voters: decode_core_replicas("outgoing_voters", proto.outgoing_voters)?,
             },
+            last_removed_replica: decode_removal_proof(
+                proto.last_removed_replica_id,
+                proto.last_removed_replica_index,
+                proto.last_removed_replica_term,
+                proto.last_removed_conf_state_version,
+            )?,
             size_bytes: proto.size_bytes,
             checksum,
             file_name: proto.file_name,
@@ -118,7 +135,23 @@ impl RaftSnapshotPointerRecord {
         }
         self.conf_state
             .validate()
-            .map_err(|error| RaftStableStateCodecError::InvalidConfState(format!("{error:?}")))
+            .map_err(|error| RaftStableStateCodecError::InvalidConfState(format!("{error:?}")))?;
+
+        if let Some((replica_id, index, term, version)) = self.last_removed_replica {
+            if index == 0
+                || index > self.last_included_index
+                || term == 0
+                || version == 0
+                || version > self.conf_state.version
+            {
+                return Err(RaftStableStateCodecError::InvalidRemovalProof);
+            }
+            if self.conf_state.contains(replica_id) {
+                return Err(RaftStableStateCodecError::InvalidRemovalProof);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -643,6 +676,23 @@ fn decode_core_replicas(
     Ok(decoded)
 }
 
+fn decode_removal_proof(
+    replica_id: u64,
+    index: u64,
+    term: u64,
+    version: u64,
+) -> Result<Option<RemovalProof>, RaftStableStateCodecError> {
+    if replica_id == 0 && index == 0 && term == 0 && version == 0 {
+        return Ok(None);
+    }
+    let replica_id = raft::types::ReplicaId::new(replica_id)
+        .ok_or(RaftStableStateCodecError::InvalidRemovalProof)?;
+    if index == 0 || term == 0 || version == 0 {
+        return Err(RaftStableStateCodecError::InvalidRemovalProof);
+    }
+    Ok(Some((replica_id, index, term, version)))
+}
+
 /// Invalid or corrupt durable Raft stable-state record.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RaftStableStateCodecError {
@@ -708,6 +758,9 @@ pub enum RaftStableStateCodecError {
 
     #[error("invalid Raft ConfState: {0}")]
     InvalidConfState(String),
+
+    #[error("invalid committed replica-removal proof")]
+    InvalidRemovalProof,
 
     #[error("cannot decode durable Raft stable-state record: {0}")]
     Decode(String),

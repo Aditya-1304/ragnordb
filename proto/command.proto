@@ -17,6 +17,20 @@ message TabletCommandEnvelope {
     ragnordb.ids.TabletId tablet_id = 3;
     uint64 expected_epoch = 4;
     TabletCommand command = 5;
+    ragnordb.ids.LogicalCommandId logical_command_id = 6;
+
+    // Durable retry-horizon watermark observed by the client when this
+    // command was issued. The tablet may compact outcomes at or below this
+    // watermark only after the watermark itself has entered the Raft log.
+    optional uint64 acknowledged_through = 7;
+}
+
+// A bounded, deterministic group of already-routed mutation commands for one
+// tablet. The individual envelopes remain complete so request identity,
+// retry horizons, and tablet-generation validation survive batching.
+message TabletCommandBatchEnvelope {
+    uint32 format_version = 1;
+    repeated TabletCommandEnvelope commands = 2;
 }
 
 message TabletCommand {
@@ -104,6 +118,8 @@ message TabletStateMachineSnapshot {
     uint64 tablet_epoch = 3;
     repeated ClientDeduplicationSnapshot clients = 4;
     ragnordb.ids.RaftGroupId raft_group_id = 5;
+    repeated LogicalCommandDeduplicationSnapshot logical_commands = 6;
+    repeated LogicalClientRetryHorizon logical_client_retry_horizons = 7;
 }
 
 // last applied request and cached result for one client in this Raft group
@@ -111,6 +127,21 @@ message ClientDeduplicationSnapshot {
     ragnordb.ids.RequestId last_request_id = 1;
     CachedTabletCommandResult cached_result = 2;
     CachedTabletCommandRejection cached_rejection = 3;
+}
+
+// V2 deduplication entries are keyed by logical command identity rather than
+// by a group-qualified legacy RequestId. This is what makes a retry safe when
+// metadata routes the same logical command to a different tablet generation.
+message LogicalCommandDeduplicationSnapshot {
+    ragnordb.ids.LogicalCommandId logical_command_id = 1;
+    CachedTabletCommandResult cached_result = 2;
+    CachedTabletCommandRejection cached_rejection = 3;
+}
+
+message LogicalClientRetryHorizon {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 acknowledged_through = 3;
 }
 
 message CachedTabletCommandRejection {

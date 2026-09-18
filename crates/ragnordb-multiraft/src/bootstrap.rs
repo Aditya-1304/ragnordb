@@ -1,6 +1,7 @@
 //! Exactly-once bootstrap coordination for local Raft group replicas.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -102,6 +103,125 @@ impl FileBootstrapStore {
             BootstrapStoreError::Unavailable(format!("read bootstrap {}: {error}", path.display()))
         })?;
         Ok(Some(bytes))
+    }
+
+    /// discover every authoritative Raft-group bootstrap in this node's
+    /// bootstrap directory
+    ///
+    /// temporary files are never considered authoritative. Every final file is
+    /// decoded and its embedded group identity must agree with its filename
+    /// Startup fails closed on malformed authoritative files
+    pub fn load_all_durable_bootstraps(
+        &self,
+    ) -> Result<BTreeMap<RaftGroupId, RaftGroupBootstrap>, BootstrapGroupError> {
+        let mut bootstraps = BTreeMap::new();
+
+        let entries = fs::read_dir(&self.directory).map_err(|error| {
+            BootstrapStoreError::Unavailable(format!(
+                "read bootstrap directory {}: {error}",
+                self.directory.display()
+            ))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                BootstrapStoreError::Unavailable(format!(
+                    "enumerate bootstrap directory {}: {error}",
+                    self.directory.display()
+                ))
+            })?;
+
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    BootstrapStoreError::Unavailable(format!(
+                        "inspect bootstrap entry {}: {error}",
+                        entry.path().display()
+                    ))
+                })?
+                .is_file()
+            {
+                continue;
+            }
+
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+
+            if is_temporary_bootstrap_name(file_name) {
+                continue;
+            }
+
+            let Some(group_text) = file_name
+                .strip_prefix("raft-group-")
+                .and_then(|name| name.strip_suffix(".bootstrap"))
+            else {
+                continue;
+            };
+
+            let raw_group_id = group_text.parse::<u64>().map_err(|_| {
+                BootstrapStoreError::Unavailable(format!(
+                    "invalid authoritative bootstrap filename: {file_name}"
+                ))
+            })?;
+
+            let filename_group_id = RaftGroupId(raw_group_id);
+
+            let bytes = self.read_existing(&entry.path())?.ok_or_else(|| {
+                BootstrapStoreError::Unavailable(format!(
+                    "bootstrap disappeared during discovery: {}",
+                    entry.path().display()
+                ))
+            })?;
+
+            let bootstrap = RaftGroupBootstrap::decode(&bytes)?;
+
+            if bootstrap.raft_group_id != filename_group_id {
+                return Err(BootstrapGroupError::FileIdentityMismatch {
+                    filename_group_id,
+                    record_group_id: bootstrap.raft_group_id,
+                });
+            }
+
+            if bootstraps
+                .insert(bootstrap.raft_group_id, bootstrap)
+                .is_some()
+            {
+                return Err(BootstrapGroupError::DuplicateGroup(filename_group_id));
+            }
+        }
+
+        Ok(bootstraps)
+    }
+
+    /// Remove one durable bootstrap after its initial membership witness has
+    /// been copied into the local lifecycle registry.
+    ///
+    /// This operation is intentionally explicit and idempotent. Callers must
+    /// persist the witness before invoking it; otherwise a restart could no
+    /// longer reconstruct committed configuration entries from retained WAL.
+    pub fn remove_durable_bootstrap(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<bool, BootstrapStoreError> {
+        let path = self.final_path(raft_group_id);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_directory(&self.directory).map_err(|error| {
+                    BootstrapStoreError::OutcomeUnknown(format!(
+                        "synchronize removed bootstrap {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(BootstrapStoreError::Unavailable(format!(
+                "remove bootstrap {}: {error}",
+                path.display()
+            ))),
+        }
     }
 }
 
@@ -263,6 +383,17 @@ pub enum BootstrapGroupError {
     Envelope(#[from] RaftGroupBootstrapError),
     #[error(transparent)]
     Storage(#[from] BootstrapStoreError),
+    #[error(
+        "bootstrap filename identifies group {filename_group_id:?}, \
+         but the durable record identifies {record_group_id:?}"
+    )]
+    FileIdentityMismatch {
+        filename_group_id: RaftGroupId,
+        record_group_id: RaftGroupId,
+    },
+
+    #[error("duplicate durable bootstrap discovered for Raft group {0:?}")]
+    DuplicateGroup(RaftGroupId),
 }
 
 /// Installs one group's bootstrap exactly once.

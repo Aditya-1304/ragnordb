@@ -1,7 +1,251 @@
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub use crate::result::StreamingResultFrame;
 
 const LEN_SIZE: usize = 4;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const V2_MAGIC: &[u8; 4] = b"RDB2";
+const V2_STREAMING_MAGIC: &[u8; 4] = b"RDBS";
+
+pub const MAX_STREAMING_BATCH_ROWS: u32 = 65_536;
+pub const MAX_STREAMING_BATCH_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Client-owned V2 request envelope. The root identity is preserved across
+/// gateways and topology changes; only the tablet route is allowed to change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRequestV2 {
+    pub protocol_version: u16,
+    pub client_id: u128,
+    pub client_session_epoch: u64,
+    pub request_sequence: u64,
+    pub acknowledged_through: Option<u64>,
+    pub statement_timeout_ms: u64,
+    pub sql: String,
+}
+
+impl ClientRequestV2 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.protocol_version != 2 {
+            return Err("unsupported client request protocol version");
+        }
+        if self.client_id == 0 {
+            return Err("client ID must be non-zero");
+        }
+        if self.client_session_epoch == 0 {
+            return Err("client session epoch must be non-zero");
+        }
+        if self.request_sequence == 0 {
+            return Err("client request sequence must be non-zero");
+        }
+        if self
+            .acknowledged_through
+            .is_some_and(|acknowledged| acknowledged > self.request_sequence)
+        {
+            return Err("acknowledged request sequence is ahead of the request");
+        }
+        if self.statement_timeout_ms == 0 {
+            return Err("client statement timeout must be non-zero");
+        }
+        if self.sql.trim().is_empty() {
+            return Err("client SQL must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Opt-in V2 request envelope for bounded result streaming. This is a
+/// separate type and magic so the established ClientRequestV2 JSON bytes and
+/// field set remain unchanged for existing clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRequestV2Streaming {
+    pub protocol_version: u16,
+    pub client_id: u128,
+    pub client_session_epoch: u64,
+    pub request_sequence: u64,
+    pub acknowledged_through: Option<u64>,
+    pub statement_timeout_ms: u64,
+    pub sql: String,
+    pub max_rows_per_batch: u32,
+    pub max_bytes_per_batch: u32,
+}
+
+impl ClientRequestV2Streaming {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        ClientRequestV2 {
+            protocol_version: self.protocol_version,
+            client_id: self.client_id,
+            client_session_epoch: self.client_session_epoch,
+            request_sequence: self.request_sequence,
+            acknowledged_through: self.acknowledged_through,
+            statement_timeout_ms: self.statement_timeout_ms,
+            sql: self.sql.clone(),
+        }
+        .validate()?;
+        if self.max_rows_per_batch == 0 || self.max_rows_per_batch > MAX_STREAMING_BATCH_ROWS {
+            return Err("streaming max_rows_per_batch is outside the allowed range");
+        }
+        if self.max_bytes_per_batch == 0 || self.max_bytes_per_batch > MAX_STREAMING_BATCH_BYTES {
+            return Err("streaming max_bytes_per_batch is outside the allowed range");
+        }
+        Ok(())
+    }
+}
+
+/// Wire-level request accepted by the server without breaking the V1 SQL
+/// framing used by the existing shell and compatibility clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequestFrame {
+    V1(String),
+    V2(ClientRequestV2),
+    V2Streaming(ClientRequestV2Streaming),
+}
+
+pub async fn read_client_frame<R>(
+    reader: &mut R,
+) -> Result<ClientRequestFrame, Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; LEN_SIZE];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(format!("frame size {len} exceeds maximum of {MAX_FRAME_SIZE}").into());
+    }
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    if buf.starts_with(V2_MAGIC) {
+        let request: ClientRequestV2 = serde_json::from_slice(&buf[V2_MAGIC.len()..])?;
+        request
+            .validate()
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        Ok(ClientRequestFrame::V2(request))
+    } else if buf.starts_with(V2_STREAMING_MAGIC) {
+        let request: ClientRequestV2Streaming =
+            serde_json::from_slice(&buf[V2_STREAMING_MAGIC.len()..])?;
+        request
+            .validate()
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        Ok(ClientRequestFrame::V2Streaming(request))
+    } else {
+        Ok(ClientRequestFrame::V1(String::from_utf8(buf)?))
+    }
+}
+
+pub fn encode_client_request_v2(
+    request: &ClientRequestV2,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    request
+        .validate()
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let body = serde_json::to_vec(request)?;
+    let total = V2_MAGIC.len() + body.len();
+    if total > MAX_FRAME_SIZE {
+        return Err(
+            format!("V2 request frame size {total} exceeds maximum of {MAX_FRAME_SIZE}").into(),
+        );
+    }
+    let mut frame = Vec::with_capacity(LEN_SIZE + total);
+    frame.extend_from_slice(&u32::try_from(total)?.to_le_bytes());
+    frame.extend_from_slice(V2_MAGIC);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+pub fn encode_client_request_v2_streaming(
+    request: &ClientRequestV2Streaming,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    request
+        .validate()
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let body = serde_json::to_vec(request)?;
+    let total = V2_STREAMING_MAGIC.len() + body.len();
+    if total > MAX_FRAME_SIZE {
+        return Err(format!(
+            "streaming V2 request frame size {total} exceeds maximum of {MAX_FRAME_SIZE}"
+        )
+        .into());
+    }
+    let mut frame = Vec::with_capacity(LEN_SIZE + total);
+    frame.extend_from_slice(&u32::try_from(total)?.to_le_bytes());
+    frame.extend_from_slice(V2_STREAMING_MAGIC);
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+pub fn encode_streaming_result_frame(
+    frame: &StreamingResultFrame,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(frame)?;
+    if body.len() > MAX_FRAME_SIZE {
+        return Err(format!(
+            "streaming result frame size {} exceeds maximum of {MAX_FRAME_SIZE}",
+            body.len()
+        )
+        .into());
+    }
+    let mut encoded = Vec::with_capacity(LEN_SIZE + body.len());
+    encoded.extend_from_slice(&u32::try_from(body.len())?.to_le_bytes());
+    encoded.extend_from_slice(&body);
+    Ok(encoded)
+}
+
+pub fn decode_streaming_result_frame(
+    frame: &[u8],
+) -> Result<StreamingResultFrame, Box<dyn std::error::Error>> {
+    if frame.len() < LEN_SIZE {
+        return Err("streaming result frame is missing its length prefix".into());
+    }
+    let body_len = u32::from_le_bytes(frame[..LEN_SIZE].try_into()?) as usize;
+    if body_len > MAX_FRAME_SIZE {
+        return Err(format!(
+            "streaming result frame size {body_len} exceeds maximum of {MAX_FRAME_SIZE}"
+        )
+        .into());
+    }
+    if frame.len() != LEN_SIZE + body_len {
+        return Err("streaming result frame length does not match its payload".into());
+    }
+    Ok(serde_json::from_slice(&frame[LEN_SIZE..])?)
+}
+
+pub async fn read_streaming_result_frame<R>(
+    reader: &mut R,
+) -> Result<StreamingResultFrame, Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; LEN_SIZE];
+    reader.read_exact(&mut len_buf).await?;
+    let body_len = u32::from_le_bytes(len_buf) as usize;
+    if body_len > MAX_FRAME_SIZE {
+        return Err(format!(
+            "streaming result frame size {body_len} exceeds maximum of {MAX_FRAME_SIZE}"
+        )
+        .into());
+    }
+
+    let mut encoded = Vec::with_capacity(LEN_SIZE + body_len);
+    encoded.extend_from_slice(&len_buf);
+    encoded.resize(LEN_SIZE + body_len, 0);
+    reader.read_exact(&mut encoded[LEN_SIZE..]).await?;
+    decode_streaming_result_frame(&encoded)
+}
+
+pub async fn write_streaming_result_frame<W>(
+    writer: &mut W,
+    frame: &StreamingResultFrame,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: AsyncWrite + Unpin,
+{
+    let encoded = encode_streaming_result_frame(frame)?;
+    writer.write_all(&encoded).await?;
+    writer.flush().await?;
+    Ok(())
+}
 
 /// V1 client wire protocol: length-prefixed TCP frames
 ///
@@ -197,6 +441,126 @@ mod tests {
         client.write_all(&invalid_utf8).await.unwrap();
 
         assert!(read_frame(&mut server).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn v2_request_round_trip_preserves_logical_retry_identity() {
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 17,
+            client_session_epoch: 4,
+            request_sequence: 9,
+            acknowledged_through: Some(8),
+            statement_timeout_ms: 30_000,
+            sql: "INSERT INTO users (id) VALUES (1)".to_string(),
+        };
+        let encoded = encode_client_request_v2(&request).unwrap();
+        let (mut writer, mut reader) = duplex(4096);
+        writer.write_all(&encoded).await.unwrap();
+
+        assert_eq!(
+            read_client_frame(&mut reader).await.unwrap(),
+            ClientRequestFrame::V2(request)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_request_rejects_acknowledgement_beyond_root_sequence() {
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 1,
+            client_session_epoch: 1,
+            request_sequence: 2,
+            acknowledged_through: Some(3),
+            statement_timeout_ms: 30_000,
+            sql: "SELECT 1".to_string(),
+        };
+
+        assert!(encode_client_request_v2(&request).is_err());
+    }
+
+    #[tokio::test]
+    async fn opt_in_v2_streaming_request_uses_distinct_magic_and_roundtrips() {
+        let request = ClientRequestV2Streaming {
+            protocol_version: 2,
+            client_id: 17,
+            client_session_epoch: 4,
+            request_sequence: 9,
+            acknowledged_through: Some(8),
+            statement_timeout_ms: 30_000,
+            sql: "SELECT * FROM users".to_string(),
+            max_rows_per_batch: 128,
+            max_bytes_per_batch: 64 * 1024,
+        };
+        let encoded = encode_client_request_v2_streaming(&request).unwrap();
+        assert_ne!(&encoded[LEN_SIZE..LEN_SIZE + V2_MAGIC.len()], V2_MAGIC);
+
+        let (mut writer, mut reader) = duplex(4096);
+        writer.write_all(&encoded).await.unwrap();
+
+        assert_eq!(
+            read_client_frame(&mut reader).await.unwrap(),
+            ClientRequestFrame::V2Streaming(request)
+        );
+    }
+
+    #[test]
+    fn streaming_result_frames_are_tagged_and_keep_error_distinct_from_successful_end() {
+        let frames = [
+            StreamingResultFrame::ResultStart {
+                columns: vec!["id".to_string()],
+                read_ts: 100,
+            },
+            StreamingResultFrame::RowBatch {
+                rows: vec![b"row-1".to_vec()],
+                row_count: 1,
+                byte_count: 5,
+            },
+            StreamingResultFrame::ResultError {
+                code: "DISTRIBUTED_SCAN_FAILED".to_string(),
+                message: "tablet 12 unavailable".to_string(),
+                retryable: true,
+                rows_emitted: 1,
+            },
+        ];
+
+        let encoded = encode_streaming_result_frame(&frames[2]).unwrap();
+        let decoded = decode_streaming_result_frame(&encoded).unwrap();
+
+        assert_eq!(decoded, frames[2]);
+        let start_json = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(start_json["type"], "result_start");
+        assert_eq!(start_json["read_ts"], 100);
+        assert!(matches!(&decoded, StreamingResultFrame::ResultError { .. }));
+        assert!(!matches!(&decoded, StreamingResultFrame::ResultEnd { .. }));
+    }
+
+    #[test]
+    fn streaming_request_rejects_zero_or_oversized_batch_caps() {
+        let mut request = ClientRequestV2Streaming {
+            protocol_version: 2,
+            client_id: 17,
+            client_session_epoch: 4,
+            request_sequence: 9,
+            acknowledged_through: None,
+            statement_timeout_ms: 30_000,
+            sql: "SELECT * FROM users".to_string(),
+            max_rows_per_batch: 128,
+            max_bytes_per_batch: 64 * 1024,
+        };
+
+        request.max_rows_per_batch = 0;
+        assert_eq!(
+            request.validate(),
+            Err("streaming max_rows_per_batch is outside the allowed range")
+        );
+
+        request.max_rows_per_batch = 128;
+        request.max_bytes_per_batch = MAX_STREAMING_BATCH_BYTES + 1;
+        assert_eq!(
+            request.validate(),
+            Err("streaming max_bytes_per_batch is outside the allowed range")
+        );
     }
 
     /// Realistic bug caught:

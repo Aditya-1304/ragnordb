@@ -11,8 +11,16 @@
 
 pub mod command;
 pub mod read;
+pub mod router;
 pub mod snapshot;
-use std::collections::BTreeMap;
+
+pub use router::{
+    HashTabletPartitioner, ScanProgress, ScanSpan, SpanSet, TabletRouter, TabletScanFragment,
+};
+use std::{
+    collections::BTreeMap,
+    ops::Bound::{Excluded, Included, Unbounded},
+};
 
 use ragnordb_common::{
     Error, Result,
@@ -38,6 +46,16 @@ pub enum RowMutation {
 
     /// Make a row absent from the transaction's view.
     Delete { key: RowKey },
+}
+
+/// One bounded tablet scan response in domain row representation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletScanPage {
+    /// Rows visible at the transaction snapshot, ordered by canonical row key.
+    pub rows: Vec<(RowKey, Row)>,
+
+    /// Whether another visible row remains after the final returned key.
+    pub has_more: bool,
 }
 
 /// A logical tablet backed by an MVCC storage implementation.
@@ -271,6 +289,207 @@ impl<S: MvccStorage> Tablet<S> {
             .collect()
     }
 
+    /// Scan one bounded page while preserving read-your-writes semantics.
+    ///
+    /// The continuation key is exclusive. Committed rows and the transaction's
+    /// ordered pending write set are merged by encoded key, with pending
+    /// mutations winning on equal keys. Storage pages are fetched lazily when
+    /// a pending delete or a page boundary would otherwise hide later rows.
+    pub fn scan_page(
+        &self,
+        transaction: &Transaction,
+        start: Option<&RowKey>,
+        end: Option<&RowKey>,
+        resume_after: Option<&RowKey>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<TabletScanPage> {
+        if max_rows == 0 {
+            return Err(Error::InvalidArgument(
+                "scan page max_rows must be greater than zero".to_string(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "scan page max_bytes must be greater than zero".to_string(),
+            ));
+        }
+
+        if let Some(start) = start {
+            self.validate_row_key(start)?;
+        }
+        if let Some(end) = end {
+            self.validate_row_key(end)?;
+        }
+        if let Some(resume_after) = resume_after {
+            self.validate_row_key(resume_after)?;
+        }
+
+        let start = start.map(encode_row_key).transpose()?;
+        let end = end.map(encode_row_key).transpose()?;
+        let resume_after = resume_after.map(encode_row_key).transpose()?;
+        validate_scan_order(start.as_deref(), end.as_deref())?;
+
+        if let (Some(resume_after), Some(end)) = (resume_after.as_deref(), end.as_deref())
+            && resume_after >= end
+        {
+            return Ok(TabletScanPage {
+                rows: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        // Validate all buffered keys before beginning the merge. This retains
+        // the tablet ownership boundary of the unbounded scan API even when a
+        // malformed or foreign mutation falls outside this particular page.
+        for key in transaction.write_set().keys() {
+            let row_key = decode_transaction_row_key(key)?;
+            self.validate_row_key(&row_key)?;
+        }
+
+        let pending_lower = tablet_scan_lower_bound(start.as_deref(), resume_after.as_deref());
+        let pending_upper = end.as_ref().map_or(Unbounded, |end| Excluded(end.clone()));
+        let mut pending = transaction
+            .write_set()
+            .range((pending_lower, pending_upper))
+            .peekable();
+        let mut next_pending = pending.next();
+
+        // The storage page is an internal merge input. Keep its row bound but
+        // remove its byte boundary so an oversized committed row that is
+        // hidden by a pending delete or replaced by a smaller pending Put does
+        // not fail before the overlay can decide its visibility. The returned
+        // tablet page still enforces `max_bytes` below.
+        let mut storage_page = self.storage.scan_page(
+            start.as_deref(),
+            end.as_deref(),
+            resume_after.as_deref(),
+            transaction.start_ts(),
+            max_rows,
+            usize::MAX,
+        )?;
+        let mut storage_index = 0_usize;
+        let mut rows = Vec::new();
+        let mut encoded_bytes = 0_usize;
+
+        loop {
+            if storage_index == storage_page.rows.len() && storage_page.has_more {
+                let last_key = storage_page
+                    .rows
+                    .last()
+                    .map(|(key, _)| key.clone())
+                    .ok_or_else(|| {
+                        Error::CorruptData(
+                            "MVCC scan page reported more rows without a continuation key"
+                                .to_string(),
+                        )
+                    })?;
+                storage_page = self.storage.scan_page(
+                    start.as_deref(),
+                    end.as_deref(),
+                    Some(&last_key),
+                    transaction.start_ts(),
+                    max_rows,
+                    usize::MAX,
+                )?;
+                storage_index = 0;
+                if storage_page.rows.is_empty() && storage_page.has_more {
+                    return Err(Error::CorruptData(
+                        "MVCC scan page made no progress while reporting more rows".to_string(),
+                    ));
+                }
+                continue;
+            }
+
+            let pending_key = next_pending.map(|(key, _)| key.as_slice());
+            let storage_key = storage_page
+                .rows
+                .get(storage_index)
+                .map(|(key, _)| key.as_slice());
+            if pending_key.is_none() && storage_key.is_none() {
+                return Ok(TabletScanPage {
+                    rows,
+                    has_more: false,
+                });
+            }
+
+            let take_pending = match (pending_key, storage_key) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(pending_key), Some(storage_key)) => pending_key <= storage_key,
+                (None, None) => unreachable!("both scan sources were checked above"),
+            };
+            let take_storage = match (pending_key, storage_key) {
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some(pending_key), Some(storage_key)) => storage_key <= pending_key,
+                (None, None) => unreachable!("both scan sources were checked above"),
+            };
+
+            let key = if take_pending {
+                pending_key
+                    .expect("pending source selected without a pending key")
+                    .to_vec()
+            } else {
+                storage_key
+                    .expect("storage source selected without a storage key")
+                    .to_vec()
+            };
+
+            let pending_mutation = if take_pending {
+                let (_, mutation) = next_pending
+                    .take()
+                    .expect("pending source selected without a pending mutation");
+                next_pending = pending.next();
+                Some(mutation.clone())
+            } else {
+                None
+            };
+            let storage_row = if take_storage {
+                let row = storage_page
+                    .rows
+                    .get(storage_index)
+                    .expect("storage source selected without a storage row")
+                    .1
+                    .clone();
+                storage_index += 1;
+                Some(row)
+            } else {
+                None
+            };
+
+            let row = match pending_mutation {
+                Some(Mutation::Put(row)) => row,
+                Some(Mutation::Delete) => continue,
+                None => storage_row.expect("storage row is required without a pending mutation"),
+            };
+
+            let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
+                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+            })?;
+            let next_bytes = encoded_bytes.checked_add(row_bytes).ok_or_else(|| {
+                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+            })?;
+            if rows.len() >= max_rows || next_bytes > max_bytes {
+                if rows.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "scan page byte budget is smaller than the first encoded row".to_string(),
+                    ));
+                }
+                return Ok(TabletScanPage {
+                    rows,
+                    has_more: true,
+                });
+            }
+
+            let row_key = decode_row_key(&key)?;
+            self.validate_row_key(&row_key)?;
+            let row = decode_row(&row)?;
+            encoded_bytes = next_bytes;
+            rows.push((row_key, row));
+        }
+    }
+
     /// validate a non empty transaction write set against tablet ownership and
     /// mvcc conflict state without consuming or applying the transaction
     ///
@@ -401,6 +620,19 @@ fn validate_scan_order(start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
 
 fn key_is_in_range(key: &[u8], start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
     start.is_none_or(|start| key >= start) && end.is_none_or(|end| key < end)
+}
+
+fn tablet_scan_lower_bound(
+    start: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+) -> std::ops::Bound<Vec<u8>> {
+    match (start, resume_after) {
+        (None, None) => Unbounded,
+        (Some(start), None) => Included(start.to_vec()),
+        (None, Some(resume_after)) => Excluded(resume_after.to_vec()),
+        (Some(start), Some(resume_after)) if resume_after < start => Included(start.to_vec()),
+        (Some(_), Some(resume_after)) => Excluded(resume_after.to_vec()),
+    }
 }
 
 #[cfg(test)]
@@ -659,6 +891,65 @@ mod tests {
                 (third_key, row(3, "third")),
             ]
         );
+    }
+
+    #[test]
+    fn scan_page_fills_after_pending_delete_and_continues_without_duplicates() {
+        // Regression: overlaying a bounded committed page after the fact can
+        // return a short page and then repeat or omit the next committed row.
+        let mut tablet = tablet();
+        let first_key = key(1);
+        let second_key = key(2);
+        let third_key = key(3);
+        let fourth_key = key(4);
+
+        let mut seed = transaction(1, 1);
+        tablet
+            .insert(&mut seed, &first_key, &row(1, "first"))
+            .unwrap();
+        tablet
+            .insert(&mut seed, &second_key, &row(2, "second"))
+            .unwrap();
+        tablet
+            .insert(&mut seed, &third_key, &row(3, "third"))
+            .unwrap();
+        tablet.commit(seed, Timestamp(2)).unwrap();
+
+        let mut txn = transaction(2, 3);
+        assert!(tablet.delete(&mut txn, &first_key).unwrap());
+        assert!(
+            tablet
+                .update(&mut txn, &second_key, &row(2, "updated"))
+                .unwrap()
+        );
+        tablet
+            .insert(&mut txn, &fourth_key, &row(4, "fourth"))
+            .unwrap();
+
+        let first_page = tablet
+            .scan_page(&txn, None, None, None, 2, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            first_page.rows,
+            vec![
+                (second_key.clone(), row(2, "updated")),
+                (third_key.clone(), row(3, "third"))
+            ]
+        );
+        assert!(first_page.has_more);
+
+        let second_page = tablet
+            .scan_page(
+                &txn,
+                None,
+                None,
+                Some(&first_page.rows.last().unwrap().0),
+                2,
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(second_page.rows, vec![(fourth_key, row(4, "fourth"))]);
+        assert!(!second_page.has_more);
     }
 
     #[test]

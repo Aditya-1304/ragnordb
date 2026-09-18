@@ -88,6 +88,30 @@ pub fn generate_local_snapshot(
     conf_state: TabletSnapshotConfState,
     applied_frontier: AppliedTabletFrontier,
 ) -> Result<TabletSnapshotImage, TabletSnapshotGenerationError> {
+    generate_local_snapshot_with_removal_proof(
+        state_machine,
+        cluster_id,
+        replica_id,
+        snapshot_id,
+        conf_state,
+        applied_frontier,
+        None,
+    )
+}
+
+/// Generate a tablet snapshot while retaining the exact latest committed
+/// replica-removal proof needed after the corresponding log entry is
+/// compacted. The proof is metadata, not tablet payload, so it is transferred
+/// and checksummed with the immutable snapshot envelope.
+pub fn generate_local_snapshot_with_removal_proof(
+    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    cluster_id: impl Into<String>,
+    replica_id: ReplicaId,
+    snapshot_id: u64,
+    conf_state: TabletSnapshotConfState,
+    applied_frontier: AppliedTabletFrontier,
+    last_removed_replica: Option<(ReplicaId, u64, u64, u64)>,
+) -> Result<TabletSnapshotImage, TabletSnapshotGenerationError> {
     if applied_frontier.index == 0 {
         return Err(TabletSnapshotGenerationError::ZeroAppliedIndex);
     }
@@ -116,7 +140,7 @@ pub fn generate_local_snapshot(
     }
     .encode_to_vec();
 
-    let metadata = TabletSnapshotMetadata::for_payload(
+    let mut metadata = TabletSnapshotMetadata::for_payload(
         TabletSnapshotMetadataInput {
             cluster_id: cluster_id.into(),
             raft_group_id: state_machine.raft_group_id(),
@@ -129,6 +153,8 @@ pub fn generate_local_snapshot(
         },
         &payload,
     )?;
+    metadata.last_removed_replica = last_removed_replica;
+    metadata.validate()?;
 
     TabletSnapshotImage::new(metadata, payload).map_err(TabletSnapshotGenerationError::Metadata)
 }
@@ -277,6 +303,21 @@ fn decode_replica_set(
     Ok(decoded)
 }
 
+fn decode_optional_removal_proof(
+    replica_id: u64,
+    index: u64,
+    term: u64,
+    version: u64,
+) -> Result<Option<(ReplicaId, u64, u64, u64)>, TabletSnapshotMetadataError> {
+    if replica_id == 0 && index == 0 && term == 0 && version == 0 {
+        return Ok(None);
+    }
+    if replica_id == 0 || index == 0 || term == 0 || version == 0 {
+        return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+    }
+    Ok(Some((ReplicaId(replica_id), index, term, version)))
+}
+
 /// Versioned database-specific metadata for an immutable tablet snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletSnapshotMetadata {
@@ -293,6 +334,7 @@ pub struct TabletSnapshotMetadata {
     pub storage_format_version: u32,
     pub total_length: u64,
     pub checksum: [u8; 32],
+    pub last_removed_replica: Option<(ReplicaId, u64, u64, u64)>,
 }
 
 impl TabletSnapshotMetadata {
@@ -329,6 +371,7 @@ impl TabletSnapshotMetadata {
             storage_format_version: TABLET_SNAPSHOT_STORAGE_FORMAT_VERSION,
             total_length,
             checksum: *blake3::hash(payload).as_bytes(),
+            last_removed_replica: None,
         };
 
         metadata.validate()?;
@@ -384,6 +427,24 @@ impl TabletSnapshotMetadata {
 
         if self.total_length == 0 {
             return Err(TabletSnapshotMetadataError::ZeroTotalLength);
+        }
+
+        if let Some((replica_id, index, term, version)) = self.last_removed_replica {
+            if replica_id.0 == 0
+                || index == 0
+                || index > self.last_included_index
+                || term == 0
+                || version == 0
+                || version > self.conf_state.configuration_version
+            {
+                return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+            }
+            if self.conf_state.voters.contains(&replica_id)
+                || self.conf_state.learners.contains(&replica_id)
+                || self.conf_state.outgoing_voters.contains(&replica_id)
+            {
+                return Err(TabletSnapshotMetadataError::InvalidRemovalProof);
+            }
         }
 
         self.conf_state.validate()
@@ -456,6 +517,12 @@ impl TabletSnapshotMetadata {
             storage_format_version: proto.storage_format_version,
             total_length: proto.total_length,
             checksum,
+            last_removed_replica: decode_optional_removal_proof(
+                proto.last_removed_replica_id,
+                proto.last_removed_replica_index,
+                proto.last_removed_replica_term,
+                proto.last_removed_conf_state_version,
+            )?,
         };
 
         metadata.validate()?;
@@ -495,6 +562,16 @@ impl TabletSnapshotMetadata {
             storage_format_version: self.storage_format_version,
             total_length: self.total_length,
             checksum: self.checksum.to_vec(),
+            last_removed_replica_id: self
+                .last_removed_replica
+                .map(|proof| proof.0.0)
+                .unwrap_or(0),
+            last_removed_replica_index: self.last_removed_replica.map(|proof| proof.1).unwrap_or(0),
+            last_removed_replica_term: self.last_removed_replica.map(|proof| proof.2).unwrap_or(0),
+            last_removed_conf_state_version: self
+                .last_removed_replica
+                .map(|proof| proof.3)
+                .unwrap_or(0),
         }
     }
 }
@@ -927,6 +1004,59 @@ impl FileTabletSnapshotStore {
         Ok(removed)
     }
 
+    /// Remove every published snapshot and the monotonic allocator state for
+    /// one exact replica/tablet lifetime.
+    ///
+    /// The filename prefix includes all three identity components, so cleanup
+    /// cannot delete another tablet's image even when replica IDs repeat in a
+    /// different Raft group. The caller must already have durably published a
+    /// lifecycle tombstone; this method only removes local snapshot artifacts
+    /// and never changes Raft or shared-WAL state.
+    pub fn remove_replica_state(
+        &self,
+        raft_group_id: RaftGroupId,
+        replica_id: ReplicaId,
+        tablet_id: TabletId,
+    ) -> Result<usize, TabletSnapshotStoreError> {
+        if raft_group_id.0 == 0 || replica_id.0 == 0 || tablet_id.0 == 0 {
+            return Err(TabletSnapshotStoreError::InvalidSnapshotAllocatorIdentity);
+        }
+
+        let prefix = format!(
+            "tablet-{}-{}-{}-",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let allocator_name = format!(
+            "tablet-{}-{}-{}.next-snapshot-id",
+            raft_group_id.0, replica_id.0, tablet_id.0
+        );
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let is_snapshot = file_name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".snapshot"))
+                .is_some_and(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            if is_snapshot || file_name == allocator_name {
+                fs::remove_file(entry.path()).map_err(io_error)?;
+                removed += 1;
+            }
+        }
+        if removed != 0 {
+            File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error)?;
+        }
+        Ok(removed)
+    }
+
     fn file_name(metadata: &TabletSnapshotMetadata) -> String {
         format!(
             "tablet-{}-{}-{}-{}.snapshot",
@@ -1001,6 +1131,9 @@ pub enum TabletSnapshotMetadataError {
 
     #[error("tablet snapshot payload length is zero")]
     ZeroTotalLength,
+
+    #[error("tablet snapshot contains an invalid replica-removal proof")]
+    InvalidRemovalProof,
 
     #[error("tablet snapshot payload length overflows u64")]
     PayloadLengthOverflow,
@@ -1221,6 +1354,45 @@ pub struct InstalledTabletSnapshot {
     pub frontier: AppliedTabletFrontier,
 }
 
+/// Verified and restored incoming tablet image which has not yet crossed the
+/// Raft/A-WAL snapshot-boundary durability acknowledgement.
+///
+/// This value is deliberately not a successful installation. The caller must
+/// persist the matching Raft snapshot boundary before publishing this state as
+/// the live tablet image.
+#[derive(Debug)]
+pub struct PreparedTabletSnapshotInstall {
+    pub pointer: TabletSnapshotPointer,
+    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub frontier: AppliedTabletFrontier,
+}
+
+pub fn prepare_incoming_snapshot(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
+    validate_install_target(&receiver.metadata, target)?;
+
+    let image = receiver
+        .finish()
+        .map_err(TabletSnapshotInstallError::Receive)?;
+
+    // The immutable image must exist durably before Raft may reference it.
+    // Publication does not make it live database state.
+    let pointer = store
+        .publish(&image)
+        .map_err(TabletSnapshotInstallError::Store)?;
+
+    let restored = restore_verified_snapshot(&image, target)?;
+
+    Ok(PreparedTabletSnapshotInstall {
+        pointer,
+        state_machine: restored.state_machine,
+        frontier: restored.frontier,
+    })
+}
+
 /// Tablet state reconstructed from a verified immutable snapshot image.
 ///
 /// This value is private startup state until the surrounding replica
@@ -1313,28 +1485,15 @@ where
     F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
     E: std::fmt::Display,
 {
-    validate_install_target(&receiver.metadata, target)?;
+    let prepared = prepare_incoming_snapshot(store, receiver, target)?;
 
-    let image = receiver
-        .finish()
-        .map_err(TabletSnapshotInstallError::Receive)?;
-
-    // Publish the verified immutable image before restoring live state. If
-    // restoration fails, the group remains quarantined and the durable image
-    // remains an unreferenced recovery artifact.
-    let pointer = store
-        .publish(&image)
-        .map_err(TabletSnapshotInstallError::Store)?;
-
-    let restored = restore_verified_snapshot(&image, target)?;
-
-    persist_boundary(&pointer, restored.frontier)
+    persist_boundary(&prepared.pointer, prepared.frontier)
         .map_err(|error| TabletSnapshotInstallError::BoundaryPersistence(error.to_string()))?;
 
     Ok(InstalledTabletSnapshot {
-        pointer,
-        state_machine: restored.state_machine,
-        frontier: restored.frontier,
+        pointer: prepared.pointer,
+        state_machine: prepared.state_machine,
+        frontier: prepared.frontier,
     })
 }
 

@@ -22,23 +22,29 @@
 //! restart and reconstruct the group from the recovered durable prefix
 
 use std::{
+    collections::VecDeque,
     fmt::Display,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::PathBuf,
     process,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use raft::{
     core::{
-        node::{ProposeError, RaftError, RaftNode, SnapshotInstallError, StepError},
+        node::{
+            LeadershipTransferError, LeadershipTransferStatus, ProposeError, RaftError, RaftNode,
+            SnapshotInstallError, StepError,
+        },
+        read_index::{ReadIndexError, ReadState},
         ready::{AdvanceError, Ready},
     },
     entry::EntryPayload,
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
+    types::{ConfChange, HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
 };
 
 use crate::storage::{
@@ -47,10 +53,110 @@ use crate::storage::{
         RaftPersistedBatch, RaftPersistenceBatch, RaftPersistenceError, RaftWal, RaftWalStorage,
     },
 };
+use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
 
 type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
 type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
 type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
+
+/// Conservative per-group limits for work waiting at the state-machine
+/// boundary. A single oversized Ready is admitted so recovery cannot deadlock
+/// on an already-created batch; subsequent Ready generations are held back
+/// until the older prefix drains below these limits.
+pub const MAX_APPLY_BACKLOG_ENTRIES: usize = 4_096;
+pub const MAX_APPLY_BACKLOG_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_APPLY_BACKLOG_AGE_MS: u64 = 30_000;
+
+/// O(1) status for the ordered apply queue owned by one Raft group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyBacklogStatus {
+    pub entries: usize,
+    pub bytes: usize,
+    pub age_ms: u64,
+    pub generations: usize,
+}
+
+/// Outbound Ready messages split by the durability boundary they depend on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReadyOutboundMessages {
+    /// Messages whose only prerequisite is the exact durable Raft Ready.
+    pub persistence_safe: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    /// Messages which must remain behind snapshot restore or ordered apply.
+    pub apply_dependent: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+}
+
+/// Classifies Raft output without re-encoding it. Raft protocol messages carry
+/// no tablet result payload, so only snapshot-install responses advertise a
+/// restore boundary that must already be durable and applied. Treating all
+/// snapshot responses conservatively avoids acknowledging an unverified image.
+pub fn classify_ready_messages(messages: Vec<Envelope<Vec<u8>, Vec<u8>>>) -> ReadyOutboundMessages {
+    let mut classified = ReadyOutboundMessages::default();
+    for message in messages {
+        if matches!(
+            message.msg,
+            raft::message::Message::InstallSnapshotResponse(_)
+        ) {
+            classified.apply_dependent.push(message);
+        } else {
+            classified.persistence_safe.push(message);
+        }
+    }
+    classified
+}
+
+/// Progress returned by one bounded Ready/application turn.
+///
+/// A Ready is returned only after all of its committed entries have been
+/// applied and the applied frontier has advanced. Until then the runtime keeps
+/// the exact persisted Ready internally; [`RaftReadyLoop::has_pending_work`]
+/// lets the host schedule the same group again without admitting a new
+/// mutation.
+#[derive(Debug, Default)]
+pub(crate) struct ReadyApplyProgress {
+    pub(crate) ready: Option<ReadyGeneration>,
+    /// Read states become visible only after the Ready's committed prefix has
+    /// been applied. They are observations of Raft safety, not state-machine
+    /// progress, and therefore must never advance `applied_frontier`.
+    pub(crate) read_states: Vec<ReadState>,
+    pub(crate) ready_generations: usize,
+    pub(crate) apply_entries: usize,
+    pub(crate) snapshot_bytes: usize,
+    pub(crate) persistence_safe_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    pub(crate) apply_dependent_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+}
+
+/// Encoded records staged by one group before the node-wide shared-WAL append.
+/// The host owns the batch boundary; the group retains its prepared logical
+/// successor until the corresponding extent range is committed.
+#[derive(Debug)]
+pub(crate) struct ReadyPersistenceRequest {
+    pub(crate) records: Vec<(RecordType, Vec<u8>)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadyPersistenceProgress {
+    pub(crate) request: Option<ReadyPersistenceRequest>,
+    pub(crate) ready_generations: usize,
+    pub(crate) snapshot_bytes: usize,
+}
+
+struct PendingReadyApplication {
+    ready: ReadyGeneration,
+    next_entry: usize,
+    applied_through: Option<LogIndex>,
+    applied_frontier: Option<AppliedRaftFrontier>,
+    verified_snapshot: Option<Snapshot<Vec<u8>>>,
+    snapshot_bytes: usize,
+    apply_dependent_messages: Vec<Envelope<Vec<u8>, Vec<u8>>>,
+    started_at: Instant,
+}
+
+struct PendingReadyPersistence {
+    ready: ReadyGeneration,
+    prepared: crate::storage::persistence::PreparedBatch,
+    verified_snapshot: Option<Snapshot<Vec<u8>>>,
+    snapshot_bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
@@ -112,6 +218,12 @@ pub enum ReadyLoopError {
 
     #[error("Raft proposal failed: {0:?}")]
     Proposal(ProposeError),
+
+    #[error("Raft leadership transfer failed: {0:?}")]
+    LeadershipTransfer(LeadershipTransferError),
+
+    #[error("Raft ReadIndex admission failed: {0:?}")]
+    ReadIndex(ReadIndexError),
 
     #[error("invalid applied Raft frontier: index {index}, term {term}")]
     InvalidAppliedFrontier { index: LogIndex, term: Term },
@@ -185,6 +297,11 @@ pub enum ReadyApplyError {
         expected: Box<SnapshotMetadata>,
         received: Box<SnapshotMetadata>,
     },
+
+    #[error(
+        "apply backlog is full: {entries} entries and {bytes} bytes are waiting for ordered apply"
+    )]
+    ApplyBacklogFull { entries: usize, bytes: usize },
 
     #[error("state-machine snapshot restore failed: {0}")]
     SnapshotRestore(String),
@@ -268,6 +385,7 @@ impl RaftSnapshotStore for FileRaftSnapshotStore {
             last_included_term: snapshot.last_included_term,
             applied_index: snapshot.last_included_index,
             conf_state: snapshot.conf_state.clone(),
+            last_removed_replica: snapshot.last_removed_replica,
             size_bytes: snapshot.size_bytes,
             checksum: snapshot.checksum,
             file_name: Self::file_name(identity, snapshot.snapshot_id),
@@ -360,6 +478,7 @@ impl RaftSnapshotStore for FileRaftSnapshotStore {
             last_included_index: pointer.last_included_index,
             last_included_term: pointer.last_included_term,
             conf_state: pointer.conf_state.clone(),
+            last_removed_replica: pointer.last_removed_replica,
             size_bytes: pointer.size_bytes,
             checksum: pointer.checksum,
             data,
@@ -378,6 +497,11 @@ where
     persistence: RaftWalStorage<W>,
     state: RuntimeState,
     applied_frontier: Option<AppliedRaftFrontier>,
+    pending_apply: VecDeque<PendingReadyApplication>,
+    pending_persistence: Option<PendingReadyPersistence>,
+    apply_backlog_entries: usize,
+    apply_backlog_bytes: usize,
+    apply_backlog_started_at: Option<Instant>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -396,6 +520,11 @@ where
             persistence,
             state: RuntimeState::Active,
             applied_frontier: None,
+            pending_apply: VecDeque::new(),
+            pending_persistence: None,
+            apply_backlog_entries: 0,
+            apply_backlog_bytes: 0,
+            apply_backlog_started_at: None,
         }
     }
 
@@ -414,6 +543,45 @@ where
     /// caller must not substitute the commit index for this value
     pub fn applied_frontier(&self) -> Option<AppliedRaftFrontier> {
         self.applied_frontier
+    }
+
+    /// Returns bounded aggregate apply pressure without walking every pending
+    /// entry. The age is measured from the oldest Ready generation currently
+    /// waiting for the contiguous apply frontier.
+    pub fn apply_backlog_status(&self) -> ApplyBacklogStatus {
+        ApplyBacklogStatus {
+            entries: self.apply_backlog_entries,
+            bytes: self.apply_backlog_bytes,
+            age_ms: self
+                .apply_backlog_started_at
+                .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            generations: self.pending_apply.len(),
+        }
+    }
+
+    pub(crate) fn apply_backlog_full(&self) -> bool {
+        let status = self.apply_backlog_status();
+        !self.pending_apply.is_empty()
+            && (status.entries >= MAX_APPLY_BACKLOG_ENTRIES
+                || status.bytes >= MAX_APPLY_BACKLOG_BYTES
+                || status.age_ms >= MAX_APPLY_BACKLOG_AGE_MS)
+    }
+
+    /// Returns whether this group has a Ready generation or an applied Ready
+    /// that must be resumed before another Raft mutation is admitted.
+    pub fn has_pending_work(&self) -> bool {
+        self.pending_persistence.is_some()
+            || !self.pending_apply.is_empty()
+            || self.raft.has_ready()
+    }
+
+    pub(crate) fn has_pending_persistence(&self) -> bool {
+        self.pending_persistence.is_some()
+    }
+
+    pub(crate) fn has_pending_apply(&self) -> bool {
+        !self.pending_apply.is_empty()
     }
 
     /// Release storage retention through the group lifecycle owner.
@@ -458,6 +626,69 @@ where
             .map_err(ReadyLoopError::Proposal)
     }
 
+    /// Admits one typed Raft membership transition.
+    ///
+    /// Configuration entries use the same Ready boundary as application
+    /// commands: the transition is only visible after the shared WAL has
+    /// acknowledged the Ready and the committed entry has crossed the
+    /// applied frontier. Keeping this method beside normal proposal admission
+    /// prevents hosts from appending membership records outside that ordering.
+    pub fn propose_conf_change(&mut self, change: ConfChange) -> Result<LogIndex, ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+
+        self.raft
+            .propose_conf_change(change)
+            .map_err(ReadyLoopError::Proposal)
+    }
+
+    /// Requests a bounded leadership transfer through the Raft core.
+    ///
+    /// Leadership transfer is a volatile protocol operation: it emits a
+    /// targeted control message and fences new proposals while the transfer
+    /// is active, but it does not create a database log entry or a WAL record.
+    /// The Ready boundary is still checked first so a caller cannot overlap a
+    /// transfer request with an earlier unpersisted Raft mutation.
+    pub fn transfer_leadership(
+        &mut self,
+        target: raft::types::NodeId,
+        timeout_ticks: u64,
+    ) -> Result<LeadershipTransferStatus, ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+
+        self.raft
+            .transfer_leadership(target, timeout_ticks)
+            .map_err(|error: LeadershipTransferError| ReadyLoopError::LeadershipTransfer(error))
+    }
+
+    /// Records that the host has applied the current-term activation entry.
+    ///
+    /// The host owns the application-specific no-op, so the Raft core cannot
+    /// identify it directly. This method is intentionally rejected while a
+    /// Ready generation is pending; callers must cross the normal persistence
+    /// and apply boundary before enabling ReadIndex for the term.
+    pub fn activate_read_index(&mut self, term: Term) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+        self.raft
+            .activate_read_index(term)
+            .map_err(ReadyLoopError::ReadIndex)
+    }
+
+    /// Starts one quorum-confirmed read barrier for an opaque host context.
+    ///
+    /// This only admits the protocol request. The resulting [`ReadState`] is
+    /// delivered through the completed Ready path after the local committed
+    /// prefix has applied; this method never advances the applied frontier.
+    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReadyLoopError> {
+        self.ensure_active()?;
+        self.ensure_no_pending_ready()?;
+        self.raft
+            .read_index(context)
+            .map_err(ReadyLoopError::ReadIndex)
+    }
+
     /// persists and acknowledges the next exact Ready generation
     ///
     /// snapshot pointers must reference already-published and synchronized
@@ -468,6 +699,10 @@ where
         snapshot_pointer: Option<RaftSnapshotPointerRecord>,
     ) -> ReadyLoopResult {
         self.ensure_active()?;
+
+        if self.pending_persistence.is_some() {
+            return Err(ReadyLoopError::PendingReady);
+        }
 
         let Some(ready) = self.raft.ready() else {
             if snapshot_pointer.is_some() {
@@ -539,6 +774,220 @@ where
         }
 
         Ok(Some(ready))
+    }
+
+    /// Prepare the next Ready generation without acknowledging it to Raft.
+    ///
+    /// Snapshot publication and WAL-record validation happen before the
+    /// request is exposed to the host. The exact prepared state remains owned
+    /// by this loop, which prevents a retry or a later Ready from changing the
+    /// bytes represented by the request.
+    pub(crate) fn prepare_next_ready_for_batch<SF>(
+        &mut self,
+        snapshot_store: &mut SF,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyPersistenceProgress, ReadyApplyError>
+    where
+        SF: RaftSnapshotStore,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        if let Some(pending) = &self.pending_persistence {
+            return Ok(ReadyPersistenceProgress {
+                request: Some(ReadyPersistenceRequest {
+                    records: RaftWalStorage::<W>::prepared_records(&pending.prepared),
+                }),
+                ready_generations: 1,
+                snapshot_bytes: pending.snapshot_bytes,
+            });
+        }
+
+        if budget.max_ready_generations == 0 {
+            return Ok(ReadyPersistenceProgress::default());
+        }
+
+        let Some(ready) = self.raft.ready() else {
+            return Ok(ReadyPersistenceProgress::default());
+        };
+
+        let ready_entries = ready.committed_entries.len();
+        let ready_bytes = ready_apply_bytes(&ready);
+        let entries = self.apply_backlog_entries.saturating_add(ready_entries);
+        let bytes = self.apply_backlog_bytes.saturating_add(ready_bytes);
+        if !self.pending_apply.is_empty()
+            && (entries > MAX_APPLY_BACKLOG_ENTRIES || bytes > MAX_APPLY_BACKLOG_BYTES)
+        {
+            return Err(ReadyApplyError::ApplyBacklogFull { entries, bytes });
+        }
+
+        let verified_snapshot = if let Some(snapshot) = ready.snapshot.as_ref() {
+            if snapshot.size_bytes > budget.max_snapshot_bytes as u64 {
+                return Ok(ReadyPersistenceProgress {
+                    ready_generations: 1,
+                    ..ReadyPersistenceProgress::default()
+                });
+            }
+
+            let identity = self.persistence.log_view().identity();
+            let pointer = snapshot_store
+                .publish(identity, snapshot)
+                .map_err(|error| {
+                    self.quarantine();
+                    ReadyApplyError::SnapshotStore(error.to_string())
+                })?;
+            let verified = snapshot_store.load_verified(&pointer).map_err(|error| {
+                self.quarantine();
+                ReadyApplyError::SnapshotStore(error.to_string())
+            })?;
+
+            if verified.metadata() != snapshot.metadata() {
+                self.quarantine();
+                return Err(ReadyApplyError::SnapshotMetadataMismatch {
+                    expected: Box::new(snapshot.metadata()),
+                    received: Box::new(verified.metadata()),
+                });
+            }
+
+            Some((pointer, verified))
+        } else {
+            None
+        };
+
+        let pointer = verified_snapshot
+            .as_ref()
+            .map(|(pointer, _)| pointer.clone());
+        let prepared = self
+            .persistence
+            .prepare_persistence_batch(RaftPersistenceBatch {
+                snapshot: pointer,
+                entries: ready.entries_to_persist.clone(),
+                hard_state: ready.hard_state.clone(),
+            })
+            .map_err(|error| {
+                self.quarantine();
+                ReadyApplyError::Ready(ReadyLoopError::PersistenceRejected(error))
+            })?;
+        let records = RaftWalStorage::<W>::prepared_records(&prepared);
+        let snapshot_bytes = verified_snapshot
+            .as_ref()
+            .map(|(_, snapshot)| snapshot.size_bytes as usize)
+            .unwrap_or(0);
+
+        self.pending_persistence = Some(PendingReadyPersistence {
+            ready,
+            prepared,
+            verified_snapshot: verified_snapshot.map(|(_, snapshot)| snapshot),
+            snapshot_bytes,
+        });
+
+        Ok(ReadyPersistenceProgress {
+            request: Some(ReadyPersistenceRequest { records }),
+            ready_generations: 1,
+            snapshot_bytes,
+        })
+    }
+
+    /// Complete a prepared Ready after the host's shared-WAL batch returns.
+    ///
+    /// A retryable pre-staging failure restores the exact pending request. An
+    /// outcome-unknown failure reports that Ready to Raft and fences this loop;
+    /// callers must not acknowledge or retry it in the current process.
+    pub(crate) fn complete_prepared_ready<SM>(
+        &mut self,
+        outcome: Result<BatchAppendResult, BatchAppendFailure>,
+        _state_machine: &mut SM,
+        _budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        let pending = self
+            .pending_persistence
+            .take()
+            .ok_or(ReadyApplyError::Ready(ReadyLoopError::PendingReady))?;
+
+        let result = match outcome {
+            Ok(result) => result,
+            Err(BatchAppendFailure::NotStaged(source)) => {
+                let recovery_required = source.requires_recovery();
+                if !recovery_required {
+                    self.pending_persistence = Some(pending);
+                    return Err(ReadyApplyError::Ready(
+                        ReadyLoopError::RetryablePersistence(RaftPersistenceError::NotStaged {
+                            recovery_required: false,
+                            reason: source.to_string(),
+                        }),
+                    ));
+                }
+
+                self.state = RuntimeState::RecoveryRequired;
+                return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+            }
+            Err(BatchAppendFailure::OutcomeUnknown { .. }) => {
+                let report_result = self
+                    .raft
+                    .report_persistence_outcome_unknown(pending.ready.id);
+                self.state = RuntimeState::RecoveryRequired;
+                if let Err(error) = report_result {
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
+                }
+                return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+            }
+        };
+
+        if let Err(error) = self
+            .persistence
+            .commit_prepared_batch(pending.prepared, result)
+        {
+            match error {
+                RaftPersistenceError::RecoveryRequired
+                | RaftPersistenceError::NotStaged {
+                    recovery_required: true,
+                    ..
+                }
+                | RaftPersistenceError::PostSyncInvariant(_)
+                | RaftPersistenceError::InternalInvariant(_) => {
+                    self.state = RuntimeState::RecoveryRequired;
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::RecoveryRequired));
+                }
+                other => {
+                    self.quarantine();
+                    return Err(ReadyApplyError::Ready(ReadyLoopError::PersistenceRejected(
+                        other,
+                    )));
+                }
+            }
+        }
+
+        self.raft
+            .advance_persisted(pending.ready.id)
+            .map_err(|error| {
+                self.state = RuntimeState::RecoveryRequired;
+                ReadyApplyError::Ready(ReadyLoopError::Advance(error))
+            })?;
+
+        let classified = classify_ready_messages(pending.ready.messages.clone());
+        self.enqueue_apply_bundle(PendingReadyApplication {
+            ready: pending.ready,
+            next_entry: 0,
+            applied_through: None,
+            applied_frontier: self.applied_frontier,
+            verified_snapshot: pending.verified_snapshot,
+            snapshot_bytes: pending.snapshot_bytes,
+            apply_dependent_messages: classified.apply_dependent,
+            started_at: Instant::now(),
+        });
+
+        // Do not drain the state-machine queue in the persistence completion
+        // callback. The caller can publish these messages immediately after
+        // the exact A-WAL result while the ordered apply queue is scheduled as
+        // independent bounded work.
+        Ok(ReadyApplyProgress {
+            persistence_safe_messages: classified.persistence_safe,
+            ..ReadyApplyProgress::default()
+        })
     }
 
     /// completes an externally transferred snapshot after its image has been
@@ -790,8 +1239,115 @@ where
         Ok(())
     }
 
-    /// persists the next Ready, restores any verified snapshot, applies
-    /// committed commands in order, and acknowledges the applied frontier
+    /// Persists the next Ready and applies a bounded prefix of its committed
+    /// entries. The exact Ready remains owned by this runtime until its whole
+    /// committed prefix reaches `advance_applied`.
+    pub(crate) fn persist_and_apply_next_ready_budgeted<SM, SF>(
+        &mut self,
+        snapshot_store: &mut SF,
+        state_machine: &mut SM,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+        SF: RaftSnapshotStore,
+    {
+        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+
+        if self.pending_persistence.is_some() {
+            return Err(ReadyApplyError::Ready(ReadyLoopError::PendingReady));
+        }
+
+        if budget.max_ready_generations == 0 {
+            return Ok(ReadyApplyProgress::default());
+        }
+
+        let pending_apply = if let Some(pending_apply) = self.pending_apply.pop_front() {
+            pending_apply
+        } else {
+            let Some(pending) = self.raft.ready() else {
+                return Ok(ReadyApplyProgress::default());
+            };
+
+            if let Some(snapshot) = pending.snapshot.as_ref()
+                && snapshot.size_bytes > budget.max_snapshot_bytes as u64
+            {
+                return Ok(ReadyApplyProgress {
+                    ready_generations: 1,
+                    ..ReadyApplyProgress::default()
+                });
+            }
+
+            let verified_snapshot = if let Some(snapshot) = pending.snapshot.as_ref() {
+                let identity = self.persistence.log_view().identity();
+
+                let pointer = match snapshot_store.publish(identity, snapshot) {
+                    Ok(pointer) => pointer,
+                    Err(error) => {
+                        self.quarantine();
+                        return Err(ReadyApplyError::SnapshotStore(error.to_string()));
+                    }
+                };
+
+                let verified = match snapshot_store.load_verified(&pointer) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.quarantine();
+                        return Err(ReadyApplyError::SnapshotStore(error.to_string()));
+                    }
+                };
+
+                if verified.metadata() != snapshot.metadata() {
+                    self.quarantine();
+                    return Err(ReadyApplyError::SnapshotMetadataMismatch {
+                        expected: Box::new(snapshot.metadata()),
+                        received: Box::new(verified.metadata()),
+                    });
+                }
+
+                Some((pointer, verified))
+            } else {
+                None
+            };
+
+            let snapshot_bytes = verified_snapshot
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.size_bytes as usize)
+                .unwrap_or(0);
+            let pointer = verified_snapshot
+                .as_ref()
+                .map(|(pointer, _)| pointer.clone());
+
+            let ready = self
+                .persist_next_ready(pointer)
+                .map_err(ReadyApplyError::Ready)?
+                .expect("the pending Ready was observed immediately before persistence");
+            let classified = classify_ready_messages(ready.messages.clone());
+            self.enqueue_apply_bundle(PendingReadyApplication {
+                ready,
+                next_entry: 0,
+                applied_through: None,
+                applied_frontier: self.applied_frontier,
+                verified_snapshot: verified_snapshot.map(|(_, snapshot)| snapshot),
+                snapshot_bytes,
+                apply_dependent_messages: classified.apply_dependent,
+                started_at: Instant::now(),
+            });
+
+            let pending_apply = self
+                .pending_apply
+                .pop_front()
+                .expect("a persisted Ready must create one apply bundle");
+            let mut progress = self.apply_ready_prefix(pending_apply, state_machine, budget)?;
+            progress.persistence_safe_messages = classified.persistence_safe;
+            return Ok(progress);
+        };
+
+        self.apply_ready_prefix(pending_apply, state_machine, budget)
+    }
+
+    /// Compatibility entry point for callers that intentionally drain one
+    /// Ready generation without an application budget.
     pub fn persist_and_apply_next_ready<SM, SF>(
         &mut self,
         snapshot_store: &mut SF,
@@ -801,87 +1357,90 @@ where
         SM: RaftReadyStateMachine,
         SF: RaftSnapshotStore,
     {
-        self.ensure_active().map_err(ReadyApplyError::Ready)?;
+        let progress = self.persist_and_apply_next_ready_budgeted(
+            snapshot_store,
+            state_machine,
+            crate::host::MultiRaftTurnBudget {
+                max_groups: usize::MAX,
+                max_messages: usize::MAX,
+                max_ready_generations: 1,
+                max_apply_entries: usize::MAX,
+                max_apply_bytes: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )?;
 
-        let Some(pending) = self.raft.ready() else {
-            return Ok(None);
-        };
+        Ok(progress.ready)
+    }
 
-        let verified_snapshot = if let Some(snapshot) = pending.snapshot.as_ref() {
-            let identity = self.persistence.log_view().identity();
+    fn enqueue_apply_bundle(&mut self, pending: PendingReadyApplication) {
+        let entries = pending.ready.committed_entries.len();
+        let bytes = ready_apply_bytes(&pending.ready);
+        if self.apply_backlog_started_at.is_none() {
+            self.apply_backlog_started_at = Some(pending.started_at);
+        }
+        self.apply_backlog_entries = self.apply_backlog_entries.saturating_add(entries);
+        self.apply_backlog_bytes = self.apply_backlog_bytes.saturating_add(bytes);
+        self.pending_apply.push_back(pending);
+    }
 
-            let pointer = match snapshot_store.publish(identity, snapshot) {
-                Ok(pointer) => pointer,
-                Err(error) => {
+    fn apply_ready_prefix<SM>(
+        &mut self,
+        mut pending: PendingReadyApplication,
+        state_machine: &mut SM,
+        budget: crate::host::MultiRaftTurnBudget,
+    ) -> Result<ReadyApplyProgress, ReadyApplyError>
+    where
+        SM: RaftReadyStateMachine,
+    {
+        let snapshot_bytes = pending.snapshot_bytes;
+        pending.snapshot_bytes = 0;
+        if pending.applied_through.is_none() {
+            if let Some(snapshot) = pending.verified_snapshot.take() {
+                if let Err(error) = state_machine.restore_snapshot(&snapshot) {
                     self.quarantine();
-                    return Err(ReadyApplyError::SnapshotStore(error.to_string()));
+                    return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
                 }
-            };
-
-            let verified = match snapshot_store.load_verified(&pointer) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.quarantine();
-                    return Err(ReadyApplyError::SnapshotStore(error.to_string()));
-                }
-            };
-
-            if verified.metadata() != snapshot.metadata() {
-                self.quarantine();
-                return Err(ReadyApplyError::SnapshotMetadataMismatch {
-                    expected: Box::new(snapshot.metadata()),
-                    received: Box::new(verified.metadata()),
-                });
+                self.raft.restore_snapshot(snapshot.clone());
+                pending.applied_through = Some(snapshot.last_included_index);
+                pending.applied_frontier = Some(AppliedRaftFrontier::new(
+                    snapshot.last_included_index,
+                    snapshot.last_included_term,
+                ));
+                self.apply_backlog_bytes = self
+                    .apply_backlog_bytes
+                    .saturating_sub(snapshot.size_bytes as usize);
+            } else {
+                pending.applied_through = Some(self.raft.last_applied());
             }
-
-            Some((pointer, verified))
-        } else {
-            None
-        };
-
-        let pointer = verified_snapshot
-            .as_ref()
-            .map(|(pointer, _)| pointer.clone());
-
-        let ready = self
-            .persist_next_ready(pointer)
-            .map_err(ReadyApplyError::Ready)?
-            .expect("the pending Ready was observed immediately before persistence");
-
-        let mut applied_through = self.raft.last_applied();
-        let mut applied_frontier = self.applied_frontier;
-
-        if let Some((_, snapshot)) = verified_snapshot {
-            if let Err(error) = state_machine.restore_snapshot(&snapshot) {
-                self.quarantine();
-                return Err(ReadyApplyError::SnapshotRestore(error.to_string()));
-            }
-
-            self.raft.restore_snapshot(snapshot);
-
-            applied_through = ready
-                .snapshot
-                .as_ref()
-                .expect("snapshot persistence must retain the Ready snapshot")
-                .last_included_index;
-
-            let snapshot = ready
-                .snapshot
-                .as_ref()
-                .expect("snapshot persistence must retain the Ready snapshot");
-            applied_frontier = Some(AppliedRaftFrontier::new(
-                snapshot.last_included_index,
-                snapshot.last_included_term,
-            ));
         }
 
-        for entry in &ready.committed_entries {
-            let expected_index = applied_through.saturating_add(1);
+        let mut applied_entries = 0;
+        let mut applied_bytes = 0_usize;
+        while pending.next_entry < pending.ready.committed_entries.len()
+            && applied_entries < budget.max_apply_entries
+        {
+            let entry = &pending.ready.committed_entries[pending.next_entry];
+            let entry_bytes = match &entry.payload {
+                EntryPayload::Normal(command) => command.len(),
+                EntryPayload::Configuration(_) => 0,
+            };
+
+            if (applied_entries == 0 && budget.max_apply_bytes == 0)
+                || (applied_entries > 0
+                    && applied_bytes.saturating_add(entry_bytes) > budget.max_apply_bytes)
+            {
+                break;
+            }
+            let previous = pending
+                .applied_through
+                .expect("apply base is initialized before entry validation");
+            let expected_index = previous.saturating_add(1);
 
             if entry.index != expected_index {
                 self.quarantine();
                 return Err(ReadyApplyError::ApplyOrder {
-                    previous: applied_through,
+                    previous,
                     received: entry.index,
                 });
             }
@@ -896,10 +1455,28 @@ where
                 });
             }
 
-            applied_through = entry.index;
-            applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
+            pending.applied_through = Some(entry.index);
+            pending.applied_frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
+            pending.next_entry += 1;
+            applied_entries += 1;
+            applied_bytes = applied_bytes.saturating_add(entry_bytes);
+            self.apply_backlog_entries = self.apply_backlog_entries.saturating_sub(1);
+            self.apply_backlog_bytes = self.apply_backlog_bytes.saturating_sub(entry_bytes);
         }
 
+        if pending.next_entry < pending.ready.committed_entries.len() {
+            self.pending_apply.push_front(pending);
+            return Ok(ReadyApplyProgress {
+                ready_generations: 1,
+                apply_entries: applied_entries,
+                snapshot_bytes,
+                ..ReadyApplyProgress::default()
+            });
+        }
+
+        let applied_through = pending
+            .applied_through
+            .expect("apply base is initialized before frontier advancement");
         if applied_through > self.raft.last_applied()
             && let Err(error) = self.raft.advance_applied(applied_through)
         {
@@ -907,9 +1484,21 @@ where
             return Err(ReadyApplyError::Ready(ReadyLoopError::Advance(error)));
         }
 
-        self.applied_frontier = applied_frontier;
-
-        Ok(Some(ready))
+        self.applied_frontier = pending.applied_frontier;
+        let read_states = pending.ready.read_states.clone();
+        let apply_dependent_messages = pending.apply_dependent_messages;
+        if self.pending_apply.is_empty() {
+            self.apply_backlog_started_at = None;
+        }
+        Ok(ReadyApplyProgress {
+            ready: Some(pending.ready),
+            read_states,
+            ready_generations: 1,
+            apply_entries: applied_entries,
+            snapshot_bytes,
+            apply_dependent_messages,
+            ..ReadyApplyProgress::default()
+        })
     }
 
     fn ensure_active(&self) -> Result<(), ReadyLoopError> {
@@ -921,7 +1510,7 @@ where
     }
 
     fn ensure_no_pending_ready(&self) -> Result<(), ReadyLoopError> {
-        if self.raft.has_ready() {
+        if self.pending_persistence.is_some() {
             return Err(ReadyLoopError::PendingReady);
         }
 
@@ -950,6 +1539,7 @@ fn validate_snapshot_pointer(
         last_included_index: pointer.last_included_index,
         last_included_term: pointer.last_included_term,
         conf_state: pointer.conf_state.clone(),
+        last_removed_replica: pointer.last_removed_replica,
         size_bytes: pointer.size_bytes,
         checksum: pointer.checksum,
     };
@@ -962,4 +1552,185 @@ fn validate_snapshot_pointer(
     }
 
     Ok(())
+}
+
+fn ready_apply_bytes(ready: &ReadyGeneration) -> usize {
+    ready
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.size_bytes as usize)
+        .unwrap_or(0)
+        .saturating_add(
+            ready
+                .committed_entries
+                .iter()
+                .map(|entry| match &entry.payload {
+                    EntryPayload::Normal(command) => command.len(),
+                    EntryPayload::Configuration(_) => 0,
+                })
+                .sum::<usize>(),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raft::{core::node::RaftNode, storage::mem::MemStorage};
+    use ragnordb_common::ids::{RaftGroupId, ReplicaId};
+    use wal::{
+        error::BatchAppendFailure,
+        lsn::Lsn,
+        types::RecordType,
+        wal::{AppendResult, BatchAppendResult},
+    };
+
+    type TestNode =
+        RaftNode<Vec<u8>, Vec<u8>, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+    type TestLoop =
+        RaftReadyLoop<TestWal, MemStorage<Vec<u8>, Vec<u8>>, MemStorage<Vec<u8>, Vec<u8>>>;
+
+    struct TestWal {
+        next_lsn: Lsn,
+    }
+
+    impl RaftWal for TestWal {
+        fn append_batch_and_sync(
+            &mut self,
+            records: &[(RecordType, &[u8])],
+        ) -> Result<BatchAppendResult, BatchAppendFailure> {
+            let mut extents = Vec::with_capacity(records.len());
+            for (_, payload) in records {
+                let start_lsn = self.next_lsn;
+                let end_lsn = start_lsn
+                    .checked_add_bytes(payload.len() as u64 + 1)
+                    .expect("test WAL LSN must not overflow");
+                self.next_lsn = end_lsn;
+                extents.push(AppendResult { start_lsn, end_lsn });
+            }
+
+            Ok(BatchAppendResult {
+                final_end_lsn: extents
+                    .last()
+                    .map(|extent| extent.end_lsn)
+                    .unwrap_or(Lsn::ZERO),
+                record_extents: extents,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TestStateMachine {
+        applied: Vec<u64>,
+    }
+
+    impl RaftReadyStateMachine for TestStateMachine {
+        type Error = &'static str;
+
+        fn restore_snapshot(&mut self, _snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn apply(&mut self, index: u64, _command: &[u8]) -> Result<(), Self::Error> {
+            self.applied.push(index);
+            Ok(())
+        }
+    }
+
+    struct TestSnapshotStore;
+
+    impl RaftSnapshotStore for TestSnapshotStore {
+        type Error = &'static str;
+
+        fn publish(
+            &mut self,
+            _identity: RaftReplicaIdentity,
+            _snapshot: &Snapshot<Vec<u8>>,
+        ) -> Result<RaftSnapshotPointerRecord, Self::Error> {
+            Err("snapshots are not part of this Ready-order test")
+        }
+
+        fn load_verified(
+            &mut self,
+            _pointer: &RaftSnapshotPointerRecord,
+        ) -> Result<Snapshot<Vec<u8>>, Self::Error> {
+            Err("snapshots are not part of this Ready-order test")
+        }
+    }
+
+    fn new_loop() -> TestLoop {
+        let node: TestNode =
+            RaftNode::new(1, Vec::new(), MemStorage::new(), MemStorage::new(), 5, 2);
+        RaftReadyLoop::new(
+            node,
+            RaftWalStorage::new(
+                TestWal {
+                    next_lsn: Lsn::new(100),
+                },
+                RaftReplicaIdentity::new(RaftGroupId(101), ReplicaId(1)).unwrap(),
+            ),
+        )
+    }
+
+    fn prepare_leader(
+        loop_: &mut TestLoop,
+        store: &mut TestSnapshotStore,
+        state: &mut TestStateMachine,
+    ) {
+        loop_.persist_next_ready(None).unwrap();
+        loop_.tick(loop_.raft().current_election_timeout()).unwrap();
+        loop_.persist_and_apply_next_ready(store, state).unwrap();
+    }
+
+    #[test]
+    /// Catches releasing ReadState from a Ready generation while a bounded
+    /// apply turn still owns an unapplied committed prefix.
+    fn read_state_waits_for_the_complete_ready_apply_prefix() {
+        let mut loop_ = new_loop();
+        let mut store = TestSnapshotStore;
+        let mut state = TestStateMachine::default();
+        prepare_leader(&mut loop_, &mut store, &mut state);
+
+        let activation_index = loop_.propose(b"activation".to_vec(), 10).unwrap();
+        loop_
+            .persist_and_apply_next_ready(&mut store, &mut state)
+            .unwrap();
+        loop_
+            .activate_read_index(loop_.raft().current_term())
+            .unwrap();
+
+        // The runtime API correctly refuses new Raft mutations while a Ready
+        // is outstanding. This test intentionally uses the private core only
+        // to construct one legal Ready containing both committed entries and
+        // a completed ReadState, then exercises the production apply boundary.
+        loop_.raft.propose(b"first".to_vec()).unwrap();
+        loop_.raft.propose(b"second".to_vec()).unwrap();
+        loop_.raft.read_index(b"bounded-read".to_vec()).unwrap();
+
+        let budget = crate::host::MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        };
+        let first = loop_
+            .persist_and_apply_next_ready_budgeted(&mut store, &mut state, budget)
+            .unwrap();
+        assert!(first.read_states.is_empty());
+        assert_eq!(first.apply_entries, 1);
+        assert_eq!(state.applied, vec![activation_index, activation_index + 1]);
+
+        let second = loop_
+            .persist_and_apply_next_ready_budgeted(&mut store, &mut state, budget)
+            .unwrap();
+        assert_eq!(second.read_states.len(), 1);
+        assert_eq!(second.read_states[0].request_ctx, b"bounded-read");
+        assert_eq!(second.read_states[0].index, activation_index + 2);
+        assert_eq!(
+            state.applied,
+            vec![activation_index, activation_index + 1, activation_index + 2]
+        );
+        assert_eq!(loop_.raft.last_applied(), activation_index + 2);
+    }
 }

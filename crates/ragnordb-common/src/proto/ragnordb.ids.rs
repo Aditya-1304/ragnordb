@@ -50,3 +50,72 @@ pub struct RequestId {
     #[prost(message, optional, tag = "3")]
     pub raft_group_id: ::core::option::Option<RaftGroupId>,
 }
+/// Stable client identity for protocol V2. The session epoch fences a client
+/// restart, while request sequence remains monotonic within that epoch.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientRequestId {
+    #[prost(bytes = "vec", tag = "1")]
+    pub client_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub session_epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub request_sequence: u64,
+}
+/// Topology-independent logical identity. Raft-group routing is deliberately
+/// absent so a retry after a range move keeps one deduplication identity.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogicalCommandId {
+    #[prost(message, optional, tag = "1")]
+    pub client_request_id: ::core::option::Option<ClientRequestId>,
+    #[prost(uint32, tag = "2")]
+    pub command_ordinal: u32,
+    #[prost(enumeration = "CommandKind", tag = "3")]
+    pub kind: i32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CommandKind {
+    Unspecified = 0,
+    Read = 1,
+    Prewrite = 2,
+    Commit = 3,
+    Rollback = 4,
+    ResolveIntent = 5,
+    SingleShardCommit = 6,
+    Catalog = 7,
+    Noop = 8,
+}
+impl CommandKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMMAND_KIND_UNSPECIFIED",
+            Self::Read => "COMMAND_KIND_READ",
+            Self::Prewrite => "COMMAND_KIND_PREWRITE",
+            Self::Commit => "COMMAND_KIND_COMMIT",
+            Self::Rollback => "COMMAND_KIND_ROLLBACK",
+            Self::ResolveIntent => "COMMAND_KIND_RESOLVE_INTENT",
+            Self::SingleShardCommit => "COMMAND_KIND_SINGLE_SHARD_COMMIT",
+            Self::Catalog => "COMMAND_KIND_CATALOG",
+            Self::Noop => "COMMAND_KIND_NOOP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMMAND_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMMAND_KIND_READ" => Some(Self::Read),
+            "COMMAND_KIND_PREWRITE" => Some(Self::Prewrite),
+            "COMMAND_KIND_COMMIT" => Some(Self::Commit),
+            "COMMAND_KIND_ROLLBACK" => Some(Self::Rollback),
+            "COMMAND_KIND_RESOLVE_INTENT" => Some(Self::ResolveIntent),
+            "COMMAND_KIND_SINGLE_SHARD_COMMIT" => Some(Self::SingleShardCommit),
+            "COMMAND_KIND_CATALOG" => Some(Self::Catalog),
+            "COMMAND_KIND_NOOP" => Some(Self::Noop),
+            _ => None,
+        }
+    }
+}

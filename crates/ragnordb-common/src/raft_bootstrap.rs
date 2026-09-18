@@ -113,6 +113,28 @@ impl RaftGroupBootstrap {
 
         Ok(())
     }
+    ///
+    /// return the replica lifetime initially assigned to a physical node
+    ///
+    /// Raft replica identities and physical node identities are separate
+    /// namespaces. Callers must resolve the relationship through the durable
+    /// bootstrap rather than assuming `ReplicaId == NodeId`
+    pub fn replica_on_node(&self, node_id: NodeId) -> Option<ReplicaId> {
+        self.replica_to_node
+            .iter()
+            .find_map(|(replica_id, mapped_node_id)| {
+                (*mapped_node_id == node_id).then_some(*replica_id)
+            })
+    }
+
+    /// return the physical node initially hosting a Raft replica
+    ///
+    /// this mapping is bootstrap authority only. Later membership/placement
+    /// changes must use committed configuration and metadata rather than
+    /// reconstructing membership from static process configuration
+    pub fn node_for_replica(&self, replica_id: ReplicaId) -> Option<NodeId> {
+        self.replica_to_node.get(&replica_id).copied()
+    }
 
     pub fn encode(&self) -> Result<Vec<u8>, RaftGroupBootstrapError> {
         self.validate()?;

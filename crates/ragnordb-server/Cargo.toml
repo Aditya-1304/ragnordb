@@ -25,6 +25,7 @@ toml.workspace = true
 ragnordb-storage = { path = "../ragnordb-storage" }
 wal.workspace = true
 raft.workspace = true
+prost.workspace = true
 
 [dev-dependencies]
 tokio-util.workspace = true

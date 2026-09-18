@@ -17,7 +17,7 @@ use ragnordb_common::{
         TabletStateMachineSnapshotError,
     },
     encoding::encode_row,
-    ids::{RaftGroupId, TabletId},
+    ids::{LogicalCommandId, RaftGroupId, TabletId},
 };
 use ragnordb_storage::{
     key::decode_row_key,
@@ -45,6 +45,11 @@ pub struct TabletStateMachine<S = InMemoryMvcc> {
     // watermark; deleting entries earlier could permit an old acknowledged
     // request to execute twice after restart.
     client_deduplication: BTreeMap<ClientDeduplicationKey, ClientDeduplicationState>,
+    logical_command_deduplication: BTreeMap<LogicalCommandId, ClientDeduplicationState>,
+    /// Durable V2 retry floors keyed by client session. The floor remains
+    /// after outcome compaction so an acknowledged request cannot be mistaken
+    /// for a new command after a restart or tablet move.
+    logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
 }
 
 impl<S: MvccStorage> TabletStateMachine<S> {
@@ -67,6 +72,8 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             epoch,
             raft_group_id,
             client_deduplication: BTreeMap::new(),
+            logical_command_deduplication: BTreeMap::new(),
+            logical_client_retry_horizons: BTreeMap::new(),
         })
     }
 
@@ -109,6 +116,19 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         }
     }
 
+    /// Look up a retained V2 mutation outcome without routing a retry through
+    /// the command executor. A missing value is not proof of non-commit; the
+    /// caller must first establish that the current ownership generation has
+    /// the complete retry-horizon state.
+    pub fn logical_command_outcome(
+        &self,
+        logical_command_id: &LogicalCommandId,
+    ) -> Option<&CachedTabletCommandOutcome> {
+        self.logical_command_deduplication
+            .get(logical_command_id)
+            .map(|state| &state.cached_outcome)
+    }
+
     /// Encode replicated command metadata that must accompany a tablet snapshot.
     ///
     /// MVCC data is intentionally owned by the surrounding tablet snapshot. This
@@ -129,8 +149,30 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             })
             .collect();
 
-        TabletStateMachineSnapshot::new(self.tablet.id(), self.epoch, self.raft_group_id, clients)?
-            .encode()
+        let logical_commands = self
+            .logical_command_deduplication
+            .clone()
+            .into_iter()
+            .map(|(logical_command_id, state)| {
+                (
+                    logical_command_id,
+                    ragnordb_common::command_codec::ClientDeduplicationSnapshot {
+                        last_sequence_applied: state.last_sequence_applied,
+                        cached_outcome: state.cached_outcome,
+                    },
+                )
+            })
+            .collect();
+
+        TabletStateMachineSnapshot::new_with_logical_commands_and_horizons(
+            self.tablet.id(),
+            self.epoch,
+            self.raft_group_id,
+            clients,
+            logical_commands,
+            self.logical_client_retry_horizons.clone(),
+        )?
+        .encode()
     }
 
     /// restore replicated command metadata before applying any post-snapshot Raft
@@ -166,11 +208,27 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             })
             .collect();
 
+        let logical_command_deduplication = snapshot
+            .logical_commands
+            .into_iter()
+            .map(|(logical_command_id, state)| {
+                (
+                    logical_command_id,
+                    ClientDeduplicationState {
+                        last_sequence_applied: state.last_sequence_applied,
+                        cached_outcome: state.cached_outcome,
+                    },
+                )
+            })
+            .collect();
+
         Ok(Self {
             tablet,
             epoch: snapshot.tablet_epoch,
             raft_group_id: snapshot.raft_group_id,
             client_deduplication,
+            logical_command_deduplication,
+            logical_client_retry_horizons: snapshot.logical_client_retry_horizons,
         })
     }
 
@@ -246,6 +304,71 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         self.validate_proposal(&envelope)?;
 
         let client_id = envelope.request_id.client_id;
+        if let Some(logical_command_id) = envelope.logical_command_id {
+            self.apply_retry_horizon(logical_command_id, envelope.acknowledged_through)?;
+
+            if self
+                .logical_client_retry_horizons
+                .get(&(
+                    logical_command_id.client_request_id.client_id,
+                    logical_command_id.client_request_id.session_epoch,
+                ))
+                .is_some_and(|acknowledged_through| {
+                    logical_command_id.client_request_id.request_sequence <= *acknowledged_through
+                })
+            {
+                return Err(TabletCommandApplyError::RequestIdExpired {
+                    client_id: logical_command_id.client_request_id.client_id,
+                    session_epoch: logical_command_id.client_request_id.session_epoch,
+                    sequence: logical_command_id.client_request_id.request_sequence,
+                    acknowledged_through: *self
+                        .logical_client_retry_horizons
+                        .get(&(
+                            logical_command_id.client_request_id.client_id,
+                            logical_command_id.client_request_id.session_epoch,
+                        ))
+                        .expect("retry horizon was checked above"),
+                });
+            }
+
+            if let Some(deduplication) = self.logical_command_deduplication.get(&logical_command_id)
+            {
+                return match &deduplication.cached_outcome {
+                    CachedTabletCommandOutcome::Applied(result) => {
+                        Ok(TabletCommandApplyOutcome::deduplicated((*result).into()))
+                    }
+                    CachedTabletCommandOutcome::Rejected(rejection) => {
+                        Err(error_from_cached_rejection(rejection))
+                    }
+                };
+            }
+
+            let result = match self.dispatch_command(envelope.command) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(rejection) = cached_rejection_from_error(&error) {
+                        self.logical_command_deduplication.insert(
+                            logical_command_id,
+                            ClientDeduplicationState {
+                                last_sequence_applied: 1,
+                                cached_outcome: CachedTabletCommandOutcome::Rejected(rejection),
+                            },
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+
+            self.logical_command_deduplication.insert(
+                logical_command_id,
+                ClientDeduplicationState {
+                    last_sequence_applied: 1,
+                    cached_outcome: CachedTabletCommandOutcome::Applied(result.into()),
+                },
+            );
+            return Ok(TabletCommandApplyOutcome::applied(result));
+        }
+
         let deduplication_key = ClientDeduplicationKey {
             client_id,
             raft_group_id: envelope.request_id.raft_group_id,
@@ -291,19 +414,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             });
         }
 
-        let dispatched = match envelope.command {
-            TabletCommand::Noop(_) => Ok(TabletCommandApplyResult::Noop),
-            TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command),
-            TabletCommand::Prewrite(command) => self.apply_prewrite(command),
-            TabletCommand::Commit(command) => self.apply_commit(command),
-            TabletCommand::Rollback(command) => self.apply_rollback(command),
-            TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
-            // Catalog publication is materialized by the server catalog owner.
-            // The tablet state machine still deduplicates and orders the command
-            // at this exact Raft position.
-            TabletCommand::Catalog(_) => Ok(TabletCommandApplyResult::Noop),
-        };
-
+        let dispatched = self.dispatch_command(envelope.command);
         let result = match dispatched {
             Ok(result) => result,
             Err(error) => {
@@ -329,6 +440,69 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         );
 
         Ok(TabletCommandApplyOutcome::applied(result))
+    }
+
+    /// Apply a caller acknowledgement only through the replicated command
+    /// envelope. Outcomes at or below the new floor are then removable because
+    /// every future retry receives REQUEST_ID_EXPIRED instead of executing.
+    fn apply_retry_horizon(
+        &mut self,
+        logical_command_id: LogicalCommandId,
+        acknowledged_through: Option<u64>,
+    ) -> Result<(), TabletCommandApplyError> {
+        let Some(acknowledged_through) = acknowledged_through else {
+            return Ok(());
+        };
+
+        let session_key = (
+            logical_command_id.client_request_id.client_id,
+            logical_command_id.client_request_id.session_epoch,
+        );
+        if let Some(previous) = self.logical_client_retry_horizons.get(&session_key)
+            && acknowledged_through < *previous
+        {
+            return Err(TabletCommandApplyError::AcknowledgementRegression {
+                client_id: session_key.0,
+                session_epoch: session_key.1,
+                existing: *previous,
+                received: acknowledged_through,
+            });
+        }
+
+        if self
+            .logical_client_retry_horizons
+            .get(&session_key)
+            .is_some_and(|previous| *previous == acknowledged_through)
+        {
+            return Ok(());
+        }
+
+        self.logical_client_retry_horizons
+            .insert(session_key, acknowledged_through);
+        self.logical_command_deduplication.retain(|logical_id, _| {
+            let root = logical_id.client_request_id;
+            (root.client_id, root.session_epoch) != session_key
+                || root.request_sequence > acknowledged_through
+        });
+        Ok(())
+    }
+
+    fn dispatch_command(
+        &mut self,
+        command: TabletCommand,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        match command {
+            TabletCommand::Noop(_) => Ok(TabletCommandApplyResult::Noop),
+            TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command),
+            TabletCommand::Prewrite(command) => self.apply_prewrite(command),
+            TabletCommand::Commit(command) => self.apply_commit(command),
+            TabletCommand::Rollback(command) => self.apply_rollback(command),
+            TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
+            // Catalog publication is materialized by the server catalog owner.
+            // The tablet state machine still deduplicates and orders the command
+            // at this exact Raft position.
+            TabletCommand::Catalog(_) => Ok(TabletCommandApplyResult::Noop),
+        }
     }
 
     fn apply_single_shard_commit(
@@ -772,6 +946,26 @@ pub enum TabletCommandApplyError {
     #[error("request sequence space is exhausted for client {client_id:#034x}")]
     RequestSequenceExhausted { client_id: u128 },
 
+    #[error(
+        "request identity client {client_id:#034x}, session {session_epoch}, sequence {sequence} expired at acknowledgement {acknowledged_through}"
+    )]
+    RequestIdExpired {
+        client_id: u128,
+        session_epoch: u64,
+        sequence: u64,
+        acknowledged_through: u64,
+    },
+
+    #[error(
+        "request acknowledgement regressed for client {client_id:#034x}, session {session_epoch}: existing {existing}, received {received}"
+    )]
+    AcknowledgementRegression {
+        client_id: u128,
+        session_epoch: u64,
+        existing: u64,
+        received: u64,
+    },
+
     #[error("invalid tablet command: {reason}")]
     InvalidCommand { reason: String },
 
@@ -800,7 +994,10 @@ mod tests {
             CommitCommand, NoopCommand, PrewriteCommand, ResolveIntentCommand, RollbackCommand,
             SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
         },
-        ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
+        ids::{
+            ClientRequestId, CommandKind, LogicalCommandId, RaftGroupId, RequestId, TableId,
+            TabletId, Timestamp, TxnId,
+        },
     };
     use ragnordb_storage::key::{encode_row_key, make_row_key};
     use ragnordb_txn::Transaction;
@@ -977,6 +1174,122 @@ mod tests {
                 deduplicated: true,
             }
         );
+    }
+
+    #[test]
+    fn logical_command_retry_deduplicates_even_when_transport_sequence_changes() {
+        let mut state_machine = state_machine();
+        let logical_command_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 0x55,
+                session_epoch: 3,
+                request_sequence: 1,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Noop,
+        };
+
+        let first = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x55,
+                sequence: 1,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_command_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+        let retry = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x55,
+                sequence: 9,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_command_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+
+        assert!(!state_machine.apply(first).unwrap().deduplicated);
+        assert!(state_machine.apply(retry).unwrap().deduplicated);
+    }
+
+    #[test]
+    fn acknowledged_logical_command_is_expired_after_durable_watermark() {
+        let mut state_machine = state_machine();
+        let logical_command_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 0x56,
+                session_epoch: 3,
+                request_sequence: 1,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Noop,
+        };
+        let first = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x56,
+                sequence: 1,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_command_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+        state_machine.apply(first).unwrap();
+
+        let mut acknowledged_retry = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x56,
+                sequence: 1,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_command_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+        acknowledged_retry.acknowledged_through = Some(1);
+
+        assert_eq!(
+            state_machine.apply(acknowledged_retry).unwrap_err(),
+            TabletCommandApplyError::RequestIdExpired {
+                client_id: 0x56,
+                session_epoch: 3,
+                sequence: 1,
+                acknowledged_through: 1,
+            }
+        );
+
+        let snapshot = state_machine.encode_snapshot_state().unwrap();
+        let mut restored = TabletStateMachine::restore_from_snapshot(
+            Tablet::new(LOCAL_TABLET_ID, TableId(1)).unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        let retry_after_restart = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x56,
+                sequence: 1,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_command_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+        assert!(matches!(
+            restored.apply(retry_after_restart),
+            Err(TabletCommandApplyError::RequestIdExpired { .. })
+        ));
     }
 
     #[test]

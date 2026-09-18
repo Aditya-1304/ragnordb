@@ -14,6 +14,100 @@ pub struct TabletCommandRequest {
     pub request_id: ::core::option::Option<super::ids::RequestId>,
     #[prost(message, optional, tag = "2")]
     pub command: ::core::option::Option<super::command::TabletCommand>,
+    #[prost(message, optional, tag = "3")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "4")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "5")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(uint64, optional, tag = "6")]
+    pub acknowledged_through: ::core::option::Option<u64>,
+    /// Physical transport-attempt correlation. This is deliberately
+    /// separate from RequestId and LogicalCommandId so a delayed response
+    /// from an earlier retry cannot satisfy a newer waiter.
+    #[prost(uint64, optional, tag = "7")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletOutcomeQueryRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(message, optional, tag = "3")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "4")]
+    pub tablet_epoch: u64,
+    #[prost(uint64, optional, tag = "5")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletReadRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "4")]
+    pub row_key: ::core::option::Option<super::row::RowKey>,
+    #[prost(message, optional, tag = "5")]
+    pub read_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(message, optional, tag = "6")]
+    pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
+    #[prost(uint64, optional, tag = "7")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded attempt.
+    /// The receiver never reconstructs a deadline from its wall clock.
+    #[prost(uint64, optional, tag = "8")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
+}
+/// A bounded, resumable read over one logical half-open tablet span. The
+/// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
+/// response so scan failures retain the established retry and attempt-correlation
+/// fields without introducing a second response envelope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub start_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub end_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub resume_after: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, optional, tag = "7")]
+    pub read_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(uint32, tag = "8")]
+    pub max_rows: u32,
+    #[prost(uint32, tag = "9")]
+    pub max_bytes: u32,
+    #[prost(uint64, optional, tag = "10")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded attempt.
+    /// The receiver never reconstructs a deadline from its wall clock.
+    #[prost(uint64, optional, tag = "11")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanRow {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub row: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<TabletScanRow>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub next_resume_after: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bool, tag = "3")]
+    pub exhausted: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommandResponse {
@@ -29,10 +123,20 @@ pub struct TabletCommandResponse {
     pub retryable: bool,
     #[prost(bytes = "vec", tag = "6")]
     pub result_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "7")]
+    pub found: bool,
+    #[prost(uint64, tag = "8")]
+    pub leader_replica_id: u64,
+    #[prost(uint64, tag = "9")]
+    pub current_tablet_epoch: u64,
+    #[prost(uint64, tag = "10")]
+    pub expected_tablet_epoch: u64,
+    #[prost(uint64, optional, tag = "11")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataRequest {
-    #[prost(oneof = "metadata_request::Request", tags = "1, 2, 3")]
+    #[prost(oneof = "metadata_request::Request", tags = "1, 2, 3, 4, 5")]
     pub request: ::core::option::Option<metadata_request::Request>,
 }
 /// Nested message and enum types in `MetadataRequest`.
@@ -45,6 +149,10 @@ pub mod metadata_request {
         LookupTablet(super::LookupTabletRequest),
         #[prost(message, tag = "3")]
         LookupSchema(super::LookupSchemaRequest),
+        #[prost(message, tag = "4")]
+        ProposeCommand(super::MetadataProposalRequest),
+        #[prost(message, tag = "5")]
+        ProposeConfChange(super::MetadataConfChangeRequest),
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -63,7 +171,7 @@ pub struct LookupSchemaRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataResponse {
-    #[prost(oneof = "metadata_response::Response", tags = "1, 2, 3")]
+    #[prost(oneof = "metadata_response::Response", tags = "1, 2, 3, 4, 5")]
     pub response: ::core::option::Option<metadata_response::Response>,
 }
 /// Nested message and enum types in `MetadataResponse`.
@@ -76,6 +184,182 @@ pub mod metadata_response {
         LookupTablet(super::LookupTabletResponse),
         #[prost(message, tag = "3")]
         LookupSchema(super::LookupSchemaResponse),
+        #[prost(message, tag = "4")]
+        ProposeCommand(super::MetadataProposalResponse),
+        #[prost(message, tag = "5")]
+        ProposeConfChange(super::MetadataConfChangeResponse),
+    }
+}
+/// A metadata proposal is forwarded as the exact command envelope created by
+/// the gateway. The receiving node submits that envelope to its local metadata
+/// Raft host, preserving durable logical identity across gateway changes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataProposalRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub command_envelope: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataProposalResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(bool, tag = "3")]
+    pub success: bool,
+    #[prost(string, tag = "4")]
+    pub error_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub error_message: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub outcome: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "7")]
+    pub leader_replica_id: u64,
+}
+/// Internal control-plane request used when a draining metadata member is not
+/// the metadata leader. The receiving node proposes the ConfChange through its
+/// Ready owner; it never mutates membership directly from the RPC thread.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MetadataConfChangeRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "2")]
+    pub expected_conf_state_version: u64,
+    #[prost(message, optional, tag = "3")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(bool, tag = "4")]
+    pub remove_replica: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataConfChangeResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    #[prost(string, tag = "3")]
+    pub error_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub error_message: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub leader_replica_id: u64,
+}
+/// Control-plane admission for a post-bootstrap replica lifetime. The target
+/// persists this witness before registering its Raft and snapshot routes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaJoinRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(message, optional, tag = "4")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "5")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "6")]
+    pub replica_id: ::core::option::Option<super::ids::ReplicaId>,
+    #[prost(message, optional, tag = "7")]
+    pub physical_node_id: ::core::option::Option<super::ids::NodeId>,
+    #[prost(uint64, tag = "8")]
+    pub expected_current_conf_state_version: u64,
+    #[prost(uint64, tag = "9")]
+    pub committed_membership_version: u64,
+    #[prost(message, repeated, tag = "10")]
+    pub voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "11")]
+    pub learners: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    #[prost(message, repeated, tag = "12")]
+    pub outgoing_voters: ::prost::alloc::vec::Vec<super::ids::ReplicaId>,
+    /// Non-zero only for a promotion-readiness probe. The target must have
+    /// crossed this leader's committed frontier locally before it replies
+    /// success; zero is the route/materialization probe used before AddLearner.
+    #[prost(uint64, tag = "13")]
+    pub leader_commit_index: u64,
+    #[prost(bool, tag = "14")]
+    pub require_caught_up: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicaJoinResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    #[prost(string, tag = "3")]
+    pub error_message: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataProposalOutcome {
+    #[prost(enumeration = "metadata_proposal_outcome::Kind", tag = "1")]
+    pub kind: i32,
+    #[prost(uint64, tag = "2")]
+    pub client_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub session_epoch: u64,
+    #[prost(uint64, tag = "4")]
+    pub table_id: u64,
+    #[prost(uint64, tag = "5")]
+    pub tablet_id: u64,
+    #[prost(uint64, tag = "6")]
+    pub raft_group_id: u64,
+    #[prost(string, tag = "7")]
+    pub rejection: ::prost::alloc::string::String,
+}
+/// Nested message and enum types in `MetadataProposalOutcome`.
+pub mod metadata_proposal_outcome {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Kind {
+        Unspecified = 0,
+        Applied = 1,
+        AlreadyApplied = 2,
+        ClientRegistered = 3,
+        ClientRenewed = 4,
+        TableCreated = 5,
+        Rejected = 6,
+    }
+    impl Kind {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "KIND_UNSPECIFIED",
+                Self::Applied => "APPLIED",
+                Self::AlreadyApplied => "ALREADY_APPLIED",
+                Self::ClientRegistered => "CLIENT_REGISTERED",
+                Self::ClientRenewed => "CLIENT_RENEWED",
+                Self::TableCreated => "TABLE_CREATED",
+                Self::Rejected => "REJECTED",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "KIND_UNSPECIFIED" => Some(Self::Unspecified),
+                "APPLIED" => Some(Self::Applied),
+                "ALREADY_APPLIED" => Some(Self::AlreadyApplied),
+                "CLIENT_REGISTERED" => Some(Self::ClientRegistered),
+                "CLIENT_RENEWED" => Some(Self::ClientRenewed),
+                "TABLE_CREATED" => Some(Self::TableCreated),
+                "REJECTED" => Some(Self::Rejected),
+                _ => None,
+            }
+        }
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -98,6 +382,10 @@ pub struct LookupTabletResponse {
     pub leader_replica_id: ::core::option::Option<super::ids::ReplicaId>,
     #[prost(message, repeated, tag = "5")]
     pub replicas: ::prost::alloc::vec::Vec<ReplicaRoute>,
+    #[prost(message, optional, tag = "6")]
+    pub raft_group_id: ::core::option::Option<super::ids::RaftGroupId>,
+    #[prost(uint64, tag = "7")]
+    pub tablet_epoch: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LookupSchemaResponse {
@@ -115,6 +403,11 @@ pub enum MessageType {
     TabletCommandResponse = 3,
     MetadataRequest = 4,
     MetadataResponse = 5,
+    TabletReadRequest = 6,
+    TabletOutcomeQueryRequest = 7,
+    TabletScanRequest = 8,
+    ReplicaJoinRequest = 9,
+    ReplicaJoinResponse = 10,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -129,6 +422,13 @@ impl MessageType {
             Self::TabletCommandResponse => "MESSAGE_TYPE_TABLET_COMMAND_RESPONSE",
             Self::MetadataRequest => "MESSAGE_TYPE_METADATA_REQUEST",
             Self::MetadataResponse => "MESSAGE_TYPE_METADATA_RESPONSE",
+            Self::TabletReadRequest => "MESSAGE_TYPE_TABLET_READ_REQUEST",
+            Self::TabletOutcomeQueryRequest => {
+                "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST"
+            }
+            Self::TabletScanRequest => "MESSAGE_TYPE_TABLET_SCAN_REQUEST",
+            Self::ReplicaJoinRequest => "MESSAGE_TYPE_REPLICA_JOIN_REQUEST",
+            Self::ReplicaJoinResponse => "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -140,6 +440,13 @@ impl MessageType {
             "MESSAGE_TYPE_TABLET_COMMAND_RESPONSE" => Some(Self::TabletCommandResponse),
             "MESSAGE_TYPE_METADATA_REQUEST" => Some(Self::MetadataRequest),
             "MESSAGE_TYPE_METADATA_RESPONSE" => Some(Self::MetadataResponse),
+            "MESSAGE_TYPE_TABLET_READ_REQUEST" => Some(Self::TabletReadRequest),
+            "MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST" => {
+                Some(Self::TabletOutcomeQueryRequest)
+            }
+            "MESSAGE_TYPE_TABLET_SCAN_REQUEST" => Some(Self::TabletScanRequest),
+            "MESSAGE_TYPE_REPLICA_JOIN_REQUEST" => Some(Self::ReplicaJoinRequest),
+            "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE" => Some(Self::ReplicaJoinResponse),
             _ => None,
         }
     }

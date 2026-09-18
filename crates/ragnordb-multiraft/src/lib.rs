@@ -1,6 +1,9 @@
 use ragnordb_common::ids::NodeId;
 
 pub mod bootstrap;
+pub mod host;
+pub mod membership;
+pub mod meta;
 pub mod proposal;
 pub mod replica_startup;
 pub mod runtime;
@@ -8,12 +11,13 @@ pub mod snapshot;
 pub mod storage;
 pub mod tablet_apply;
 pub mod tablet_cluster;
+pub mod transport;
 
-/// Hosts all Raft group replicas assigned to one physical database node.
+/// Stable identity of one physical database node.
 ///
-/// Group registration must pass through the exactly-once bootstrap path before
-/// a runtime enters the active group map. The scheduler and A-WAL-backed group
-/// runtime are introduced in the following Milestone 4 phases.
+/// [`host::MultiRaftHost`] owns the registered replica runtimes and their
+/// shared-WAL lifecycle; this lightweight value remains the node identity used
+/// by bootstrap and transport configuration.
 #[derive(Debug, Clone)]
 pub struct MultiRaftNode {
     pub id: NodeId,

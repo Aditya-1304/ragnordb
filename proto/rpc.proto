@@ -3,6 +3,7 @@ package ragnordb.rpc;
 
 import "ids.proto";
 import "command.proto";
+import "row.proto";
 
 enum MessageType {
     MESSAGE_TYPE_UNSPECIFIED = 0;
@@ -11,6 +12,11 @@ enum MessageType {
     MESSAGE_TYPE_TABLET_COMMAND_RESPONSE = 3;
     MESSAGE_TYPE_METADATA_REQUEST = 4;
     MESSAGE_TYPE_METADATA_RESPONSE = 5;
+    MESSAGE_TYPE_TABLET_READ_REQUEST = 6;
+    MESSAGE_TYPE_TABLET_OUTCOME_QUERY_REQUEST = 7;
+    MESSAGE_TYPE_TABLET_SCAN_REQUEST = 8;
+    MESSAGE_TYPE_REPLICA_JOIN_REQUEST = 9;
+    MESSAGE_TYPE_REPLICA_JOIN_RESPONSE = 10;
 }
 
 message RpcFrame {
@@ -22,6 +28,66 @@ message RpcFrame {
 message TabletCommandRequest {
         ragnordb.ids.RequestId request_id = 1;
         ragnordb.command.TabletCommand command = 2;
+        ragnordb.ids.TabletId tablet_id = 3;
+        uint64 tablet_epoch = 4;
+        ragnordb.ids.LogicalCommandId logical_command_id = 5;
+        optional uint64 acknowledged_through = 6;
+        // Physical transport-attempt correlation. This is deliberately
+        // separate from RequestId and LogicalCommandId so a delayed response
+        // from an earlier retry cannot satisfy a newer waiter.
+        optional uint64 rpc_attempt_id = 7;
+}
+
+message TabletOutcomeQueryRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.LogicalCommandId logical_command_id = 2;
+        ragnordb.ids.TabletId tablet_id = 3;
+        uint64 tablet_epoch = 4;
+        optional uint64 rpc_attempt_id = 5;
+}
+
+message TabletReadRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.TabletId tablet_id = 2;
+        uint64 tablet_epoch = 3;
+        ragnordb.row.RowKey row_key = 4;
+        ragnordb.ids.Timestamp read_timestamp = 5;
+        ragnordb.ids.LogicalCommandId logical_command_id = 6;
+        optional uint64 rpc_attempt_id = 7;
+        // Conservative remaining caller budget for one forwarded attempt.
+        // The receiver never reconstructs a deadline from its wall clock.
+        optional uint64 deadline_remaining_ms = 8;
+}
+
+// A bounded, resumable read over one logical half-open tablet span. The
+// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
+// response so scan failures retain the established retry and attempt-correlation
+// fields without introducing a second response envelope.
+message TabletScanRequest {
+        ragnordb.ids.RequestId request_id = 1;
+        ragnordb.ids.TabletId tablet_id = 2;
+        uint64 tablet_epoch = 3;
+        optional bytes start_key = 4;
+        optional bytes end_key = 5;
+        optional bytes resume_after = 6;
+        ragnordb.ids.Timestamp read_timestamp = 7;
+        uint32 max_rows = 8;
+        uint32 max_bytes = 9;
+        optional uint64 rpc_attempt_id = 10;
+        // Conservative remaining caller budget for one forwarded attempt.
+        // The receiver never reconstructs a deadline from its wall clock.
+        optional uint64 deadline_remaining_ms = 11;
+}
+
+message TabletScanRow {
+        bytes key = 1;
+        bytes row = 2;
+}
+
+message TabletScanBatch {
+        repeated TabletScanRow rows = 1;
+        optional bytes next_resume_after = 2;
+        bool exhausted = 3;
 }
 
 message TabletCommandResponse {
@@ -31,6 +97,11 @@ message TabletCommandResponse {
     string error_code = 4;
     bool retryable = 5;
     bytes result_data = 6;
+    bool found = 7;
+    uint64 leader_replica_id = 8;
+    uint64 current_tablet_epoch = 9;
+    uint64 expected_tablet_epoch = 10;
+    optional uint64 rpc_attempt_id = 11;
 }
 
 message MetadataRequest {
@@ -38,6 +109,8 @@ message MetadataRequest {
         AllocateTimestampRequest allocate_timestamp = 1;
         LookupTabletRequest lookup_tablet = 2;
         LookupSchemaRequest lookup_schema = 3;
+        MetadataProposalRequest propose_command = 4;
+        MetadataConfChangeRequest propose_conf_change = 5;
     }
 }
 
@@ -58,7 +131,94 @@ message MetadataResponse {
         AllocateTimestampResponse allocate_timestamp = 1;
         LookupTabletResponse lookup_tablet = 2;
         LookupSchemaResponse lookup_schema = 3;
+        MetadataProposalResponse propose_command = 4;
+        MetadataConfChangeResponse propose_conf_change = 5;
     }
+}
+
+// A metadata proposal is forwarded as the exact command envelope created by
+// the gateway. The receiving node submits that envelope to its local metadata
+// Raft host, preserving durable logical identity across gateway changes.
+message MetadataProposalRequest {
+    optional uint64 rpc_attempt_id = 1;
+    ragnordb.ids.RequestId request_id = 2;
+    bytes command_envelope = 3;
+}
+
+message MetadataProposalResponse {
+    optional uint64 rpc_attempt_id = 1;
+    ragnordb.ids.RequestId request_id = 2;
+    bool success = 3;
+    string error_code = 4;
+    string error_message = 5;
+    bytes outcome = 6;
+    uint64 leader_replica_id = 7;
+}
+
+// Internal control-plane request used when a draining metadata member is not
+// the metadata leader. The receiving node proposes the ConfChange through its
+// Ready owner; it never mutates membership directly from the RPC thread.
+message MetadataConfChangeRequest {
+    optional uint64 rpc_attempt_id = 1;
+    uint64 expected_conf_state_version = 2;
+    ragnordb.ids.ReplicaId replica_id = 3;
+    bool remove_replica = 4;
+}
+
+message MetadataConfChangeResponse {
+    optional uint64 rpc_attempt_id = 1;
+    bool success = 2;
+    string error_code = 3;
+    string error_message = 4;
+    uint64 leader_replica_id = 5;
+}
+
+// Control-plane admission for a post-bootstrap replica lifetime. The target
+// persists this witness before registering its Raft and snapshot routes.
+message ReplicaJoinRequest {
+    optional uint64 rpc_attempt_id = 1;
+    string cluster_id = 2;
+    ragnordb.ids.RaftGroupId raft_group_id = 3;
+    ragnordb.ids.TabletId tablet_id = 4;
+    uint64 tablet_epoch = 5;
+    ragnordb.ids.ReplicaId replica_id = 6;
+    ragnordb.ids.NodeId physical_node_id = 7;
+    uint64 expected_current_conf_state_version = 8;
+    uint64 committed_membership_version = 9;
+    repeated ragnordb.ids.ReplicaId voters = 10;
+    repeated ragnordb.ids.ReplicaId learners = 11;
+    repeated ragnordb.ids.ReplicaId outgoing_voters = 12;
+    // Non-zero only for a promotion-readiness probe. The target must have
+    // crossed this leader's committed frontier locally before it replies
+    // success; zero is the route/materialization probe used before AddLearner.
+    uint64 leader_commit_index = 13;
+    bool require_caught_up = 14;
+}
+
+message ReplicaJoinResponse {
+    optional uint64 rpc_attempt_id = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+message MetadataProposalOutcome {
+    enum Kind {
+        KIND_UNSPECIFIED = 0;
+        APPLIED = 1;
+        ALREADY_APPLIED = 2;
+        CLIENT_REGISTERED = 3;
+        CLIENT_RENEWED = 4;
+        TABLE_CREATED = 5;
+        REJECTED = 6;
+    }
+
+    Kind kind = 1;
+    uint64 client_id = 2;
+    uint64 session_epoch = 3;
+    uint64 table_id = 4;
+    uint64 tablet_id = 5;
+    uint64 raft_group_id = 6;
+    string rejection = 7;
 }
 
 message AllocateTimestampResponse {
@@ -79,6 +239,8 @@ message LookupTabletResponse {
 
     ragnordb.ids.ReplicaId leader_replica_id = 4;
     repeated ReplicaRoute replicas = 5;
+    ragnordb.ids.RaftGroupId raft_group_id = 6;
+    uint64 tablet_epoch = 7;
 }
 
 message LookupSchemaResponse {

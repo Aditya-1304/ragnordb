@@ -15,7 +15,7 @@ mod metadata;
 pub use durable::{
     CatalogCreateOutcome, CatalogLogExtent, CatalogLogRecord, DurableCatalog, DurableCatalogLog,
 };
-pub use metadata::{MetadataApplyOutcome, MetadataState};
+pub use metadata::{MetadataApplyOutcome, MetadataRejection, MetadataState, MetadataTableCreated};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -195,7 +195,7 @@ pub trait Catalog: Send + Sync {
 ///
 /// Table identifiers start at one. Zero remains reserved so a default protobuf
 /// scalar cannot accidentally refer to a valid table.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryCatalog {
     table_ids_by_name: HashMap<String, TableId>,
     tables_by_id: BTreeMap<TableId, Arc<TableSchema>>,

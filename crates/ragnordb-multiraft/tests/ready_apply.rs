@@ -2,19 +2,26 @@ use std::{fs, path::PathBuf, process};
 
 use raft::{
     core::node::RaftNode,
-    message::{Envelope, InstallSnapshotRequest, Message},
+    message::{
+        AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest, Message,
+        ReadIndexResponse,
+    },
     storage::mem::MemStorage,
-    types::{ConfState, Snapshot},
+    types::{ConfChange, ConfChangeKind, ConfState, Snapshot},
 };
-use ragnordb_common::ids::{RaftGroupId, ReplicaId};
+use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
+    host::{
+        MultiRaftHost, MultiRaftRole, MultiRaftTurnBudget, MultiRaftTurnResult,
+        ReadyLoopHostedGroup, RoutedRaftMessage,
+    },
     runtime::{
         AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
         RaftSnapshotStore, ReadyApplyError, ReadyLoopError,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
-        persistence::{RaftWal, RaftWalStorage},
+        persistence::{NodeRaftWal, RaftWal, RaftWalStorage},
     },
 };
 use wal::{
@@ -68,10 +75,27 @@ impl RaftWal for TestWal {
     }
 }
 
+fn run_until(
+    host: &mut MultiRaftHost<TestWal>,
+    budget: MultiRaftTurnBudget,
+    mut ready: impl FnMut(&MultiRaftTurnResult) -> bool,
+) -> MultiRaftTurnResult {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let result = host.run_turn(0, budget).unwrap();
+        if ready(&result) {
+            return result;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
 #[derive(Default)]
 struct RecordingStateMachine {
     restored: Vec<u64>,
     applied: Vec<(u64, Vec<u8>)>,
+    fail_restore: bool,
     fail_apply: bool,
 }
 
@@ -79,6 +103,10 @@ impl RaftReadyStateMachine for RecordingStateMachine {
     type Error = &'static str;
 
     fn restore_snapshot(&mut self, snapshot: &Snapshot<Vec<u8>>) -> Result<(), Self::Error> {
+        if self.fail_restore {
+            return Err("snapshot restore failed");
+        }
+
         self.restored.push(snapshot.last_included_index);
         Ok(())
     }
@@ -115,6 +143,7 @@ impl RaftSnapshotStore for MemorySnapshotStore {
             last_included_term: snapshot.last_included_term,
             applied_index: snapshot.last_included_index,
             conf_state: snapshot.conf_state.clone(),
+            last_removed_replica: snapshot.last_removed_replica,
             size_bytes: snapshot.size_bytes,
             checksum: snapshot.checksum,
             file_name: format!(
@@ -150,6 +179,12 @@ fn new_loop() -> TestLoop {
     RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()))
 }
 
+fn new_follower_loop() -> TestLoop {
+    let node: TestNode = RaftNode::new(1, vec![2], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()))
+}
+
 fn prepare_leader(loop_: &mut TestLoop) {
     loop_.persist_next_ready(None).unwrap();
 
@@ -167,6 +202,7 @@ fn snapshot() -> Snapshot<Vec<u8>> {
         last_included_index: 5,
         last_included_term: 2,
         conf_state: ConfState::new(1, [raft::types::ReplicaId::must(1)], []).unwrap(),
+        last_removed_replica: None,
         size_bytes: data.len() as u64,
         checksum: *blake3::hash(&data).as_bytes(),
         data,
@@ -197,6 +233,500 @@ fn persisted_ready_applies_committed_entries_before_acknowledging_applied_fronti
         loop_.applied_frontier(),
         Some(AppliedRaftFrontier::new(1, ready.committed_entries[0].term))
     );
+}
+
+/// Catches configuration entries being routed through the tablet/state-machine
+/// decoder as if they were application commands, and catches membership state
+/// becoming visible before the shared Ready persistence boundary completes.
+#[test]
+fn configuration_ready_updates_membership_without_applying_a_tablet_command() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let index = loop_
+        .propose_conf_change(ConfChange {
+            expected_version: 1,
+            kind: ConfChangeKind::AddLearner(raft::types::ReplicaId::must(2)),
+        })
+        .unwrap();
+    let mut store = MemorySnapshotStore::default();
+    let mut state_machine = RecordingStateMachine::default();
+
+    let ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(index, 1);
+    assert!(matches!(
+        ready.committed_entries.first().map(|entry| &entry.payload),
+        Some(raft::entry::EntryPayload::Configuration(_))
+    ));
+    assert!(state_machine.applied.is_empty());
+    assert_eq!(loop_.raft().conf_state().version, 2);
+    assert!(
+        loop_
+            .raft()
+            .conf_state()
+            .learners
+            .contains(&raft::types::ReplicaId::must(2))
+    );
+    assert_eq!(loop_.raft().last_applied(), index);
+}
+
+#[test]
+fn host_status_publishes_committed_membership_and_replication_frontiers() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose_conf_change(
+        group_identity.raft_group_id,
+        ConfChange {
+            expected_version: 1,
+            kind: ConfChangeKind::AddLearner(raft::types::ReplicaId::must(2)),
+        },
+    )
+    .unwrap();
+
+    let status = &host.status().groups[0];
+    assert_eq!(status.conf_state_version, Some(2));
+    assert!(!status.joining);
+    assert_eq!(status.voters, vec![ReplicaId(1)]);
+    assert_eq!(status.learners, vec![ReplicaId(2)]);
+    assert_eq!(status.outgoing_voters, Vec::<ReplicaId>::new());
+    assert_eq!(status.pending_conf_change_index, None);
+    assert_eq!(
+        status.replica_match_indices,
+        vec![(ReplicaId(1), 1), (ReplicaId(2), 0)]
+    );
+}
+
+/// Catches releasing a quorum-confirmed read before the Ready that carries it
+/// has crossed the normal persistence and state-machine apply boundary, and
+/// catches treating the read's safe index as a new applied frontier.
+#[test]
+fn read_state_is_delivered_after_apply_without_moving_the_applied_frontier() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    loop_.propose(b"activation".to_vec(), 10).unwrap();
+
+    let mut store = MemorySnapshotStore::default();
+    let mut state_machine = RecordingStateMachine::default();
+    let activation_ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+    let frontier = loop_
+        .applied_frontier()
+        .expect("the activation entry must establish an applied frontier");
+
+    loop_
+        .activate_read_index(loop_.raft().current_term())
+        .unwrap();
+    loop_.read_index(b"read-after-activation".to_vec()).unwrap();
+
+    let read_ready = loop_
+        .persist_and_apply_next_ready(&mut store, &mut state_machine)
+        .unwrap()
+        .unwrap();
+
+    assert!(activation_ready.read_states.is_empty());
+    assert_eq!(state_machine.applied.len(), 1);
+    assert!(read_ready.committed_entries.is_empty());
+    assert_eq!(read_ready.read_states.len(), 1);
+    assert_eq!(
+        read_ready.read_states[0].request_ctx,
+        b"read-after-activation"
+    );
+    assert_eq!(read_ready.read_states[0].index, frontier.index);
+    assert_eq!(read_ready.read_states[0].term, frontier.term);
+    assert_eq!(loop_.applied_frontier(), Some(frontier));
+}
+
+/// Catches bypassing the physical-node lifecycle when a caller admits a
+/// ReadIndex request directly against a group instead of through the host.
+#[test]
+fn host_read_index_admission_delivers_the_group_tagged_read_state() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"host-correlated-read".to_vec(),
+    )
+    .unwrap();
+
+    let first = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    assert!(first.read_states.is_empty());
+
+    let result = run_until(&mut host, MultiRaftTurnBudget::default(), |result| {
+        !result.read_states.is_empty()
+    });
+
+    assert_eq!(result.read_states.len(), 1);
+    assert_eq!(result.read_states[0].0, group_identity.raft_group_id);
+    assert_eq!(result.read_states[0].1.request_ctx, b"host-correlated-read");
+}
+
+/// Catches the compatibility proposal path consuming a completed read Ready
+/// without returning its ReadState through a later bounded host turn.
+#[test]
+fn direct_host_operations_do_not_drop_completed_read_states() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"read-before-direct-proposal".to_vec(),
+    )
+    .unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"next-command".to_vec(),
+        b"next-command".len(),
+    )
+    .unwrap();
+
+    let result = host.run_turn(2, MultiRaftTurnBudget::default()).unwrap();
+    assert_eq!(result.read_states.len(), 1);
+    assert_eq!(
+        result.read_states[0].1.request_ctx,
+        b"read-before-direct-proposal"
+    );
+    assert!(
+        result.outbound.is_empty(),
+        "a deferred ReadState must be the only observable work in its host turn"
+    );
+}
+
+/// Catches publishing a deferred ReadState before a later message in the same
+/// host turn demotes its group. The state is safe only if the group is still
+/// the local leader in the state term after the complete turn finishes.
+#[test]
+fn host_turn_discards_deferred_read_state_after_same_turn_higher_term_message() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(
+        group_identity.raft_group_id,
+        b"stale-after-demotion".to_vec(),
+    )
+    .unwrap();
+
+    // The direct proposal drains the completed ReadState into the adapter's
+    // compatibility queue. It remains unpublished until the next host turn.
+    host.propose(
+        group_identity.raft_group_id,
+        b"next-command".to_vec(),
+        b"next-command".len(),
+    )
+    .unwrap();
+
+    host.enqueue_message(RoutedRaftMessage {
+        raft_group_id: group_identity.raft_group_id,
+        envelope: Envelope {
+            from: raft::types::ReplicaId::must(1),
+            to: raft::types::ReplicaId::must(1),
+            msg: Message::ReadIndexResponse(ReadIndexResponse {
+                term: term + 1,
+                request_id: 1,
+                context: b"stale-after-demotion".to_vec(),
+            }),
+        },
+    })
+    .unwrap();
+
+    let turn = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 2,
+                max_messages: 1,
+                ..MultiRaftTurnBudget::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(turn.messages_processed, 1);
+    assert!(turn.read_states.is_empty());
+    assert_eq!(host.status().groups[0].role, Some(MultiRaftRole::Follower));
+}
+
+/// Catches direct compatibility admission bypassing the adapter-owned
+/// deferred ReadState queue and accumulating completed states without bound.
+#[test]
+fn direct_read_index_rejects_admission_while_a_state_is_deferred() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+
+    host.propose(
+        group_identity.raft_group_id,
+        b"activation".to_vec(),
+        b"activation".len(),
+    )
+    .unwrap();
+    let term = host
+        .status()
+        .groups
+        .first()
+        .expect("the registered group must be visible")
+        .term;
+    host.activate_read_index(group_identity.raft_group_id, term)
+        .unwrap();
+    host.read_index(group_identity.raft_group_id, b"first-read".to_vec())
+        .unwrap();
+    host.propose(
+        group_identity.raft_group_id,
+        b"drain-first-read".to_vec(),
+        b"drain-first-read".len(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        host.read_index(group_identity.raft_group_id, b"second-read".to_vec()),
+        Err(ragnordb_multiraft::host::MultiRaftHostError::GroupRetryable {
+            raft_group_id,
+            ..
+        }) if raft_group_id == group_identity.raft_group_id
+    ));
+}
+
+/// Catches a host turn acknowledging a Ready after only part of its apply
+/// budget was available, which would either lose the remaining entries or
+/// admit a new Raft mutation before the applied frontier is complete.
+#[test]
+fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
+    let mut loop_ = new_loop();
+    prepare_leader(&mut loop_);
+    loop_.propose(b"command".to_vec(), 7).unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let _writer = host.issue_group_writer(identity()).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(identity().raft_group_id).unwrap();
+
+    let blocked = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 0,
+                max_apply_bytes: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+    assert_eq!(blocked.apply_entries, 0);
+    assert_eq!(blocked.ready_generations, 1);
+
+    let resumed = run_until(
+        &mut host,
+        MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        },
+        |result| result.apply_entries == 1,
+    );
+    assert_eq!(resumed.apply_entries, 1);
+    assert_eq!(resumed.ready_generations, 1);
+}
+
+/// Catches a follower delaying a durable replication acknowledgement behind
+/// tablet/MVCC apply. The acknowledgement is safe after the exact A-WAL
+/// boundary, while the applied frontier must remain unchanged until the
+/// ordered state-machine turn runs.
+#[test]
+fn durable_append_ack_is_released_before_apply_budget_is_available() {
+    let mut loop_ = new_follower_loop();
+    loop_.persist_next_ready(None).unwrap();
+    loop_
+        .step(Envelope {
+            from: raft::types::ReplicaId::must(2),
+            to: raft::types::ReplicaId::must(1),
+            msg: Message::AppendEntries(AppendEntriesRequest {
+                term: 1,
+                leader_id: raft::types::ReplicaId::must(2),
+                generation: 0,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![raft::entry::LogEntry::normal(1, 1, b"replicated".to_vec())],
+                leader_commit: 1,
+            }),
+        })
+        .unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine::default(),
+        MemorySnapshotStore::default(),
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(group_identity.raft_group_id)
+        .unwrap();
+
+    let persisted_only = run_until(
+        &mut host,
+        MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 0,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        },
+        |result| !result.outbound.is_empty(),
+    );
+
+    assert_eq!(persisted_only.apply_entries, 0);
+    assert_eq!(persisted_only.outbound.len(), 1);
+    assert!(matches!(
+        persisted_only.outbound[0].envelope.msg,
+        Message::AppendEntriesResponse(AppendEntriesResponse {
+            success: true,
+            match_index: Some(1),
+            ..
+        })
+    ));
+    assert_eq!(host.status().groups[0].applied_index, 0);
+    assert!(host.status().groups[0].pending_work);
+    assert_eq!(host.status().groups[0].apply_backlog_entries, 1);
+    assert!(host.status().groups[0].apply_backlog_bytes >= b"replicated".len());
+
+    let applied = host
+        .run_turn(
+            0,
+            MultiRaftTurnBudget {
+                max_groups: 1,
+                max_messages: 0,
+                max_ready_generations: 1,
+                max_apply_entries: 1,
+                max_apply_bytes: usize::MAX,
+                max_snapshot_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(applied.apply_entries, 1);
+    assert!(applied.outbound.is_empty());
+    assert_eq!(host.status().groups[0].applied_index, 1);
+    assert_eq!(host.status().groups[0].apply_backlog_entries, 0);
+    assert_eq!(host.status().groups[0].apply_backlog_bytes, 0);
 }
 
 /// Catches an application failure after WAL persistence from being treated as
@@ -263,6 +793,72 @@ fn snapshot_is_verified_restored_and_applied_before_ready_release() {
     assert_eq!(state_machine.restored, vec![5]);
     assert_eq!(loop_.raft().last_applied(), 5);
     assert_eq!(ready.snapshot.unwrap().last_included_index, 5);
+    assert!(
+        ready
+            .messages
+            .iter()
+            .any(|message| matches!(&message.msg, Message::InstallSnapshotResponse(_)))
+    );
+}
+
+/// Catches an InstallSnapshot success response crossing the shared-WAL
+/// boundary before the verified image has been restored into the state
+/// machine. A restore failure must therefore produce no outbound response.
+#[test]
+fn snapshot_install_response_waits_for_verified_restore() {
+    let snapshot = snapshot();
+    let mut node: TestNode = RaftNode::new(1, vec![2], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    node.step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+            3,
+            raft::types::ReplicaId::must(2),
+            snapshot.metadata(),
+        )),
+    });
+
+    let mut loop_ = RaftReadyLoop::new(node, RaftWalStorage::new(TestWal::new(), identity()));
+    let mut store = MemorySnapshotStore::default();
+    let mut initial_state_machine = RecordingStateMachine::default();
+    loop_
+        .persist_and_apply_next_ready(&mut store, &mut initial_state_machine)
+        .unwrap();
+    loop_.complete_snapshot_install(snapshot).unwrap();
+
+    let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(TestWal::new()));
+    let group_identity = identity();
+    let _writer = host.issue_group_writer(group_identity).unwrap();
+    host.register_new_group(Box::new(ReadyLoopHostedGroup::new(
+        loop_,
+        RecordingStateMachine {
+            fail_restore: true,
+            ..RecordingStateMachine::default()
+        },
+        store,
+    )))
+    .unwrap();
+    host.activate().unwrap();
+    host.schedule_group_now(group_identity.raft_group_id)
+        .unwrap();
+
+    let first = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    assert!(first.outbound.is_empty());
+    assert!(host.status().groups[0].quarantine_reason.is_none());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = loop {
+        let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+        if host.status().groups[0].quarantine_reason.is_some() {
+            break result;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+
+    assert!(result.outbound.is_empty());
+    assert!(host.status().groups[0].quarantine_reason.is_some());
 }
 
 /// Catches accepting a snapshot file after its contents changed since

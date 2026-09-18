@@ -1,14 +1,33 @@
 syntax = "proto3";
+
 package ragnordb.metadata;
 
 import "catalog.proto";
 import "ids.proto";
 
-// commands committed by the metadata Raft group. This schema intentionally
-// represents desired topology only; per-group committed membership belongs to
-// the Raft ConfState and current leadership is refreshed from live Raft state
+// Commands committed through the metadata Raft group.
+//
+// Metadata owns desired cluster topology and SQL/catalog state. It deliberately
+// does not own:
+//   - the current Raft leader, which is transient observation/cache state;
+//   - committed voters/learners, which belong to each group's Raft ConfState.
 message MetadataCommand {
     uint32 format_version = 1;
+
+    // Present for client-originated proposals. Startup compatibility commands
+    // may omit it because they predate metadata request deduplication.
+    ragnordb.ids.RequestId request_id = 9;
+
+    // Present with request_id. This version is separate from the command
+    // format_version because the same command payload is also used by legacy
+    // startup entries without an envelope.
+    uint32 envelope_version = 10;
+
+    // Topology-independent durable identity. `request_id` remains the
+    // proposal/RPC correlation identity, while this field is the metadata
+    // state machine's deduplication key and therefore carries the session
+    // epoch across reconnects.
+    ragnordb.ids.LogicalCommandId logical_command_id = 13;
 
     oneof command {
         ClusterInitialized cluster_initialized = 2;
@@ -17,6 +36,24 @@ message MetadataCommand {
         CreateTablet create_tablet = 5;
         SetDesiredReplicaPlacement set_desired_replica_placement = 6;
         UpdateTableSchema update_table_schema = 7;
+
+        // Phase 5.2 authoritative CREATE TABLE transition. The metadata state
+        // machine assigns all cluster-global identities when this entry applies.
+        CreateTableTopology create_table_topology = 8;
+
+        // Client retry-session control-plane records. Request outcomes remain
+        // tied to the session epoch and may not be silently recreated after
+        // metadata restart or client reconnect.
+        RegisterClient register_client = 11;
+        RenewClient renew_client = 12;
+
+        // Independent metadata proof that a committed Raft removal completed.
+        RecordReplicaRetirement record_replica_retirement = 14;
+
+        // Lifecycle changes are committed independently from the physical
+        // directory record so administrative control cannot rewrite endpoint
+        // identity while advancing a node through the drain protocol.
+        SetNodeLifecycle set_node_lifecycle = 15;
     }
 }
 
@@ -24,25 +61,96 @@ message ClusterInitialized {
     string cluster_id = 1;
 }
 
+// Durable physical-node directory record.
+//
+// Field 2 was used by the pre-Phase-5 experimental format for one generic
+// endpoint. It must never be reinterpreted as one of the production addresses.
 message NodeDescriptor {
     ragnordb.ids.NodeId node_id = 1;
-    string endpoint = 2;
+
+    reserved 2;
+
+    string raft_addr = 3;
+    string snapshot_addr = 4;
+    string sql_addr = 5;
+    string admin_addr = 6;
+
+    // Physical placement and lifecycle metadata. Empty locality labels retain
+    // compatibility with the original static bootstrap format.
+    string region = 7;
+    string zone = 8;
+    string rack = 9;
+    string storage_class = 10;
+    NodeLifecycle lifecycle = 11;
+}
+
+enum NodeLifecycle {
+    NODE_LIFECYCLE_UNSPECIFIED = 0;
+    NODE_LIFECYCLE_ACTIVE = 1;
+    NODE_LIFECYCLE_DRAINING = 2;
+    NODE_LIFECYCLE_DECOMMISSIONING = 3;
+    NODE_LIFECYCLE_DECOMMISSIONED = 4;
+    NODE_LIFECYCLE_TOMBSTONED = 5;
 }
 
 message RegisterNode {
     NodeDescriptor node = 1;
 }
 
+message SetNodeLifecycle {
+    ragnordb.ids.NodeId node_id = 1;
+    NodeLifecycle lifecycle = 2;
+}
+
 message CreateTable {
     ragnordb.catalog.TableDefinition table = 1;
 }
 
+// Unallocated SQL schema submitted to metadata Raft.
+//
+// The proposer supplies schema semantics only. Table/tablet/Raft identities,
+// schema version, tablet count and desired placement are metadata decisions.
+message CreateTableTopology {
+    string table_name = 1;
+    repeated ragnordb.catalog.ColumnDefinition columns = 2;
+    repeated uint64 primary_key_column_ids = 3;
+}
+
+message HashPartition {
+    // Zero-based bucket number.
+    uint32 bucket = 1;
+
+    // Total number of hash buckets for this table.
+    uint32 bucket_count = 2;
+}
+
+message RangePartition {
+    // Empty start_key means -infinity; empty end_key means +infinity.
+    bytes start_key = 1;
+    bytes end_key = 2;
+}
+
+message PartitionSpec {
+    oneof kind {
+        HashPartition hash = 1;
+        RangePartition range = 2;
+    }
+}
+
+// Stable mapping from one logical tablet to one Raft group.
+//
+// Field 5 was schema_version in the experimental metadata format. Schema
+// version belongs to the table definition and would become stale on every
+// schema update, so that field is permanently retired.
 message TabletDescriptor {
     ragnordb.ids.TabletId tablet_id = 1;
     ragnordb.ids.TableId table_id = 2;
     ragnordb.ids.RaftGroupId raft_group_id = 3;
     uint64 tablet_epoch = 4;
-    uint64 schema_version = 5;
+
+    reserved 5;
+
+    PartitionSpec partition = 6;
 }
 
 message CreateTablet {
@@ -61,13 +169,151 @@ message DesiredReplica {
     DesiredReplicaRole role = 3;
 }
 
+// Desired membership for one tablet.
+//
+// configuration_epoch is metadata authority only. It must not be interpreted
+// as the Raft ConfState version. Reconciliation compares this desired state to
+// the independently committed ConfState of the tablet Raft group.
 message SetDesiredReplicaPlacement {
     ragnordb.ids.TabletId tablet_id = 1;
     uint64 configuration_epoch = 2;
     repeated DesiredReplica replicas = 3;
+    PlacementPolicy placement_policy = 4;
+}
+
+// Placement constraints are metadata intent, not a copy of the currently
+// committed Raft ConfState. Reconciliation must satisfy these constraints
+// while it moves the group through safe learner/voter transitions.
+message PlacementPolicy {
+    uint32 replication_factor = 1;
+    uint32 min_distinct_regions = 2;
+    uint32 min_distinct_zones = 3;
+    uint32 min_distinct_racks = 4;
+    string required_storage_class = 5;
+    repeated ragnordb.ids.NodeId preferred_leader_nodes = 6;
 }
 
 message UpdateTableSchema {
     uint64 expected_schema_version = 1;
     ragnordb.catalog.TableDefinition table = 2;
+}
+
+message RegisterClient {
+    bytes client_id = 1;
+
+    // Zero requests the next metadata-assigned epoch. A non-zero value is
+    // used by a reconnecting client that has already obtained its epoch from
+    // the control plane and is being re-established at a gateway.
+    uint64 requested_session_epoch = 2;
+}
+
+message RenewClient {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 acknowledged_through = 3;
+}
+
+// Permanent record that one consensus identity has ended.
+//
+// Replica IDs are scoped to one Raft group, so the tombstone key is the full
+// (raft_group_id, replica_id) pair.
+message RetiredReplicaLifetime {
+    ragnordb.ids.RaftGroupId raft_group_id = 1;
+    ragnordb.ids.ReplicaId replica_id = 2;
+    uint64 desired_configuration_epoch = 3;
+    uint64 removed_conf_state_version = 4;
+    uint64 removal_index = 5;
+    uint64 removal_term = 6;
+}
+
+message RecordReplicaRetirement {
+    ragnordb.ids.RaftGroupId raft_group_id = 1;
+    ragnordb.ids.ReplicaId replica_id = 2;
+    uint64 desired_configuration_epoch = 3;
+    uint64 removed_conf_state_version = 4;
+    uint64 removal_index = 5;
+    uint64 removal_term = 6;
+}
+
+// Monotonic identity high-water marks owned by metadata.
+//
+// These values survive removal of visible metadata objects. A future DROP TABLE
+// must never make an old identity allocatable again.
+message MetadataAllocatorState {
+    uint64 max_table_id = 1;
+    uint64 max_tablet_id = 2;
+    uint64 max_raft_group_id = 3;
+    // Replica IDs are group-local but their allocation high-water mark is
+    // cluster-owned. Retaining it prevents a replacement lifetime from being
+    // reused in the interval between desired-placement removal and the second
+    // committed retirement proof.
+    uint64 max_replica_id = 4;
+}
+
+// Deterministic snapshot of the metadata Raft state machine.
+//
+// All repeated fields are serialized in ascending stable-ID order. This gives
+// one canonical representation for the same logical metadata projection.
+message MetadataSnapshot {
+    uint32 format_version = 1;
+
+    // The metadata group may technically snapshot before ClusterInitialized.
+    // Keep that state representable instead of manufacturing a cluster ID.
+    bool initialized = 2;
+    string cluster_id = 3;
+
+    repeated NodeDescriptor nodes = 4;
+    repeated ragnordb.catalog.TableDefinition tables = 5;
+    repeated TabletDescriptor tablets = 6;
+    repeated SetDesiredReplicaPlacement desired_placements = 7;
+    repeated RetiredReplicaLifetime retired_replicas = 8;
+
+    MetadataAllocatorState allocator_state = 9;
+
+    // Request results are part of replicated metadata state. Without this
+    // history, a retry after leadership change or snapshot restore could
+    // allocate a second table identity.
+    repeated MetadataRequestDeduplication request_deduplication = 10;
+
+    repeated ClientSession client_sessions = 11;
+}
+
+message ClientSession {
+    bytes client_id = 1;
+    uint64 session_epoch = 2;
+    uint64 acknowledged_through = 3;
+    uint64 first_retained_sequence = 4;
+}
+
+enum MetadataCachedOutcomeKind {
+    METADATA_CACHED_OUTCOME_UNSPECIFIED = 0;
+    METADATA_CACHED_OUTCOME_APPLIED = 1;
+    METADATA_CACHED_OUTCOME_ALREADY_APPLIED = 2;
+    METADATA_CACHED_OUTCOME_TABLE_CREATED = 3;
+    METADATA_CACHED_OUTCOME_REJECTED = 4;
+    METADATA_CACHED_OUTCOME_CLIENT_REGISTERED = 5;
+    METADATA_CACHED_OUTCOME_CLIENT_RENEWED = 6;
+}
+
+message MetadataRequestDeduplication {
+    ragnordb.ids.RequestId request_id = 1;
+    MetadataCachedOutcomeKind outcome_kind = 2;
+
+    // Populated only for METADATA_CACHED_OUTCOME_TABLE_CREATED.
+    uint64 table_id = 3;
+    uint64 tablet_id = 4;
+    uint64 raft_group_id = 5;
+
+    // Populated only for METADATA_CACHED_OUTCOME_REJECTED. The original
+    // rejection text is retained so a replay has the same client-visible
+    // deterministic result without re-evaluating current metadata state.
+    string rejection = 6;
+
+    bytes client_id = 7;
+    uint64 session_epoch = 8;
+
+    // New snapshots retain the logical identity independently of the legacy
+    // group-qualified request correlation ID. Readers of older snapshots may
+    // derive the compatibility identity from request_id.
+    ragnordb.ids.LogicalCommandId logical_command_id = 9;
 }

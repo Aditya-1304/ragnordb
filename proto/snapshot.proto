@@ -72,6 +72,11 @@ message TabletSnapshotMetadata {
     uint32 storage_format_version = 14;
     uint64 total_length = 15;
     bytes checksum = 16;
+    // Exact removal evidence retained when the log entry is compacted.
+    uint64 last_removed_replica_id = 17;
+    uint64 last_removed_replica_index = 18;
+    uint64 last_removed_replica_term = 19;
+    uint64 last_removed_conf_state_version = 20;
 }
 
 // the on-disk artifact contains metadata and the immutable state payload

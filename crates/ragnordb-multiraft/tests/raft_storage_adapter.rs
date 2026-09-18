@@ -123,6 +123,7 @@ fn durable_storage_with(wal: RecordingWal) -> RaftWalStorage<RecordingWal> {
                 last_included_term: 1,
                 applied_index: 2,
                 conf_state: conf_state(),
+                last_removed_replica: None,
                 size_bytes: 1024,
                 checksum: [7; 32],
                 file_name: "raft-81-91-2.snapshot".to_string(),

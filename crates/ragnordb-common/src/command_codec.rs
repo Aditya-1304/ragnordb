@@ -1,12 +1,22 @@
 use super::catalog_codec::TableDefinition as TableDef;
 use super::codec::{Row, WriteKind};
-use crate::ids::{RaftGroupId, RequestId, TabletId, Timestamp, TxnId};
+use crate::ids::{LogicalCommandId, RaftGroupId, RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::proto::command;
 /// the tablet command envelope format accepted
 pub const TABLET_COMMAND_ENVELOPE_VERSION: u32 = 2;
+
+/// Version of the bounded multi-command proposal envelope.
+pub const TABLET_COMMAND_BATCH_ENVELOPE_VERSION: u32 = 1;
+
+/// Keep one batch small enough that one Raft proposal does not monopolize the
+/// owner reactor or turn a single malformed entry into a large recovery unit.
+pub const MAX_TABLET_COMMAND_BATCH_COMMANDS: usize = 32;
+
+/// Maximum encoded size accepted for a multi-command proposal.
+pub const MAX_TABLET_COMMAND_BATCH_BYTES: usize = 1024 * 1024;
 
 /// tablet state machine snapshot format
 pub const TABLET_STATE_MACHINE_SNAPSHOT_VERSION: u32 = 2;
@@ -23,6 +33,14 @@ pub struct TabletCommandEnvelope {
     pub request_id: RequestId,
     pub tablet_id: TabletId,
     pub expected_epoch: u64,
+    /// Optional V2 identity. The legacy RequestId remains required on the
+    /// compatibility wire path because Raft proposal correlation still uses
+    /// its group-qualified form.
+    pub logical_command_id: Option<LogicalCommandId>,
+    /// Monotonic client acknowledgement watermark carried into the replicated
+    /// command log. Applying it and compacting older outcomes must be one
+    /// durable state-machine transition so expiry survives restart.
+    pub acknowledged_through: Option<u64>,
     pub command: TabletCommand,
 }
 
@@ -39,9 +57,51 @@ impl TabletCommandEnvelope {
             request_id,
             tablet_id,
             expected_epoch,
+            logical_command_id: None,
+            acknowledged_through: None,
             command,
         };
 
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Build an envelope carrying a topology-independent V2 logical identity.
+    pub fn new_with_logical_command_id(
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        command: TabletCommand,
+    ) -> Result<Self, TabletCommandEnvelopeError> {
+        Self::new_with_logical_command_id_and_ack(
+            request_id,
+            logical_command_id,
+            tablet_id,
+            expected_epoch,
+            None,
+            command,
+        )
+    }
+
+    /// Build a V2 envelope carrying the caller's acknowledged retry floor.
+    pub fn new_with_logical_command_id_and_ack(
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        tablet_id: TabletId,
+        expected_epoch: u64,
+        acknowledged_through: Option<u64>,
+        command: TabletCommand,
+    ) -> Result<Self, TabletCommandEnvelopeError> {
+        let envelope = Self {
+            format_version: TABLET_COMMAND_ENVELOPE_VERSION,
+            request_id,
+            tablet_id,
+            expected_epoch,
+            logical_command_id: Some(logical_command_id),
+            acknowledged_through,
+            command,
+        };
         envelope.validate()?;
         Ok(envelope)
     }
@@ -85,6 +145,11 @@ impl TabletCommandEnvelope {
                 "Raft group ID must be non-zero",
             ));
         }
+        if let Some(logical_command_id) = self.logical_command_id {
+            logical_command_id
+                .validate()
+                .map_err(TabletCommandEnvelopeError::InvalidLogicalCommandId)?;
+        }
 
         Ok(())
     }
@@ -110,6 +175,8 @@ impl TabletCommandEnvelope {
             request_id: Some(self.request_id.to_proto()),
             tablet_id: Some(self.tablet_id.to_proto()),
             expected_epoch: self.expected_epoch,
+            logical_command_id: self.logical_command_id.map(|id| id.to_proto()),
+            acknowledged_through: self.acknowledged_through,
             command: Some(
                 self.command
                     .to_proto()
@@ -135,6 +202,12 @@ impl TabletCommandEnvelope {
                     .ok_or(TabletCommandEnvelopeError::MissingField("tablet_id"))?,
             ),
             expected_epoch: proto.expected_epoch,
+            logical_command_id: proto
+                .logical_command_id
+                .map(LogicalCommandId::from_proto)
+                .transpose()
+                .map_err(TabletCommandEnvelopeError::InvalidLogicalCommandId)?,
+            acknowledged_through: proto.acknowledged_through,
             command: TabletCommand::from_proto(
                 proto
                     .command
@@ -165,10 +238,232 @@ pub enum TabletCommandEnvelopeError {
     #[error("invalid request ID: {0}")]
     InvalidRequestId(&'static str),
 
+    #[error("invalid logical command ID: {0}")]
+    InvalidLogicalCommandId(&'static str),
+
     #[error("invalid tablet command: {0}")]
     InvalidCommand(&'static str),
 
     #[error("cannot decode tablet command envelope: {0}")]
+    Decode(String),
+}
+
+/// A validated batch of complete tablet command envelopes.
+///
+/// Batching is intentionally defined above the individual command envelope,
+/// rather than by concatenating protobuf payloads. This keeps recovery able to
+/// validate every subcommand and lets proposal correlation retain one
+/// topology-independent identity per subcommand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletCommandBatchEnvelope {
+    pub format_version: u32,
+    pub commands: Vec<TabletCommandEnvelope>,
+}
+
+impl TabletCommandBatchEnvelope {
+    pub fn new(
+        commands: Vec<TabletCommandEnvelope>,
+    ) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        let batch = Self {
+            format_version: TABLET_COMMAND_BATCH_ENVELOPE_VERSION,
+            commands,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    /// Validate all structural invariants before a batch enters Raft.
+    pub fn validate(&self) -> Result<(), TabletCommandBatchEnvelopeError> {
+        if self.format_version != TABLET_COMMAND_BATCH_ENVELOPE_VERSION {
+            return Err(TabletCommandBatchEnvelopeError::UnsupportedVersion(
+                self.format_version,
+            ));
+        }
+        if self.commands.len() < 2 {
+            return Err(TabletCommandBatchEnvelopeError::TooFewCommands(
+                self.commands.len(),
+            ));
+        }
+        if self.commands.len() > MAX_TABLET_COMMAND_BATCH_COMMANDS {
+            return Err(TabletCommandBatchEnvelopeError::TooManyCommands(
+                self.commands.len(),
+            ));
+        }
+
+        let first = self
+            .commands
+            .first()
+            .expect("minimum batch length was validated above");
+        let target_tablet = first.tablet_id;
+        let target_epoch = first.expected_epoch;
+        let target_group = first.request_id.raft_group_id;
+        let mut request_ids = BTreeSet::new();
+        let mut logical_command_ids = BTreeSet::new();
+
+        for (index, envelope) in self.commands.iter().enumerate() {
+            envelope.validate().map_err(|source| {
+                TabletCommandBatchEnvelopeError::InvalidEnvelope {
+                    index,
+                    reason: source.to_string(),
+                }
+            })?;
+
+            if envelope.tablet_id != target_tablet {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedTablet {
+                    expected: target_tablet,
+                    received: envelope.tablet_id,
+                });
+            }
+            if envelope.expected_epoch != target_epoch {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedEpoch {
+                    expected: target_epoch,
+                    received: envelope.expected_epoch,
+                });
+            }
+            if envelope.request_id.raft_group_id != target_group {
+                return Err(TabletCommandBatchEnvelopeError::MismatchedRaftGroup {
+                    expected: target_group,
+                    received: envelope.request_id.raft_group_id,
+                });
+            }
+            if !envelope.command.is_batchable() {
+                return Err(TabletCommandBatchEnvelopeError::NonBatchableCommand {
+                    index,
+                    command: envelope.command.kind_name(),
+                });
+            }
+            if !request_ids.insert(envelope.request_id.clone()) {
+                return Err(TabletCommandBatchEnvelopeError::DuplicateRequestId(
+                    envelope.request_id.clone(),
+                ));
+            }
+            if let Some(logical_command_id) = envelope.logical_command_id
+                && !logical_command_ids.insert(logical_command_id)
+            {
+                return Err(TabletCommandBatchEnvelopeError::DuplicateLogicalCommandId(
+                    logical_command_id,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, TabletCommandBatchEnvelopeError> {
+        self.validate()?;
+        let encoded = self.to_proto().encode_to_vec();
+        if encoded.len() > MAX_TABLET_COMMAND_BATCH_BYTES {
+            return Err(TabletCommandBatchEnvelopeError::TooLarge {
+                encoded_bytes: encoded.len(),
+                max_bytes: MAX_TABLET_COMMAND_BATCH_BYTES,
+            });
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        if bytes.len() > MAX_TABLET_COMMAND_BATCH_BYTES {
+            return Err(TabletCommandBatchEnvelopeError::TooLarge {
+                encoded_bytes: bytes.len(),
+                max_bytes: MAX_TABLET_COMMAND_BATCH_BYTES,
+            });
+        }
+        let proto = command::TabletCommandBatchEnvelope::decode(bytes)
+            .map_err(|error| TabletCommandBatchEnvelopeError::Decode(error.to_string()))?;
+        if proto.commands.len() > MAX_TABLET_COMMAND_BATCH_COMMANDS {
+            return Err(TabletCommandBatchEnvelopeError::TooManyCommands(
+                proto.commands.len(),
+            ));
+        }
+        Self::from_proto(proto)
+    }
+
+    fn to_proto(&self) -> command::TabletCommandBatchEnvelope {
+        command::TabletCommandBatchEnvelope {
+            format_version: self.format_version,
+            commands: self
+                .commands
+                .iter()
+                .map(|command| {
+                    command
+                        .to_proto()
+                        .expect("validated batch contains valid command envelopes")
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(
+        proto: command::TabletCommandBatchEnvelope,
+    ) -> Result<Self, TabletCommandBatchEnvelopeError> {
+        let commands = proto
+            .commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                TabletCommandEnvelope::from_proto(command).map_err(|source| {
+                    TabletCommandBatchEnvelopeError::InvalidEnvelope {
+                        index,
+                        reason: source.to_string(),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let batch = Self {
+            format_version: proto.format_version,
+            commands,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum TabletCommandBatchEnvelopeError {
+    #[error("unsupported tablet command batch envelope version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("tablet command batch must contain at least two commands, received {0}")]
+    TooFewCommands(usize),
+
+    #[error("tablet command batch contains too many commands: {0}")]
+    TooManyCommands(usize),
+
+    #[error("tablet command batch command {index} is invalid: {reason}")]
+    InvalidEnvelope { index: usize, reason: String },
+
+    #[error("tablet command batch targets tablet {received:?}, expected {expected:?}")]
+    MismatchedTablet {
+        expected: TabletId,
+        received: TabletId,
+    },
+
+    #[error("tablet command batch targets epoch {received}, expected {expected}")]
+    MismatchedEpoch { expected: u64, received: u64 },
+
+    #[error("tablet command batch targets Raft group {received:?}, expected {expected:?}")]
+    MismatchedRaftGroup {
+        expected: RaftGroupId,
+        received: RaftGroupId,
+    },
+
+    #[error("tablet command batch command {index} ({command}) cannot be batched")]
+    NonBatchableCommand { index: usize, command: &'static str },
+
+    #[error("tablet command batch repeats request ID {0:?}")]
+    DuplicateRequestId(RequestId),
+
+    #[error("tablet command batch repeats logical command ID {0:?}")]
+    DuplicateLogicalCommandId(LogicalCommandId),
+
+    #[error("tablet command batch encodes to {encoded_bytes} bytes, maximum is {max_bytes}")]
+    TooLarge {
+        encoded_bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("cannot decode tablet command batch envelope: {0}")]
     Decode(String),
 }
 
@@ -228,6 +523,101 @@ pub enum CachedTabletCommandOutcome {
     Rejected(CachedTabletCommandRejection),
 }
 
+impl CachedTabletCommandOutcome {
+    /// Encode one retained outcome for the read-only outcome-query RPC. The
+    /// query payload intentionally reuses the snapshot outcome representation
+    /// so the same validation rules protect both recovery and live lookup.
+    pub fn encode_for_outcome_query(&self) -> Result<Vec<u8>, TabletStateMachineSnapshotError> {
+        Ok(outcome_to_proto(self).encode_to_vec())
+    }
+
+    /// Decode an outcome returned by a tablet owner without executing a new
+    /// command. A malformed outcome is corruption, never an invitation to
+    /// retry the mutation.
+    pub fn decode_from_outcome_query(
+        bytes: &[u8],
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
+        let proto = command::LogicalCommandDeduplicationSnapshot::decode(bytes)
+            .map_err(|error| TabletStateMachineSnapshotError::Decode(error.to_string()))?;
+        outcome_from_proto(proto.cached_result, proto.cached_rejection)
+    }
+}
+
+fn outcome_to_proto(
+    outcome: &CachedTabletCommandOutcome,
+) -> command::LogicalCommandDeduplicationSnapshot {
+    command::LogicalCommandDeduplicationSnapshot {
+        logical_command_id: None,
+        cached_result: match outcome {
+            CachedTabletCommandOutcome::Applied(result) => result.to_proto() as i32,
+            CachedTabletCommandOutcome::Rejected(_) => {
+                command::CachedTabletCommandResult::Unspecified as i32
+            }
+        },
+        cached_rejection: match outcome {
+            CachedTabletCommandOutcome::Applied(_) => None,
+            CachedTabletCommandOutcome::Rejected(rejection) => {
+                Some(command::CachedTabletCommandRejection {
+                    kind: match rejection.kind {
+                        CachedTabletCommandRejectionKind::InvalidCommand => {
+                            command::CachedTabletCommandRejectionKind::InvalidCommand
+                        }
+                        CachedTabletCommandRejectionKind::WriteConflict => {
+                            command::CachedTabletCommandRejectionKind::WriteConflict
+                        }
+                        CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                            command::CachedTabletCommandRejectionKind::UnsupportedCommand
+                        }
+                    } as i32,
+                    reason: rejection.reason.clone(),
+                })
+            }
+        },
+    }
+}
+
+fn outcome_from_proto(
+    cached_result: i32,
+    cached_rejection: Option<command::CachedTabletCommandRejection>,
+) -> Result<CachedTabletCommandOutcome, TabletStateMachineSnapshotError> {
+    if let Some(rejection) = cached_rejection {
+        if cached_result != command::CachedTabletCommandResult::Unspecified as i32 {
+            return Err(TabletStateMachineSnapshotError::MultipleCachedOutcomes);
+        }
+        let kind = match command::CachedTabletCommandRejectionKind::try_from(rejection.kind)
+            .map_err(|_| TabletStateMachineSnapshotError::InvalidCachedRejection(rejection.kind))?
+        {
+            command::CachedTabletCommandRejectionKind::InvalidCommand => {
+                CachedTabletCommandRejectionKind::InvalidCommand
+            }
+            command::CachedTabletCommandRejectionKind::WriteConflict => {
+                CachedTabletCommandRejectionKind::WriteConflict
+            }
+            command::CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                CachedTabletCommandRejectionKind::UnsupportedCommand
+            }
+            command::CachedTabletCommandRejectionKind::Unspecified => {
+                return Err(TabletStateMachineSnapshotError::InvalidCachedRejection(
+                    rejection.kind,
+                ));
+            }
+        };
+        return Ok(CachedTabletCommandOutcome::Rejected(
+            CachedTabletCommandRejection {
+                kind,
+                reason: rejection.reason,
+            },
+        ));
+    }
+
+    Ok(CachedTabletCommandOutcome::Applied(
+        CachedTabletCommandResult::from_proto(
+            command::CachedTabletCommandResult::try_from(cached_result)
+                .map_err(|_| TabletStateMachineSnapshotError::InvalidCachedResult(cached_result))?,
+        )?,
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedTabletCommandRejection {
     pub kind: CachedTabletCommandRejectionKind,
@@ -253,6 +643,11 @@ pub struct TabletStateMachineSnapshot {
     pub tablet_epoch: u64,
     pub raft_group_id: RaftGroupId,
     pub clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+    pub logical_commands: BTreeMap<LogicalCommandId, ClientDeduplicationSnapshot>,
+    /// Durable compaction watermarks keyed by `(client_id, session_epoch)`.
+    /// Retaining the watermark after deleting outcomes makes old retries fail
+    /// closed after snapshot restore.
+    pub logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
 }
 
 impl TabletStateMachineSnapshot {
@@ -262,12 +657,48 @@ impl TabletStateMachineSnapshot {
         raft_group_id: RaftGroupId,
         clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
     ) -> Result<Self, TabletStateMachineSnapshotError> {
+        Self::new_with_logical_commands(
+            tablet_id,
+            tablet_epoch,
+            raft_group_id,
+            clients,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn new_with_logical_commands(
+        tablet_id: TabletId,
+        tablet_epoch: u64,
+        raft_group_id: RaftGroupId,
+        clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+        logical_commands: BTreeMap<LogicalCommandId, ClientDeduplicationSnapshot>,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
+        Self::new_with_logical_commands_and_horizons(
+            tablet_id,
+            tablet_epoch,
+            raft_group_id,
+            clients,
+            logical_commands,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn new_with_logical_commands_and_horizons(
+        tablet_id: TabletId,
+        tablet_epoch: u64,
+        raft_group_id: RaftGroupId,
+        clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+        logical_commands: BTreeMap<LogicalCommandId, ClientDeduplicationSnapshot>,
+        logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
         let snapshot = Self {
             format_version: TABLET_STATE_MACHINE_SNAPSHOT_VERSION,
             tablet_id,
             tablet_epoch,
             raft_group_id,
             clients,
+            logical_commands,
+            logical_client_retry_horizons,
         };
 
         snapshot.validate()?;
@@ -299,6 +730,21 @@ impl TabletStateMachineSnapshot {
             .any(|client| client.last_sequence_applied == 0)
         {
             return Err(TabletStateMachineSnapshotError::ZeroRequestSequence);
+        }
+
+        for logical_command_id in self.logical_commands.keys() {
+            logical_command_id
+                .validate()
+                .map_err(TabletStateMachineSnapshotError::InvalidLogicalCommandId)?;
+        }
+
+        for (client_id, session_epoch) in self.logical_client_retry_horizons.keys() {
+            if *client_id == 0 {
+                return Err(TabletStateMachineSnapshotError::ZeroRetryHorizonClientId);
+            }
+            if *session_epoch == 0 {
+                return Err(TabletStateMachineSnapshotError::ZeroRetryHorizonSessionEpoch);
+            }
         }
 
         Ok(())
@@ -356,6 +802,45 @@ impl TabletStateMachineSnapshot {
                             },
                         ),
                     },
+                })
+                .collect(),
+            logical_commands: self
+                .logical_commands
+                .iter()
+                .map(|(logical_command_id, state)| {
+                    command::LogicalCommandDeduplicationSnapshot {
+                        logical_command_id: Some(logical_command_id.to_proto()),
+                        cached_result: match &state.cached_outcome {
+                            CachedTabletCommandOutcome::Applied(result) => result.to_proto() as i32,
+                            CachedTabletCommandOutcome::Rejected(_) => {
+                                command::CachedTabletCommandResult::Unspecified as i32
+                            }
+                        },
+                        cached_rejection: match &state.cached_outcome {
+                            CachedTabletCommandOutcome::Applied(_) => None,
+                            CachedTabletCommandOutcome::Rejected(rejection) => Some(
+                                command::CachedTabletCommandRejection {
+                                    kind: match rejection.kind {
+                                        CachedTabletCommandRejectionKind::InvalidCommand => command::CachedTabletCommandRejectionKind::InvalidCommand,
+                                        CachedTabletCommandRejectionKind::WriteConflict => command::CachedTabletCommandRejectionKind::WriteConflict,
+                                        CachedTabletCommandRejectionKind::UnsupportedCommand => command::CachedTabletCommandRejectionKind::UnsupportedCommand,
+                                    } as i32,
+                                    reason: rejection.reason.clone(),
+                                },
+                            ),
+                        },
+                    }
+                })
+                .collect(),
+            logical_client_retry_horizons: self
+                .logical_client_retry_horizons
+                .iter()
+                .map(|((client_id, session_epoch), acknowledged_through)| {
+                    command::LogicalClientRetryHorizon {
+                        client_id: client_id.to_le_bytes().to_vec(),
+                        session_epoch: *session_epoch,
+                        acknowledged_through: *acknowledged_through,
+                    }
                 })
                 .collect(),
         }
@@ -443,12 +928,112 @@ impl TabletStateMachineSnapshot {
             }
         }
 
+        let mut logical_commands = BTreeMap::new();
+        for logical_command in proto.logical_commands {
+            let logical_command_id =
+                LogicalCommandId::from_proto(logical_command.logical_command_id.ok_or(
+                    TabletStateMachineSnapshotError::MissingField(
+                        "logical_commands.logical_command_id",
+                    ),
+                )?)
+                .map_err(TabletStateMachineSnapshotError::InvalidLogicalCommandId)?;
+
+            let cached_outcome = if let Some(rejection) = logical_command.cached_rejection {
+                if logical_command.cached_result
+                    != command::CachedTabletCommandResult::Unspecified as i32
+                {
+                    return Err(TabletStateMachineSnapshotError::MultipleCachedOutcomes);
+                }
+                let kind = match command::CachedTabletCommandRejectionKind::try_from(rejection.kind)
+                    .map_err(|_| {
+                        TabletStateMachineSnapshotError::InvalidCachedRejection(rejection.kind)
+                    })? {
+                    command::CachedTabletCommandRejectionKind::InvalidCommand => {
+                        CachedTabletCommandRejectionKind::InvalidCommand
+                    }
+                    command::CachedTabletCommandRejectionKind::WriteConflict => {
+                        CachedTabletCommandRejectionKind::WriteConflict
+                    }
+                    command::CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                        CachedTabletCommandRejectionKind::UnsupportedCommand
+                    }
+                    command::CachedTabletCommandRejectionKind::Unspecified => {
+                        return Err(TabletStateMachineSnapshotError::InvalidCachedRejection(
+                            rejection.kind,
+                        ));
+                    }
+                };
+                CachedTabletCommandOutcome::Rejected(CachedTabletCommandRejection {
+                    kind,
+                    reason: rejection.reason,
+                })
+            } else {
+                CachedTabletCommandOutcome::Applied(CachedTabletCommandResult::from_proto(
+                    command::CachedTabletCommandResult::try_from(logical_command.cached_result)
+                        .map_err(|_| {
+                            TabletStateMachineSnapshotError::InvalidCachedResult(
+                                logical_command.cached_result,
+                            )
+                        })?,
+                )?)
+            };
+
+            if logical_commands
+                .insert(
+                    logical_command_id,
+                    ClientDeduplicationSnapshot {
+                        last_sequence_applied: 1,
+                        cached_outcome,
+                    },
+                )
+                .is_some()
+            {
+                return Err(TabletStateMachineSnapshotError::DuplicateLogicalCommand(
+                    logical_command_id,
+                ));
+            }
+        }
+
+        let mut logical_client_retry_horizons = BTreeMap::new();
+        for horizon in proto.logical_client_retry_horizons {
+            if horizon.client_id.len() != 16 {
+                return Err(TabletStateMachineSnapshotError::InvalidRetryHorizonClientId);
+            }
+            let client_id = u128::from_le_bytes(
+                horizon
+                    .client_id
+                    .as_slice()
+                    .try_into()
+                    .expect("retry horizon client ID length was checked"),
+            );
+            if client_id == 0 {
+                return Err(TabletStateMachineSnapshotError::ZeroRetryHorizonClientId);
+            }
+            if horizon.session_epoch == 0 {
+                return Err(TabletStateMachineSnapshotError::ZeroRetryHorizonSessionEpoch);
+            }
+            if logical_client_retry_horizons
+                .insert(
+                    (client_id, horizon.session_epoch),
+                    horizon.acknowledged_through,
+                )
+                .is_some()
+            {
+                return Err(TabletStateMachineSnapshotError::DuplicateRetryHorizon {
+                    client_id,
+                    session_epoch: horizon.session_epoch,
+                });
+            }
+        }
+
         let snapshot = Self {
             format_version: proto.format_version,
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
             raft_group_id,
             clients,
+            logical_commands,
+            logical_client_retry_horizons,
         };
 
         snapshot.validate()?;
@@ -488,6 +1073,12 @@ pub enum TabletStateMachineSnapshotError {
     #[error("tablet state-machine snapshot contains duplicate client {0:#034x}")]
     DuplicateClient(u128),
 
+    #[error("tablet state-machine snapshot contains duplicate logical command {0:?}")]
+    DuplicateLogicalCommand(LogicalCommandId),
+
+    #[error("invalid logical command ID in tablet state-machine snapshot: {0}")]
+    InvalidLogicalCommandId(&'static str),
+
     #[error("tablet state-machine snapshot contains unknown cached result {0}")]
     InvalidCachedResult(i32),
 
@@ -496,6 +1087,20 @@ pub enum TabletStateMachineSnapshotError {
 
     #[error("tablet state-machine snapshot contains both a cached result and rejection")]
     MultipleCachedOutcomes,
+
+    #[error("tablet snapshot contains a retry horizon for client ID zero")]
+    ZeroRetryHorizonClientId,
+
+    #[error("tablet snapshot contains a retry horizon with session epoch zero")]
+    ZeroRetryHorizonSessionEpoch,
+
+    #[error("tablet snapshot retry horizon client ID must be exactly 16 bytes")]
+    InvalidRetryHorizonClientId,
+
+    #[error(
+        "tablet snapshot contains duplicate retry horizon for client {client_id:#034x}, session epoch {session_epoch}"
+    )]
+    DuplicateRetryHorizon { client_id: u128, session_epoch: u64 },
 
     #[error("tablet state-machine snapshot contains an unspecified cached result")]
     UnspecifiedCachedResult,
@@ -956,6 +1561,32 @@ pub enum TabletCommand {
 }
 
 impl TabletCommand {
+    /// Return whether this command may share one Raft entry with adjacent
+    /// mutation commands for the same tablet. Catalog changes, barriers, and
+    /// other ordering boundaries intentionally remain standalone entries.
+    pub fn is_batchable(&self) -> bool {
+        matches!(
+            self,
+            TabletCommand::Prewrite(_)
+                | TabletCommand::Commit(_)
+                | TabletCommand::Rollback(_)
+                | TabletCommand::SingleShardCommit(_)
+                | TabletCommand::ResolveIntent(_)
+        )
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            TabletCommand::Prewrite(_) => "prewrite",
+            TabletCommand::Commit(_) => "commit",
+            TabletCommand::Rollback(_) => "rollback",
+            TabletCommand::SingleShardCommit(_) => "single-shard-commit",
+            TabletCommand::ResolveIntent(_) => "resolve-intent",
+            TabletCommand::Catalog(_) => "catalog",
+            TabletCommand::Noop(_) => "noop",
+        }
+    }
+
     pub fn to_proto(&self) -> Result<command::TabletCommand, &'static str> {
         let command = match self {
             TabletCommand::Prewrite(command) => Some(command::tablet_command::Command::Prewrite(
@@ -1018,7 +1649,7 @@ mod tests {
     use super::super::catalog_codec::{ColumnDefinition, DataType};
     use super::*;
     use crate::codec::{Row, TxnStatus, Value, WriteKind};
-    use crate::ids::ColumnId;
+    use crate::ids::{ClientRequestId, ColumnId, CommandKind, LogicalCommandId};
 
     #[test]
     fn prewrite_command_roundtrip() {
@@ -1346,6 +1977,67 @@ mod tests {
     }
 
     #[test]
+    fn tablet_command_envelope_roundtrip_preserves_logical_identity() {
+        let logical_command_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 17,
+                session_epoch: 2,
+                request_sequence: 3,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Noop,
+        };
+        let envelope = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 17,
+                sequence: 3,
+                raft_group_id: RaftGroupId(12),
+            },
+            logical_command_id,
+            TabletId(41),
+            3,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+
+        assert_eq!(
+            TabletCommandEnvelope::decode(&envelope.encode().unwrap()).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn tablet_command_envelope_allows_transport_route_changes() {
+        let logical_command_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 17,
+                session_epoch: 2,
+                request_sequence: 8,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Noop,
+        };
+
+        let envelope = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                // The transport identity is correlation/routing metadata. It
+                // may change when the command is forwarded to another Raft
+                // group or tablet; the logical identity remains stable.
+                client_id: 99,
+                sequence: 3,
+                raft_group_id: RaftGroupId(12),
+            },
+            logical_command_id,
+            TabletId(41),
+            3,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+
+        assert_eq!(envelope.logical_command_id, Some(logical_command_id));
+    }
+
+    #[test]
     fn tablet_command_envelope_rejects_unknown_format_version() {
         let envelope = TabletCommandEnvelope::new(
             RequestId {
@@ -1368,5 +2060,20 @@ mod tests {
             error,
             TabletCommandEnvelopeError::UnsupportedVersion(TABLET_COMMAND_ENVELOPE_VERSION + 1)
         );
+    }
+
+    #[test]
+    fn cached_outcome_query_roundtrip_preserves_rejection_semantics() {
+        let outcome = CachedTabletCommandOutcome::Rejected(CachedTabletCommandRejection {
+            kind: CachedTabletCommandRejectionKind::WriteConflict,
+            reason: "committed version is newer".to_string(),
+        });
+
+        let decoded = CachedTabletCommandOutcome::decode_from_outcome_query(
+            &outcome.encode_for_outcome_query().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(decoded, outcome);
     }
 }

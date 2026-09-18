@@ -50,6 +50,20 @@ fn metadata_round_trip_preserves_snapshot_identity_and_boundary() {
     assert_eq!(decoded, image.metadata);
 }
 
+/// Catches dropping the exact membership-removal proof from an immutable
+/// tablet snapshot. A compacted removal entry must remain auditable after
+/// file reopen and snapshot transfer.
+#[test]
+fn metadata_round_trip_preserves_replica_removal_proof() {
+    let mut metadata = snapshot_image().metadata;
+    metadata.last_removed_replica = Some((ReplicaId(99), 11, 3, 6));
+    metadata.validate().unwrap();
+
+    let decoded = TabletSnapshotMetadata::decode(&metadata.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded.last_removed_replica, metadata.last_removed_replica);
+}
+
 /// Catches accepting a snapshot whose file was truncated or whose contents
 /// changed after its checksum was calculated.
 #[test]

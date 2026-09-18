@@ -6,6 +6,36 @@
 //!  Additional errors will be introduced later alongside
 //! the transaction, routing, and Raft milestones
 
+use serde::{Deserialize, Serialize};
+
+use crate::ids::TabletId;
+
+/// Serializable client-facing frames for the opt-in bounded result stream.
+/// `ResultEnd` is deliberately a distinct enum variant from `ResultError`, so
+/// a consumer cannot mistake batches received before a failed tablet read for
+/// a successfully completed distributed scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum StreamingResultFrame {
+    #[serde(rename = "result_start")]
+    ResultStart { columns: Vec<String>, read_ts: u64 },
+    #[serde(rename = "row_batch")]
+    RowBatch {
+        rows: Vec<Vec<u8>>,
+        row_count: u32,
+        byte_count: u32,
+    },
+    #[serde(rename = "result_end")]
+    ResultEnd { row_count: u64 },
+    #[serde(rename = "result_error")]
+    ResultError {
+        code: String,
+        message: String,
+        retryable: bool,
+        rows_emitted: u64,
+    },
+}
+
 /// Canonical error type shared across RagnorDB crates.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -58,9 +88,49 @@ pub enum Error {
     #[error("node is not the tablet leader; current leader is {leader_id:?}")]
     NotLeader { leader_id: Option<u64> },
 
+    /// The route was valid when issued, but the tablet generation changed
+    /// before admission. The caller must refresh metadata before retrying.
+    #[error("tablet epoch is stale; expected {expected_epoch}, current epoch is {current_epoch}")]
+    StaleTabletEpoch {
+        current_epoch: u64,
+        expected_epoch: u64,
+    },
+
+    /// No authoritative leader was published for the requested group.
+    #[error("tablet leader is currently unknown")]
+    LeaderUnknown,
+
+    /// The group exists in metadata but cannot currently admit work.
+    #[error("tablet is temporarily unavailable: {reason}")]
+    TabletUnavailable { reason: String },
+
+    /// The server cannot prove whether the logical operation was applied.
+    /// Retries are safe only after the retained identity outcome is queried.
+    #[error("logical request outcome is unknown: {identity}")]
+    RequestOutcomeUnknown { identity: String },
+
+    /// The request identity has fallen outside the retained retry horizon.
+    #[error("request identity has expired: {identity}")]
+    RequestIdExpired { identity: String },
+
+    /// A session epoch older than the durable client session floor was used.
+    #[error("client session epoch has expired: {session_epoch}")]
+    ClientSessionExpired { session_epoch: u64 },
+
     /// A proposal lost leadership or exceeded its deadline before apply.
     #[error("replicated proposal did not reach a known apply result: {reason}")]
     ProposalUnavailable { reason: String },
+
+    /// One required tablet in an all-or-nothing distributed scan could not
+    /// provide its assigned logical span. `retryable` is part of the semantic
+    /// error contract because the gateway must not retry a permanent failure
+    /// as though it were a stale leader or transient outage.
+    #[error("distributed scan failed on tablet {tablet_id:?} (retryable={retryable}): {reason}")]
+    DistributedScanFailed {
+        tablet_id: TabletId,
+        retryable: bool,
+        reason: String,
+    },
 
     /// A-WAL rejected the database record before assigning it a logical extent
     ///
@@ -163,5 +233,98 @@ pub enum Error {
     },
 }
 
+/// Canonical action associated with a client-visible distributed error.
+///
+/// This is deliberately more precise than the legacy boolean `retryable`: an
+/// unknown mutation must be queried with its original identity, never replayed
+/// as a fresh transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    None,
+    RetrySameRequest,
+    RestartTransaction,
+    QueryOriginalOutcome,
+}
+
+impl Error {
+    pub const fn retry_action(&self) -> RetryAction {
+        match self {
+            Self::NotLeader { .. }
+            | Self::StaleTabletEpoch { .. }
+            | Self::LeaderUnknown
+            | Self::TabletUnavailable { .. }
+            | Self::ProposalUnavailable { .. }
+            | Self::StatementTimeout { .. } => RetryAction::RetrySameRequest,
+            Self::DistributedScanFailed {
+                retryable: true, ..
+            } => RetryAction::RetrySameRequest,
+            Self::RequestOutcomeUnknown { .. }
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::CatalogOutcomeUnknown { .. }
+            | Self::CheckpointOutcomeUnknown { .. } => RetryAction::QueryOriginalOutcome,
+            Self::WriteConflict(_) => RetryAction::RestartTransaction,
+            Self::RequestIdExpired { .. }
+            | Self::ClientSessionExpired { .. }
+            | Self::ConstraintViolation(_)
+            | Self::InvalidArgument(_)
+            | Self::CorruptData(_)
+            | Self::NotImplemented(_)
+            | Self::SqlParse(_)
+            | Self::UnsupportedSql(_)
+            | Self::SchemaMismatch(_)
+            | Self::Configuration(_)
+            | Self::DistributedScanFailed {
+                retryable: false, ..
+            }
+            | Self::WalAppendNotStaged { .. }
+            | Self::RecoveryRequired { .. }
+            | Self::RecoveryFailed { .. }
+            | Self::SnapshotPublicationFailed { .. } => RetryAction::None,
+        }
+    }
+}
+
 /// Standard result type used throughout RagnorDB
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, RetryAction};
+
+    #[test]
+    fn unknown_mutation_outcome_requires_lookup_not_fresh_retry() {
+        assert_eq!(
+            Error::RequestOutcomeUnknown {
+                identity: "client=1/epoch=2/sequence=3".to_string(),
+            }
+            .retry_action(),
+            RetryAction::QueryOriginalOutcome
+        );
+        assert_eq!(
+            Error::NotLeader { leader_id: None }.retry_action(),
+            RetryAction::RetrySameRequest
+        );
+    }
+
+    #[test]
+    fn distributed_scan_failure_preserves_tablet_and_retry_policy() {
+        assert_eq!(
+            Error::DistributedScanFailed {
+                tablet_id: crate::ids::TabletId(12),
+                retryable: true,
+                reason: "leader election in progress".to_string(),
+            }
+            .retry_action(),
+            RetryAction::RetrySameRequest
+        );
+        assert_eq!(
+            Error::DistributedScanFailed {
+                tablet_id: crate::ids::TabletId(12),
+                retryable: false,
+                reason: "corrupt scan response".to_string(),
+            }
+            .retry_action(),
+            RetryAction::None
+        );
+    }
+}

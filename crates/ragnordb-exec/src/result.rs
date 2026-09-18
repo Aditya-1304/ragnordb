@@ -5,6 +5,7 @@
 //! JSON allows future protocol implementations to reuse the execution layer.
 
 use ragnordb_common::{
+    Result,
     catalog_codec::DataType,
     codec::Row,
     ids::{TableId, Timestamp, TxnId},
@@ -32,6 +33,31 @@ pub struct ResultColumn {
 pub struct ResultSet {
     pub columns: Vec<ResultColumn>,
     pub rows: Vec<Row>,
+}
+
+/// Bounded producer interface used by the V2 streaming protocol.
+///
+/// Implementations must block or reject `push_batch` when their bounded
+/// transport queue is full. That backpressure deliberately runs on the SQL
+/// blocking worker, stopping additional tablet pages from being requested
+/// while the client is slow. `cancelled` lets a disconnected client or an
+/// expired statement release the database owner without waiting for another
+/// batch to fill.
+pub trait QueryResultSink {
+    fn start(&mut self, columns: Vec<ResultColumn>, read_ts: Timestamp) -> Result<()>;
+
+    fn push_batch(&mut self, rows: Vec<Row>) -> Result<()>;
+
+    fn cancelled(&self) -> bool;
+}
+
+/// Successful completion metadata returned only after every required scan
+/// span has finished. The server emits `ResultEnd` from this value; errors
+/// after earlier batches therefore cannot be mistaken for a complete result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryStreamSummary {
+    pub read_ts: Timestamp,
+    pub rows_read: u64,
 }
 
 /// Supported data-mutation operation.

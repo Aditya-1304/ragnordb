@@ -46,6 +46,10 @@ const fn default_statement_logging() -> StatementLogging {
     StatementLogging::MetadataOnly
 }
 
+fn default_storage_class() -> String {
+    "default".to_string()
+}
+
 const fn default_snapshot_interval_entries() -> u64 {
     DEFAULT_SNAPSHOT_INTERVAL_ENTRIES
 }
@@ -62,6 +66,12 @@ const fn default_snapshot_chunk_bytes() -> u64 {
     DEFAULT_SNAPSHOT_CHUNK_BYTES
 }
 
+fn default_reactor_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
 /// Static address information for one cluster seed node.
 ///
 /// Seed-node IDs and addresses must be stable across restarts. The metadata
@@ -76,6 +86,18 @@ pub struct SeedNodeConfig {
     pub snapshot_addr: SocketAddr,
     pub sql_addr: SocketAddr,
     pub admin_addr: SocketAddr,
+
+    #[serde(default)]
+    pub region: Option<String>,
+
+    #[serde(default)]
+    pub zone: Option<String>,
+
+    #[serde(default)]
+    pub rack: Option<String>,
+
+    #[serde(default = "default_storage_class")]
+    pub storage_class: String,
 }
 
 /// Validated runtime configuration for one RagnorDB node.
@@ -128,6 +150,10 @@ pub struct NodeConfig {
 
     /// Maximum payload carried by one out-of-band snapshot transport chunk.
     pub snapshot_chunk_bytes: u64,
+
+    /// Number of fixed ownership reactors used for replicated tablet state.
+    /// Live groups are not moved between reactors after assignment.
+    pub reactor_count: usize,
 }
 
 /// Deserialization-only representation of the TOML file
@@ -172,6 +198,9 @@ struct NodeConfigFile {
     max_snapshot_file_bytes: u64,
     #[serde(default = "default_snapshot_chunk_bytes")]
     snapshot_chunk_bytes: u64,
+
+    #[serde(default = "default_reactor_count")]
+    reactor_count: usize,
 }
 
 const fn default_max_connections() -> u32 {
@@ -203,6 +232,7 @@ impl NodeConfig {
             snapshot_min_elapsed_ms: DEFAULT_SNAPSHOT_MIN_ELAPSED_MS,
             max_snapshot_file_bytes: DEFAULT_MAX_SNAPSHOT_FILE_BYTES,
             snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+            reactor_count: default_reactor_count(),
         };
 
         config.validate()?;
@@ -251,6 +281,7 @@ impl NodeConfig {
             snapshot_min_elapsed_ms: file.snapshot_min_elapsed_ms,
             max_snapshot_file_bytes: file.max_snapshot_file_bytes,
             snapshot_chunk_bytes: file.snapshot_chunk_bytes,
+            reactor_count: file.reactor_count,
         };
 
         config.validate()?;
@@ -319,6 +350,12 @@ impl NodeConfig {
             ));
         }
 
+        if self.reactor_count == 0 {
+            return Err(Error::Configuration(
+                "reactor_count must be greater than zero".to_string(),
+            ));
+        }
+
         if self.snapshot_interval_entries == 0
             || self.snapshot_interval_bytes == 0
             || self.max_snapshot_file_bytes == 0
@@ -373,6 +410,16 @@ impl NodeConfig {
                 ));
             }
 
+            validate_locality_label("region", &seed.region)?;
+            validate_locality_label("zone", &seed.zone)?;
+            validate_locality_label("rack", &seed.rack)?;
+            if seed.storage_class.trim().is_empty() {
+                return Err(Error::Configuration(format!(
+                    "seed node {} storage_class cannot be empty",
+                    seed.id.0
+                )));
+            }
+
             if !node_ids.insert(seed.id) {
                 return Err(Error::Configuration(format!(
                     "duplicate seed node ID: {}",
@@ -422,17 +469,47 @@ impl NodeConfig {
             }
         }
 
-        if !self.seed_nodes.is_empty()
-            && !self.seed_nodes.iter().any(|seed| seed.id == self.node_id)
-        {
-            return Err(Error::Configuration(format!(
-                "local node ID {} is missing from the static seed-node list",
-                self.node_id.0
-            )));
-        }
+        if !self.seed_nodes.is_empty() {
+            let local_seed = self
+                .seed_nodes
+                .iter()
+                .find(|seed| seed.id == self.node_id)
+                .ok_or_else(|| {
+                    Error::Configuration(format!(
+                        "local node ID {} is missing from the static seed-node list",
+                        self.node_id.0,
+                    ))
+                })?;
 
+            // Metadata will publish these addresses as the durable physical-node
+            // directory. Publishing an address different from the one this process
+            // actually binds would make otherwise correct routing permanently wrong.
+            if local_seed.sql_addr != self.listen_addr {
+                return Err(Error::Configuration(format!(
+                    "local seed SQL address {} does not match listen_addr {}",
+                    local_seed.sql_addr, self.listen_addr,
+                )));
+            }
+
+            if local_seed.admin_addr != self.admin_addr {
+                return Err(Error::Configuration(format!(
+                    "local seed admin address {} does not match admin_addr {}",
+                    local_seed.admin_addr, self.admin_addr,
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_locality_label(field: &'static str, value: &Option<String>) -> Result<()> {
+    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(Error::Configuration(format!(
+            "seed node {field} cannot be an empty string"
+        )));
+    }
+
+    Ok(())
 }
 
 fn derive_admin_addr(listen_addr: SocketAddr) -> Result<SocketAddr> {
@@ -467,6 +544,7 @@ mod tests {
         assert_eq!(config.shutdown_grace_period_ms, 5_000);
         assert_eq!(config.statement_logging, StatementLogging::MetadataOnly);
         assert!(config.seed_nodes.is_empty());
+        assert!(config.reactor_count > 0);
     }
 
     #[test]
@@ -494,6 +572,7 @@ shutdown_grace_period_ms = 7000
 statement_logging = "redacted"
 cluster_id = "ragnordb-dev"
 bootstrap = true
+reactor_count = 3
 
 [[seed_nodes]]
 id = 1
@@ -527,6 +606,26 @@ admin_addr = "127.0.0.1:7203"
         assert_eq!(config.seed_nodes.len(), 3);
         assert_eq!(config.cluster_id.as_deref(), Some("ragnordb-dev"));
         assert!(config.bootstrap);
+        assert_eq!(config.reactor_count, 3);
+    }
+
+    #[test]
+    fn rejects_zero_reactor_count() {
+        let error = NodeConfig::from_toml_str(
+            r#"
+node_id = 1
+data_dir = "./data/n1"
+listen_addr = "127.0.0.1:7101"
+reactor_count = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reactor_count must be greater than zero")
+        );
     }
 
     #[test]

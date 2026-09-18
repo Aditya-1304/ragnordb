@@ -224,7 +224,12 @@ fn new_replica_uses_durable_bootstrap_before_becoming_visible() {
         started.tablet.state_machine().raft_group_id(),
         RAFT_GROUP_ID
     );
-    assert!(started.initial_ready.conf_state.is_some());
+    assert!(
+        started
+            .initial_ready
+            .as_ref()
+            .is_some_and(|ready| ready.conf_state.is_some())
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

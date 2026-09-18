@@ -1,27 +1,44 @@
 pub mod admin;
+mod bootstrap;
 pub mod build_info;
 pub mod config;
 pub mod data_directory_lock;
 pub mod database;
+pub mod drain_jobs;
 pub mod metrics;
+pub mod multiraft_runtime;
+pub mod node_lifecycle;
 pub mod protocol;
+pub(crate) mod replica_join;
+pub mod replica_registry;
 pub mod replicated_tablet;
+pub mod rpc;
 pub mod session;
 mod snapshot_transport;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use admin::AdminState;
 use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
-use database::{LocalDatabase, SharedLocalDatabase};
+use data_directory_lock::DataDirectoryLock;
+use database::{LocalDatabase, SharedDatabaseServices, SharedLocalDatabase};
+use multiraft_runtime::MultiRaftRuntime;
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
-use ragnordb_common::protocol::{read_frame, write_frame};
-use replicated_tablet::{ReplicatedTabletHandle, ReplicatedTabletRuntime};
+use ragnordb_common::protocol::{
+    ClientRequestFrame, ClientRequestV2, StreamingResultFrame, read_client_frame, write_frame,
+    write_streaming_result_frame,
+};
+use ragnordb_common::{Error, Result as CommonResult, codec::Row, encoding::encode_row};
+use ragnordb_exec::{QueryResultSink, SharedMetadataTableCreator};
+use replicated_tablet::ReplicatedTabletHandle;
 use session::Session;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -86,12 +103,21 @@ impl Server {
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let replicated = self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty();
         let (database, recovery_report, recovered_raft) = if replicated {
-            let configurations = ReplicatedTabletRuntime::recovery_configurations(&self.config)?;
-            let (database, report, recovered) = LocalDatabase::recover_shared_with_raft(
+            // Acquire process ownership before touching any bootstrap or WAL
+            // state. The same guard is transferred into LocalDatabase and held
+            // for the entire live database lifetime.
+            let data_directory_lock = DataDirectoryLock::acquire(&data_dir)?;
+
+            let configurations =
+                MultiRaftRuntime::recovery_configurations(&self.config, &data_directory_lock)?;
+
+            let (database, report, recovered) = LocalDatabase::recover_shared_with_raft_with_lock(
                 &data_dir,
                 self.config.node_id,
                 &configurations,
+                data_directory_lock,
             )?;
+
             (database, report, Some(recovered))
         } else {
             let (database, report) = LocalDatabase::recover(&data_dir, self.config.node_id)?;
@@ -115,7 +141,7 @@ impl Server {
         let database = database.into_shared();
         let replicated_runtime = match (replicated_wal, recovered_raft) {
             (Some(wal), Some(recovered)) => {
-                let runtime = ReplicatedTabletRuntime::start_from_shared_recovery(
+                let runtime = MultiRaftRuntime::start_from_shared_recovery(
                     &self.config,
                     wal,
                     database.clone(),
@@ -123,14 +149,39 @@ impl Server {
                 )?;
                 database.lock().await.replace_commit_log(runtime.handle());
                 database.lock().await.replace_catalog_log(runtime.handle());
+                database
+                    .lock()
+                    .await
+                    .replace_metadata_table_creator(runtime.metadata_table_creator());
+                database
+                    .lock()
+                    .await
+                    .replace_tablet_gateway(Arc::new(runtime.tablet_rpc_client()));
                 Some(runtime)
             }
             (None, None) => None,
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
-        let replicated_handle = replicated_runtime
+        let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
+        let database_services = if replicated_runtime.is_some() {
+            Some(database.lock().await.database_services())
+        } else {
+            None
+        };
+        let metadata_creator = replicated_runtime
             .as_ref()
-            .map(ReplicatedTabletRuntime::handle);
+            .map(MultiRaftRuntime::metadata_table_creator);
+        let multiraft_status = replicated_runtime
+            .as_ref()
+            .map(MultiRaftRuntime::host_status_handle);
+        let node_lifecycle =
+            replicated_runtime
+                .as_ref()
+                .map(|runtime| admin::NodeLifecycleAdminState {
+                    node_id: self.config.node_id,
+                    metadata: runtime.metadata_handle(),
+                    control: runtime.metadata_control(),
+                });
         let admin_state = Arc::new(AdminState {
             started_at,
             connection_semaphore: connection_semaphore.clone(),
@@ -138,6 +189,8 @@ impl Server {
             durability_gate: database.lock().await.durability_gate(),
             database: database.clone(),
             replicated_tablet: replicated_handle.clone(),
+            multiraft_status,
+            node_lifecycle,
         });
 
         info!(
@@ -200,7 +253,9 @@ impl Server {
                                         connection_semaphore.clone();
 
                                     let connection_database = database.clone();
+                                    let connection_database_services = database_services.clone();
                                     let connection_replicated = replicated_handle.clone();
+                                    let connection_metadata_creator = metadata_creator.clone();
 
                                     let connection_shutdown = server_shutdown.clone();
 
@@ -209,7 +264,9 @@ impl Server {
                                             handle_connection_with_policy(
                                                 stream,
                                                 connection_database,
+                                                connection_database_services,
                                                 connection_replicated,
+                                                connection_metadata_creator,
                                                 connection_shutdown,
                                                 statement_timeout_ms,
                                                 statement_logging,
@@ -341,10 +398,11 @@ impl Server {
 /// Handle one framed SQL client connection.
 ///
 /// Each connection owns one server session and processes at most one statement
-/// at a time. All connections share the same local database runtime.
+/// at a time. Single-node compatibility connections use the serialized local
+/// runtime; distributed connections use the split `DatabaseServices` owner.
 ///
-/// The database mutex is released before the response is written so a slow
-/// client cannot block SQL execution for every other connection.
+/// The compatibility database mutex is released before the response is written
+/// so a slow client cannot block SQL execution for every other connection.
 pub async fn handle_connection(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
@@ -353,6 +411,8 @@ pub async fn handle_connection(
         stream,
         database,
         None,
+        None,
+        None,
         CancellationToken::new(),
         30_000,
         StatementLogging::MetadataOnly,
@@ -360,10 +420,282 @@ pub async fn handle_connection(
     .await
 }
 
+enum StreamingEvent {
+    Start { columns: Vec<String>, read_ts: u64 },
+    Batch { rows: Vec<Vec<u8>>, byte_count: u32 },
+}
+
+struct ChannelQuerySink {
+    sender: mpsc::Sender<StreamingEvent>,
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+impl ChannelQuerySink {
+    fn send(&self, mut event: StreamingEvent) -> CommonResult<()> {
+        loop {
+            if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+                return Err(Error::StatementTimeout {
+                    timeout_ms: self
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64,
+                });
+            }
+            match self.sender.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    event = returned;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(Error::ProposalUnavailable {
+                        reason: "streaming client disconnected".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl QueryResultSink for ChannelQuerySink {
+    fn start(
+        &mut self,
+        columns: Vec<ragnordb_exec::ResultColumn>,
+        read_ts: ragnordb_common::ids::Timestamp,
+    ) -> CommonResult<()> {
+        self.send(StreamingEvent::Start {
+            columns: columns.into_iter().map(|column| column.name).collect(),
+            read_ts: read_ts.0,
+        })
+    }
+
+    fn push_batch(&mut self, rows: Vec<Row>) -> CommonResult<()> {
+        if rows.is_empty() || rows.len() > self.max_rows {
+            return Err(Error::InvalidArgument(
+                "streaming sink received an invalid row batch size".to_string(),
+            ));
+        }
+        let encoded_rows = rows
+            .iter()
+            .map(encode_row)
+            .collect::<CommonResult<Vec<_>>>()?;
+        let byte_count = encoded_rows.iter().map(Vec::len).sum::<usize>();
+        if byte_count > self.max_bytes {
+            return Err(Error::InvalidArgument(
+                "streaming sink received an oversized row batch".to_string(),
+            ));
+        }
+        self.send(StreamingEvent::Batch {
+            rows: encoded_rows,
+            byte_count: u32::try_from(byte_count).unwrap_or(u32::MAX),
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_streaming_request(
+    database: SharedLocalDatabase,
+    database_services: Option<SharedDatabaseServices>,
+    session: &mut Session,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    shutdown: &CancellationToken,
+    statement: String,
+    root_request_sequence: Option<u64>,
+    statement_timeout_ms: u64,
+    max_rows: u32,
+    max_bytes: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let admission_timeout = Duration::from_millis(statement_timeout_ms);
+    let database_guard = if database_services.is_none() {
+        match tokio::time::timeout(admission_timeout, database.lock_owned()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                write_streaming_result_frame(
+                    writer,
+                    &streaming_error_frame(
+                        &Error::StatementTimeout {
+                            timeout_ms: statement_timeout_ms,
+                        },
+                        0,
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let statement_permit = if let Some(services) = database_services.as_ref() {
+        match services.acquire_statement(admission_timeout).await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                write_streaming_result_frame(writer, &streaming_error_frame(&error, 0)).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
+
+    let (sender, mut receiver) = mpsc::channel(2);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let producer_cancelled = cancelled.clone();
+    let mut sql_session = std::mem::take(&mut session.sql);
+    sql_session.set_tablet_request_timeout(admission_timeout);
+    if let Some(root_sequence) = root_request_sequence {
+        sql_session.set_client_request_identity_with_ack(
+            session.client_id(),
+            session
+                .v2_session_epoch()
+                .ok_or(Error::ClientSessionExpired { session_epoch: 0 })?,
+            root_sequence,
+            session.acknowledged_through(),
+        )?;
+    }
+    let producer_deadline = Instant::now()
+        .checked_add(admission_timeout)
+        .ok_or("streaming statement deadline overflowed")?;
+    let producer = if let Some(services) = database_services {
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelQuerySink {
+                sender,
+                cancelled: producer_cancelled,
+                deadline: producer_deadline,
+                max_rows: max_rows as usize,
+                max_bytes: max_bytes as usize,
+            };
+            let _statement_permit = statement_permit;
+            let result = services.execute_sql_streaming(
+                &mut sql_session,
+                &statement,
+                &mut sink,
+                max_rows as usize,
+                max_bytes as usize,
+            );
+            (sql_session, result)
+        })
+    } else {
+        let database_guard =
+            database_guard.expect("compatibility path acquired its database guard");
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelQuerySink {
+                sender,
+                cancelled: producer_cancelled,
+                deadline: producer_deadline,
+                max_rows: max_rows as usize,
+                max_bytes: max_bytes as usize,
+            };
+            let mut database = database_guard;
+            let result = database.execute_sql_streaming(
+                &mut sql_session,
+                &statement,
+                &mut sink,
+                max_rows as usize,
+                max_bytes as usize,
+            );
+            (sql_session, result)
+        })
+    };
+
+    let mut rows_emitted = 0_u64;
+    let mut write_failed = false;
+    while let Some(event) = tokio::select! {
+        _ = shutdown.cancelled() => {
+            cancelled.store(true, Ordering::Release);
+            None
+        }
+        event = receiver.recv() => event,
+    } {
+        let frame = match event {
+            StreamingEvent::Start { columns, read_ts } => {
+                StreamingResultFrame::ResultStart { columns, read_ts }
+            }
+            StreamingEvent::Batch { rows, byte_count } => {
+                rows_emitted = rows_emitted.saturating_add(rows.len() as u64);
+                StreamingResultFrame::RowBatch {
+                    row_count: rows.len() as u32,
+                    rows,
+                    byte_count,
+                }
+            }
+        };
+        let remaining = producer_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, write_streaming_result_frame(writer, &frame))
+                .await
+                .is_err()
+        {
+            cancelled.store(true, Ordering::Release);
+            write_failed = true;
+            break;
+        }
+    }
+    if write_failed {
+        cancelled.store(true, Ordering::Release);
+    }
+    drop(receiver);
+    let (returned_session, execution) = producer.await?;
+    session.sql = returned_session;
+    if write_failed || shutdown.is_cancelled() {
+        return Ok(());
+    }
+    match execution {
+        Ok(summary) => {
+            write_streaming_result_frame(
+                writer,
+                &StreamingResultFrame::ResultEnd {
+                    row_count: summary.rows_read,
+                },
+            )
+            .await?;
+        }
+        Err(error) => {
+            write_streaming_result_frame(writer, &streaming_error_frame(&error, rows_emitted))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn streaming_error_frame(error: &Error, rows_emitted: u64) -> StreamingResultFrame {
+    let (code, retryable) = match error {
+        Error::DistributedScanFailed { retryable, .. } => ("DISTRIBUTED_SCAN_FAILED", *retryable),
+        Error::StatementTimeout { .. } => ("STATEMENT_TIMEOUT", true),
+        Error::UnsupportedSql(_) => ("UNSUPPORTED_SQL", false),
+        Error::SqlParse(_) => ("SQL_PARSE_ERROR", false),
+        Error::SchemaMismatch(_) => ("SCHEMA_MISMATCH", false),
+        Error::InvalidArgument(_) => ("INVALID_ARGUMENT", false),
+        _ => ("STREAM_ERROR", false),
+    };
+    StreamingResultFrame::ResultError {
+        code: code.to_string(),
+        message: error.to_string(),
+        retryable,
+        rows_emitted,
+    }
+}
+
+// Keep the compatibility database and split distributed services explicit at
+// this boundary: hiding either owner in a broad connection context would make
+// it easy to reacquire the node-global mutex around distributed execution.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_policy(
     stream: tokio::net::TcpStream,
     database: SharedLocalDatabase,
+    database_services: Option<SharedDatabaseServices>,
     replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
+    metadata_creator: Option<SharedMetadataTableCreator>,
     shutdown: CancellationToken,
     statement_timeout_ms: u64,
     statement_logging: StatementLogging,
@@ -374,24 +706,93 @@ async fn handle_connection_with_policy(
     session.statement_timeout_ms = statement_timeout_ms;
 
     loop {
-        let sql = tokio::select! {
+        let request_frame = tokio::select! {
             _ = shutdown.cancelled() => break,
-            frame = read_frame(&mut reader) => match frame {
-                Ok(sql) => sql,
+            frame = read_client_frame(&mut reader) => match frame {
+                Ok(frame) => frame,
                 Err(_) => break,
             },
         };
 
+        let prepared = match request_frame {
+            ClientRequestFrame::V1(sql) => Ok((sql, None, None)),
+            ClientRequestFrame::V2(request) => {
+                prepare_v2_request(request, &mut session, metadata_creator.as_ref())
+                    .map(|(sql, sequence)| (sql, sequence, None))
+            }
+            ClientRequestFrame::V2Streaming(request) => {
+                let stream_limits = Some((request.max_rows_per_batch, request.max_bytes_per_batch));
+                let request = ClientRequestV2 {
+                    protocol_version: request.protocol_version,
+                    client_id: request.client_id,
+                    client_session_epoch: request.client_session_epoch,
+                    request_sequence: request.request_sequence,
+                    acknowledged_through: request.acknowledged_through,
+                    statement_timeout_ms: request.statement_timeout_ms,
+                    sql: request.sql,
+                };
+                prepare_v2_request(request, &mut session, metadata_creator.as_ref())
+                    .map(|(sql, sequence)| (sql, sequence, stream_limits))
+            }
+        };
+        let (sql, root_request_sequence, streaming_limits) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                write_frame(&mut writer, &internal_error_response(&error)).await?;
+                continue;
+            }
+        };
+        let statement_timeout_ms = session.statement_timeout_ms;
+
         let trimmed = sql.trim().to_string();
+
+        // Allocate the identity before parsing so leading SQL comments or
+        // equivalent parser syntax cannot accidentally fall back to the local
+        // catalog path. Non-CREATE statements simply carry and ignore this
+        // optional identity at the executor boundary.
+        let metadata_request_id = if replicated_tablet.is_some() {
+            Some(match root_request_sequence {
+                Some(sequence) => session.metadata_request_id_for_sequence(sequence)?,
+                None => session.next_metadata_request_id()?,
+            })
+        } else {
+            None
+        };
+        let metadata_logical_request_id =
+            metadata_request_id
+                .as_ref()
+                .map(|request_id| ragnordb_common::ids::ClientRequestId {
+                    client_id: session.client_id(),
+                    session_epoch: session.v2_session_epoch().unwrap_or(1),
+                    request_sequence: request_id.sequence,
+                });
 
         metrics::counter_inc("RagnorDB_requests_received_total");
 
         log_statement(statement_logging, session.session_id.0, &trimmed);
 
+        if let Some((max_rows, max_bytes)) = streaming_limits {
+            let stream_timeout_ms = session.statement_timeout_ms;
+            handle_streaming_request(
+                database.clone(),
+                database_services.clone(),
+                &mut session,
+                &mut writer,
+                &shutdown,
+                trimmed,
+                root_request_sequence,
+                stream_timeout_ms,
+                max_rows,
+                max_bytes,
+            )
+            .await?;
+            continue;
+        }
+
         // Latest reads are served only after an exact no-op has committed and
         // applied on the current leader. This check happens before database
         // admission so the Ready owner never waits on the SQL state mutex.
-        let read_barrier_error = if is_latest_read(&trimmed) {
+        let read_barrier_error = if metadata_creator.is_none() && is_latest_read(&trimmed) {
             if let Some(replicated) = replicated_tablet.clone() {
                 let timeout = Duration::from_millis(session.statement_timeout_ms);
                 tokio::task::spawn_blocking(move || replicated.read_barrier(timeout))
@@ -411,6 +812,69 @@ async fn handle_connection_with_policy(
         // blocking pool so Tokio workers remain available to network tasks.
         let execution = if let Some(error) = read_barrier_error {
             Err(error)
+        } else if let Some(services) = database_services.clone() {
+            match services
+                .acquire_statement(Duration::from_millis(session.statement_timeout_ms))
+                .await
+            {
+                Ok(statement_permit) if !shutdown.is_cancelled() => {
+                    let mut sql_session = std::mem::take(&mut session.sql);
+                    sql_session
+                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
+                    if let Some(root_sequence) = root_request_sequence {
+                        sql_session.set_client_request_identity_with_ack(
+                            session.client_id(),
+                            session.v2_session_epoch().ok_or(
+                                ragnordb_common::Error::ClientSessionExpired { session_epoch: 0 },
+                            )?,
+                            root_sequence,
+                            session.acknowledged_through(),
+                        )?;
+                    }
+                    let started = Instant::now();
+                    let statement = trimmed.clone();
+                    let (returned_session, result) = tokio::task::spawn_blocking(move || {
+                        let _statement_permit = statement_permit;
+                        let result = services.execute_sql(
+                            &mut sql_session,
+                            &statement,
+                            metadata_request_id,
+                            metadata_logical_request_id,
+                            Duration::from_millis(statement_timeout_ms),
+                        );
+                        (sql_session, result)
+                    })
+                    .await?;
+                    let status = database.lock().await.status();
+                    session.sql = returned_session;
+                    metrics::histogram_record(
+                        "ragnordb_statement_execution_seconds",
+                        started.elapsed().as_secs_f64(),
+                    );
+                    metrics::gauge_set("ragnordb_wal_durable_lsn", status.durable_lsn as f64);
+                    metrics::gauge_set(
+                        "ragnordb_wal_retained_bytes",
+                        status.wal_retained_bytes as f64,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_append_latency_seconds",
+                        status.wal_last_append_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::histogram_record(
+                        "ragnordb_wal_sync_latency_seconds",
+                        status.wal_last_sync_nanos as f64 / 1_000_000_000.0,
+                    );
+                    metrics::gauge_set(
+                        "ragnordb_wal_oldest_retention_pin",
+                        status.oldest_retention_pin_lsn.unwrap_or(0) as f64,
+                    );
+                    result
+                }
+                Ok(_) => Err(Error::Configuration(
+                    "database statement service is shutting down".to_string(),
+                )),
+                Err(error) => Err(error),
+            }
         } else {
             match tokio::time::timeout(
                 Duration::from_millis(session.statement_timeout_ms),
@@ -420,12 +884,30 @@ async fn handle_connection_with_policy(
             {
                 Ok(database_guard) if !shutdown.is_cancelled() => {
                     let mut sql_session = std::mem::take(&mut session.sql);
+                    sql_session
+                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
+                    if let Some(root_sequence) = root_request_sequence {
+                        sql_session.set_client_request_identity_with_ack(
+                            session.client_id(),
+                            session.v2_session_epoch().ok_or(
+                                ragnordb_common::Error::ClientSessionExpired { session_epoch: 0 },
+                            )?,
+                            root_sequence,
+                            session.acknowledged_through(),
+                        )?;
+                    }
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result, status) =
                         tokio::task::spawn_blocking(move || {
                             let mut database = database_guard;
-                            let result = database.execute_sql(&mut sql_session, &statement);
+                            let result = database.execute_sql_with_metadata_request_and_identity(
+                                &mut sql_session,
+                                &statement,
+                                metadata_request_id,
+                                metadata_logical_request_id,
+                                Duration::from_millis(statement_timeout_ms),
+                            );
                             let status = database.status();
                             (sql_session, result, status)
                         })
@@ -524,6 +1006,68 @@ async fn handle_connection_with_policy(
     Ok(())
 }
 
+fn prepare_v2_request(
+    request: ClientRequestV2,
+    session: &mut Session,
+    metadata_creator: Option<&SharedMetadataTableCreator>,
+) -> ragnordb_common::Result<(String, Option<u64>)> {
+    if let Some(creator) = metadata_creator
+        && let Some(active_epoch) = creator.active_client_session_epoch(request.client_id)?
+        && request.client_session_epoch < active_epoch
+    {
+        return Err(ragnordb_common::Error::ClientSessionExpired {
+            session_epoch: request.client_session_epoch,
+        });
+    }
+    if let Some(creator) = metadata_creator
+        && !session.v2_metadata_registered()
+    {
+        let registration_request_id = session.metadata_registration_request_id(
+            request.client_id,
+            request.client_session_epoch,
+            request.request_sequence,
+        )?;
+        let registered_epoch = creator.register_client(
+            registration_request_id,
+            request.client_id,
+            request.client_session_epoch,
+            Duration::from_millis(request.statement_timeout_ms),
+        )?;
+        if registered_epoch != request.client_session_epoch {
+            return Err(ragnordb_common::Error::ClientSessionExpired {
+                session_epoch: request.client_session_epoch,
+            });
+        }
+        session.mark_v2_metadata_registered();
+    }
+    if let Some(creator) = metadata_creator
+        && let Some(acknowledged_through) = request.acknowledged_through
+        && acknowledged_through > 0
+        && session.should_renew_metadata_ack(acknowledged_through)
+    {
+        creator.renew_client(
+            session.metadata_renewal_request_id(
+                request.client_id,
+                request.client_session_epoch,
+                acknowledged_through,
+            )?,
+            request.client_id,
+            request.client_session_epoch,
+            acknowledged_through,
+            Duration::from_millis(request.statement_timeout_ms),
+        )?;
+        session.mark_metadata_acknowledged(acknowledged_through);
+    }
+    session.accept_v2_request(
+        request.client_id,
+        request.client_session_epoch,
+        request.request_sequence,
+        request.acknowledged_through,
+        request.statement_timeout_ms,
+    )?;
+    Ok((request.sql, Some(request.request_sequence)))
+}
+
 fn log_statement(policy: StatementLogging, session_id: u64, statement: &str) {
     let operation = statement.split_whitespace().next().unwrap_or("empty");
 
@@ -581,6 +1125,10 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod operational_tests {
     use super::*;
+    use ragnordb_common::protocol::{
+        ClientRequestV2, ClientRequestV2Streaming, encode_client_request_v2,
+        encode_client_request_v2_streaming, read_frame, read_streaming_result_frame,
+    };
     use tokio::io::AsyncWriteExt;
 
     /// Realistic bug caught:
@@ -602,6 +1150,8 @@ mod operational_tests {
             handle_connection_with_policy(
                 stream,
                 handler_database,
+                None,
+                None,
                 None,
                 CancellationToken::new(),
                 20,
@@ -629,5 +1179,164 @@ mod operational_tests {
         drop(client);
         drop(held_database_owner);
         server.await.unwrap();
+    }
+
+    /// Realistic bug caught:
+    ///
+    /// A V2 client envelope could be parsed successfully but silently fall
+    /// back to the legacy session path, losing the client session identity
+    /// before SQL execution. This exercises the actual TCP handler boundary.
+    #[tokio::test]
+    async fn v2_client_frame_executes_through_the_session_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = LocalDatabase::shared();
+        let handler_database = database.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_with_policy(
+                stream,
+                handler_database,
+                None,
+                None,
+                None,
+                CancellationToken::new(),
+                1_000,
+                StatementLogging::Off,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = ClientRequestV2 {
+            protocol_version: 2,
+            client_id: 0x1234,
+            client_session_epoch: 7,
+            request_sequence: 1,
+            acknowledged_through: None,
+            statement_timeout_ms: 1_000,
+            sql: "BEGIN".to_string(),
+        };
+        client
+            .write_all(&encode_client_request_v2(&request).unwrap())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(response["ok"], true, "V2 response: {response}");
+        assert!(
+            response["result"]["transaction_id"].is_number(),
+            "V2 response: {response}"
+        );
+
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// Realistic bug caught: a streaming request could be accepted by the
+    /// common protocol but silently fall back to one materialized JSON result,
+    /// losing the fixed-snapshot start/end framing and bounded batch contract.
+    #[tokio::test]
+    async fn v2_streaming_request_emits_start_batch_and_end_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = LocalDatabase::shared();
+        let handler_database = database.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_with_policy(
+                stream,
+                handler_database,
+                None,
+                None,
+                None,
+                CancellationToken::new(),
+                1_000,
+                StatementLogging::Off,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        for sql in [
+            "CREATE TABLE streamed (id INT PRIMARY KEY)",
+            "INSERT INTO streamed (id) VALUES (1)",
+        ] {
+            let bytes = sql.as_bytes();
+            client
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
+            client.write_all(bytes).await.unwrap();
+            client.flush().await.unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&read_frame(&mut client).await.unwrap()).unwrap();
+            assert_eq!(response["ok"], true, "setup response: {response}");
+        }
+        let request = ClientRequestV2Streaming {
+            protocol_version: 2,
+            client_id: 0x2345,
+            client_session_epoch: 1,
+            request_sequence: 1,
+            acknowledged_through: None,
+            statement_timeout_ms: 1_000,
+            sql: "SELECT id FROM streamed".to_string(),
+            max_rows_per_batch: 8,
+            max_bytes_per_batch: 1024,
+        };
+        client
+            .write_all(&encode_client_request_v2_streaming(&request).unwrap())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let start = read_streaming_result_frame(&mut client).await.unwrap();
+        assert!(matches!(
+            start,
+            StreamingResultFrame::ResultStart { read_ts, .. } if read_ts > 0
+        ));
+        let end = loop {
+            match read_streaming_result_frame(&mut client).await.unwrap() {
+                StreamingResultFrame::ResultEnd { row_count } => break row_count,
+                StreamingResultFrame::RowBatch { .. } => {}
+                other => panic!("unexpected streaming frame: {other:?}"),
+            }
+        };
+        assert_eq!(end, 1);
+
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// Realistic bug caught: a disconnected slow client could leave the
+    /// blocking SQL producer parked forever on a full result queue, retaining
+    /// the database owner and all scan state. Cancellation must wake it.
+    #[tokio::test]
+    async fn streaming_sink_cancellation_releases_a_full_queue() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut sink = ChannelQuerySink {
+            sender,
+            cancelled: cancelled.clone(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            max_rows: 1,
+            max_bytes: 128,
+        };
+        sink.start(Vec::new(), ragnordb_common::ids::Timestamp(1))
+            .unwrap();
+        let producer = tokio::task::spawn_blocking(move || {
+            sink.push_batch(vec![Row {
+                values: vec![ragnordb_common::codec::Value::Int(1)],
+            }])
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancelled.store(true, Ordering::Release);
+        assert!(producer.await.unwrap().is_err());
     }
 }

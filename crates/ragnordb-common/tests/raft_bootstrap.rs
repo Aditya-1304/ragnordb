@@ -25,7 +25,9 @@ fn bootstrap() -> RaftGroupBootstrap {
 #[test]
 fn metadata_lookup_preserves_replica_and_routing_identities() {
     let response = MetadataResponse::LookupTablet {
+        raft_group_id: RaftGroupId(100),
         tablet_id: TabletId(7),
+        tablet_epoch: 1,
         leader_replica_id: ReplicaId(12),
         replicas: vec![
             ReplicaRoute {
@@ -85,4 +87,26 @@ fn bootstrap_rejects_a_voter_without_a_physical_route() {
         result,
         Err(RaftGroupBootstrapError::MembershipMappingMismatch)
     ));
+}
+
+#[test]
+fn resolves_replica_and_node_without_assuming_equal_ids() {
+    let bootstrap = RaftGroupBootstrap::new(
+        "cluster-a".to_string(),
+        RaftGroupId(7),
+        1,
+        BTreeMap::from([
+            (ReplicaId(101), NodeId(1)),
+            (ReplicaId(205), NodeId(2)),
+            (ReplicaId(309), NodeId(3)),
+        ]),
+        BTreeSet::from([ReplicaId(101), ReplicaId(205), ReplicaId(309)]),
+        BTreeSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(bootstrap.replica_on_node(NodeId(2)), Some(ReplicaId(205)));
+    assert_eq!(bootstrap.node_for_replica(ReplicaId(309)), Some(NodeId(3)));
+
+    assert_eq!(bootstrap.replica_on_node(NodeId(205)), None);
 }

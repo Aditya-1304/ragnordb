@@ -3,7 +3,7 @@ use raft::{
     types::{ConfState, HardState, ReplicaId as CoreReplicaId},
 };
 use ragnordb_common::{
-    durability::{DurabilityGate, NodeDurabilityState},
+    durability::{DurabilityFailureKind, DurabilityGate, NodeDurabilityState},
     ids::{RaftGroupId, ReplicaId},
 };
 use ragnordb_multiraft::storage::{
@@ -237,6 +237,7 @@ fn snapshot_pointer() -> RaftSnapshotPointerRecord {
         last_included_term: 7,
         applied_index: 19,
         conf_state: conf_state(),
+        last_removed_replica: None,
         size_bytes: 4096,
         checksum: [9; 32],
         file_name: "raft-51-61-19.snapshot".to_string(),
@@ -260,6 +261,20 @@ fn stable_state_codecs_preserve_replica_lifetime_and_core_state() {
     assert_eq!(decoded_hard.identity, identity);
     assert_eq!(decoded_hard.to_core().unwrap(), hard_state);
     assert_eq!(decoded_snapshot, snapshot);
+}
+
+/// Catches losing removal evidence at the WAL snapshot-pointer boundary. The
+/// pointer is the durable source used to reconstruct a node after the removal
+/// entry itself has been compacted away.
+#[test]
+fn snapshot_pointer_codec_preserves_replica_removal_proof() {
+    let mut snapshot = snapshot_pointer();
+    snapshot.conf_state = ConfState::new(3, [CoreReplicaId::must(61)], []).unwrap();
+    snapshot.last_removed_replica = Some((CoreReplicaId::must(62), 11, 7, 2));
+
+    let decoded = RaftSnapshotPointerRecord::decode(&snapshot.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded.last_removed_replica, snapshot.last_removed_replica);
 }
 
 /// Realistic bug caught: recovery trusts a pointer that either escapes the
@@ -290,7 +305,7 @@ fn node_wide_wal_forwards_snapshot_retention_pins() {
     let node_wal = NodeRaftWal::new(PinTrackingWal {
         active_pins: Arc::clone(&active_pins),
     });
-    let handle = node_wal.group_writer();
+    let handle = node_wal.group_writer_for(identity()).unwrap();
 
     let pin = handle
         .acquire_retention_pin("tablet-snapshot", Lsn::new(100))
@@ -331,6 +346,38 @@ fn node_wide_retention_prunes_only_through_the_slowest_registered_group() {
         *pruned_through.lock().unwrap(),
         vec![Lsn::new(200), Lsn::new(500)]
     );
+}
+
+/// Realistic bug caught: leaving a tombstoned replica's last floor in the
+/// shared registry permanently pins future WAL pruning even after its state is
+/// detached. The released handle must also reject stale persistence use.
+#[test]
+fn released_replica_retention_no_longer_pins_shared_wal() {
+    let pruned_through = Arc::new(Mutex::new(Vec::new()));
+    let node_wal = NodeRaftWal::new(RetentionTrackingWal {
+        pruned_through: Arc::clone(&pruned_through),
+    });
+    let first_identity = identity();
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+
+    let mut first = node_wal.group_writer_for(first_identity).unwrap();
+    let mut stale_clone = first.clone();
+    let mut second = node_wal.group_writer_for(second_identity).unwrap();
+    node_wal.seal_retention_registry().unwrap();
+
+    first.prune_before(Lsn::new(200)).unwrap();
+    first.release_retention().unwrap();
+    second.prune_before(Lsn::new(500)).unwrap();
+
+    assert_eq!(*pruned_through.lock().unwrap(), vec![Lsn::new(500)]);
+    assert!(first.prune_before(Lsn::new(600)).is_err());
+    assert!(
+        first
+            .acquire_retention_pin("released-replica", Lsn::new(500))
+            .is_err()
+    );
+    assert!(first.append_batch_and_sync(&[]).is_err());
+    assert!(stale_clone.append_batch_and_sync(&[]).is_err());
 }
 
 /// Realistic bug caught:
@@ -608,9 +655,12 @@ fn persistence_rejects_hard_state_below_resulting_log_term_before_wal_append() {
 fn uncertain_batch_fences_every_group_writer_on_the_node() {
     let gate = DurabilityGate::new();
     let node_wal = NodeRaftWal::with_durability_gate(FakeWal::failing_sync(), gate.clone());
-    let mut first = RaftWalStorage::new(node_wal.group_writer(), identity());
+    let mut first = RaftWalStorage::new(node_wal.group_writer_for(identity()).unwrap(), identity());
     let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
-    let mut second = RaftWalStorage::new(node_wal.group_writer(), second_identity);
+    let mut second = RaftWalStorage::new(
+        node_wal.group_writer_for(second_identity).unwrap(),
+        second_identity,
+    );
 
     assert!(matches!(
         first.persist(batch()).unwrap_err(),
@@ -691,4 +741,48 @@ fn every_ready_record_prefix_recovers_without_dangling_dependencies() {
 
         assert!(replica.progress().applied_index <= recovered_last_index);
     }
+}
+
+#[test]
+fn external_shared_wal_fence_stops_every_raft_writer() {
+    let gate = DurabilityGate::new();
+
+    let node_wal = NodeRaftWal::with_durability_gate(FakeWal::healthy(), gate.clone());
+
+    let first_identity = identity();
+
+    let second_identity = RaftReplicaIdentity::new(RaftGroupId(52), ReplicaId(62)).unwrap();
+
+    let mut first = node_wal.group_writer_for(first_identity).unwrap();
+
+    let mut second = node_wal.group_writer_for(second_identity).unwrap();
+
+    node_wal.seal_retention_registry().unwrap();
+
+    let _ = gate.require_recovery(
+        DurabilityFailureKind::CatalogOutcomeUnknown,
+        "injected catalog WAL uncertainty",
+    );
+
+    assert!(
+        node_wal.recovery_required(),
+        "NodeRaftWal must observe recovery required by another shared-WAL owner",
+    );
+
+    let records = [(
+        RaftWalRecordType::LogEntry.as_wal_record_type(),
+        &b"must-not-write"[..],
+    )];
+
+    assert!(matches!(
+        first.append_batch_and_sync(&records),
+        Err(BatchAppendFailure::NotStaged(source))
+            if source.requires_recovery()
+    ));
+
+    assert!(matches!(
+        second.append_batch_and_sync(&records),
+        Err(BatchAppendFailure::NotStaged(source))
+            if source.requires_recovery()
+    ));
 }

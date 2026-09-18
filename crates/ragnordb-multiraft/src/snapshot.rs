@@ -10,10 +10,11 @@ use ragnordb_tablet::{
     command::TabletStateMachine,
     snapshot::{
         AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
-        InstalledTabletSnapshot, TabletSnapshotConfState, TabletSnapshotGenerationError,
-        TabletSnapshotImage, TabletSnapshotInstallError, TabletSnapshotInstallTarget,
-        TabletSnapshotMetadata, TabletSnapshotPointer, TabletSnapshotReceiveError,
-        generate_local_snapshot, install_incoming_snapshot,
+        InstalledTabletSnapshot, PreparedTabletSnapshotInstall, TabletSnapshotConfState,
+        TabletSnapshotGenerationError, TabletSnapshotImage, TabletSnapshotInstallError,
+        TabletSnapshotInstallTarget, TabletSnapshotMetadata, TabletSnapshotPointer,
+        TabletSnapshotReceiveError, generate_local_snapshot_with_removal_proof,
+        install_incoming_snapshot, prepare_incoming_snapshot,
     },
 };
 
@@ -314,6 +315,7 @@ impl TabletSnapshotTransfer {
             last_included_index: self.raft_metadata.last_included_index,
             last_included_term: self.raft_metadata.last_included_term,
             conf_state: self.raft_metadata.conf_state,
+            last_removed_replica: self.raft_metadata.last_removed_replica,
             size_bytes: self.raft_metadata.size_bytes,
             checksum: self.raft_metadata.checksum,
             data: self.image.data,
@@ -463,9 +465,23 @@ pub fn raft_metadata_for_tablet(
         last_included_index: metadata.last_included_index,
         last_included_term: metadata.last_included_term,
         conf_state: core_conf_state_for_tablet(&metadata.conf_state)?,
+        last_removed_replica: core_removal_proof_for_tablet(metadata.last_removed_replica)?,
         size_bytes: metadata.total_length,
         checksum: metadata.checksum,
     })
+}
+
+fn core_removal_proof_for_tablet(
+    proof: Option<(ragnordb_common::ids::ReplicaId, u64, u64, u64)>,
+) -> Result<Option<raft::types::RemovalProof>, TabletSnapshotIntegrationError> {
+    proof
+        .map(|(replica_id, index, term, version)| {
+            let replica_id = replica_id
+                .to_raft()
+                .map_err(|error| TabletSnapshotIntegrationError::CoreConfiguration(error.into()))?;
+            Ok((replica_id, index, term, version))
+        })
+        .transpose()
 }
 
 /// Convert the published tablet pointer into the durable Raft pointer shape.
@@ -504,6 +520,7 @@ pub fn raft_pointer_for_tablet(
         last_included_term: pointer.metadata.last_included_term,
         applied_index: pointer.metadata.last_included_index,
         conf_state: core_conf_state_for_tablet(&pointer.metadata.conf_state)?,
+        last_removed_replica: core_removal_proof_for_tablet(pointer.metadata.last_removed_replica)?,
         size_bytes: pointer.metadata.total_length,
         checksum: pointer.metadata.checksum,
         file_name: pointer.file_name.clone(),
@@ -543,13 +560,26 @@ where
         .ok_or(TabletSnapshotIntegrationError::AppliedFrontierUnavailable)?;
     let permit = work.acquire(SnapshotWorkKind::Generation)?;
 
-    let image = generate_local_snapshot(
+    let last_removed_replica =
+        ready_loop
+            .raft()
+            .last_removed_replica()
+            .map(|(replica_id, index, term, version)| {
+                (
+                    ragnordb_common::ids::ReplicaId::from_raft(replica_id),
+                    index,
+                    term,
+                    version,
+                )
+            });
+    let image = generate_local_snapshot_with_removal_proof(
         state_machine,
         cluster_id,
         replica_id,
         snapshot_id,
         conf_state,
         AppliedTabletFrontier::new(frontier.index, frontier.term),
+        last_removed_replica,
     )
     .map_err(TabletSnapshotIntegrationError::Generation)?;
 
@@ -676,10 +706,7 @@ where
 
         Ok::<(), TabletSnapshotIntegrationError>(())
     })
-    .map_err(|error| {
-        ready_loop.quarantine();
-        TabletSnapshotIntegrationError::Install(error)
-    })?;
+    .map_err(TabletSnapshotIntegrationError::Install)?;
 
     let persisted = persisted.ok_or(TabletSnapshotIntegrationError::PersistenceShape)?;
     install_permit.note_bytes(installed.pointer.metadata.total_length);
@@ -694,6 +721,56 @@ where
 pub struct DurableTabletSnapshotInstall {
     pub installed: InstalledTabletSnapshot,
     pub persisted: RaftPersistedBatch,
+}
+
+/// Fully verified/restored incoming snapshot whose live publication is waiting
+/// for the matching Raft durability boundary.
+///
+/// Both admission permits remain owned here across retryable WAL rejection.
+/// Dropping this value cleanly abandons the candidate without modifying the
+/// currently live tablet state.
+#[derive(Debug)]
+pub struct PreparedIncomingTabletSnapshotInstall {
+    installed: PreparedTabletSnapshotInstall,
+    _receive_permit: SnapshotWorkPermit,
+    install_permit: SnapshotWorkPermit,
+}
+
+impl PreparedIncomingTabletSnapshotInstall {
+    pub fn pointer(&self) -> &TabletSnapshotPointer {
+        &self.installed.pointer
+    }
+
+    pub fn frontier(&self) -> AppliedTabletFrontier {
+        self.installed.frontier
+    }
+
+    pub fn into_installed(self) -> PreparedTabletSnapshotInstall {
+        self.install_permit
+            .note_bytes(self.installed.pointer.metadata.total_length);
+
+        self.installed
+    }
+}
+
+pub fn prepare_incoming_tablet_snapshot(
+    store: &FileTabletSnapshotStore,
+    receiver: TabletSnapshotReceiveSession,
+    target: &TabletSnapshotInstallTarget,
+    install_permit: SnapshotWorkPermit,
+) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    let (receiver, receive_permit) = receiver.into_parts();
+
+    let installed = prepare_incoming_snapshot(store, receiver, target)
+        .map_err(TabletSnapshotIntegrationError::Install)?;
+
+    install_permit.set_total_bytes(installed.pointer.metadata.total_length);
+
+    Ok(PreparedIncomingTabletSnapshotInstall {
+        installed,
+        _receive_permit: receive_permit,
+        install_permit,
+    })
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
