@@ -199,6 +199,25 @@ async fn admin_status_returns_json() {
     assert_eq!(json["multiraft"]["group_count"], 2);
     assert_eq!(json["multiraft"]["top_groups"].as_array().unwrap().len(), 0);
 
+    let groups_body = read_http_body(addr, "/status/groups").await.unwrap();
+    let groups_json: serde_json::Value = serde_json::from_str(&groups_body).unwrap();
+    assert_eq!(
+        groups_json["multiraft"]["groups"][0]["apply_backlog_entries"],
+        0
+    );
+    assert_eq!(
+        groups_json["multiraft"]["groups"][0]["apply_backlog_bytes"],
+        0
+    );
+    assert_eq!(
+        groups_json["multiraft"]["groups"][0]["apply_backlog_age_ms"],
+        0
+    );
+    assert_eq!(
+        groups_json["multiraft"]["groups"][0]["apply_backlog_generations"],
+        0
+    );
+
     shutdown.cancel();
     server_task.await.unwrap();
 }

@@ -187,7 +187,7 @@ fn host_with_groups(group_count: u64) -> MultiRaftHost<BenchWal> {
 fn bench_multiraft_density(c: &mut Criterion) {
     let mut group = c.benchmark_group("multiraft_density");
 
-    for group_count in [1_u64, 100, 1_000, 10_000] {
+    for group_count in [1_u64, 100, 1_000, 10_000, 50_000] {
         group.bench_with_input(
             BenchmarkId::new("scheduler_turn", group_count),
             &group_count,

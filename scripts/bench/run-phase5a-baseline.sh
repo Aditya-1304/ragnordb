@@ -107,7 +107,10 @@ wait_for_group_leader() {
 
   for attempt in $(seq 1 240); do
     for node_id in 1 2 3; do
-      status_json="$(curl -fsS "http://127.0.0.1:$((7200 + node_id))/status" 2>/dev/null || true)"
+      # The bounded /status response intentionally omits the full group list;
+      # readiness needs the explicit diagnostic endpoint so it cannot confuse
+      # an active host with an elected metadata leader.
+      status_json="$(curl -fsS --max-time 2 "http://127.0.0.1:$((7200 + node_id))/status/groups" 2>/dev/null || true)"
       if printf '%s' "$status_json" \
           | jq -e --argjson group_id "$group_id" \
             'any(.multiraft.groups[]?; .raft_group_id == $group_id and .role == "leader")' \
@@ -130,6 +133,8 @@ save_statuses() {
   for node_id in 1 2 3; do
     curl -fsS "http://127.0.0.1:$((7200 + node_id))/status" \
       > "$OUTPUT_DIR/status-$label-node-$node_id.json"
+    curl -fsS "http://127.0.0.1:$((7200 + node_id))/status/groups" \
+      > "$OUTPUT_DIR/status-groups-$label-node-$node_id.json"
     curl -fsS "http://127.0.0.1:$((7200 + node_id))/metrics" \
       > "$OUTPUT_DIR/metrics-$label-node-$node_id.txt"
   done
@@ -236,7 +241,8 @@ run_live() {
   local exit_code=0
   local leader_node
 
-  leader_node="$(wait_for_group_leader 1)"
+  # Group 2 is the reserved metadata group in the current bootstrap contract.
+  leader_node="$(wait_for_group_leader 2)"
   wait_for_group_leader 3 >/dev/null
   leader_addr="127.0.0.1:$((7100 + leader_node))"
   leader_pid="$(cat "$CLUSTER_DIR/node-$leader_node.pid")"
@@ -257,7 +263,7 @@ run_live() {
   fi
 }
 
-metadata_leader_node="$(wait_for_group_leader 1)"
+metadata_leader_node="$(wait_for_group_leader 2)"
 metadata_leader_addr="127.0.0.1:$((7100 + metadata_leader_node))"
 
 "$BENCH_BIN" load \
@@ -304,7 +310,7 @@ run_live range-scan \
   --timeout-ms "$TIMEOUT_MS" \
   --seed "$SEED"
 
-leader_node="$(wait_for_group_leader 1)"
+leader_node="$(wait_for_group_leader 2)"
 wait_for_group_leader 3 >/dev/null
 metadata_leader_addr="127.0.0.1:$((7100 + leader_node))"
 leader_pid="$(cat "$CLUSTER_DIR/node-$leader_node.pid")"

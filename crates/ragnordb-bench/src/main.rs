@@ -47,6 +47,12 @@ enum Command {
         #[arg(long)]
         addr: String,
 
+        /// SQL table identifier used by this load. Keeping the identifier
+        /// explicit lets the release gate exercise independent tablet groups
+        /// without changing the benchmark client's deterministic workload.
+        #[arg(long, default_value = "bench")]
+        table: String,
+
         #[arg(long, default_value_t = 100_000)]
         rows: u64,
 
@@ -80,6 +86,11 @@ enum Command {
     Run {
         #[arg(long)]
         addr: String,
+
+        /// SQL table identifier used by all workers in this run. The value is
+        /// validated before interpolation into generated benchmark SQL.
+        #[arg(long, default_value = "bench")]
+        table: String,
 
         #[arg(long, value_enum)]
         workload: Workload,
@@ -336,21 +347,41 @@ impl SplitMix64 {
     }
 }
 
-fn point_read(row_id: u64) -> String {
-    format!("SELECT * FROM bench WHERE id = {row_id}")
+fn point_read(table: &str, row_id: u64) -> String {
+    format!("SELECT * FROM {table} WHERE id = {row_id}")
 }
 
-fn point_write(row_id: u64, value: &str) -> String {
-    format!("UPDATE bench SET value = '{value}' WHERE id = {row_id}")
+fn point_write(table: &str, row_id: u64, value: &str) -> String {
+    format!("UPDATE {table} SET value = '{value}' WHERE id = {row_id}")
 }
 
-fn range_scan(scan_rows: u64) -> String {
-    format!("SELECT * FROM bench WHERE id <= {scan_rows}")
+fn range_scan(table: &str, scan_rows: u64) -> String {
+    format!("SELECT * FROM {table} WHERE id <= {scan_rows}")
+}
+
+/// Validate the restricted SQL identifier grammar used by generated workload
+/// statements. The benchmark client intentionally accepts identifiers rather
+/// than arbitrary SQL fragments so parallel-table measurements cannot turn a
+/// command-line value into an injection or a second statement.
+fn validate_table_name(table: &str) -> Result<()> {
+    let mut characters = table.chars();
+    let Some(first) = characters.next() else {
+        bail!("table must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        bail!(
+            "table must be a simple SQL identifier containing ASCII letters, digits, and underscores"
+        );
+    }
+    Ok(())
 }
 
 fn workload_sql(
     workload: Workload,
     random: &mut SplitMix64,
+    table: &str,
     rows: u64,
     read_percent: u64,
     scan_rows: u64,
@@ -359,12 +390,12 @@ fn workload_sql(
     match workload {
         Workload::PointRead => {
             let row_id = random.next() % rows + 1;
-            point_read(row_id)
+            point_read(table, row_id)
         }
 
         Workload::PointWrite => {
             let row_id = random.next() % rows + 1;
-            point_write(row_id, write_value)
+            point_write(table, row_id, write_value)
         }
 
         Workload::Mixed => {
@@ -374,13 +405,13 @@ fn workload_sql(
             let operation_draw = random.next() % 100;
 
             if operation_draw < read_percent {
-                point_read(row_id)
+                point_read(table, row_id)
             } else {
-                point_write(row_id, write_value)
+                point_write(table, row_id, write_value)
             }
         }
 
-        Workload::RangeScan => range_scan(scan_rows),
+        Workload::RangeScan => range_scan(table, scan_rows),
     }
 }
 
@@ -426,6 +457,7 @@ impl WorkerStats {
 #[derive(Clone)]
 struct RunOptions {
     addr: Arc<str>,
+    table: Arc<str>,
     workload: Workload,
     seconds: u64,
     rows: u64,
@@ -476,6 +508,7 @@ async fn run_worker(
         let sql = workload_sql(
             options.workload,
             &mut random,
+            &options.table,
             options.rows,
             options.read_percent,
             options.scan_rows,
@@ -535,6 +568,7 @@ async fn run_worker(
         let sql = workload_sql(
             options.workload,
             &mut random,
+            &options.table,
             options.rows,
             options.read_percent,
             options.scan_rows,
@@ -598,6 +632,7 @@ struct RunReport {
     benchmark: &'static str,
     load_model: &'static str,
     addr: String,
+    table: String,
     protocol: Protocol,
     workload: Workload,
     clients: u32,
@@ -666,6 +701,7 @@ async fn exec_one(addr: String, sql: String, timeout_ms: u64) -> Result<()> {
 
 struct LoadConfig {
     addr: String,
+    table: String,
     rows: u64,
     value_bytes: usize,
     batch_size: u64,
@@ -679,6 +715,7 @@ struct LoadConfig {
 async fn load_table(config: LoadConfig) -> Result<()> {
     let LoadConfig {
         addr,
+        table,
         rows,
         value_bytes,
         batch_size,
@@ -692,6 +729,8 @@ async fn load_table(config: LoadConfig) -> Result<()> {
     if rows == 0 {
         bail!("rows must be greater than zero");
     }
+
+    validate_table_name(&table)?;
 
     if batch_size == 0 {
         bail!("batch-size must be greater than zero");
@@ -716,7 +755,7 @@ async fn load_table(config: LoadConfig) -> Result<()> {
             client_id,
             session_epoch,
             request_sequence,
-            "CREATE TABLE bench (id INT PRIMARY KEY, value TEXT NOT NULL)",
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value TEXT NOT NULL)"),
         )
         .await?;
         request_sequence = request_sequence
@@ -736,7 +775,7 @@ async fn load_table(config: LoadConfig) -> Result<()> {
     while first <= rows {
         let last = first.saturating_add(batch_size - 1).min(rows);
 
-        let mut sql = String::from("INSERT INTO bench (id, value) VALUES ");
+        let mut sql = format!("INSERT INTO {table} (id, value) VALUES ");
 
         for row_id in first..=last {
             if row_id != first {
@@ -800,6 +839,7 @@ async fn load_table(config: LoadConfig) -> Result<()> {
 
 struct BenchmarkConfig {
     addr: String,
+    table: String,
     workload: Workload,
     clients: u32,
     seconds: u64,
@@ -819,6 +859,7 @@ struct BenchmarkConfig {
 async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     let BenchmarkConfig {
         addr,
+        table,
         workload,
         clients,
         seconds,
@@ -838,6 +879,8 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     if clients == 0 {
         bail!("clients must be greater than zero");
     }
+
+    validate_table_name(&table)?;
 
     if matches!(protocol, Protocol::V2) && client_id == 0 {
         bail!("client-id must be non-zero for V2");
@@ -884,6 +927,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
 
     let options = RunOptions {
         addr: Arc::from(addr.as_str()),
+        table: Arc::from(table.as_str()),
         workload,
         seconds,
         rows,
@@ -974,6 +1018,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         benchmark: "RagnorDB SQL",
         load_model: "closed-loop",
         addr,
+        table,
         protocol,
         workload,
         clients,
@@ -1022,6 +1067,7 @@ async fn main() -> Result<()> {
 
         Command::Load {
             addr,
+            table,
             rows,
             value_bytes,
             batch_size,
@@ -1033,6 +1079,7 @@ async fn main() -> Result<()> {
         } => {
             load_table(LoadConfig {
                 addr,
+                table,
                 rows,
                 value_bytes,
                 batch_size,
@@ -1047,6 +1094,7 @@ async fn main() -> Result<()> {
 
         Command::Run {
             addr,
+            table,
             workload,
             clients,
             seconds,
@@ -1064,6 +1112,7 @@ async fn main() -> Result<()> {
         } => {
             run_benchmark(BenchmarkConfig {
                 addr,
+                table,
                 workload,
                 clients,
                 seconds,
