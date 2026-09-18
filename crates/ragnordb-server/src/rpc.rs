@@ -18,7 +18,7 @@ use std::{
 };
 
 use prost::Message;
-use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataState};
+use ragnordb_catalog::{Catalog, MetadataApplyOutcome, MetadataRejection, MetadataState};
 use ragnordb_common::{
     Error, Result,
     command_codec::{CachedTabletCommandOutcome, TabletCommand},
@@ -2796,6 +2796,13 @@ fn metadata_outcome_to_wire(
         MetadataApplyOutcome::ClientRenewed => {
             ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRenewed
         }
+        MetadataApplyOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        } => ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        },
         MetadataApplyOutcome::TableCreated(created) => {
             ragnordb_common::rpc_codec::MetadataProposalOutcome::TableCreated {
                 table_id: created.table_id,
@@ -2803,11 +2810,17 @@ fn metadata_outcome_to_wire(
                 raft_group_id: created.raft_group_id,
             }
         }
-        MetadataApplyOutcome::Rejected(rejection) => {
-            ragnordb_common::rpc_codec::MetadataProposalOutcome::Rejected {
-                reason: rejection.to_string(),
+        MetadataApplyOutcome::Rejected(rejection) => match rejection {
+            MetadataRejection::TimestampReservationRegressed { current, received } => {
+                ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampReservationRegressed {
+                    current,
+                    received,
+                }
             }
-        }
+            rejection => ragnordb_common::rpc_codec::MetadataProposalOutcome::Rejected {
+                reason: rejection.to_string(),
+            },
+        },
     }
 }
 

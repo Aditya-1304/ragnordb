@@ -19,7 +19,7 @@ use ragnordb_common::{
     catalog_codec::TableDefinition,
     ids::{
         ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
-        TableId, TabletId,
+        TableId, TabletId, Timestamp,
     },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
@@ -58,8 +58,15 @@ pub struct MetadataTableCreated {
 pub enum MetadataApplyOutcome {
     Applied,
     AlreadyApplied,
-    ClientRegistered { client_id: u128, session_epoch: u64 },
+    ClientRegistered {
+        client_id: u128,
+        session_epoch: u64,
+    },
     ClientRenewed,
+    TimestampsReserved {
+        reserved_from: Timestamp,
+        reserved_until: Timestamp,
+    },
     TableCreated(MetadataTableCreated),
     Rejected(MetadataRejection),
 }
@@ -71,6 +78,7 @@ impl MetadataApplyOutcome {
             Self::Applied
                 | Self::ClientRegistered { .. }
                 | Self::ClientRenewed
+                | Self::TimestampsReserved { .. }
                 | Self::TableCreated(_)
         )
     }
@@ -169,6 +177,12 @@ pub enum MetadataRejection {
 
     #[error("metadata {0} identity space is exhausted")]
     IdentitySpaceExhausted(&'static str),
+
+    #[error("timestamp reservation regressed from {current:?} to {received:?}")]
+    TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
+    },
 
     #[error(
         "metadata references unknown table {}",
@@ -389,6 +403,12 @@ pub struct MetadataState {
 
     allocator: MetadataAllocatorState,
 
+    /// Highest timestamp endpoint durably reserved by metadata Raft. This is
+    /// separate from identity allocation because timestamp ranges are consumed
+    /// by transaction traffic and may contain values that are not yet visible
+    /// in catalog state.
+    timestamp_reserved_until: Timestamp,
+
     nodes: BTreeMap<NodeId, NodeDescriptor>,
 
     tables: BTreeMap<TableId, Arc<TableSchema>>,
@@ -430,6 +450,7 @@ impl Default for MetadataState {
         Self {
             cluster_id: None,
             allocator: MetadataAllocatorState::initial(),
+            timestamp_reserved_until: Timestamp(0),
             nodes: BTreeMap::new(),
             tables: BTreeMap::new(),
             table_ids_by_name: BTreeMap::new(),
@@ -455,6 +476,10 @@ impl MetadataState {
 
     pub const fn allocator_state(&self) -> MetadataAllocatorState {
         self.allocator
+    }
+
+    pub const fn timestamp_reserved_until(&self) -> Timestamp {
+        self.timestamp_reserved_until
     }
 
     /// Return the next never-published replica identity.
@@ -607,6 +632,10 @@ impl MetadataState {
                 acknowledged_through,
             } => self.apply_renew_client(client_id, session_epoch, acknowledged_through),
 
+            MetadataCommand::ReserveTimestamps { reserved_until } => {
+                self.apply_reserve_timestamps(reserved_until)
+            }
+
             MetadataCommand::RegisterNode(node) => self.apply_register_node(node),
 
             MetadataCommand::SetNodeLifecycle { node_id, lifecycle } => {
@@ -669,6 +698,8 @@ impl MetadataState {
 
             allocator: self.allocator,
 
+            timestamp_reserved_until: self.timestamp_reserved_until,
+
             request_deduplication: self
                 .request_deduplication
                 .iter()
@@ -703,6 +734,7 @@ impl MetadataState {
             desired_placements,
             retired_replicas,
             allocator,
+            timestamp_reserved_until,
             request_deduplication,
             client_sessions,
         } = snapshot;
@@ -710,6 +742,7 @@ impl MetadataState {
         if cluster_id.is_none() {
             let mut state = Self::new();
             state.allocator = allocator;
+            state.timestamp_reserved_until = timestamp_reserved_until;
             return Ok(state);
         }
 
@@ -821,6 +854,7 @@ impl MetadataState {
         // visible identities. Install them only after the semantic projection
         // has been reconstructed successfully.
         state.allocator = allocator;
+        state.timestamp_reserved_until = timestamp_reserved_until;
 
         for request in request_deduplication {
             if let MetadataCachedOutcome::TableCreated {
@@ -894,6 +928,28 @@ impl MetadataState {
                 existing: existing.clone(),
                 received: cluster_id,
             }),
+        }
+    }
+
+    fn apply_reserve_timestamps(&mut self, reserved_until: Timestamp) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+
+        if reserved_until <= self.timestamp_reserved_until {
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::TimestampReservationRegressed {
+                    current: self.timestamp_reserved_until,
+                    received: reserved_until,
+                },
+            );
+        }
+
+        let reserved_from = Timestamp(self.timestamp_reserved_until.0 + 1);
+        self.timestamp_reserved_until = reserved_until;
+        MetadataApplyOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
         }
     }
 
@@ -1987,10 +2043,24 @@ fn metadata_outcome_to_cached(outcome: &MetadataApplyOutcome) -> MetadataCachedO
             session_epoch: *session_epoch,
         },
         MetadataApplyOutcome::ClientRenewed => MetadataCachedOutcome::ClientRenewed,
+        MetadataApplyOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        } => MetadataCachedOutcome::TimestampsReserved {
+            reserved_from: *reserved_from,
+            reserved_until: *reserved_until,
+        },
         MetadataApplyOutcome::TableCreated(created) => MetadataCachedOutcome::TableCreated {
             table_id: created.table_id,
             tablet_id: created.tablet_id,
             raft_group_id: created.raft_group_id,
+        },
+        MetadataApplyOutcome::Rejected(MetadataRejection::TimestampReservationRegressed {
+            current,
+            received,
+        }) => MetadataCachedOutcome::TimestampReservationRegressed {
+            current: *current,
+            received: *received,
         },
         MetadataApplyOutcome::Rejected(rejection) => {
             MetadataCachedOutcome::Rejected(rejection.to_string())
@@ -2010,6 +2080,13 @@ fn metadata_outcome_from_cached(outcome: &MetadataCachedOutcome) -> MetadataAppl
             session_epoch: *session_epoch,
         },
         MetadataCachedOutcome::ClientRenewed => MetadataApplyOutcome::ClientRenewed,
+        MetadataCachedOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        } => MetadataApplyOutcome::TimestampsReserved {
+            reserved_from: *reserved_from,
+            reserved_until: *reserved_until,
+        },
         MetadataCachedOutcome::TableCreated {
             table_id,
             tablet_id,
@@ -2019,6 +2096,12 @@ fn metadata_outcome_from_cached(outcome: &MetadataCachedOutcome) -> MetadataAppl
             tablet_id: *tablet_id,
             raft_group_id: *raft_group_id,
         }),
+        MetadataCachedOutcome::TimestampReservationRegressed { current, received } => {
+            MetadataApplyOutcome::Rejected(MetadataRejection::TimestampReservationRegressed {
+                current: *current,
+                received: *received,
+            })
+        }
         MetadataCachedOutcome::Rejected(reason) => {
             MetadataApplyOutcome::Rejected(MetadataRejection::InvalidCommand(reason.clone()))
         }
@@ -2108,6 +2191,7 @@ fn apply_snapshot_command(state: &mut MetadataState, command: MetadataCommand) -
         | MetadataApplyOutcome::AlreadyApplied
         | MetadataApplyOutcome::ClientRegistered { .. }
         | MetadataApplyOutcome::ClientRenewed
+        | MetadataApplyOutcome::TimestampsReserved { .. }
         | MetadataApplyOutcome::TableCreated(_) => Ok(()),
 
         MetadataApplyOutcome::Rejected(rejection) => Err(Error::CorruptData(format!(

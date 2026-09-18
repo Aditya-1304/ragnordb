@@ -307,6 +307,14 @@ pub struct MetadataProposalOutcome {
     pub raft_group_id: u64,
     #[prost(string, tag = "7")]
     pub rejection: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "8")]
+    pub timestamp_reserved_until: u64,
+    #[prost(uint64, tag = "9")]
+    pub timestamp_current: u64,
+    #[prost(uint64, tag = "10")]
+    pub timestamp_received: u64,
+    #[prost(uint64, tag = "11")]
+    pub timestamp_reserved_from: u64,
 }
 /// Nested message and enum types in `MetadataProposalOutcome`.
 pub mod metadata_proposal_outcome {
@@ -330,6 +338,8 @@ pub mod metadata_proposal_outcome {
         ClientRenewed = 4,
         TableCreated = 5,
         Rejected = 6,
+        TimestampsReserved = 7,
+        TimestampReservationRegressed = 8,
     }
     impl Kind {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -345,6 +355,8 @@ pub mod metadata_proposal_outcome {
                 Self::ClientRenewed => "CLIENT_RENEWED",
                 Self::TableCreated => "TABLE_CREATED",
                 Self::Rejected => "REJECTED",
+                Self::TimestampsReserved => "TIMESTAMPS_RESERVED",
+                Self::TimestampReservationRegressed => "TIMESTAMP_RESERVATION_REGRESSED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -357,6 +369,10 @@ pub mod metadata_proposal_outcome {
                 "CLIENT_RENEWED" => Some(Self::ClientRenewed),
                 "TABLE_CREATED" => Some(Self::TableCreated),
                 "REJECTED" => Some(Self::Rejected),
+                "TIMESTAMPS_RESERVED" => Some(Self::TimestampsReserved),
+                "TIMESTAMP_RESERVATION_REGRESSED" => {
+                    Some(Self::TimestampReservationRegressed)
+                }
                 _ => None,
             }
         }

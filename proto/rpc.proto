@@ -210,6 +210,8 @@ message MetadataProposalOutcome {
         CLIENT_RENEWED = 4;
         TABLE_CREATED = 5;
         REJECTED = 6;
+        TIMESTAMPS_RESERVED = 7;
+        TIMESTAMP_RESERVATION_REGRESSED = 8;
     }
 
     Kind kind = 1;
@@ -219,6 +221,10 @@ message MetadataProposalOutcome {
     uint64 tablet_id = 5;
     uint64 raft_group_id = 6;
     string rejection = 7;
+    uint64 timestamp_reserved_until = 8;
+    uint64 timestamp_current = 9;
+    uint64 timestamp_received = 10;
+    uint64 timestamp_reserved_from = 11;
 }
 
 message AllocateTimestampResponse {

@@ -481,6 +481,7 @@ fn metadata_outcome_name(outcome: &ragnordb_catalog::MetadataApplyOutcome) -> &'
         ragnordb_catalog::MetadataApplyOutcome::AlreadyApplied => "already_applied",
         ragnordb_catalog::MetadataApplyOutcome::ClientRegistered { .. } => "client_registered",
         ragnordb_catalog::MetadataApplyOutcome::ClientRenewed => "client_renewed",
+        ragnordb_catalog::MetadataApplyOutcome::TimestampsReserved { .. } => "timestamps_reserved",
         ragnordb_catalog::MetadataApplyOutcome::TableCreated(_) => "table_created",
         ragnordb_catalog::MetadataApplyOutcome::Rejected(_) => "rejected",
     }

@@ -27,7 +27,7 @@ use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
 use data_directory_lock::DataDirectoryLock;
 use database::{LocalDatabase, SharedDatabaseServices, SharedLocalDatabase};
-use multiraft_runtime::MultiRaftRuntime;
+use multiraft_runtime::{MetadataTimestampReservationClient, MultiRaftRuntime};
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{
     ClientRequestFrame, ClientRequestV2, StreamingResultFrame, read_client_frame, write_frame,
@@ -163,6 +163,22 @@ impl Server {
             _ => unreachable!("replicated WAL and shared Raft recovery are created together"),
         };
         let replicated_handle = replicated_runtime.as_ref().map(MultiRaftRuntime::handle);
+        if let Some(runtime) = replicated_runtime.as_ref() {
+            let durable_frontier = runtime
+                .metadata_handle()
+                .state_snapshot()
+                .timestamp_reserved_until();
+            let provider = MetadataTimestampReservationClient::new(
+                runtime.metadata_control(),
+                Duration::from_secs(5),
+            );
+            database.lock().await.install_reserved_timestamp_manager(
+                provider,
+                durable_frontier,
+                1_024,
+                256,
+            )?;
+        }
         let database_services = if replicated_runtime.is_some() {
             Some(database.lock().await.database_services())
         } else {

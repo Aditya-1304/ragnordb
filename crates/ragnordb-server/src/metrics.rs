@@ -93,6 +93,34 @@ fn describe_metrics() {
         "ragnordb_checkpoint_failure_total",
         "Checkpoint publication attempts that failed"
     );
+    metrics::describe_counter!(
+        "ragnordb_timestamp_allocations_total",
+        "MVCC timestamps allocated from committed local ranges"
+    );
+    metrics::describe_counter!(
+        "ragnordb_timestamp_reservations_total",
+        "Durable metadata timestamp-range reservations committed"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_timestamp_allocation_latency_seconds",
+        "Timestamp allocation latency, including any local prefetch"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_timestamp_reservation_latency_seconds",
+        "Metadata Raft timestamp reservation latency"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_timestamp_last_allocated",
+        "Most recently allocated MVCC timestamp"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_timestamp_reserved_until",
+        "Durable timestamp reservation frontier"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_timestamp_unused_reserved_gap",
+        "Reserved timestamp values above the last allocation"
+    );
     metrics::describe_gauge!("ragnordb_wal_durable_lsn", "Current durable WAL frontier");
     metrics::describe_gauge!("ragnordb_wal_retained_bytes", "Current retained WAL bytes");
     metrics::describe_gauge!(

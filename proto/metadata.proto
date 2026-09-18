@@ -54,7 +54,16 @@ message MetadataCommand {
         // directory record so administrative control cannot rewrite endpoint
         // identity while advancing a node through the drain protocol.
         SetNodeLifecycle set_node_lifecycle = 15;
+
+        // Durable timestamp high-water reservation. Individual timestamp
+        // allocations are served from the committed interval in memory.
+        ReserveTimestamps reserve_timestamps = 16;
     }
+}
+
+message ReserveTimestamps {
+    // Highest MVCC timestamp covered by the durable reservation.
+    uint64 reserved_until = 1;
 }
 
 message ClusterInitialized {
@@ -276,6 +285,10 @@ message MetadataSnapshot {
     repeated MetadataRequestDeduplication request_deduplication = 10;
 
     repeated ClientSession client_sessions = 11;
+
+    // Highest MVCC timestamp durably reserved by the metadata oracle. A zero
+    // value is valid for legacy snapshots created before Phase 6.1.
+    uint64 timestamp_reserved_until = 12;
 }
 
 message ClientSession {
@@ -293,6 +306,8 @@ enum MetadataCachedOutcomeKind {
     METADATA_CACHED_OUTCOME_REJECTED = 4;
     METADATA_CACHED_OUTCOME_CLIENT_REGISTERED = 5;
     METADATA_CACHED_OUTCOME_CLIENT_RENEWED = 6;
+    METADATA_CACHED_OUTCOME_TIMESTAMPS_RESERVED = 7;
+    METADATA_CACHED_OUTCOME_TIMESTAMP_RESERVATION_REGRESSED = 8;
 }
 
 message MetadataRequestDeduplication {
@@ -316,4 +331,10 @@ message MetadataRequestDeduplication {
     // group-qualified request correlation ID. Readers of older snapshots may
     // derive the compatibility identity from request_id.
     ragnordb.ids.LogicalCommandId logical_command_id = 9;
+
+    // Populated only for METADATA_CACHED_OUTCOME_TIMESTAMPS_RESERVED.
+    uint64 timestamp_reserved_until = 10;
+    uint64 timestamp_reserved_from = 11;
+    uint64 timestamp_reservation_current = 12;
+    uint64 timestamp_reservation_received = 13;
 }

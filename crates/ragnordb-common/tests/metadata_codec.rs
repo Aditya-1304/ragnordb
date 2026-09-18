@@ -1,7 +1,7 @@
 use prost::Message;
 use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
-    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    ids::{ColumnId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId, Timestamp},
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         LEGACY_METADATA_SNAPSHOT_VERSION, METADATA_SNAPSHOT_VERSION, MetadataAllocatorState,
@@ -9,6 +9,7 @@ use ragnordb_common::{
         NodeDescriptor, NodeLifecycle, PartitionSpec, PlacementPolicy, RetiredReplicaLifetime,
         TabletDescriptor,
     },
+    rpc_codec::MetadataProposalOutcome,
 };
 
 fn table() -> TableDefinition {
@@ -268,6 +269,18 @@ fn metadata_command_envelope_roundtrips_request_identity() {
 }
 
 #[test]
+fn timestamp_reservation_rpc_outcome_preserves_the_committed_frontier() {
+    let outcome = MetadataProposalOutcome::TimestampsReserved {
+        reserved_from: Timestamp(1),
+        reserved_until: Timestamp(4096),
+    };
+
+    let decoded = MetadataProposalOutcome::from_proto(outcome.to_proto()).unwrap();
+
+    assert_eq!(decoded, outcome);
+}
+
+#[test]
 fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
     let snapshot = MetadataSnapshot {
         cluster_id: Some("cluster-a".to_string()),
@@ -296,6 +309,8 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
             max_replica_id: 32,
         },
 
+        timestamp_reserved_until: Timestamp(0),
+
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
     };
@@ -318,6 +333,8 @@ fn metadata_snapshot_rejects_noncanonical_node_order() {
         retired_replicas: Vec::new(),
 
         allocator: MetadataAllocatorState::initial(),
+
+        timestamp_reserved_until: Timestamp(0),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -349,6 +366,8 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
             max_raft_group_id: 300,
             max_replica_id: 32,
         },
+
+        timestamp_reserved_until: Timestamp(0),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -385,6 +404,8 @@ fn current_metadata_snapshot_requires_allocator_state() {
         retired_replicas: Vec::new(),
         allocator: MetadataAllocatorState::initial(),
 
+        timestamp_reserved_until: Timestamp(0),
+
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
     };
@@ -419,6 +440,8 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
             max_replica_id: 0,
         },
 
+        timestamp_reserved_until: Timestamp(0),
+
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
     };
@@ -433,4 +456,15 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
         MetadataSnapshot::decode(&proto.encode_to_vec()).unwrap(),
         snapshot
     );
+}
+
+#[test]
+fn reserve_timestamps_command_roundtrips_with_a_nonzero_frontier() {
+    let command = MetadataCommand::ReserveTimestamps {
+        reserved_until: Timestamp(4096),
+    };
+
+    let decoded = MetadataCommand::decode(&command.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded, command);
 }

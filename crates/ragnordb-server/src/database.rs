@@ -25,7 +25,7 @@ use ragnordb_common::{
     Error, Result,
     command_codec::SingleShardCommitCommand,
     durability::DurabilityGate,
-    ids::{NodeId, RequestId, TableId},
+    ids::{NodeId, RequestId, TableId, Timestamp},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
@@ -49,7 +49,10 @@ use ragnordb_storage::{
     },
     wal::{CheckpointRetentionPin, RagnorDbWalAdapter},
 };
-use ragnordb_txn::{LocalTransactionManager, TransactionManager};
+use ragnordb_txn::{
+    LocalTransactionManager, ReservedTimestampTransactionManager, TimestampReservationProvider,
+    TransactionManager,
+};
 use tokio::sync::{Mutex, Semaphore};
 use wal::{
     config::WalConfig,
@@ -76,10 +79,14 @@ pub type SharedDatabaseServices = Arc<DatabaseServices>;
 /// compatibility runtime.
 pub struct DatabaseServices {
     executor: Arc<RwLock<LocalExecutor>>,
-    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
+    transaction_manager: Arc<StdMutex<Box<dyn TransactionManager + Send>>>,
     durability_gate: DurabilityGate,
     statement_permits: Arc<Semaphore>,
     published_view_generation: AtomicU64,
+    timestamp_allocations_reported: AtomicU64,
+    timestamp_reservations_reported: AtomicU64,
+    timestamp_allocation_latency_reported: AtomicU64,
+    timestamp_reservation_latency_reported: AtomicU64,
 }
 
 impl fmt::Debug for DatabaseServices {
@@ -137,6 +144,56 @@ impl DatabaseServices {
                 Ok(())
             }
         }
+    }
+
+    fn record_timestamp_metrics(&self) {
+        let stats = self
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .timestamp_oracle_stats();
+        let allocations =
+            take_counter_delta(&self.timestamp_allocations_reported, stats.allocations);
+        let reservations =
+            take_counter_delta(&self.timestamp_reservations_reported, stats.reservations);
+        let allocation_latency = take_counter_delta(
+            &self.timestamp_allocation_latency_reported,
+            stats.allocation_latency_nanos,
+        );
+        let reservation_latency = take_counter_delta(
+            &self.timestamp_reservation_latency_reported,
+            stats.reservation_latency_nanos,
+        );
+
+        if allocations != 0 {
+            crate::metrics::counter_add("ragnordb_timestamp_allocations_total", allocations);
+            crate::metrics::histogram_record(
+                "ragnordb_timestamp_allocation_latency_seconds",
+                allocation_latency as f64 / allocations as f64 / 1_000_000_000.0,
+            );
+        }
+        if reservations != 0 {
+            crate::metrics::counter_add("ragnordb_timestamp_reservations_total", reservations);
+            crate::metrics::histogram_record(
+                "ragnordb_timestamp_reservation_latency_seconds",
+                reservation_latency as f64 / reservations as f64 / 1_000_000_000.0,
+            );
+        }
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_last_allocated",
+            stats.last_allocated.0 as f64,
+        );
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_reserved_until",
+            stats.reserved_until.0 as f64,
+        );
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_unused_reserved_gap",
+            stats
+                .reserved_until
+                .0
+                .saturating_sub(stats.last_allocated.0) as f64,
+        );
     }
 
     /// Return the generation pinned by the next shared executor read section.
@@ -298,6 +355,7 @@ impl DatabaseServices {
         if let Err(error) = &result {
             self.durability_gate.observe_error(error);
         }
+        self.record_timestamp_metrics();
         result
     }
 
@@ -379,7 +437,7 @@ impl DatabaseServices {
                 .map(|_| executor.detached_remote_execution_view())
         };
 
-        if session.has_active_transaction() {
+        let result = if session.has_active_transaction() {
             if let Some(executor) = detached_executor.as_ref() {
                 session.execute_select_streaming_with_shared_executor(
                     plan, executor, sink, max_rows, max_bytes,
@@ -428,7 +486,9 @@ impl DatabaseServices {
             };
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
             Ok(summary)
-        }
+        };
+        self.record_timestamp_metrics();
+        result
     }
 }
 
@@ -439,6 +499,21 @@ fn data_plan_table_id(plan: &Plan) -> Option<TableId> {
         Plan::Update(plan) => Some(plan.table.table_id),
         Plan::Delete(plan) => Some(plan.table.table_id),
         _ => None,
+    }
+}
+
+fn take_counter_delta(counter: &AtomicU64, current: u64) -> u64 {
+    loop {
+        let previous = counter.load(Ordering::Acquire);
+        if current <= previous {
+            return 0;
+        }
+        if counter
+            .compare_exchange(previous, current, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current - previous;
+        }
     }
 }
 
@@ -484,7 +559,7 @@ pub struct LiveCheckpointPublication {
 /// out of order
 pub struct LocalDatabase {
     executor: Arc<RwLock<LocalExecutor>>,
-    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
+    transaction_manager: Arc<StdMutex<Box<dyn TransactionManager + Send>>>,
     next_snapshot_id: Option<u64>,
     data_dir: Option<PathBuf>,
     checkpoint_adapter: Option<Arc<LocalWalAdapter>>,
@@ -501,7 +576,7 @@ impl fmt::Debug for LocalDatabase {
         formatter
             .debug_struct("LocalDatabase")
             .field("executor", &self.executor)
-            .field("transaction_manager", &self.transaction_manager)
+            .field("has_transaction_manager", &true)
             .field("next_snapshot_id", &self.next_snapshot_id)
             .field("data_dir", &self.data_dir)
             .field("has_checkpoint_adapter", &self.checkpoint_adapter.is_some())
@@ -514,7 +589,9 @@ impl Default for LocalDatabase {
     fn default() -> Self {
         Self {
             executor: Arc::new(RwLock::new(LocalExecutor::default())),
-            transaction_manager: Arc::new(StdMutex::new(LocalTransactionManager::default())),
+            transaction_manager: Arc::new(StdMutex::new(Box::new(
+                LocalTransactionManager::default(),
+            ))),
             next_snapshot_id: Some(1),
             data_dir: None,
             checkpoint_adapter: None,
@@ -532,6 +609,29 @@ impl LocalDatabase {
     /// construct an in memory runtime for tests that do not exercise durability
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the compatibility allocator with the metadata-backed oracle
+    /// before distributed SQL admission begins. The replacement is startup-only
+    /// so no active session can retain a reference to the previous allocator.
+    pub fn install_reserved_timestamp_manager<P>(
+        &mut self,
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<()>
+    where
+        P: TimestampReservationProvider + Send + 'static,
+    {
+        let manager = ReservedTimestampTransactionManager::from_durable_frontier(
+            provider,
+            durable_frontier,
+            reservation_size,
+            prefetch_threshold,
+        )?;
+        self.transaction_manager = Arc::new(StdMutex::new(Box::new(manager)));
+        Ok(())
     }
 
     /// recover a complete local runtime from the node's A-WAL directory
@@ -760,7 +860,7 @@ impl LocalDatabase {
         Ok((
             Self {
                 executor: Arc::new(RwLock::new(executor)),
-                transaction_manager: Arc::new(StdMutex::new(transaction_manager)),
+                transaction_manager: Arc::new(StdMutex::new(Box::new(transaction_manager))),
                 next_snapshot_id: Some(floors.next_snapshot_id),
                 data_dir: Some(data_dir),
                 checkpoint_adapter: Some(adapter),
@@ -811,6 +911,10 @@ impl LocalDatabase {
             durability_gate: self.durability_gate.clone(),
             statement_permits: Arc::new(Semaphore::new(parallelism)),
             published_view_generation: AtomicU64::new(published_view_generation),
+            timestamp_allocations_reported: AtomicU64::new(0),
+            timestamp_reservations_reported: AtomicU64::new(0),
+            timestamp_allocation_latency_reported: AtomicU64::new(0),
+            timestamp_reservation_latency_reported: AtomicU64::new(0),
         })
     }
 

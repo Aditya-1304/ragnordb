@@ -14,7 +14,11 @@ pub use coordinator::{
     OwnedMvccParticipant, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
     SingleNodeCommitParticipant,
 };
-pub use manager::{CommitTimestampAllocator, LocalTransactionManager, TransactionManager};
+pub use manager::{
+    CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,
+    TimestampOracle, TimestampOracleStats, TimestampReservation, TimestampReservationProvider,
+    TransactionManager,
+};
 
 use std::collections::BTreeMap;
 

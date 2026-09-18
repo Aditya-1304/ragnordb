@@ -666,6 +666,14 @@ pub enum MetadataProposalOutcome {
         tablet_id: TabletId,
         raft_group_id: RaftGroupId,
     },
+    TimestampsReserved {
+        reserved_from: Timestamp,
+        reserved_until: Timestamp,
+    },
+    TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
+    },
     Rejected {
         reason: String,
     },
@@ -673,67 +681,131 @@ pub enum MetadataProposalOutcome {
 
 impl MetadataProposalOutcome {
     pub fn to_proto(&self) -> rpc::MetadataProposalOutcome {
-        let (kind, client_id, session_epoch, table_id, tablet_id, raft_group_id, rejection) =
-            match self {
-                Self::Applied => (
-                    rpc::metadata_proposal_outcome::Kind::Applied,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::AlreadyApplied => (
-                    rpc::metadata_proposal_outcome::Kind::AlreadyApplied,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::ClientRegistered { session_epoch } => (
-                    rpc::metadata_proposal_outcome::Kind::ClientRegistered,
-                    0,
-                    *session_epoch,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::ClientRenewed => (
-                    rpc::metadata_proposal_outcome::Kind::ClientRenewed,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::TableCreated {
-                    table_id,
-                    tablet_id,
-                    raft_group_id,
-                } => (
-                    rpc::metadata_proposal_outcome::Kind::TableCreated,
-                    0,
-                    0,
-                    table_id.0,
-                    tablet_id.0,
-                    raft_group_id.0,
-                    String::new(),
-                ),
-                Self::Rejected { reason } => (
-                    rpc::metadata_proposal_outcome::Kind::Rejected,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    reason.clone(),
-                ),
-            };
+        let (
+            kind,
+            client_id,
+            session_epoch,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+            timestamp_reserved_until,
+            timestamp_current,
+            timestamp_received,
+            timestamp_reserved_from,
+        ) = match self {
+            Self::Applied => (
+                rpc::metadata_proposal_outcome::Kind::Applied,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::AlreadyApplied => (
+                rpc::metadata_proposal_outcome::Kind::AlreadyApplied,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::ClientRegistered { session_epoch } => (
+                rpc::metadata_proposal_outcome::Kind::ClientRegistered,
+                0,
+                *session_epoch,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::ClientRenewed => (
+                rpc::metadata_proposal_outcome::Kind::ClientRenewed,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => (
+                rpc::metadata_proposal_outcome::Kind::TableCreated,
+                0,
+                0,
+                table_id.0,
+                tablet_id.0,
+                raft_group_id.0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => (
+                rpc::metadata_proposal_outcome::Kind::TimestampsReserved,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                reserved_until.0,
+                0,
+                0,
+                reserved_from.0,
+            ),
+            Self::TimestampReservationRegressed { current, received } => (
+                rpc::metadata_proposal_outcome::Kind::TimestampReservationRegressed,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                current.0,
+                received.0,
+                0,
+            ),
+            Self::Rejected { reason } => (
+                rpc::metadata_proposal_outcome::Kind::Rejected,
+                0,
+                0,
+                0,
+                0,
+                0,
+                reason.clone(),
+                0,
+                0,
+                0,
+                0,
+            ),
+        };
         rpc::MetadataProposalOutcome {
             kind: kind as i32,
             client_id,
@@ -742,6 +814,10 @@ impl MetadataProposalOutcome {
             tablet_id,
             raft_group_id,
             rejection,
+            timestamp_reserved_until,
+            timestamp_current,
+            timestamp_received,
+            timestamp_reserved_from,
         }
     }
 
@@ -768,6 +844,24 @@ impl MetadataProposalOutcome {
                     table_id: TableId(proto.table_id),
                     tablet_id: TabletId(proto.tablet_id),
                     raft_group_id: RaftGroupId(proto.raft_group_id),
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::TimestampsReserved => {
+                if proto.timestamp_reserved_until == 0 {
+                    return Err("timestamp reservation outcome has zero frontier");
+                }
+                Ok(Self::TimestampsReserved {
+                    reserved_from: Timestamp(proto.timestamp_reserved_from),
+                    reserved_until: Timestamp(proto.timestamp_reserved_until),
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::TimestampReservationRegressed => {
+                if proto.timestamp_current == 0 || proto.timestamp_received == 0 {
+                    return Err("timestamp regression outcome contains a zero frontier");
+                }
+                Ok(Self::TimestampReservationRegressed {
+                    current: Timestamp(proto.timestamp_current),
+                    received: Timestamp(proto.timestamp_received),
                 })
             }
             rpc::metadata_proposal_outcome::Kind::Rejected => Ok(Self::Rejected {

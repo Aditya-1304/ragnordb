@@ -24,6 +24,7 @@ use ragnordb_common::{
     Error, Result,
     ids::{
         ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
+        Timestamp,
     },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
@@ -55,6 +56,7 @@ use ragnordb_multiraft::{
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
 use ragnordb_tablet::snapshot::FileTabletSnapshotStore;
 use ragnordb_tablet::snapshot::TabletSnapshotInstallTarget;
+use ragnordb_txn::{TimestampReservation, TimestampReservationProvider};
 
 use wal::{io::directory::FsSegmentDirectory, wal::WalHandle};
 
@@ -2404,6 +2406,36 @@ impl MetadataProposalClient {
         )
     }
 
+    /// Reserve a monotonically increasing timestamp frontier through the
+    /// metadata Raft group. Completion means the reservation command was
+    /// applied, not merely queued, so the returned interval survives restart.
+    pub fn reserve_timestamps(
+        &self,
+        reserved_until: Timestamp,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let sequence = self
+            .next_admin_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::InvalidArgument("timestamp reservation sequence exhausted".into())
+            })?;
+        let request_id = RequestId {
+            client_id: self.admin_client_id,
+            sequence,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+        };
+
+        self.propose_metadata_command(
+            MetadataCommand::ReserveTimestamps { reserved_until },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
     /// Propose removal of one physical metadata member through the metadata
     /// leader. A draining node is commonly a follower, so this path first
     /// attempts the local Ready owner and then uses the authenticated metadata
@@ -2501,7 +2533,8 @@ impl MetadataProposalClient {
                 MetadataApplyOutcome::Applied
                 | MetadataApplyOutcome::AlreadyApplied
                 | MetadataApplyOutcome::ClientRegistered { .. }
-                | MetadataApplyOutcome::ClientRenewed => Err(Error::CorruptData(
+                | MetadataApplyOutcome::ClientRenewed
+                | MetadataApplyOutcome::TimestampsReserved { .. } => Err(Error::CorruptData(
                     "metadata CREATE TABLE apply did not return allocated topology".to_string(),
                 )),
 
@@ -2697,6 +2730,67 @@ impl MetadataProposalClient {
     }
 }
 
+/// Synchronous adapter used by the SQL transaction manager. The manager holds
+/// its own mutex while reserving a range, so this call must not depend on a
+/// callback from SQL or on the database mutex that owns the manager.
+#[derive(Clone)]
+pub struct MetadataTimestampReservationClient {
+    metadata: MetadataProposalClient,
+    timeout: Duration,
+}
+
+impl MetadataTimestampReservationClient {
+    pub fn new(metadata: MetadataProposalClient, timeout: Duration) -> Self {
+        Self { metadata, timeout }
+    }
+}
+
+impl TimestampReservationProvider for MetadataTimestampReservationClient {
+    fn reserve_timestamps(&mut self, requested_until: Timestamp) -> Result<TimestampReservation> {
+        let mut requested_until = requested_until;
+        for _ in 0..8 {
+            match self
+                .metadata
+                .reserve_timestamps(requested_until, self.timeout)?
+            {
+                MetadataApplyOutcome::TimestampsReserved {
+                    reserved_from,
+                    reserved_until,
+                } => {
+                    return Ok(TimestampReservation {
+                        reserved_from,
+                        reserved_until,
+                    });
+                }
+                MetadataApplyOutcome::Rejected(
+                    ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                        current,
+                        ..
+                    },
+                ) => {
+                    requested_until = Timestamp(current.0.checked_add(1).ok_or_else(|| {
+                        Error::Configuration(
+                            "timestamp reservation frontier is exhausted".to_string(),
+                        )
+                    })?);
+                }
+                MetadataApplyOutcome::Rejected(rejection) => {
+                    return Err(Error::ConstraintViolation(rejection.to_string()));
+                }
+                other => {
+                    return Err(Error::CorruptData(format!(
+                        "timestamp reservation returned unexpected metadata outcome {other:?}"
+                    )));
+                }
+            }
+        }
+        Err(Error::ProposalUnavailable {
+            reason: "timestamp reservation conflicted repeatedly with concurrent owners"
+                .to_string(),
+        })
+    }
+}
+
 fn metadata_error_can_forward(error: &Error) -> bool {
     matches!(
         error,
@@ -2750,6 +2844,22 @@ fn metadata_response_to_outcome(
         ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRenewed => {
             Ok(MetadataApplyOutcome::ClientRenewed)
         }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        } => Ok(MetadataApplyOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        }),
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampReservationRegressed {
+            current,
+            received,
+        } => Ok(MetadataApplyOutcome::Rejected(
+            ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                current,
+                received,
+            },
+        )),
         ragnordb_common::rpc_codec::MetadataProposalOutcome::TableCreated {
             table_id,
             tablet_id,
@@ -4395,6 +4505,12 @@ fn drain_metadata_results(
             )))
         } else {
             match applied.outcome {
+                MetadataApplyOutcome::Rejected(
+                    rejection
+                    @ ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                        ..
+                    },
+                ) => Ok(MetadataApplyOutcome::Rejected(rejection)),
                 MetadataApplyOutcome::Rejected(rejection) => {
                     Err(Error::ConstraintViolation(rejection.to_string()))
                 }

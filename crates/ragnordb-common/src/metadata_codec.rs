@@ -13,7 +13,7 @@ use crate::{
     catalog_codec::{ColumnDefinition, TableDefinition},
     ids::{
         ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
-        RequestId, TableId, TabletId,
+        RequestId, TableId, TabletId, Timestamp,
     },
     proto::metadata,
 };
@@ -70,6 +70,13 @@ pub enum MetadataCommand {
         client_id: u128,
         session_epoch: u64,
         acknowledged_through: u64,
+    },
+
+    /// Advance the durable timestamp reservation frontier owned by metadata
+    /// Raft. Timestamp values below this frontier are safe to allocate after
+    /// recovery because the frontier itself is replicated state.
+    ReserveTimestamps {
+        reserved_until: Timestamp,
     },
 
     RegisterNode(NodeDescriptor),
@@ -259,6 +266,14 @@ pub enum MetadataCachedOutcome {
         table_id: TableId,
         tablet_id: TabletId,
         raft_group_id: RaftGroupId,
+    },
+    TimestampsReserved {
+        reserved_from: Timestamp,
+        reserved_until: Timestamp,
+    },
+    TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
     },
     Rejected(String),
 }
@@ -503,6 +518,9 @@ pub struct MetadataSnapshot {
     pub desired_placements: Vec<DesiredReplicaPlacement>,
     pub retired_replicas: Vec<RetiredReplicaLifetime>,
     pub allocator: MetadataAllocatorState,
+    /// Highest timestamp range endpoint durably reserved by metadata Raft.
+    /// Zero is valid for an uninitialized cluster and for legacy snapshots.
+    pub timestamp_reserved_until: Timestamp,
 
     pub request_deduplication: Vec<MetadataRequestDeduplication>,
     pub client_sessions: Vec<MetadataClientSession>,
@@ -613,6 +631,13 @@ impl MetadataCommand {
                 Ok(())
             }
 
+            Self::ReserveTimestamps { reserved_until } => {
+                if reserved_until.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+                Ok(())
+            }
+
             Self::RegisterNode(node) => node.validate(),
 
             Self::SetNodeLifecycle { node_id, .. } => {
@@ -686,6 +711,12 @@ impl MetadataCommand {
                 session_epoch: *session_epoch,
                 acknowledged_through: *acknowledged_through,
             }),
+
+            Self::ReserveTimestamps { reserved_until } => {
+                Command::ReserveTimestamps(metadata::ReserveTimestamps {
+                    reserved_until: reserved_until.0,
+                })
+            }
 
             Self::RegisterNode(node) => Command::RegisterNode(metadata::RegisterNode {
                 node: Some(node.to_proto()),
@@ -775,6 +806,10 @@ impl MetadataCommand {
                 client_id: decode_client_id(&command.client_id)?,
                 session_epoch: command.session_epoch,
                 acknowledged_through: command.acknowledged_through,
+            },
+
+            Some(Command::ReserveTimestamps(command)) => Self::ReserveTimestamps {
+                reserved_until: Timestamp(command.reserved_until),
             },
 
             Some(Command::RegisterNode(command)) => {
@@ -1563,6 +1598,7 @@ impl MetadataSnapshot {
                     || !self.retired_replicas.is_empty()
                     || !self.client_sessions.is_empty()
                     || !self.request_deduplication.is_empty()
+                    || self.timestamp_reserved_until.0 != 0
                 {
                     return Err(MetadataCommandCodecError::UninitializedSnapshotHasState);
                 }
@@ -1750,6 +1786,8 @@ impl MetadataSnapshot {
 
             allocator_state: Some(self.allocator.to_proto()),
 
+            timestamp_reserved_until: self.timestamp_reserved_until.0,
+
             request_deduplication: self
                 .request_deduplication
                 .iter()
@@ -1784,6 +1822,7 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator_state,
+            timestamp_reserved_until,
             request_deduplication,
             client_sessions,
             ..
@@ -1917,6 +1956,7 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator,
+            timestamp_reserved_until: Timestamp(timestamp_reserved_until),
             request_deduplication,
             client_sessions,
         };
@@ -2031,6 +2071,21 @@ impl MetadataRequestDeduplication {
                 }
             }
 
+            MetadataCachedOutcome::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => {
+                if reserved_from.0 == 0 || reserved_from > reserved_until {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+            }
+
+            MetadataCachedOutcome::TimestampReservationRegressed { current, received } => {
+                if current.0 == 0 || received.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+            }
+
             MetadataCachedOutcome::Rejected(reason) if reason.trim().is_empty() => {
                 return Err(MetadataCommandCodecError::InvalidCachedOutcome(
                     "rejection reason cannot be empty",
@@ -2044,70 +2099,134 @@ impl MetadataRequestDeduplication {
     }
 
     fn to_proto(&self) -> metadata::MetadataRequestDeduplication {
-        let (outcome_kind, table_id, tablet_id, raft_group_id, rejection, client_id, session_epoch) =
-            match &self.outcome {
-                MetadataCachedOutcome::Applied => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::AlreadyApplied => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::ClientRegistered {
-                    client_id,
-                    session_epoch,
-                } => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    client_id.to_le_bytes().to_vec(),
-                    *session_epoch,
-                ),
-                MetadataCachedOutcome::ClientRenewed => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::TableCreated {
-                    table_id,
-                    tablet_id,
-                    raft_group_id,
-                } => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
-                    table_id.0,
-                    tablet_id.0,
-                    raft_group_id.0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::Rejected(reason) => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
-                    0,
-                    0,
-                    0,
-                    reason.clone(),
-                    Vec::new(),
-                    0,
-                ),
-            };
+        let (
+            outcome_kind,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+            client_id,
+            session_epoch,
+            timestamp_reserved_from,
+            timestamp_reserved_until,
+            timestamp_reservation_current,
+            timestamp_reservation_received,
+        ) = match &self.outcome {
+            MetadataCachedOutcome::Applied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::AlreadyApplied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::ClientRegistered {
+                client_id,
+                session_epoch,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered,
+                0,
+                0,
+                0,
+                String::new(),
+                client_id.to_le_bytes().to_vec(),
+                *session_epoch,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::ClientRenewed => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
+                table_id.0,
+                tablet_id.0,
+                raft_group_id.0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampsReserved,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                reserved_until.0,
+                reserved_from.0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TimestampReservationRegressed { current, received } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampReservationRegressed,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                current.0,
+                received.0,
+            ),
+            MetadataCachedOutcome::Rejected(reason) => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
+                0,
+                0,
+                0,
+                reason.clone(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+        };
 
         metadata::MetadataRequestDeduplication {
             request_id: Some(self.request_id.to_proto()),
@@ -2118,6 +2237,10 @@ impl MetadataRequestDeduplication {
             rejection,
             client_id,
             session_epoch,
+            timestamp_reserved_from,
+            timestamp_reserved_until,
+            timestamp_reservation_current,
+            timestamp_reservation_received,
             logical_command_id: Some(self.logical_command_id.to_proto()),
         }
     }
@@ -2162,6 +2285,18 @@ impl MetadataRequestDeduplication {
                     table_id: TableId(proto.table_id),
                     tablet_id: TabletId(proto.tablet_id),
                     raft_group_id: RaftGroupId(proto.raft_group_id),
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampsReserved => {
+                MetadataCachedOutcome::TimestampsReserved {
+                    reserved_from: Timestamp(proto.timestamp_reserved_from),
+                    reserved_until: Timestamp(proto.timestamp_reserved_until),
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampReservationRegressed => {
+                MetadataCachedOutcome::TimestampReservationRegressed {
+                    current: Timestamp(proto.timestamp_reservation_current),
+                    received: Timestamp(proto.timestamp_reservation_received),
                 }
             }
             metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected => {
@@ -2368,6 +2503,9 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata expected schema version must be non-zero")]
     ZeroExpectedSchemaVersion,
+
+    #[error("metadata timestamp reservation endpoint must be non-zero")]
+    ZeroTimestamp,
 
     #[error("metadata table must have at least one tablet")]
     ZeroTabletCount,
