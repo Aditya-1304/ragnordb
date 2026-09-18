@@ -2616,39 +2616,49 @@ impl MetadataProposalClient {
         let envelope_bytes = envelope
             .encode()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
-        let local_result = self.propose_local(envelope, deadline);
-        match local_result {
-            Ok(outcome) => Ok(outcome),
-            Err(local_error) if metadata_error_can_forward(&local_error) => {
-                let mut last_error = local_error;
-                for target in self
-                    .metadata_nodes
-                    .iter()
-                    .copied()
-                    .filter(|target| *target != self.local_node_id)
-                {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    let response = self.metadata_rpc.propose(
-                        target,
-                        METADATA_RAFT_GROUP_ID,
-                        ragnordb_common::rpc_codec::MetadataProposalRequest {
-                            request_id: request_id.clone(),
-                            command_envelope: envelope_bytes.clone(),
-                        },
-                        remaining,
-                    );
-                    match response.and_then(metadata_response_to_outcome) {
-                        Ok(outcome) => return Ok(outcome),
-                        Err(error) => last_error = error,
-                    }
-                }
-                Err(last_error)
+        let mut last_error = None;
+        while !deadline.saturating_duration_since(Instant::now()).is_zero() {
+            match self.propose_local(envelope.clone(), deadline) {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if metadata_error_can_forward(&error) => last_error = Some(error),
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
+
+            for target in self
+                .metadata_nodes
+                .iter()
+                .copied()
+                .filter(|target| *target != self.local_node_id)
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let response = self.metadata_rpc.propose(
+                    target,
+                    METADATA_RAFT_GROUP_ID,
+                    ragnordb_common::rpc_codec::MetadataProposalRequest {
+                        request_id: request_id.clone(),
+                        command_envelope: envelope_bytes.clone(),
+                    },
+                    remaining,
+                );
+                match response.and_then(metadata_response_to_outcome) {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(error) if metadata_error_can_forward(&error) => last_error = Some(error),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(Duration::from_millis(2).min(remaining));
+            }
         }
+
+        Err(last_error.unwrap_or_else(|| Error::ProposalUnavailable {
+            reason: "metadata proposal deadline elapsed".to_string(),
+        }))
     }
 
     fn propose_local(
@@ -4216,7 +4226,10 @@ fn graceful_leadership_handoff(
     }
 }
 
-fn publish_host_status(status: &SharedMultiRaftHostStatus, host: &MultiRaftHost<impl RaftWal>) {
+fn publish_host_status(
+    status: &SharedMultiRaftHostStatus,
+    host: &MultiRaftHost<impl RaftWal + Send + 'static>,
+) {
     *status
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = host.status();
@@ -4231,7 +4244,7 @@ fn service_metadata_requests<W>(
     max_requests: usize,
 ) -> bool
 where
-    W: RaftWal,
+    W: RaftWal + Send + 'static,
 {
     let mut serviced = 0;
     while serviced < max_requests {

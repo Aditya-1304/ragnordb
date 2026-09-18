@@ -118,6 +118,16 @@ const TABLET_BATCH_DEADLINE_GRACE: Duration = Duration::from_millis(1);
 /// limits time spent inspecting already-queued compatible requests in one
 /// owner turn when the queue is continuously busy.
 const TABLET_BATCH_MAX_DELAY: Duration = Duration::from_millis(1);
+
+fn protobuf_varint_len(mut value: usize) -> usize {
+    let mut length = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
+}
+
 /// Bound the number of caller reply channels retained while one coalesced
 /// ReadIndex request waits for quorum or its fallback barrier.
 const MAX_PENDING_READ_BARRIER_WAITERS: usize = 1_024;
@@ -865,7 +875,7 @@ pub(crate) struct FixedReactorSet {
     next_reactor: AtomicUsize,
     next_generation: AtomicU64,
     shutdown: Arc<AtomicBool>,
-    ownerships: Mutex<BTreeMap<RaftReplicaIdentity, ReactorOwnership>>,
+    ownerships: Arc<Mutex<BTreeMap<RaftReplicaIdentity, ReactorOwnership>>>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
@@ -901,16 +911,17 @@ impl FixedReactorSet {
             next_reactor: AtomicUsize::new(0),
             next_generation: AtomicU64::new(1),
             shutdown: Arc::clone(&shutdown),
-            ownerships: Mutex::new(BTreeMap::new()),
+            ownerships: Arc::new(Mutex::new(BTreeMap::new())),
             workers: Mutex::new(Vec::with_capacity(count)),
         });
 
         for (reactor_id, receiver) in receivers.into_iter().enumerate() {
             let wake = reactors.slots[reactor_id].wake.clone();
             let worker_shutdown = Arc::clone(&shutdown);
+            let ownerships = Arc::clone(&reactors.ownerships);
             let worker = thread::Builder::new()
                 .name(format!("ragnordb-reactor-{reactor_id}"))
-                .spawn(move || run_fixed_reactor(receiver, wake, worker_shutdown))
+                .spawn(move || run_fixed_reactor(receiver, wake, worker_shutdown, ownerships))
                 .map_err(|source| {
                     Error::Configuration(format!("spawn reactor {reactor_id}: {source}"))
                 })?;
@@ -951,12 +962,25 @@ impl FixedReactorSet {
                 .ownerships
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if ownerships.insert(identity, assignment.ownership).is_some() {
+            if let std::collections::btree_map::Entry::Occupied(existing) =
+                ownerships.entry(identity)
+            {
                 return Err(Error::Configuration(format!(
-                    "reactor ownership already exists for {identity:?}"
+                    "reactor ownership already exists for {identity:?}: {:?}",
+                    existing.get()
                 )));
             }
+            ownerships.insert(identity, assignment.ownership);
         }
+
+        let rollback = || {
+            let mut ownerships = self
+                .ownerships
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            remove_matching_ownership(&mut ownerships, identity, assignment.ownership);
+        };
+
         let (reply, response) = mpsc::sync_channel(1);
         let send_result = assignment
             .command
@@ -971,10 +995,7 @@ impl FixedReactorSet {
                 })
             });
         if let Err(error) = send_result {
-            self.ownerships
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&identity);
+            rollback();
             return Err(error);
         }
         assignment.wake.wake();
@@ -984,14 +1005,7 @@ impl FixedReactorSet {
                 Error::Configuration("reactor registration acknowledgement was lost".to_string())
             })?
             .map_err(Error::Configuration);
-        if let Err(error) = result {
-            self.ownerships
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&identity);
-            return Err(error);
-        }
-        Ok(())
+        result.inspect_err(|_| rollback())
     }
 
     pub(crate) fn wake_all(&self) {
@@ -1028,6 +1042,7 @@ fn run_fixed_reactor(
     receiver: Receiver<ReactorCommand>,
     wake: ReactorWake,
     shutdown: Arc<AtomicBool>,
+    ownerships: Arc<Mutex<BTreeMap<RaftReplicaIdentity, ReactorOwnership>>>,
 ) {
     wake.bind_current_thread();
     let mut groups = BTreeMap::<RaftReplicaIdentity, Box<dyn ReactorGroup>>::new();
@@ -1071,7 +1086,9 @@ fn run_fixed_reactor(
                 continue;
             };
             if group.is_shutdown() {
+                let ownership = group.ownership();
                 groups.remove(&identity);
+                remove_reactor_ownership(&ownerships, identity, ownership);
                 continue;
             }
             serviced += 1;
@@ -1085,7 +1102,14 @@ fn run_fixed_reactor(
                     }
                 }
                 Ok(false) => {}
-                Err(reason) => group.fail(reason),
+                Err(reason) => {
+                    group.fail(reason);
+                    if group.is_shutdown() {
+                        let ownership = group.ownership();
+                        groups.remove(&identity);
+                        remove_reactor_ownership(&ownerships, identity, ownership);
+                    }
+                }
             }
         }
 
@@ -1095,6 +1119,27 @@ fn run_fixed_reactor(
             thread::yield_now();
         }
     }
+}
+
+fn remove_matching_ownership(
+    ownerships: &mut BTreeMap<RaftReplicaIdentity, ReactorOwnership>,
+    identity: RaftReplicaIdentity,
+    ownership: ReactorOwnership,
+) {
+    if ownerships.get(&identity) == Some(&ownership) {
+        ownerships.remove(&identity);
+    }
+}
+
+fn remove_reactor_ownership(
+    ownerships: &Arc<Mutex<BTreeMap<RaftReplicaIdentity, ReactorOwnership>>>,
+    identity: RaftReplicaIdentity,
+    ownership: ReactorOwnership,
+) {
+    let mut directory = ownerships
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_matching_ownership(&mut directory, identity, ownership);
 }
 
 fn snapshot_boundary_hard_state(
@@ -3570,6 +3615,7 @@ where
             match request {
                 PendingTabletRequest::Prepared(first) => {
                     let mut batch = vec![*first];
+                    let mut batch_encoded_bytes: Option<usize> = None;
                     let now = Instant::now();
                     let batch_started = now;
                     if batch[0].deadline > now + TABLET_BATCH_DEADLINE_GRACE {
@@ -3611,20 +3657,47 @@ where
                                 break;
                             }
 
-                            let mut candidate_envelopes = batch
-                                .iter()
-                                .map(|request| request.envelope.clone())
-                                .collect::<Vec<_>>();
-                            candidate_envelopes.push(next.envelope.clone());
-                            let candidate_fits =
-                                TabletCommandBatchEnvelope::new(candidate_envelopes)
-                                    .and_then(|batch| batch.encode())
-                                    .is_ok();
+                            let had_encoded_bytes = batch_encoded_bytes.is_some();
+                            let candidate_fits = if let Some(current_bytes) = batch_encoded_bytes {
+                                next.envelope.encode().is_ok_and(|encoded| {
+                                    let candidate_bytes = current_bytes
+                                        .saturating_add(1)
+                                        .saturating_add(protobuf_varint_len(encoded.len()))
+                                        .saturating_add(encoded.len());
+                                    candidate_bytes <= MAX_TABLET_COMMAND_BATCH_BYTES
+                                })
+                            } else {
+                                TabletCommandBatchEnvelope::new(vec![
+                                    batch[0].envelope.clone(),
+                                    next.envelope.clone(),
+                                ])
+                                .and_then(|batch| batch.encode())
+                                .inspect(|encoded| {
+                                    batch_encoded_bytes = Some(encoded.len());
+                                })
+                                .is_ok()
+                            };
                             if !candidate_fits {
                                 pending_requests.push_front(PendingTabletRequest::Prepared(next));
                                 break;
                             }
                             batch.push(*next);
+                            if had_encoded_bytes {
+                                let current_bytes = batch_encoded_bytes
+                                    .expect("an encoded batch size exists after the first member");
+                                let encoded = batch
+                                    .last()
+                                    .expect("the accepted batch member exists")
+                                    .envelope
+                                    .encode()
+                                    .expect("prepared batch member remains encodable");
+                                batch_encoded_bytes = Some(
+                                    current_bytes
+                                        .saturating_add(1)
+                                        .saturating_add(protobuf_varint_len(encoded.len()))
+                                        .saturating_add(encoded.len()),
+                                );
+                            }
                         }
                     }
 
@@ -6557,6 +6630,65 @@ mod tests {
         );
         drop(owners);
         drop(reactors);
+    }
+
+    #[test]
+    /// Realistic bug caught: duplicate registration used to overwrite the
+    /// live directory entry before returning an error, so later cleanup could
+    /// route work away from the reactor that still owned the group.
+    fn duplicate_registration_preserves_the_live_ownership_generation() {
+        let reactors = FixedReactorSet::new(2).expect("the fixed reactor set must start");
+        let identity = RaftReplicaIdentity::new(RaftGroupId(7), ReplicaId(1)).unwrap();
+        let first = reactors.assign().unwrap();
+        reactors
+            .register(
+                &first,
+                Box::new(OwnershipProbe {
+                    identity,
+                    ownership: first.ownership,
+                    observations: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
+                }),
+            )
+            .unwrap();
+
+        let duplicate = reactors.assign().unwrap();
+        assert!(
+            reactors
+                .register(
+                    &duplicate,
+                    Box::new(OwnershipProbe {
+                        identity,
+                        ownership: duplicate.ownership,
+                        observations: Arc::new((Mutex::new(HashMap::new()), Condvar::new(),)),
+                    }),
+                )
+                .is_err()
+        );
+
+        assert_eq!(
+            reactors.ownerships.lock().unwrap().get(&identity),
+            Some(&first.ownership)
+        );
+    }
+
+    #[test]
+    /// Realistic bug caught: a delayed cleanup from an old reactor generation
+    /// must not remove a newer ownership record for the same replica identity.
+    fn stale_reactor_cleanup_cannot_remove_a_newer_generation() {
+        let identity = RaftReplicaIdentity::new(RaftGroupId(8), ReplicaId(1)).unwrap();
+        let old = ReactorOwnership {
+            reactor_id: 0,
+            generation: 1,
+        };
+        let new = ReactorOwnership {
+            reactor_id: 1,
+            generation: 2,
+        };
+        let mut ownerships = BTreeMap::from([(identity, new)]);
+
+        remove_matching_ownership(&mut ownerships, identity, old);
+
+        assert_eq!(ownerships.get(&identity), Some(&new));
     }
 
     #[test]

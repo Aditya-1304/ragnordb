@@ -13,6 +13,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RAFT_ROOT="$(cd "$REPO_ROOT/../Papers/raft" && pwd)"
+WAL_ROOT="$(cd "$REPO_ROOT/../wal" && pwd)"
+BLOOM_ROOT="$(cd "$REPO_ROOT/../bloom-bloom" && pwd)"
 mkdir -p "$OUTPUT_DIR"
 cd "$REPO_ROOT"
 
@@ -51,6 +53,23 @@ git -C "$REPO_ROOT" status --short > "$OUTPUT_DIR/git-status.txt"
 git -C "$REPO_ROOT" diff --stat > "$OUTPUT_DIR/git-diff-stat.txt"
 git -C "$REPO_ROOT" diff --name-status > "$OUTPUT_DIR/git-diff-name-status.txt"
 git -C "$RAFT_ROOT" rev-parse HEAD > "$OUTPUT_DIR/raft-commit.txt"
+git -C "$WAL_ROOT" rev-parse HEAD > "$OUTPUT_DIR/wal-commit.txt"
+git -C "$BLOOM_ROOT" rev-parse HEAD > "$OUTPUT_DIR/bloom-commit.txt"
+git -C "$RAFT_ROOT" status --porcelain > "$OUTPUT_DIR/raft-status.txt"
+git -C "$WAL_ROOT" status --porcelain > "$OUTPUT_DIR/wal-status.txt"
+git -C "$BLOOM_ROOT" status --porcelain > "$OUTPUT_DIR/bloom-status.txt"
+
+for dependency_status in \
+  "$OUTPUT_DIR/raft-status.txt" \
+  "$OUTPUT_DIR/wal-status.txt" \
+  "$OUTPUT_DIR/bloom-status.txt"
+do
+  if [ -s "$dependency_status" ]; then
+    printf 'dependency repository is dirty: %s\n' "$dependency_status" >&2
+    exit 1
+  fi
+done
+
 uname -a > "$OUTPUT_DIR/uname.txt"
 lscpu > "$OUTPUT_DIR/lscpu.txt"
 rustc --version --verbose > "$OUTPUT_DIR/rustc.txt"
@@ -197,6 +216,36 @@ run_one_table() {
   local table_name="$1"
   local client_id="$2"
   local seed="$3"
+
+  local readiness_attempt
+  for readiness_attempt in $(seq 1 120); do
+    if "$BENCH_BIN" run \
+      --addr "$metadata_leader_addr" \
+      --table "$table_name" \
+      --protocol v2 \
+      --client-id "$((700000 + readiness_attempt))" \
+      --session-epoch "$readiness_attempt" \
+      --workload point-read \
+      --clients 1 \
+      --seconds 1 \
+      --warmup 0 \
+      --rows "$TABLE_ROWS" \
+      --value-bytes 64 \
+      --scan-rows "$TABLE_ROWS" \
+      --timeout-ms "$TIMEOUT_MS" \
+      --seed "$seed" \
+      > "$OUTPUT_DIR/independent-$table_name-readiness.json" \
+      2> "$OUTPUT_DIR/independent-$table_name-readiness.stderr"
+    then
+      break
+    fi
+    if [ "$readiness_attempt" -eq 120 ]; then
+      printf 'independent workload readiness did not converge: %s\n' "$table_name" >&2
+      return 1
+    fi
+    sleep 0.25
+  done
+
   "$BENCH_BIN" run \
     --addr "$metadata_leader_addr" \
     --table "$table_name" \

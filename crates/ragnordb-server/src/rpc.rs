@@ -64,6 +64,9 @@ const MAX_PENDING_INBOUND_TABLET_RPCS: usize = 4_096;
 const INBOUND_TABLET_RPC_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const INBOUND_TABLET_RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_DISPATCH_MESSAGE_BUDGET: usize = 256;
+const MAX_PENDING_CONTROL_RPCS: usize = 512;
+const CONTROL_RPC_DRAIN_BUDGET: usize = 256;
+const CONTROL_RPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PendingTabletRpc {
     source: NodeId,
@@ -73,6 +76,48 @@ struct PendingTabletRpc {
     status: Arc<RwLock<ReplicatedTabletStatus>>,
     deadline: Instant,
     completion: Option<TabletRpcCompletion>,
+    kind: PendingTabletRpcKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTabletRpcKind {
+    Mutation,
+    ReadOnly,
+}
+
+enum PendingControlRpc {
+    ReplicaJoin {
+        source: NodeId,
+        group_id: RaftGroupId,
+        attempt_id: u64,
+        deadline: Instant,
+        response: mpsc::Receiver<ReplicaJoinAdmissionResult>,
+    },
+    MetadataCommand {
+        source: NodeId,
+        group_id: RaftGroupId,
+        attempt_id: u64,
+        request_id: RequestId,
+        deadline: Instant,
+        response: mpsc::Receiver<Result<MetadataApplyOutcome>>,
+    },
+    MetadataConfChange {
+        source: NodeId,
+        group_id: RaftGroupId,
+        attempt_id: u64,
+        deadline: Instant,
+        response: mpsc::Receiver<Result<()>>,
+    },
+}
+
+impl PendingControlRpc {
+    fn attempt_id(&self) -> u64 {
+        match self {
+            Self::ReplicaJoin { attempt_id, .. }
+            | Self::MetadataCommand { attempt_id, .. }
+            | Self::MetadataConfChange { attempt_id, .. } => *attempt_id,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -81,6 +126,7 @@ pub(crate) struct RpcState {
     next_attempt: Arc<AtomicU64>,
     inbound_tablet: Arc<Mutex<BTreeMap<u64, PendingTabletRpc>>>,
     next_tablet_token: Arc<AtomicU64>,
+    pending_control: Arc<Mutex<Vec<PendingControlRpc>>>,
     dispatcher_wake: Arc<Mutex<Option<thread::Thread>>>,
 }
 
@@ -324,6 +370,7 @@ impl RpcState {
             next_attempt: Arc::new(AtomicU64::new(1)),
             inbound_tablet: Arc::new(Mutex::new(BTreeMap::new())),
             next_tablet_token: Arc::new(AtomicU64::new(1)),
+            pending_control: Arc::new(Mutex::new(Vec::new())),
             dispatcher_wake: Arc::new(Mutex::new(None)),
         }
     }
@@ -382,6 +429,27 @@ impl RpcState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&token);
+    }
+
+    fn reserve_control_rpc(&self, pending: PendingControlRpc) -> Result<()> {
+        let mut pending_requests = self
+            .pending_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending_requests.len() >= MAX_PENDING_CONTROL_RPCS {
+            return Err(Error::ProposalUnavailable {
+                reason: "control-plane RPC completion capacity is full".to_string(),
+            });
+        }
+        pending_requests.push(pending);
+        Ok(())
+    }
+
+    fn cancel_control_rpc(&self, attempt_id: u64) {
+        self.pending_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|pending| pending.attempt_id() != attempt_id);
     }
 
     fn take_ready_tablet_rpcs(&self, now: Instant) -> Vec<PendingTabletRpc> {
@@ -882,18 +950,29 @@ impl TabletRpcClient {
         let mut current_route = route.clone();
         let mut last_error = None;
         let mut attempted_replicas = BTreeSet::new();
+        let mut attempt = 0_u32;
 
-        for attempt in 0..MAX_TABLET_RETRY_ATTEMPTS {
+        while !deadline.saturating_duration_since(Instant::now()).is_zero() {
             let (target_replica, target) =
                 match next_unattempted_replica(&current_route, &attempted_replicas) {
                     Ok(target) => target,
                     Err(_) => {
-                        last_error = Some(Error::LeaderUnknown);
+                        attempted_replicas.clear();
+                        let backoff = retry_backoff(
+                            attempt,
+                            deadline.saturating_duration_since(Instant::now()),
+                        );
+                        if !backoff.is_zero() {
+                            thread::sleep(backoff);
+                        }
                         continue;
                     }
                 };
             attempted_replicas.insert((current_route.raft_group_id, target_replica));
-            let attempt_timeout = retry_attempt_timeout(deadline, attempt);
+            let attempt_timeout = retry_attempt_timeout(
+                deadline,
+                attempt.min(MAX_TABLET_RETRY_ATTEMPTS.saturating_sub(1)),
+            );
             if attempt_timeout.is_zero() {
                 break;
             }
@@ -912,10 +991,10 @@ impl TabletRpcClient {
                     self.record_successful_leader(&current_route, target_replica);
                     return Ok(row);
                 }
-                Err(error)
-                    if is_retryable_tablet_error(&error)
-                        && attempt + 1 < MAX_TABLET_RETRY_ATTEMPTS =>
-                {
+                Err(error) => {
+                    if !is_retryable_tablet_error(&error) {
+                        return Err(error);
+                    }
                     let route_refreshed =
                         if let Error::StaleTabletEpoch { current_epoch, .. } = &error {
                             if *current_epoch == 0 {
@@ -944,6 +1023,7 @@ impl TabletRpcClient {
                     }
                     self.update_route_after_error(&mut current_route, target_replica, &error);
                     last_error = Some(error);
+                    attempt = attempt.saturating_add(1);
                     let backoff = retry_backoff(
                         attempt,
                         deadline.saturating_duration_since(std::time::Instant::now()),
@@ -952,7 +1032,6 @@ impl TabletRpcClient {
                         thread::sleep(backoff);
                     }
                 }
-                Err(error) => return Err(error),
             }
         }
 
@@ -1437,7 +1516,7 @@ fn build_routing_snapshot(generation: u64, state: &MetadataState) -> Result<Rout
                 tablet_id: descriptor.tablet_id,
                 tablet_epoch: descriptor.tablet_epoch,
                 leader_replica_id,
-                replicas,
+                replicas: replicas.into(),
             };
             route
                 .validate()
@@ -1607,6 +1686,7 @@ pub(crate) fn spawn_dispatcher(
             rpc_state.bind_dispatcher();
             while !shutdown.load(Ordering::Acquire) {
                 let mut made_progress = false;
+                drain_control_rpc_completions(&transport, &rpc_state);
                 drain_tablet_rpc_completions(&transport, &rpc_state);
 
                 for _ in 0..RPC_DISPATCH_MESSAGE_BUDGET {
@@ -1624,6 +1704,7 @@ pub(crate) fn spawn_dispatcher(
                         message.source_node_id,
                         message.frame,
                     );
+                    drain_control_rpc_completions(&transport, &rpc_state);
                     drain_tablet_rpc_completions(&transport, &rpc_state);
                 }
 
@@ -1636,27 +1717,201 @@ pub(crate) fn spawn_dispatcher(
                     thread::park_timeout(INBOUND_TABLET_RPC_POLL_INTERVAL);
                 }
             }
+            drain_control_rpc_completions(&transport, &rpc_state);
             drain_tablet_rpc_completions(&transport, &rpc_state);
         })
         .expect("tablet RPC dispatcher thread creation must succeed");
     (client, worker)
 }
 
+fn drain_control_rpc_completions(transport: &NodeRaftTransport, rpc_state: &RpcState) {
+    let now = Instant::now();
+    let mut pending = {
+        let mut requests = rpc_state
+            .pending_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *requests)
+    };
+    let mut retained = Vec::with_capacity(pending.len());
+    let mut drained = 0;
+
+    for request in pending.drain(..) {
+        if drained >= CONTROL_RPC_DRAIN_BUDGET {
+            retained.push(request);
+            continue;
+        }
+
+        match request {
+            PendingControlRpc::ReplicaJoin {
+                source,
+                group_id,
+                attempt_id,
+                deadline,
+                response,
+            } => match response.try_recv() {
+                Ok(result) => {
+                    send_replica_join_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        result.success,
+                        result.error_message,
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) if deadline > now => {
+                    retained.push(PendingControlRpc::ReplicaJoin {
+                        source,
+                        group_id,
+                        attempt_id,
+                        deadline,
+                        response,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    send_replica_join_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        false,
+                        "replica join admission deadline elapsed".to_string(),
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    send_replica_join_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        false,
+                        "replica join admission owner disconnected".to_string(),
+                    );
+                    drained += 1;
+                }
+            },
+            PendingControlRpc::MetadataCommand {
+                source,
+                group_id,
+                attempt_id,
+                request_id,
+                deadline,
+                response,
+            } => match response.try_recv() {
+                Ok(result) => {
+                    send_metadata_response(
+                        transport, source, group_id, attempt_id, request_id, result,
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) if deadline > now => {
+                    retained.push(PendingControlRpc::MetadataCommand {
+                        source,
+                        group_id,
+                        attempt_id,
+                        request_id,
+                        deadline,
+                        response,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    send_metadata_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        request_id,
+                        Err(Error::ProposalUnavailable {
+                            reason: "metadata proposal forwarding deadline elapsed".to_string(),
+                        }),
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    send_metadata_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        request_id,
+                        Err(Error::ProposalUnavailable {
+                            reason: "metadata proposal owner disconnected".to_string(),
+                        }),
+                    );
+                    drained += 1;
+                }
+            },
+            PendingControlRpc::MetadataConfChange {
+                source,
+                group_id,
+                attempt_id,
+                deadline,
+                response,
+            } => match response.try_recv() {
+                Ok(result) => {
+                    send_metadata_conf_change_response(
+                        transport, source, group_id, attempt_id, result,
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) if deadline > now => {
+                    retained.push(PendingControlRpc::MetadataConfChange {
+                        source,
+                        group_id,
+                        attempt_id,
+                        deadline,
+                        response,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        Err(Error::ProposalUnavailable {
+                            reason: "metadata ConfChange forwarding deadline elapsed".to_string(),
+                        }),
+                    );
+                    drained += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        Err(Error::ProposalUnavailable {
+                            reason: "metadata ConfChange owner disconnected".to_string(),
+                        }),
+                    );
+                    drained += 1;
+                }
+            },
+        }
+    }
+
+    let mut requests = rpc_state
+        .pending_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    requests.extend(retained);
+}
+
 fn drain_tablet_rpc_completions(transport: &NodeRaftTransport, rpc_state: &RpcState) {
     let now = Instant::now();
     for mut pending in rpc_state.take_ready_tablet_rpcs(now) {
         if pending.deadline <= now {
+            let error = tablet_rpc_deadline_error(&pending);
             send_response(
                 transport,
                 pending.source,
                 pending.group_id,
                 pending.attempt_id,
-                error_response(
-                    pending.request_id,
-                    Error::ProposalUnavailable {
-                        reason: "tablet RPC deadline elapsed before completion".to_string(),
-                    },
-                ),
+                error_response(pending.request_id, error),
             );
             continue;
         }
@@ -1672,6 +1927,22 @@ fn drain_tablet_rpc_completions(transport: &NodeRaftTransport, rpc_state: &RpcSt
             pending.attempt_id,
             response,
         );
+    }
+}
+
+fn tablet_rpc_deadline_error(pending: &PendingTabletRpc) -> Error {
+    match pending.kind {
+        PendingTabletRpcKind::Mutation => Error::RequestOutcomeUnknown {
+            identity: format!(
+                "client={:#034x}/group={}/sequence={}",
+                pending.request_id.client_id,
+                pending.request_id.raft_group_id.0,
+                pending.request_id.sequence,
+            ),
+        },
+        PendingTabletRpcKind::ReadOnly => Error::ProposalUnavailable {
+            reason: "tablet RPC deadline elapsed before completion".to_string(),
+        },
     }
 }
 
@@ -1787,6 +2058,29 @@ fn dispatch_message(
                 return;
             };
             let (reply, response) = mpsc::channel();
+            let group_id = frame.raft_group_id;
+            if let Err(error) = rpc_state.reserve_control_rpc(PendingControlRpc::ReplicaJoin {
+                source,
+                group_id,
+                attempt_id,
+                deadline: Instant::now() + CONTROL_RPC_DEFAULT_TIMEOUT,
+                response,
+            }) {
+                send_replica_join_response(
+                    transport,
+                    source,
+                    group_id,
+                    attempt_id,
+                    false,
+                    error.to_string(),
+                );
+                return;
+            }
+
+            // The lifecycle owner may wait on WAL/database ownership and must
+            // not block this dispatcher: doing so would let one slow join
+            // starve unrelated tablet and metadata RPCs. The admission queue
+            // is bounded; a full queue is rejected synchronously above.
             if join_requests
                 .try_send(ReplicaJoinAdmission {
                     source_node_id: source,
@@ -1795,10 +2089,11 @@ fn dispatch_message(
                 })
                 .is_err()
             {
+                rpc_state.cancel_control_rpc(attempt_id);
                 send_replica_join_response(
                     transport,
                     source,
-                    frame.raft_group_id,
+                    group_id,
                     attempt_id,
                     false,
                     "replica join lifecycle owner is unavailable".to_string(),
@@ -1806,28 +2101,6 @@ fn dispatch_message(
                 return;
             }
             host_wake.wake();
-            // The lifecycle owner may wait on WAL/database ownership and must
-            // not block this dispatcher: doing so would let one slow join
-            // starve unrelated tablet and metadata RPCs. The admission queue
-            // is bounded; a full queue is rejected synchronously above.
-            let transport = transport.clone();
-            let group_id = frame.raft_group_id;
-            thread::spawn(move || {
-                let result = response.recv_timeout(Duration::from_secs(30)).unwrap_or(
-                    ReplicaJoinAdmissionResult {
-                        success: false,
-                        error_message: "replica join admission deadline elapsed".to_string(),
-                    },
-                );
-                send_replica_join_response(
-                    &transport,
-                    source,
-                    group_id,
-                    attempt_id,
-                    result.success,
-                    result.error_message,
-                );
-            });
         }
         MessageType::TabletCommandRequest => {
             let Ok(proto) = rpc::TabletCommandRequest::decode(frame.payload.as_slice()) else {
@@ -1882,6 +2155,7 @@ fn dispatch_message(
                 status: handle.status_shared(),
                 deadline,
                 completion: None,
+                kind: PendingTabletRpcKind::Mutation,
             }) {
                 Ok(token) => token,
                 Err(error) => {
@@ -1972,6 +2246,7 @@ fn dispatch_message(
                 status: handle.status_shared(),
                 deadline,
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             }) {
                 Ok(token) => token,
                 Err(error) => {
@@ -2063,6 +2338,7 @@ fn dispatch_message(
                 status: handle.status_shared(),
                 deadline,
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             }) {
                 Ok(token) => token,
                 Err(error) => {
@@ -2141,6 +2417,7 @@ fn dispatch_message(
                 status: handle.status_shared(),
                 deadline,
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             }) {
                 Ok(token) => token,
                 Err(error) => {
@@ -2231,7 +2508,26 @@ fn dispatch_message(
                     );
                     return;
                 }
+                let group_id = frame.raft_group_id;
                 let (reply, response) = mpsc::channel();
+                if let Err(error) =
+                    rpc_state.reserve_control_rpc(PendingControlRpc::MetadataConfChange {
+                        source,
+                        group_id,
+                        attempt_id,
+                        deadline: Instant::now() + CONTROL_RPC_DEFAULT_TIMEOUT,
+                        response,
+                    })
+                {
+                    send_metadata_conf_change_response(
+                        transport,
+                        source,
+                        group_id,
+                        attempt_id,
+                        Err(error),
+                    );
+                    return;
+                }
                 if metadata_requests
                     .try_send(MetadataHostRequest::ConfChange {
                         expected_conf_state_version: request.expected_conf_state_version,
@@ -2240,10 +2536,11 @@ fn dispatch_message(
                     })
                     .is_err()
                 {
+                    rpc_state.cancel_control_rpc(attempt_id);
                     send_metadata_conf_change_response(
                         transport,
                         source,
-                        frame.raft_group_id,
+                        group_id,
                         attempt_id,
                         Err(Error::ProposalUnavailable {
                             reason: "metadata ConfChange queue is full".to_string(),
@@ -2252,20 +2549,6 @@ fn dispatch_message(
                     return;
                 }
                 host_wake.wake();
-
-                let transport = transport.clone();
-                let group_id = frame.raft_group_id;
-                thread::spawn(move || {
-                    let result = response
-                        .recv_timeout(Duration::from_secs(30))
-                        .map_err(|error| Error::ProposalUnavailable {
-                            reason: format!("metadata ConfChange forwarding failed: {error}"),
-                        })
-                        .and_then(|result| result);
-                    send_metadata_conf_change_response(
-                        &transport, source, group_id, attempt_id, result,
-                    );
-                });
                 return;
             }
             let Some(rpc::metadata_request::Request::ProposeCommand(request)) = proto.request
@@ -2296,7 +2579,27 @@ fn dispatch_message(
                 );
                 return;
             };
+            let group_id = frame.raft_group_id;
             let (reply, response) = mpsc::channel();
+            if let Err(error) = rpc_state.reserve_control_rpc(PendingControlRpc::MetadataCommand {
+                source,
+                group_id,
+                attempt_id,
+                request_id: request_id.clone(),
+                deadline: Instant::now() + CONTROL_RPC_DEFAULT_TIMEOUT,
+                response,
+            }) {
+                send_metadata_response(
+                    transport,
+                    source,
+                    group_id,
+                    attempt_id,
+                    request_id,
+                    Err(error),
+                );
+                return;
+            }
+
             if metadata_requests
                 .try_send(MetadataHostRequest::Command {
                     envelope: Box::new(envelope),
@@ -2305,6 +2608,7 @@ fn dispatch_message(
                 })
                 .is_err()
             {
+                rpc_state.cancel_control_rpc(attempt_id);
                 send_metadata_response(
                     transport,
                     source,
@@ -2318,26 +2622,6 @@ fn dispatch_message(
                 return;
             }
             host_wake.wake();
-
-            let transport = transport.clone();
-            let request_id_for_thread = request_id.clone();
-            let group_id = frame.raft_group_id;
-            thread::spawn(move || {
-                let result = response
-                    .recv_timeout(Duration::from_secs(30))
-                    .map_err(|error| Error::ProposalUnavailable {
-                        reason: format!("metadata proposal forwarding failed: {error}"),
-                    })?;
-                send_metadata_response(
-                    &transport,
-                    source,
-                    group_id,
-                    attempt_id,
-                    request_id_for_thread,
-                    result,
-                );
-                Ok::<(), Error>(())
-            });
         }
         MessageType::MetadataResponse => {
             let Ok(proto) = rpc::MetadataResponse::decode(frame.payload.as_slice()) else {
@@ -2996,6 +3280,7 @@ mod tests {
                 status: status.clone(),
                 deadline: Instant::now() + Duration::from_secs(1),
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             })
             .unwrap();
         let second = state
@@ -3011,6 +3296,7 @@ mod tests {
                 status,
                 deadline: Instant::now() + Duration::from_secs(1),
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             })
             .unwrap();
 
@@ -3042,6 +3328,7 @@ mod tests {
                 status: Arc::new(RwLock::new(ReplicatedTabletStatus::default())),
                 deadline: Instant::now() + Duration::from_secs(1),
                 completion: None,
+                kind: PendingTabletRpcKind::ReadOnly,
             })
             .unwrap();
 
@@ -3049,6 +3336,87 @@ mod tests {
         state.publish_tablet_completion(token, TabletRpcCompletion::Outcome(Ok(None)));
 
         assert!(state.take_ready_tablet_rpcs(Instant::now()).is_empty());
+    }
+
+    /// Realistic bug caught: replacing completion threads with a vector is
+    /// only safe when the vector itself remains bounded independently of the
+    /// number of in-flight control requests.
+    #[test]
+    fn control_rpc_completion_capacity_is_bounded() {
+        let state = RpcState::new();
+        for attempt_id in 1..=MAX_PENDING_CONTROL_RPCS as u64 {
+            let (_sender, response) = mpsc::channel();
+            state
+                .reserve_control_rpc(PendingControlRpc::ReplicaJoin {
+                    source: NodeId(2),
+                    group_id: RaftGroupId(7),
+                    attempt_id,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    response,
+                })
+                .unwrap();
+        }
+
+        let (_sender, response) = mpsc::channel();
+        assert!(matches!(
+            state.reserve_control_rpc(PendingControlRpc::ReplicaJoin {
+                source: NodeId(2),
+                group_id: RaftGroupId(7),
+                attempt_id: MAX_PENDING_CONTROL_RPCS as u64 + 1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            }),
+            Err(Error::ProposalUnavailable { .. })
+        ));
+        assert_eq!(
+            state.pending_control.lock().unwrap().len(),
+            MAX_PENDING_CONTROL_RPCS
+        );
+    }
+
+    /// Realistic bug caught: timing out after mutation admission cannot be
+    /// mapped to an ordinary retry because the command may already be durable
+    /// or applied on the owning reactor.
+    #[test]
+    fn admitted_mutation_timeout_is_outcome_unknown_but_reads_remain_retryable() {
+        let status = Arc::new(RwLock::new(ReplicatedTabletStatus::default()));
+        let mutation = PendingTabletRpc {
+            source: NodeId(2),
+            group_id: RaftGroupId(7),
+            attempt_id: Some(1),
+            request_id: RequestId {
+                client_id: 9,
+                sequence: 4,
+                raft_group_id: RaftGroupId(7),
+            },
+            status: status.clone(),
+            deadline: Instant::now(),
+            completion: None,
+            kind: PendingTabletRpcKind::Mutation,
+        };
+        let read = PendingTabletRpc {
+            source: NodeId(2),
+            group_id: RaftGroupId(7),
+            attempt_id: Some(1),
+            request_id: RequestId {
+                client_id: 9,
+                sequence: 4,
+                raft_group_id: RaftGroupId(7),
+            },
+            status,
+            deadline: Instant::now(),
+            completion: None,
+            kind: PendingTabletRpcKind::ReadOnly,
+        };
+
+        assert!(matches!(
+            tablet_rpc_deadline_error(&mutation),
+            Error::RequestOutcomeUnknown { .. }
+        ));
+        assert!(matches!(
+            tablet_rpc_deadline_error(&read),
+            Error::ProposalUnavailable { .. }
+        ));
     }
 
     #[test]
@@ -3071,7 +3439,8 @@ mod tests {
                     replica_id: ReplicaId(3),
                     node_id: NodeId(13),
                 },
-            ],
+            ]
+            .into(),
         };
         let mut attempted = BTreeSet::new();
         assert_eq!(
@@ -3151,7 +3520,8 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(1),
                 node_id: NodeId(11),
-            }],
+            }]
+            .into(),
         };
 
         assert!(!apply_leader_hint(&mut route, ReplicaId(99)));

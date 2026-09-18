@@ -234,6 +234,43 @@ finish_process_metrics() {
   proc_snapshot "$pid" "$OUTPUT_DIR/metrics-$label-after.txt"
 }
 
+wait_for_live_readiness() {
+  local label="$1"
+  local leader_addr="$2"
+  local attempt
+
+  # Raft leadership is published before the tablet's current-term activation
+  # boundary is complete. Require a successful end-to-end read before starting
+  # a measured workload so intentional activation-time NOT_LEADER responses do
+  # not become benchmark failures.
+  for attempt in $(seq 1 120); do
+    if "$BENCH_BIN" run \
+      --addr "$leader_addr" \
+      --table bench \
+      --protocol v2 \
+      --client-id "$((400000 + attempt))" \
+      --session-epoch "$attempt" \
+      --workload point-read \
+      --clients 1 \
+      --seconds 1 \
+      --warmup 0 \
+      --rows "$DATASET_ROWS" \
+      --value-bytes "$VALUE_BYTES" \
+      --scan-rows "$SCAN_ROWS" \
+      --timeout-ms "$TIMEOUT_MS" \
+      --seed "$SEED" \
+      > "$OUTPUT_DIR/$label-readiness.json" \
+      2> "$OUTPUT_DIR/$label-readiness.stderr"
+    then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  printf 'live workload readiness did not converge: %s\n' "$label" >&2
+  return 1
+}
+
 run_live() {
   local label="$1"
   shift
@@ -245,6 +282,7 @@ run_live() {
   leader_node="$(wait_for_group_leader 2)"
   wait_for_group_leader 3 >/dev/null
   leader_addr="127.0.0.1:$((7100 + leader_node))"
+  wait_for_live_readiness "$label" "$leader_addr"
   leader_pid="$(cat "$CLUSTER_DIR/node-$leader_node.pid")"
   start_process_metrics "$leader_pid" "$LIVE_SECONDS" "$label"
   "$BENCH_BIN" run --addr "$leader_addr" "$@" > "$OUTPUT_DIR/$label.json" 2> "$OUTPUT_DIR/$label.stderr" || exit_code=$?

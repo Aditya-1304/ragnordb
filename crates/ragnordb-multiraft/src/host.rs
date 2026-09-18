@@ -9,7 +9,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock, mpsc},
+    thread,
 };
 
 use raft::{
@@ -643,45 +644,101 @@ enum PersistenceAdmissionError {
 /// The single host-owned service which stages prepared Ready generations and
 /// submits their immutable records to the node-wide A-WAL in FIFO order.
 ///
-/// This is intentionally an in-process service rather than an additional OS
-/// thread. The current Ready contract does not allow a group to expose its
+/// This is intentionally one dedicated worker rather than one thread per
+/// request. The current Ready contract does not allow a group to expose its
 /// next generation until the previous one is acknowledged, so the useful
 /// overlap is preparation by other groups while this service performs one
-/// ordered append-and-sync operation.
+/// ordered append-and-sync operation outside the host scheduler thread.
+struct PersistenceWork {
+    groups: Vec<PendingPersistenceGroup>,
+}
+
+struct PersistenceCompletion {
+    groups: Vec<PendingPersistenceGroup>,
+    outcome: Result<BatchAppendResult, BatchAppendFailure>,
+}
+
 struct PersistenceService<W>
 where
-    W: RaftWal,
+    W: RaftWal + Send + 'static,
 {
     node_wal: NodeRaftWal<W>,
     max_pending_groups: usize,
     max_pending_records: usize,
     max_pending_bytes: usize,
     pending: VecDeque<PendingPersistenceGroup>,
+    pending_group_ids: BTreeSet<RaftGroupId>,
     pending_records: usize,
     pending_bytes: usize,
+    in_flight: bool,
+    in_flight_groups: usize,
+    in_flight_records: usize,
+    in_flight_bytes: usize,
+    work_tx: Option<mpsc::SyncSender<PersistenceWork>>,
+    completion_rx: mpsc::Receiver<PersistenceCompletion>,
+    host_thread: Arc<Mutex<Option<thread::Thread>>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl<W> PersistenceService<W>
 where
-    W: RaftWal,
+    W: RaftWal + Send + 'static,
 {
     fn new(node_wal: NodeRaftWal<W>, config: MultiRaftHostConfig) -> Self {
+        let (work_tx, work_rx) = mpsc::sync_channel::<PersistenceWork>(1);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let host_thread = Arc::new(Mutex::new(None::<thread::Thread>));
+        let worker_host_thread = Arc::clone(&host_thread);
+        let worker_wal = node_wal.clone();
+        let worker = thread::Builder::new()
+            .name("ragnordb-raft-persistence".to_string())
+            .spawn(move || {
+                while let Ok(work) = work_rx.recv() {
+                    let groups = work.groups;
+                    let outcome = append_prepared_batch(&worker_wal, &groups);
+                    if completion_tx
+                        .send(PersistenceCompletion { groups, outcome })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if let Some(host) = worker_host_thread
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .cloned()
+                    {
+                        host.unpark();
+                    }
+                }
+            })
+            .expect("Raft persistence worker thread creation must succeed");
+
         Self {
             node_wal,
             max_pending_groups: config.max_pending_persistence_groups,
             max_pending_records: config.max_pending_persistence_records,
             max_pending_bytes: config.max_pending_persistence_bytes,
             pending: VecDeque::new(),
+            pending_group_ids: BTreeSet::new(),
             pending_records: 0,
             pending_bytes: 0,
+            in_flight: false,
+            in_flight_groups: 0,
+            in_flight_records: 0,
+            in_flight_bytes: 0,
+            work_tx: Some(work_tx),
+            completion_rx,
+            host_thread,
+            worker: Some(worker),
         }
     }
 
     fn status(&self) -> MultiRaftPersistenceStatus {
         MultiRaftPersistenceStatus {
-            pending_groups: self.pending.len(),
-            pending_records: self.pending_records,
-            pending_bytes: self.pending_bytes,
+            pending_groups: self.pending.len() + self.in_flight_groups,
+            pending_records: self.pending_records + self.in_flight_records,
+            pending_bytes: self.pending_bytes + self.in_flight_bytes,
         }
     }
 
@@ -689,6 +746,10 @@ where
         &mut self,
         pending: PendingPersistenceGroup,
     ) -> Result<(), PersistenceAdmissionError> {
+        if self.pending_group_ids.contains(&pending.raft_group_id) {
+            return Err(PersistenceAdmissionError::Capacity(pending));
+        }
+
         let record_count = pending.batch.record_count();
         let encoded_bytes = pending.batch.encoded_bytes();
         if record_count > self.max_pending_records || encoded_bytes > self.max_pending_bytes {
@@ -699,77 +760,180 @@ where
             });
         }
 
-        if self.pending.len() >= self.max_pending_groups
-            || self.pending_records.saturating_add(record_count) > self.max_pending_records
-            || self.pending_bytes.saturating_add(encoded_bytes) > self.max_pending_bytes
+        if self.pending.len() + self.in_flight_groups >= self.max_pending_groups
+            || self
+                .pending_records
+                .saturating_add(self.in_flight_records)
+                .saturating_add(record_count)
+                > self.max_pending_records
+            || self
+                .pending_bytes
+                .saturating_add(self.in_flight_bytes)
+                .saturating_add(encoded_bytes)
+                > self.max_pending_bytes
         {
             return Err(PersistenceAdmissionError::Capacity(pending));
         }
 
         self.pending_records = self.pending_records.saturating_add(record_count);
         self.pending_bytes = self.pending_bytes.saturating_add(encoded_bytes);
+        self.pending_group_ids.insert(pending.raft_group_id);
         self.pending.push_back(pending);
         Ok(())
     }
 
-    /// Drain the currently admitted requests as one ordered A-WAL operation.
-    ///
-    /// The service consumes its queue before calling A-WAL so no caller can
-    /// append a later group past an unresolved sync. The returned request list
-    /// remains paired with the exact extent ranges for completion callbacks.
-    fn flush(&mut self) -> Option<PersistenceServiceBatch> {
-        if self.pending.is_empty() {
-            return None;
+    fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
+        self.pending_group_ids.contains(&raft_group_id)
+    }
+
+    fn bind_host_thread(&self) {
+        *self
+            .host_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(thread::current());
+    }
+
+    fn dispatch_if_idle(&mut self) {
+        if self.in_flight || self.pending.is_empty() {
+            return;
         }
 
         let groups = self.pending.drain(..).collect::<Vec<_>>();
+        let record_count = groups
+            .iter()
+            .map(PendingPersistenceGroup::record_count)
+            .sum::<usize>();
+        let encoded_bytes = groups
+            .iter()
+            .map(PendingPersistenceGroup::encoded_bytes)
+            .sum::<usize>();
         self.pending_records = 0;
         self.pending_bytes = 0;
 
-        let total_records = groups.iter().fold(0_usize, |total, pending| {
-            total.saturating_add(pending.batch.record_count())
-        });
-        let records: Vec<_> = groups
-            .iter()
-            .flat_map(|pending| pending.batch.records.iter())
-            // A-WAL remains the checksum and LSN authority. Passing these
-            // exact borrowed payloads avoids a second encoding or checksum
-            // interpretation between preparation and the durable boundary.
-            .map(|record| (record.record_type, record.payload.as_ref()))
-            .collect();
-
-        let mut outcome = if records.is_empty() {
-            Ok(BatchAppendResult {
-                record_extents: Vec::new(),
-                final_end_lsn: wal::lsn::Lsn::ZERO,
-            })
-        } else {
-            self.node_wal.append_batch_and_sync(&records)
-        };
-
-        if let Ok(batch_result) = &outcome
-            && (batch_result.record_extents.len() != total_records
-                || (total_records > 0
-                    && batch_result
-                        .record_extents
-                        .last()
-                        .is_none_or(|extent| extent.end_lsn != batch_result.final_end_lsn)))
+        let work = PersistenceWork { groups };
+        let group_count = work.groups.len();
+        match self
+            .work_tx
+            .as_ref()
+            .expect("Raft persistence worker sender must remain available")
+            .try_send(work)
         {
-            self.node_wal
-                .require_recovery("shared A-WAL returned an invalid cross-group batch frontier");
-            outcome = Err(BatchAppendFailure::OutcomeUnknown {
-                result: batch_result.clone(),
-                source: wal::error::WalError::BrokenDurabilityContract,
-            });
+            Ok(()) => {
+                self.in_flight = true;
+                self.in_flight_groups = group_count;
+                self.in_flight_records = record_count;
+                self.in_flight_bytes = encoded_bytes;
+            }
+            Err(mpsc::TrySendError::Full(work)) => {
+                for group in work.groups.into_iter().rev() {
+                    self.pending.push_front(group);
+                }
+                self.pending_records = record_count;
+                self.pending_bytes = encoded_bytes;
+            }
+            Err(mpsc::TrySendError::Disconnected(work)) => {
+                for group in work.groups.into_iter().rev() {
+                    self.pending.push_front(group);
+                }
+                self.pending_records = record_count;
+                self.pending_bytes = encoded_bytes;
+                self.node_wal
+                    .require_recovery("Raft persistence worker disconnected");
+            }
         }
+    }
 
-        Some(PersistenceServiceBatch { groups, outcome })
+    fn try_take_completion(&mut self) -> Option<PersistenceCompletion> {
+        match self.completion_rx.try_recv() {
+            Ok(completion) => {
+                for pending in &completion.groups {
+                    self.pending_group_ids.remove(&pending.raft_group_id);
+                }
+                self.in_flight = false;
+                self.in_flight_groups = 0;
+                self.in_flight_records = 0;
+                self.in_flight_bytes = 0;
+                Some(completion)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if self.in_flight {
+                    self.node_wal
+                        .require_recovery("Raft persistence worker stopped unexpectedly");
+                    self.in_flight = false;
+                    self.in_flight_groups = 0;
+                    self.in_flight_records = 0;
+                    self.in_flight_bytes = 0;
+                }
+                None
+            }
+        }
     }
 }
 
-struct PersistenceServiceBatch {
-    groups: Vec<PendingPersistenceGroup>,
-    outcome: Result<BatchAppendResult, BatchAppendFailure>,
+impl<W> Drop for PersistenceService<W>
+where
+    W: RaftWal + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.work_tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl PendingPersistenceGroup {
+    fn record_count(&self) -> usize {
+        self.batch.record_count()
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        self.batch.encoded_bytes()
+    }
+}
+
+fn append_prepared_batch<W: RaftWal>(
+    node_wal: &NodeRaftWal<W>,
+    groups: &[PendingPersistenceGroup],
+) -> Result<BatchAppendResult, BatchAppendFailure> {
+    let total_records = groups.iter().fold(0_usize, |total, pending| {
+        total.saturating_add(pending.batch.record_count())
+    });
+    let records: Vec<_> = groups
+        .iter()
+        .flat_map(|pending| pending.batch.records.iter())
+        // A-WAL remains the checksum and LSN authority. Passing these exact
+        // borrowed payloads avoids a second encoding or checksum
+        // interpretation between preparation and the durable boundary.
+        .map(|record| (record.record_type, record.payload.as_ref()))
+        .collect();
+
+    let mut outcome = if records.is_empty() {
+        Ok(BatchAppendResult {
+            record_extents: Vec::new(),
+            final_end_lsn: wal::lsn::Lsn::ZERO,
+        })
+    } else {
+        node_wal.append_batch_and_sync(&records)
+    };
+
+    if let Ok(batch_result) = &outcome
+        && (batch_result.record_extents.len() != total_records
+            || (total_records > 0
+                && batch_result
+                    .record_extents
+                    .last()
+                    .is_none_or(|extent| extent.end_lsn != batch_result.final_end_lsn)))
+    {
+        node_wal.require_recovery("shared A-WAL returned an invalid cross-group batch frontier");
+        outcome = Err(BatchAppendFailure::OutcomeUnknown {
+            result: batch_result.clone(),
+            source: wal::error::WalError::BrokenDurabilityContract,
+        });
+    }
+
+    outcome
 }
 
 impl PendingGroupMessages {
@@ -1702,7 +1866,7 @@ enum HostState {
 /// considers every replica represented in the shared WAL.
 pub struct MultiRaftHost<W>
 where
-    W: RaftWal,
+    W: RaftWal + Send + 'static,
 {
     node_id: NodeId,
 
@@ -1773,7 +1937,7 @@ where
 
 impl<W> MultiRaftHost<W>
 where
-    W: RaftWal,
+    W: RaftWal + Send + 'static,
 {
     pub fn new(node_id: NodeId, node_wal: NodeRaftWal<W>) -> Self {
         Self::new_with_config(node_id, node_wal, MultiRaftHostConfig::default())
@@ -2338,6 +2502,7 @@ where
         budget: MultiRaftTurnBudget,
     ) -> Result<MultiRaftTurnResult, MultiRaftHostError> {
         self.ensure_active()?;
+        self.persistence.bind_host_thread();
 
         if !self.timer_advance_pending {
             for (raft_group_id, due_ticks) in self.timers.advance(ticks) {
@@ -2425,6 +2590,29 @@ where
                 .groups
                 .get(&raft_group_id)
                 .is_some_and(|group| group.has_only_deferred_read_states());
+
+            if group_has_pending_work && self.persistence.contains_group(raft_group_id) {
+                // A prepared Ready generation is already owned by the
+                // persistence service. An inbound message or timer may have
+                // made this group runnable again, but preparing the same
+                // generation a second time would produce duplicate completion
+                // and could fence a healthy node as if its Ready were lost.
+                if let Some(message) = pending_message.take() {
+                    let wire_bytes = message.wire_bytes;
+                    self.pending_messages
+                        .get_mut(&raft_group_id)
+                        .expect("popped message implies a group queue")
+                        .push_front(message);
+                    self.account_pending_addition(wire_bytes);
+                }
+                if timer_due {
+                    self.timer_due
+                        .entry(raft_group_id)
+                        .and_modify(|pending| *pending = pending.saturating_add(group_timer_ticks))
+                        .or_insert(group_timer_ticks);
+                }
+                continue;
+            }
 
             if has_queued_message && group_only_deferred_read_states && !had_message && !timer_due {
                 // A zero message budget leaves the control message queued.
@@ -2566,7 +2754,7 @@ where
                                 envelope,
                             }));
 
-                        self.ensure_shared_wal_healthy()?;
+                        self.ensure_shared_wal_healthy_for_turn()?;
                         self.reschedule_after_turn(raft_group_id, rearm_timer);
                     }
                 }
@@ -2620,7 +2808,7 @@ where
             }
         }
 
-        if let Some(service_batch) = self.persistence.flush() {
+        if let Some(service_batch) = self.persistence.try_take_completion() {
             let shared_outcome = service_batch.outcome;
             let mut extent_offset = 0;
             let mut recovery_required = false;
@@ -2707,6 +2895,12 @@ where
                 self.state = HostState::RecoveryRequired;
                 return Err(MultiRaftHostError::RecoveryRequired);
             }
+        }
+
+        self.persistence.dispatch_if_idle();
+        if self.node_wal.recovery_required() && !self.persistence.in_flight {
+            self.state = HostState::RecoveryRequired;
+            return Err(MultiRaftHostError::RecoveryRequired);
         }
 
         if let Some(error) = persistence_error {
@@ -3306,7 +3500,11 @@ where
     }
 
     fn ensure_active(&mut self) -> Result<(), MultiRaftHostError> {
-        if self.node_wal.recovery_required() {
+        // An asynchronous WAL worker may have fenced the shared owner before
+        // the host has consumed its completion. Keep this active turn alive
+        // long enough to fan the exact outcome out to every prepared group;
+        // otherwise an unknown batch would strand their Ready generations.
+        if self.node_wal.recovery_required() && !self.persistence.in_flight {
             self.state = HostState::RecoveryRequired;
         }
         match self.state {
@@ -3318,6 +3516,15 @@ where
 
     fn ensure_shared_wal_healthy(&mut self) -> Result<(), MultiRaftHostError> {
         if self.node_wal.recovery_required() {
+            self.state = HostState::RecoveryRequired;
+            Err(MultiRaftHostError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_shared_wal_healthy_for_turn(&mut self) -> Result<(), MultiRaftHostError> {
+        if self.node_wal.recovery_required() && !self.persistence.in_flight {
             self.state = HostState::RecoveryRequired;
             Err(MultiRaftHostError::RecoveryRequired)
         } else {
@@ -3460,7 +3667,7 @@ mod tests {
     };
     use ragnordb_common::ids::ReplicaId;
     use std::sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use wal::{
@@ -3606,6 +3813,72 @@ mod tests {
             } else {
                 Ok(result)
             }
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingWal {
+        state: Arc<(Mutex<BlockingWalState>, Condvar)>,
+    }
+
+    struct BlockingWalState {
+        next_lsn: Lsn,
+        append_calls: usize,
+        started: bool,
+        release: bool,
+    }
+
+    impl BlockingWal {
+        fn new() -> (Self, Arc<(Mutex<BlockingWalState>, Condvar)>) {
+            let state = Arc::new((
+                Mutex::new(BlockingWalState {
+                    next_lsn: Lsn::new(100),
+                    append_calls: 0,
+                    started: false,
+                    release: false,
+                }),
+                Condvar::new(),
+            ));
+            (
+                Self {
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl RaftWal for BlockingWal {
+        fn append_batch_and_sync(
+            &mut self,
+            records: &[(RecordType, &[u8])],
+        ) -> Result<BatchAppendResult, BatchAppendFailure> {
+            let (lock, wake) = &*self.state;
+            let mut state = lock.lock().unwrap();
+            state.append_calls += 1;
+            state.started = true;
+            wake.notify_all();
+            while !state.release {
+                state = wake.wait(state).unwrap();
+            }
+
+            let mut extents = Vec::with_capacity(records.len());
+            for (_, payload) in records {
+                let start_lsn = state.next_lsn;
+                let end_lsn = start_lsn
+                    .checked_add_bytes(payload.len() as u64 + 32)
+                    .unwrap();
+                state.next_lsn = end_lsn;
+                extents.push(AppendResult { start_lsn, end_lsn });
+            }
+
+            Ok(BatchAppendResult {
+                final_end_lsn: extents
+                    .last()
+                    .map(|extent| extent.end_lsn)
+                    .unwrap_or(Lsn::ZERO),
+                record_extents: extents,
+            })
         }
     }
 
@@ -4073,8 +4346,26 @@ mod tests {
             )
             .unwrap();
 
-        let wal_state = wal_state.lock().unwrap();
         assert_eq!(turn.groups_serviced, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while completed.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+            host.run_turn(
+                0,
+                MultiRaftTurnBudget {
+                    max_groups: 2,
+                    max_messages: 0,
+                    max_ready_generations: 1,
+                    max_apply_entries: 1,
+                    max_apply_bytes: usize::MAX,
+                    max_snapshot_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        }
+
+        let wal_state = wal_state.lock().unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 2);
         assert_eq!(wal_state.append_calls, 1);
         assert_eq!(
@@ -4093,6 +4384,94 @@ mod tests {
             *second_completions.lock().unwrap(),
             vec![Ok((1, Some(Lsn::new(100 + 11 + 32 + 16 + 32))))]
         );
+    }
+
+    /// Realistic bug caught: performing the shared append-and-sync on the host
+    /// scheduler thread prevents unrelated groups from receiving turns while
+    /// storage is slow. The dedicated FIFO worker must allow an independent
+    /// group to run before the blocked WAL operation is released.
+    #[test]
+    fn persistence_sync_does_not_block_unrelated_group_turns() {
+        let (wal, wal_state) = BlockingWal::new();
+        let mut host = MultiRaftHost::new(NodeId(7), NodeRaftWal::new(wal));
+        let first_identity = identity(10, 101);
+        let second_identity = identity(20, 202);
+        let healthy_identity = identity(30, 303);
+        let first_completions = Arc::new(Mutex::new(Vec::new()));
+        let second_completions = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let healthy_ticks = Arc::new(AtomicU64::new(0));
+
+        let _first_writer = host.issue_group_writer(first_identity).unwrap();
+        let _second_writer = host.issue_group_writer(second_identity).unwrap();
+        let _healthy_writer = host.issue_group_writer(healthy_identity).unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: first_identity,
+            records: vec![(RecordType::new(101), b"first-entry".to_vec())],
+            pending: false,
+            completions: Arc::clone(&first_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(PersistenceGroup {
+            identity: second_identity,
+            records: vec![(RecordType::new(201), b"second-entry".to_vec())],
+            pending: false,
+            completions: Arc::clone(&second_completions),
+            completed: Arc::clone(&completed),
+        }))
+        .unwrap();
+        host.register_new_group(Box::new(TestGroup {
+            identity: healthy_identity,
+            tick_behavior: TickBehavior::Healthy,
+            ticks: Arc::clone(&healthy_ticks),
+            stepped: Arc::new(AtomicU64::new(0)),
+            outbound: Vec::new(),
+        }))
+        .unwrap();
+        host.activate().unwrap();
+        host.schedule_group_now(first_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(second_identity.raft_group_id)
+            .unwrap();
+        host.schedule_group_now(healthy_identity.raft_group_id)
+            .unwrap();
+
+        let budget = MultiRaftTurnBudget {
+            max_groups: 3,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        };
+        let turn = host.run_turn(0, budget).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !wal_state.0.lock().unwrap().started {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(turn.groups_serviced, 3);
+        assert_eq!(healthy_ticks.load(Ordering::SeqCst), 1);
+        assert_eq!(wal_state.0.lock().unwrap().append_calls, 1);
+
+        {
+            let mut state = wal_state.0.lock().unwrap();
+            state.release = true;
+            wal_state.1.notify_all();
+        }
+
+        let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while completed.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < completion_deadline);
+            std::thread::yield_now();
+            host.run_turn(0, budget).unwrap();
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(first_completions.lock().unwrap().len(), 1);
+        assert_eq!(second_completions.lock().unwrap().len(), 1);
     }
 
     /// Realistic bug caught: a burst of independent Ready generations must not
@@ -4156,12 +4535,12 @@ mod tests {
         };
 
         host.run_turn(0, budget).unwrap();
-        assert_eq!(wal_state.lock().unwrap().append_calls, 1);
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
-        assert_eq!(first_completions.lock().unwrap().len(), 1);
-        assert!(second_completions.lock().unwrap().is_empty());
-
-        host.run_turn(0, budget).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while completed.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+            host.run_turn(0, budget).unwrap();
+        }
         assert_eq!(wal_state.lock().unwrap().append_calls, 2);
         assert_eq!(completed.load(Ordering::SeqCst), 2);
         assert_eq!(second_completions.lock().unwrap().len(), 1);
@@ -4222,7 +4601,16 @@ mod tests {
         ));
         assert_eq!(wal_state.lock().unwrap().append_calls, 0);
 
-        let flushed = service.flush().expect("the first request was admitted");
+        service.bind_host_thread();
+        service.dispatch_if_idle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let flushed = loop {
+            if let Some(completion) = service.try_take_completion() {
+                break completion;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
         assert_eq!(flushed.groups.len(), 1);
         assert_eq!(service.status(), MultiRaftPersistenceStatus::default());
         assert_eq!(wal_state.lock().unwrap().append_calls, 1);
@@ -4262,21 +4650,25 @@ mod tests {
         host.schedule_group_now(second_identity.raft_group_id)
             .unwrap();
 
-        assert_eq!(
-            host.run_turn(
-                0,
-                MultiRaftTurnBudget {
-                    max_groups: 2,
-                    max_messages: 0,
-                    max_ready_generations: 1,
-                    max_apply_entries: 1,
-                    max_apply_bytes: usize::MAX,
-                    max_snapshot_bytes: usize::MAX,
-                },
-            )
-            .unwrap_err(),
-            MultiRaftHostError::RecoveryRequired
-        );
+        let budget = MultiRaftTurnBudget {
+            max_groups: 2,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = loop {
+            match host.run_turn(0, budget) {
+                Ok(_) => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error, MultiRaftHostError::RecoveryRequired);
 
         assert_eq!(wal_state.lock().unwrap().append_calls, 1);
         assert_eq!(completed.load(Ordering::SeqCst), 0);

@@ -25,7 +25,7 @@ use ragnordb_common::{
     Error, Result,
     command_codec::SingleShardCommitCommand,
     durability::DurabilityGate,
-    ids::{NodeId, RequestId},
+    ids::{NodeId, RequestId, TableId},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
@@ -211,7 +211,9 @@ impl DatabaseServices {
                             .executor
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        executor.prepare_create_table_with_metadata_and_identity(
+                        let detached = executor.detached_remote_execution_view();
+                        drop(executor);
+                        detached.prepare_create_table_with_metadata_and_identity(
                             create_plan,
                             request_id,
                             logical_request_id,
@@ -241,12 +243,25 @@ impl DatabaseServices {
                 })
             }
             data_plan @ (Plan::Insert(_) | Plan::Select(_) | Plan::Update(_) | Plan::Delete(_)) => {
-                if session.has_active_transaction() {
+                let detached_executor = {
                     let executor = self
                         .executor
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    session.execute_data_plan_with_shared_executor(data_plan, &executor)
+                    data_plan_table_id(&data_plan)
+                        .filter(|table_id| executor.is_metadata_table(*table_id))
+                        .map(|_| executor.detached_remote_execution_view())
+                };
+                if session.has_active_transaction() {
+                    if let Some(executor) = detached_executor.as_ref() {
+                        session.execute_data_plan_with_shared_executor(data_plan, executor)
+                    } else {
+                        let executor = self
+                            .executor
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        session.execute_data_plan_with_shared_executor(data_plan, &executor)
+                    }
                 } else {
                     let mut transaction = {
                         let mut transaction_manager = self
@@ -256,15 +271,23 @@ impl DatabaseServices {
                         transaction_manager.begin_transaction()?
                     };
                     let statement_result = {
-                        let executor = self
-                            .executor
-                            .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        executor.execute_data_plan_with_request_context(
-                            data_plan,
-                            &mut transaction,
-                            session.request_context_mut(),
-                        )
+                        if let Some(executor) = detached_executor.as_ref() {
+                            executor.execute_data_plan_with_request_context(
+                                data_plan,
+                                &mut transaction,
+                                session.request_context_mut(),
+                            )
+                        } else {
+                            let executor = self
+                                .executor
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            executor.execute_data_plan_with_request_context(
+                                data_plan,
+                                &mut transaction,
+                                session.request_context_mut(),
+                            )
+                        }
                     }?;
                     let _ = self.commit_transaction(transaction, session.request_context_mut())?;
                     Ok(statement_result)
@@ -300,18 +323,25 @@ impl DatabaseServices {
             transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
         };
 
-        let executor = self
+        let local_target = self
             .executor
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if executor.transaction_targets_local_table(&transaction)? {
-            drop(executor);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transaction_targets_local_table(&transaction)?;
+        if local_target {
             let mut executor = self
                 .executor
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             executor.commit_transaction_outcome(transaction, commit_timestamp)
         } else {
+            let executor = {
+                let executor = self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                executor.detached_remote_execution_view()
+            };
             executor.commit_remote_transaction_outcome_with_timestamp(
                 transaction,
                 commit_timestamp,
@@ -339,14 +369,30 @@ impl DatabaseServices {
             ));
         }
 
-        if session.has_active_transaction() {
+        let detached_executor = {
             let executor = self
                 .executor
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            session.execute_select_streaming_with_shared_executor(
-                plan, &executor, sink, max_rows, max_bytes,
-            )
+            data_plan_table_id(&plan)
+                .filter(|table_id| executor.is_metadata_table(*table_id))
+                .map(|_| executor.detached_remote_execution_view())
+        };
+
+        if session.has_active_transaction() {
+            if let Some(executor) = detached_executor.as_ref() {
+                session.execute_select_streaming_with_shared_executor(
+                    plan, executor, sink, max_rows, max_bytes,
+                )
+            } else {
+                let executor = self
+                    .executor
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.execute_select_streaming_with_shared_executor(
+                    plan, &executor, sink, max_rows, max_bytes,
+                )
+            }
         } else {
             let mut transaction = {
                 let mut transaction_manager = self
@@ -356,22 +402,43 @@ impl DatabaseServices {
                 transaction_manager.begin_transaction()?
             };
             let summary = {
-                let executor = self
-                    .executor
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                executor.execute_select_streaming(
-                    plan,
-                    &mut transaction,
-                    session.request_context_mut(),
-                    sink,
-                    max_rows,
-                    max_bytes,
-                )?
+                if let Some(executor) = detached_executor.as_ref() {
+                    executor.execute_select_streaming(
+                        plan,
+                        &mut transaction,
+                        session.request_context_mut(),
+                        sink,
+                        max_rows,
+                        max_bytes,
+                    )?
+                } else {
+                    let executor = self
+                        .executor
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    executor.execute_select_streaming(
+                        plan,
+                        &mut transaction,
+                        session.request_context_mut(),
+                        sink,
+                        max_rows,
+                        max_bytes,
+                    )?
+                }
             };
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
             Ok(summary)
         }
+    }
+}
+
+fn data_plan_table_id(plan: &Plan) -> Option<TableId> {
+    match plan {
+        Plan::Insert(plan) => Some(plan.table.table_id),
+        Plan::Select(plan) => Some(plan.table.table_id),
+        Plan::Update(plan) => Some(plan.table.table_id),
+        Plan::Delete(plan) => Some(plan.table.table_id),
+        _ => None,
     }
 }
 
@@ -731,13 +798,19 @@ impl LocalDatabase {
             .map(usize::from)
             .unwrap_or(1)
             .max(1);
+        let published_view_generation = self
+            .executor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .published_view()
+            .generation();
 
         Arc::new(DatabaseServices {
             executor: self.executor.clone(),
             transaction_manager: self.transaction_manager.clone(),
             durability_gate: self.durability_gate.clone(),
             statement_permits: Arc::new(Semaphore::new(parallelism)),
-            published_view_generation: AtomicU64::new(0),
+            published_view_generation: AtomicU64::new(published_view_generation),
         })
     }
 
@@ -1358,7 +1431,8 @@ mod tests {
                 replicas: vec![ReplicaRoute {
                     replica_id: ReplicaId(1),
                     node_id: ragnordb_common::ids::NodeId(1),
-                }],
+                }]
+                .into(),
             }
         }
     }

@@ -12,7 +12,8 @@ use raft::{
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 use ragnordb_multiraft::{
     host::{
-        MultiRaftHost, MultiRaftRole, MultiRaftTurnBudget, ReadyLoopHostedGroup, RoutedRaftMessage,
+        MultiRaftHost, MultiRaftRole, MultiRaftTurnBudget, MultiRaftTurnResult,
+        ReadyLoopHostedGroup, RoutedRaftMessage,
     },
     runtime::{
         AppliedRaftFrontier, FileRaftSnapshotStore, RaftReadyLoop, RaftReadyStateMachine,
@@ -71,6 +72,22 @@ impl RaftWal for TestWal {
                 .unwrap_or(Lsn::ZERO),
             record_extents: extents,
         })
+    }
+}
+
+fn run_until(
+    host: &mut MultiRaftHost<TestWal>,
+    budget: MultiRaftTurnBudget,
+    mut ready: impl FnMut(&MultiRaftTurnResult) -> bool,
+) -> MultiRaftTurnResult {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let result = host.run_turn(0, budget).unwrap();
+        if ready(&result) {
+            return result;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
     }
 }
 
@@ -380,7 +397,9 @@ fn host_read_index_admission_delivers_the_group_tagged_read_state() {
     let first = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
     assert!(first.read_states.is_empty());
 
-    let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    let result = run_until(&mut host, MultiRaftTurnBudget::default(), |result| {
+        !result.read_states.is_empty()
+    });
 
     assert_eq!(result.read_states.len(), 1);
     assert_eq!(result.read_states[0].0, group_identity.raft_group_id);
@@ -608,19 +627,18 @@ fn host_turn_resumes_a_ready_generation_after_apply_budget_exhaustion() {
     assert_eq!(blocked.apply_entries, 0);
     assert_eq!(blocked.ready_generations, 1);
 
-    let resumed = host
-        .run_turn(
-            0,
-            MultiRaftTurnBudget {
-                max_groups: 1,
-                max_messages: 0,
-                max_ready_generations: 1,
-                max_apply_entries: 1,
-                max_apply_bytes: usize::MAX,
-                max_snapshot_bytes: usize::MAX,
-            },
-        )
-        .unwrap();
+    let resumed = run_until(
+        &mut host,
+        MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 1,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        },
+        |result| result.apply_entries == 1,
+    );
     assert_eq!(resumed.apply_entries, 1);
     assert_eq!(resumed.ready_generations, 1);
 }
@@ -662,19 +680,18 @@ fn durable_append_ack_is_released_before_apply_budget_is_available() {
     host.schedule_group_now(group_identity.raft_group_id)
         .unwrap();
 
-    let persisted_only = host
-        .run_turn(
-            0,
-            MultiRaftTurnBudget {
-                max_groups: 1,
-                max_messages: 0,
-                max_ready_generations: 1,
-                max_apply_entries: 0,
-                max_apply_bytes: usize::MAX,
-                max_snapshot_bytes: usize::MAX,
-            },
-        )
-        .unwrap();
+    let persisted_only = run_until(
+        &mut host,
+        MultiRaftTurnBudget {
+            max_groups: 1,
+            max_messages: 0,
+            max_ready_generations: 1,
+            max_apply_entries: 0,
+            max_apply_bytes: usize::MAX,
+            max_snapshot_bytes: usize::MAX,
+        },
+        |result| !result.outbound.is_empty(),
+    );
 
     assert_eq!(persisted_only.apply_entries, 0);
     assert_eq!(persisted_only.outbound.len(), 1);
@@ -830,7 +847,15 @@ fn snapshot_install_response_waits_for_verified_restore() {
     assert!(first.outbound.is_empty());
     assert!(host.status().groups[0].quarantine_reason.is_none());
 
-    let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = loop {
+        let result = host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+        if host.status().groups[0].quarantine_reason.is_some() {
+            break result;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    };
 
     assert!(result.outbound.is_empty());
     assert!(host.status().groups[0].quarantine_reason.is_some());

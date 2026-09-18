@@ -345,7 +345,7 @@ impl<W> NodeRaftWal<W> {
         if let Ok(mut state) = self.state.lock() {
             state.recovery_required = true;
             if let Some(gate) = &state.durability_gate {
-                gate.require_recovery(DurabilityFailureKind::RecoveryRequired, reason);
+                gate.require_recovery(DurabilityFailureKind::RecoveryRequired, reason.into());
             }
         }
     }

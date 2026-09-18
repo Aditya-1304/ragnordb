@@ -751,6 +751,35 @@ impl LocalExecutor {
             .clone()
     }
 
+    /// Build an immutable executor view for metadata-routed work.
+    ///
+    /// The returned executor owns no local tablet coordinators and must only be
+    /// used for operations whose table is already known to be remote. Its
+    /// schema, routing map, metadata creator, and tablet gateway are cloned
+    /// from one published generation, so RPC waits cannot retain the server's
+    /// executor mutation lock. Local-table commits continue to use the live
+    /// executor because their coordinator requires exclusive ownership.
+    pub fn detached_remote_execution_view(&self) -> Self {
+        let published_view = self.published_view();
+
+        Self {
+            catalog: DurableCatalog::from_recovered(
+                MemoryCatalog::new(),
+                Arc::new(InMemoryCatalogLog::default()),
+            ),
+            tablets: BTreeMap::new(),
+            tablet_routers: BTreeMap::new(),
+            published_view: Arc::new(RwLock::new(published_view)),
+            metadata_table_creator: self.metadata_table_creator.clone(),
+            metadata_generation: self.metadata_generation,
+            tablet_gateway: self.tablet_gateway.clone(),
+            metadata_table_ids: self.metadata_table_ids.clone(),
+            commit_log: self.commit_log.clone(),
+            next_local_catalog_timestamp: 0,
+            replay_from_end_lsn: 0,
+        }
+    }
+
     pub fn schema_snapshot(&self) -> Arc<SchemaSnapshot> {
         self.published_view().schema()
     }
@@ -1098,8 +1127,7 @@ impl LocalExecutor {
         for encoded_key in transaction.write_set().keys() {
             let row_key = decode_row_key(encoded_key)?;
             if self
-                .catalog
-                .catalog()
+                .schema_snapshot()
                 .table_by_id(row_key.table_id)
                 .is_none()
             {
@@ -2314,8 +2342,7 @@ impl LocalExecutor {
 
     fn resolve_table(&self, table: &BoundTableRef) -> Result<Arc<TableSchema>> {
         let schema = self
-            .catalog
-            .catalog()
+            .schema_snapshot()
             .table_by_id(table.table_id)
             .ok_or_else(|| {
                 Error::SchemaMismatch(format!(
@@ -3919,7 +3946,8 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(1),
                 node_id: NodeId(9),
-            }],
+            }]
+            .into(),
         };
         let row = Row {
             values: vec![Value::Int(7), Value::Text("alice".to_string())],
@@ -4004,7 +4032,8 @@ mod tests {
                     replicas: vec![ReplicaRoute {
                         replica_id: ReplicaId(1),
                         node_id: NodeId(9),
-                    }],
+                    }]
+                    .into(),
                 },
                 span: match &descriptor.partition {
                     PartitionSpec::Range { start_key, end_key } => ScanSpan::new(

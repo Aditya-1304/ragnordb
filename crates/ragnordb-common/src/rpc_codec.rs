@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use super::command_codec::TabletCommand;
 use crate::ids::{
@@ -877,7 +880,7 @@ pub struct TabletRoute {
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
     pub leader_replica_id: ReplicaId,
-    pub replicas: Vec<ReplicaRoute>,
+    pub replicas: Arc<[ReplicaRoute]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -934,7 +937,7 @@ impl TabletRoute {
 
         let mut replica_ids = BTreeSet::new();
         let mut node_ids = BTreeSet::new();
-        for route in &self.replicas {
+        for route in self.replicas.iter() {
             if route.replica_id.0 == 0 || route.node_id.0 == 0 {
                 return Err(TabletRouteError::ZeroReplicaIdentity);
             }
@@ -1207,7 +1210,7 @@ impl MetadataResponse {
                     tablet_id: *tablet_id,
                     tablet_epoch: *tablet_epoch,
                     leader_replica_id: *leader_replica_id,
-                    replicas: replicas.clone(),
+                    replicas: replicas.clone().into(),
                 };
                 route.validate()?;
                 Ok(route)
@@ -1345,7 +1348,7 @@ impl MetadataResponse {
                     tablet_id: TabletId::from_proto(resp.tablet_id.ok_or("missing tablet_id")?),
                     tablet_epoch: resp.tablet_epoch,
                     leader_replica_id,
-                    replicas: replicas.clone(),
+                    replicas: replicas.clone().into(),
                 };
                 route.validate().map_err(|_| "invalid tablet route")?;
 
@@ -1697,7 +1700,8 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(12),
                 node_id: NodeId(2),
-            }],
+            }]
+            .into(),
         };
 
         assert_eq!(
@@ -1718,7 +1722,8 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 replica_id: ReplicaId(11),
                 node_id: NodeId(1),
-            }],
+            }]
+            .into(),
         };
 
         assert_eq!(
@@ -1746,7 +1751,8 @@ mod tests {
                         replica_id: ReplicaId(12),
                         node_id: NodeId(2),
                     },
-                ],
+                ]
+                .into(),
             })
             .unwrap();
 
@@ -1788,7 +1794,8 @@ mod tests {
                     replica_id: ReplicaId(13),
                     node_id: NodeId(3),
                 },
-            ],
+            ]
+            .into(),
         };
         cache.insert(route.clone()).unwrap();
 

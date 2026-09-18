@@ -23,6 +23,10 @@ use ragnordb_storage::{
 use ragnordb_tablet::{Tablet, command::TabletStateMachine};
 use std::{
     hint::black_box,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 use wal::{
@@ -143,6 +147,10 @@ impl HostedRaftGroup for IdleHostedGroup {
         self.identity
     }
 
+    fn next_timer_delay_ticks(&self) -> Option<u64> {
+        Some(1)
+    }
+
     fn tick_and_drain(
         &mut self,
         _ticks: u64,
@@ -201,6 +209,10 @@ fn bench_multiraft_density(c: &mut Criterion) {
                 b.iter(|| {
                     host.schedule_due_ticks(1).unwrap();
                     let result = host.run_turn(0, budget).unwrap();
+                    assert_eq!(
+                        result.groups_serviced, group_count as usize,
+                        "density benchmark stopped servicing the configured groups"
+                    );
                     black_box((result.groups_serviced, result.ready_generations));
                 });
             },
@@ -353,7 +365,81 @@ fn bench_transport_codec(c: &mut Criterion) {
         );
     }
 
+    for payload_bytes in [64 * 1024_usize, 1_048_576, 4 * 1_048_576] {
+        group.bench_with_input(
+            BenchmarkId::new("tcp_bulk_then_control", payload_bytes),
+            &payload_bytes,
+            |b, &payload_bytes| {
+                b.iter(|| black_box(measure_tcp_hol(payload_bytes)));
+            },
+        );
+    }
+
     group.finish();
+}
+
+/// Measure real loopback TCP head-of-line delay rather than only frame codec
+/// cost. The receiver deliberately drains the bulk frame slowly while the
+/// writer queues a control frame during the in-flight bulk write; the control
+/// arrival timestamp therefore captures the physical stream's HOL boundary.
+fn measure_tcp_hol(payload_bytes: usize) -> Duration {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let receiver = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut header = [0_u8; 5];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], b'B');
+        let bulk_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+        assert_eq!(bulk_len, payload_bytes);
+
+        let mut remaining = bulk_len;
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut first_chunk = true;
+        while remaining > 0 {
+            let chunk = remaining.min(buffer.len());
+            stream.read_exact(&mut buffer[..chunk]).unwrap();
+            remaining -= chunk;
+            if first_chunk {
+                first_chunk = false;
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], b'C');
+        let control_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+        let mut control = vec![0_u8; control_len];
+        stream.read_exact(&mut control).unwrap();
+        Instant::now()
+    });
+
+    let mut writer_stream = TcpStream::connect(address).unwrap();
+    writer_stream.set_nodelay(true).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>();
+    let writer = thread::spawn(move || {
+        let mut bulk_header = [0_u8; 5];
+        bulk_header[0] = b'B';
+        bulk_header[1..5].copy_from_slice(&(payload_bytes as u32).to_be_bytes());
+        let bulk = vec![0xa5_u8; payload_bytes];
+        writer_stream.write_all(&bulk_header).unwrap();
+        started_tx.send(()).unwrap();
+        writer_stream.write_all(&bulk).unwrap();
+
+        let control = control_rx.recv().unwrap();
+        writer_stream
+            .write_all(&[b'C', 0, 0, 0, control.len() as u8])
+            .unwrap();
+        writer_stream.write_all(&control).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    let queued_at = Instant::now();
+    control_tx.send(vec![0x01]).unwrap();
+    let control_arrived_at = receiver.join().unwrap();
+    writer.join().unwrap();
+    control_arrived_at.saturating_duration_since(queued_at)
 }
 
 criterion_group!(

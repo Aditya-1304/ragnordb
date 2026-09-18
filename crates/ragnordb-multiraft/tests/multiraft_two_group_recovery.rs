@@ -14,7 +14,7 @@ use raft::{
 use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
 
 use ragnordb_multiraft::{
-    host::{MultiRaftHost, ReadyLoopHostedGroup},
+    host::{MultiRaftHost, MultiRaftRole, MultiRaftTurnBudget, ReadyLoopHostedGroup},
     runtime::{RaftReadyLoop, RaftReadyStateMachine, RaftSnapshotStore},
     storage::{
         adapter::RaftStorageAdapters,
@@ -243,6 +243,32 @@ fn two_real_ready_loops_share_one_node_wal_and_recover_without_namespace_collisi
     // ticks deliberately exceeds the configured randomized election window.
     for _ in 0..20 {
         host.tick_all(1).unwrap();
+    }
+
+    // Persistence is now completed by the host-owned worker. Drain that
+    // completion before using the legacy direct proposal API, whose contract
+    // still requires the preceding Ready generation to be fully acknowledged.
+    let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while host.status().pending_persistence_groups > 0 {
+        assert!(std::time::Instant::now() < completion_deadline);
+        host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+        std::thread::yield_now();
+    }
+
+    let election_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while host
+        .status()
+        .groups
+        .iter()
+        .any(|group| group.role != Some(MultiRaftRole::Leader))
+    {
+        assert!(std::time::Instant::now() < election_deadline);
+        host.tick_all(1).unwrap();
+        while host.status().pending_persistence_groups > 0 {
+            assert!(std::time::Instant::now() < election_deadline);
+            host.run_turn(0, MultiRaftTurnBudget::default()).unwrap();
+            std::thread::yield_now();
+        }
     }
 
     host.propose(RaftGroupId(10), b"group-ten".to_vec(), b"group-ten".len())
