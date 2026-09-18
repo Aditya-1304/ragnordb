@@ -1,13 +1,18 @@
 use ragnordb_common::{
+    Error,
     codec::{Row, Value},
     encoding::encode_row,
     ids::{
-        ClientRequestId, CommandKind, ParticipantCommandPhase, RaftGroupId, TableId, TabletId,
-        Timestamp, TxnId,
+        ClientRequestId, CommandKind, ParticipantCommandPhase, RaftGroupId, ReplicaId, TableId,
+        TabletId, Timestamp, TxnId,
     },
 };
 use ragnordb_storage::key::{encode_row_key, make_row_key};
 use ragnordb_txn::{DistributedTransactionCoordinator, ParticipantRoute, Transaction};
+use ragnordb_txn::{
+    ParticipantCommandPlan, ParticipantDispatchError, ParticipantPhaseDispatcher,
+    ParticipantRouteRefresher,
+};
 
 fn key(value: i64) -> Vec<u8> {
     encode_row_key(&make_row_key(TableId(1), &[Value::Int(value)]).unwrap()).unwrap()
@@ -36,7 +41,36 @@ fn root_request() -> ClientRequestId {
 }
 
 fn route(tablet_id: u64, epoch: u64, raft_group_id: u64) -> ParticipantRoute {
-    ParticipantRoute::new(TabletId(tablet_id), epoch, RaftGroupId(raft_group_id)).unwrap()
+    route_with_leader(tablet_id, epoch, raft_group_id, tablet_id)
+}
+
+fn route_with_leader(
+    tablet_id: u64,
+    epoch: u64,
+    raft_group_id: u64,
+    leader_replica_id: u64,
+) -> ParticipantRoute {
+    ParticipantRoute::new(
+        TabletId(tablet_id),
+        epoch,
+        RaftGroupId(raft_group_id),
+        ReplicaId(leader_replica_id),
+    )
+    .unwrap()
+}
+
+fn routed_coordinator() -> DistributedTransactionCoordinator {
+    let primary_key = key(1);
+    let mut coordinator =
+        DistributedTransactionCoordinator::new(transaction(), root_request(), primary_key.clone())
+            .unwrap();
+    coordinator
+        .set_participant_route(primary_key, route(10, 4, 100))
+        .unwrap();
+    coordinator
+        .set_participant_route(key(2), route(11, 5, 101))
+        .unwrap();
+    coordinator
 }
 
 #[test]
@@ -135,7 +169,164 @@ fn coordinator_rejects_invalid_primary_reads_and_routes() {
             .set_participant_route(key(99), route(10, 4, 100))
             .is_err()
     );
-    assert!(ParticipantRoute::new(TabletId(0), 1, RaftGroupId(1)).is_err());
-    assert!(ParticipantRoute::new(TabletId(1), 0, RaftGroupId(1)).is_err());
-    assert!(ParticipantRoute::new(TabletId(1), 1, RaftGroupId(0)).is_err());
+    assert!(ParticipantRoute::new(TabletId(0), 1, RaftGroupId(1), ReplicaId(1)).is_err());
+    assert!(ParticipantRoute::new(TabletId(1), 0, RaftGroupId(1), ReplicaId(1)).is_err());
+    assert!(ParticipantRoute::new(TabletId(1), 1, RaftGroupId(0), ReplicaId(1)).is_err());
+    assert!(ParticipantRoute::new(TabletId(1), 1, RaftGroupId(1), ReplicaId(0)).is_err());
+}
+
+#[test]
+fn phase_plan_uses_current_route_but_stable_logical_identity() {
+    let primary_key = key(1);
+    let mut coordinator = routed_coordinator();
+    let before = coordinator
+        .participant_command_plan(ParticipantCommandPhase::Prewrite, &primary_key)
+        .unwrap();
+
+    coordinator
+        .set_participant_route(primary_key.clone(), route(20, 9, 200))
+        .unwrap();
+    let after = coordinator
+        .participant_command_plan(ParticipantCommandPhase::Prewrite, &primary_key)
+        .unwrap();
+
+    assert_eq!(before.command_id, after.command_id);
+    assert_eq!(before.logical_command_id, after.logical_command_id);
+    assert_eq!(before.root_request_id, root_request());
+    assert_ne!(before.request_id, after.request_id);
+    assert_eq!(after.route, route(20, 9, 200));
+    assert_eq!(
+        coordinator
+            .plan_phase(ParticipantCommandPhase::Prewrite)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+struct RefreshOnce {
+    refreshed_route: ParticipantRoute,
+    calls: usize,
+}
+
+impl ParticipantRouteRefresher for RefreshOnce {
+    fn refresh_participant_route(
+        &mut self,
+        _logical_mutation_id: &ragnordb_txn::LogicalMutationId,
+        _previous_route: ParticipantRoute,
+    ) -> Result<ParticipantRoute, Error> {
+        self.calls += 1;
+        Ok(self.refreshed_route)
+    }
+}
+
+struct RefreshingDispatcher {
+    attempts: Vec<ParticipantCommandPlan>,
+}
+
+impl ParticipantPhaseDispatcher for RefreshingDispatcher {
+    type Output = ParticipantCommandPlan;
+
+    fn dispatch(
+        &mut self,
+        plan: &ParticipantCommandPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        self.attempts.push(plan.clone());
+        if self.attempts.len() == 1 {
+            return Err(ParticipantDispatchError::RouteRefreshRequired {
+                reason: "tablet epoch changed before admission".to_string(),
+            });
+        }
+        Ok(plan.clone())
+    }
+}
+
+#[test]
+fn phase_execution_refreshes_routes_without_regenerating_command_identity() {
+    let mut coordinator = routed_coordinator();
+    let mut refresher = RefreshOnce {
+        refreshed_route: route_with_leader(10, 4, 100, 99),
+        calls: 0,
+    };
+    let mut dispatcher = RefreshingDispatcher {
+        attempts: Vec::new(),
+    };
+
+    let outcomes = coordinator
+        .execute_phase_with_retry(
+            ParticipantCommandPhase::Prewrite,
+            &mut refresher,
+            &mut dispatcher,
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(refresher.calls, 1);
+    assert_eq!(dispatcher.attempts.len(), 3);
+    assert_eq!(
+        dispatcher.attempts[0].logical_command_id,
+        dispatcher.attempts[1].logical_command_id
+    );
+    assert_eq!(
+        dispatcher.attempts[0].request_id,
+        dispatcher.attempts[1].request_id
+    );
+    assert_eq!(
+        dispatcher.attempts[1].route,
+        route_with_leader(10, 4, 100, 99)
+    );
+}
+
+struct NeverRefresh {
+    calls: usize,
+}
+
+impl ParticipantRouteRefresher for NeverRefresh {
+    fn refresh_participant_route(
+        &mut self,
+        _logical_mutation_id: &ragnordb_txn::LogicalMutationId,
+        _previous_route: ParticipantRoute,
+    ) -> Result<ParticipantRoute, Error> {
+        self.calls += 1;
+        panic!("unknown outcomes must not refresh or retry a route");
+    }
+}
+
+struct UnknownDispatcher {
+    calls: usize,
+}
+
+impl ParticipantPhaseDispatcher for UnknownDispatcher {
+    type Output = ();
+
+    fn dispatch(
+        &mut self,
+        _plan: &ParticipantCommandPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        self.calls += 1;
+        Err(ParticipantDispatchError::OutcomeUnknown {
+            reason: "the Raft proposal result was lost".to_string(),
+        })
+    }
+}
+
+#[test]
+fn phase_execution_does_not_resubmit_an_unknown_outcome() {
+    let mut coordinator = routed_coordinator();
+    let mut refresher = NeverRefresh { calls: 0 };
+    let mut dispatcher = UnknownDispatcher { calls: 0 };
+
+    let error = coordinator
+        .execute_phase_with_retry(
+            ParticipantCommandPhase::Commit,
+            &mut refresher,
+            &mut dispatcher,
+            3,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RequestOutcomeUnknown { .. }));
+    assert_eq!(dispatcher.calls, 1);
+    assert_eq!(refresher.calls, 0);
 }

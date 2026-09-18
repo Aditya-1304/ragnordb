@@ -406,6 +406,86 @@ pub enum ParticipantCommandPhase {
     ResolveIntent = 4,
 }
 
+impl ParticipantCommandPhase {
+    pub const fn command_kind(self) -> CommandKind {
+        match self {
+            Self::Prewrite => CommandKind::Prewrite,
+            Self::Commit => CommandKind::Commit,
+            Self::Rollback => CommandKind::Rollback,
+            Self::ResolveIntent => CommandKind::ResolveIntent,
+        }
+    }
+}
+
+/// Derive a topology-independent logical command identity for one transaction
+/// mutation. The current tablet and Raft group are deliberately absent from
+/// this hash; they are transport routing inputs and may change after a split,
+/// merge, replica move, or leader failover.
+pub fn participant_logical_command_id(
+    txn_id: TxnId,
+    phase: ParticipantCommandPhase,
+    logical_mutation_id: &[u8],
+) -> Result<LogicalCommandId, &'static str> {
+    if txn_id.0 == 0 {
+        return Err("participant command transaction ID must be non-zero");
+    }
+    if logical_mutation_id.is_empty() {
+        return Err("participant command logical mutation ID must be non-empty");
+    }
+
+    const DOMAIN: &[u8] = b"ragnordb/participant-logical-command/v1";
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&txn_id.0.to_be_bytes());
+    hasher.update(&[phase as u8]);
+    hasher.update(&(logical_mutation_id.len() as u64).to_be_bytes());
+    hasher.update(logical_mutation_id);
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+
+    let mut client_bytes = [0_u8; 16];
+    client_bytes.copy_from_slice(&bytes[..16]);
+    let client_id = match u128::from_be_bytes(client_bytes) {
+        0 => 1,
+        client_id => client_id,
+    };
+    let session_epoch =
+        u64::from_be_bytes(bytes[16..24].try_into().expect("digest is 32 bytes")).max(1);
+    let request_sequence =
+        u64::from_be_bytes(bytes[24..32].try_into().expect("digest is 32 bytes")).max(1);
+
+    let identity = LogicalCommandId {
+        client_request_id: ClientRequestId {
+            client_id,
+            session_epoch,
+            request_sequence,
+        },
+        command_ordinal: 1,
+        kind: phase.command_kind(),
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
+/// Convert a stable logical command identity into the group-qualified request
+/// identity required by the current transport destination.
+pub fn request_id_for_logical_command(
+    logical_command_id: LogicalCommandId,
+    raft_group_id: RaftGroupId,
+) -> Result<RequestId, &'static str> {
+    logical_command_id.validate()?;
+    if raft_group_id.0 == 0 {
+        return Err("participant request Raft group ID must be non-zero");
+    }
+
+    Ok(RequestId {
+        client_id: logical_command_id.client_request_id.client_id,
+        sequence: logical_command_id.client_request_id.request_sequence,
+        raft_group_id,
+    })
+}
+
 /// derive the request identity for one distributed transaction participant
 ///
 /// The fixed, versioned byte layout makes the result independent of platform

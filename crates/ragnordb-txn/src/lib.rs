@@ -13,8 +13,10 @@ mod manager;
 
 pub use coordinator::{
     DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
-    ParticipantCommandId, ParticipantRoute, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
-    SingleNodeCommitParticipant, TransactionStatusLocation,
+    ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
+    ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
+    SingleNodeCommitCoordinator, SingleNodeCommitOutcome, SingleNodeCommitParticipant,
+    TransactionStatusLocation,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,

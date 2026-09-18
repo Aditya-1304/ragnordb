@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use ragnordb_common::{
     Error, Result,
     ids::{
-        ClientRequestId, CommandKind, ParticipantCommandPhase, RaftGroupId, TableId, TabletId,
-        Timestamp, TxnId,
+        ClientRequestId, CommandKind, LogicalCommandId, ParticipantCommandPhase, RaftGroupId,
+        ReplicaId, RequestId, TableId, TabletId, Timestamp, TxnId, participant_logical_command_id,
+        request_id_for_logical_command,
     },
 };
 use ragnordb_storage::{
@@ -57,10 +58,16 @@ pub struct ParticipantRoute {
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
     pub raft_group_id: RaftGroupId,
+    pub leader_replica_id: ReplicaId,
 }
 
 impl ParticipantRoute {
-    pub fn new(tablet_id: TabletId, tablet_epoch: u64, raft_group_id: RaftGroupId) -> Result<Self> {
+    pub fn new(
+        tablet_id: TabletId,
+        tablet_epoch: u64,
+        raft_group_id: RaftGroupId,
+        leader_replica_id: ReplicaId,
+    ) -> Result<Self> {
         if tablet_id.0 == 0 {
             return Err(Error::InvalidArgument(
                 "transaction participant tablet ID 0 is reserved".to_string(),
@@ -76,11 +83,17 @@ impl ParticipantRoute {
                 "transaction participant Raft group ID 0 is reserved".to_string(),
             ));
         }
+        if leader_replica_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction participant leader replica ID 0 is reserved".to_string(),
+            ));
+        }
 
         Ok(Self {
             tablet_id,
             tablet_epoch,
             raft_group_id,
+            leader_replica_id,
         })
     }
 }
@@ -153,13 +166,95 @@ impl ParticipantCommandId {
 
     /// Map the transaction phase to the existing tablet command kind.
     pub fn kind(&self) -> CommandKind {
-        match self.phase {
-            ParticipantCommandPhase::Prewrite => CommandKind::Prewrite,
-            ParticipantCommandPhase::Commit => CommandKind::Commit,
-            ParticipantCommandPhase::Rollback => CommandKind::Rollback,
-            ParticipantCommandPhase::ResolveIntent => CommandKind::ResolveIntent,
-        }
+        self.phase.command_kind()
     }
+
+    /// Convert the semantic identity into the existing V2 logical command
+    /// identity carried by tablet envelopes.
+    pub fn logical_command_id(&self) -> Result<LogicalCommandId> {
+        participant_logical_command_id(self.txn_id, self.phase, self.logical_mutation_id.as_key())
+            .map_err(|error| Error::InvalidArgument(error.to_string()))
+    }
+
+    /// Create the current group-qualified transport identity. A route change
+    /// may change this request ID's group field, but never changes the logical
+    /// command ID returned above.
+    pub fn request_id(&self, route: ParticipantRoute) -> Result<RequestId> {
+        let logical_command_id = self.logical_command_id()?;
+        request_id_for_logical_command(logical_command_id, route.raft_group_id)
+            .map_err(|error| Error::InvalidArgument(error.to_string()))
+    }
+}
+
+/// One dispatch-ready view of a logical participant command.
+///
+/// The logical ID is stable across retries and topology changes. The route and
+/// group-qualified request ID are regenerated from the current route hint for
+/// each attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantCommandPlan {
+    pub command_id: ParticipantCommandId,
+    pub logical_command_id: LogicalCommandId,
+    pub request_id: RequestId,
+    pub root_request_id: ClientRequestId,
+    pub route: ParticipantRoute,
+}
+
+impl ParticipantCommandPlan {
+    fn new(
+        command_id: ParticipantCommandId,
+        root_request_id: ClientRequestId,
+        route: ParticipantRoute,
+    ) -> Result<Self> {
+        let logical_command_id = command_id.logical_command_id()?;
+        let request_id = command_id.request_id(route)?;
+        Ok(Self {
+            command_id,
+            logical_command_id,
+            request_id,
+            root_request_id,
+            route,
+        })
+    }
+}
+
+/// Dispatch failures that the coordinator can classify without inspecting a
+/// transport-specific error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParticipantDispatchError {
+    /// The current route or epoch is no longer admissible. The coordinator may
+    /// refresh the route and retry the same logical command identity.
+    RouteRefreshRequired { reason: String },
+
+    /// The proposal may have applied, but its outcome is not known. This is
+    /// never safe to resubmit as a new mutation.
+    OutcomeUnknown { reason: String },
+
+    /// The participant rejected the command deterministically.
+    Rejected { reason: String },
+
+    /// The participant is temporarily unavailable after the route was already
+    /// selected. The caller may decide whether to retry the same phase.
+    Unavailable { reason: String },
+}
+
+/// Resolve a logical participant key to its current physical tablet route.
+pub trait ParticipantRouteRefresher {
+    fn refresh_participant_route(
+        &mut self,
+        logical_mutation_id: &LogicalMutationId,
+        previous_route: ParticipantRoute,
+    ) -> Result<ParticipantRoute>;
+}
+
+/// Dispatch one already-planned participant command.
+pub trait ParticipantPhaseDispatcher {
+    type Output;
+
+    fn dispatch(
+        &mut self,
+        plan: &ParticipantCommandPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError>;
 }
 
 /// Transaction-local coordinator state for the Phase 6.2 identity boundary.
@@ -284,6 +379,124 @@ impl DistributedTransactionCoordinator {
     ) -> Result<ParticipantCommandId> {
         let logical_mutation_id = LogicalMutationId::from_key(key)?;
         self.participant_command_id_for_logical(phase, logical_mutation_id)
+    }
+
+    /// Build one dispatch plan using the route currently cached for a write.
+    pub fn participant_command_plan(
+        &self,
+        phase: ParticipantCommandPhase,
+        key: &[u8],
+    ) -> Result<ParticipantCommandPlan> {
+        let logical_mutation_id = LogicalMutationId::from_key(key)?;
+        let route = self
+            .participant_routes
+            .get(&logical_mutation_id)
+            .copied()
+            .ok_or_else(|| {
+                Error::InvalidArgument(
+                    "participant command requires a current route hint".to_string(),
+                )
+            })?;
+        let command_id = self.participant_command_id_for_logical(phase, logical_mutation_id)?;
+        ParticipantCommandPlan::new(command_id, self.root_request_id, route)
+    }
+
+    /// Build plans in canonical write-key order. The order is only a stable
+    /// local dispatch order; logical command IDs remain independent of it.
+    pub fn plan_phase(
+        &self,
+        phase: ParticipantCommandPhase,
+    ) -> Result<Vec<ParticipantCommandPlan>> {
+        self.transaction
+            .write_set()
+            .keys()
+            .map(|key| self.participant_command_plan(phase, key))
+            .collect()
+    }
+
+    /// Execute one participant phase with bounded route-refresh retries.
+    ///
+    /// A route refresh only rebuilds the physical request view. If a dispatch
+    /// outcome becomes unknown, this method stops immediately and returns a
+    /// lookup-required error; it never creates a fresh command identity.
+    pub fn execute_phase_with_retry<D, R>(
+        &mut self,
+        phase: ParticipantCommandPhase,
+        refresher: &mut R,
+        dispatcher: &mut D,
+        max_route_refreshes: usize,
+    ) -> Result<Vec<D::Output>>
+    where
+        D: ParticipantPhaseDispatcher,
+        R: ParticipantRouteRefresher,
+    {
+        if max_route_refreshes == 0 {
+            return Err(Error::InvalidArgument(
+                "participant phase retry budget must be non-zero".to_string(),
+            ));
+        }
+
+        let keys = self
+            .transaction
+            .write_set()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut outcomes = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let mut refreshes = 0;
+            loop {
+                let plan = self.participant_command_plan(phase, &key)?;
+                match dispatcher.dispatch(&plan) {
+                    Ok(outcome) => {
+                        outcomes.push(outcome);
+                        break;
+                    }
+                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                        if refreshes >= max_route_refreshes {
+                            return Err(Error::TabletUnavailable {
+                                reason: format!(
+                                    "participant route refresh budget exhausted for transaction {}: {reason}",
+                                    self.transaction.id().0
+                                ),
+                            });
+                        }
+
+                        let refreshed_route = refresher.refresh_participant_route(
+                            plan.command_id.logical_mutation_id(),
+                            plan.route,
+                        )?;
+                        if refreshed_route == plan.route {
+                            return Err(Error::TabletUnavailable {
+                                reason: "participant route refresh returned the unchanged route"
+                                    .to_string(),
+                            });
+                        }
+                        self.set_participant_route(key.clone(), refreshed_route)?;
+                        refreshes += 1;
+                    }
+                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                        return Err(Error::RequestOutcomeUnknown {
+                            identity: format!(
+                                "transaction={} phase={:?} logical_command={:?}: {reason}",
+                                self.transaction.id().0,
+                                phase,
+                                plan.logical_command_id
+                            ),
+                        });
+                    }
+                    Err(ParticipantDispatchError::Rejected { reason }) => {
+                        return Err(Error::ConstraintViolation(reason));
+                    }
+                    Err(ParticipantDispatchError::Unavailable { reason }) => {
+                        return Err(Error::TabletUnavailable { reason });
+                    }
+                }
+            }
+        }
+
+        Ok(outcomes)
     }
 
     fn participant_command_id_for_logical(
