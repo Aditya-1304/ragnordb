@@ -1534,23 +1534,17 @@ mutation.
 The retry boundary is explicit:
 
 ```mermaid
-sequenceDiagram
-    participant C as Client
-    participant G1 as Gateway A
-    participant M as Metadata / Router
-    participant L as Tablet leader
-    participant G2 as Gateway B
-
-    C->>G1: V2 request(client_id, epoch, sequence)
-    G1->>M: Resolve schema, tablet, epoch, leader
-    M->>L: Route command
-    L-->>G1: Applied outcome
-    G1--xC: Response lost
-    C->>G2: Retry same identity
-    G2->>M: Refresh route if required
-    G2->>L: Forward same identity
-    L-->>G2: Deduplicated original outcome
-    G2-->>C: Original result
+flowchart TD
+    C["Client"] -->|"V2 request: client_id, epoch, sequence"| G1["Gateway A"]
+    G1 -->|"Resolve schema, tablet, epoch, leader"| M["Metadata / Router"]
+    M -->|"Route command"| L["Tablet leader"]
+    L -->|"Applied outcome"| G1
+    G1 -.->|"Response lost"| C
+    C -->|"Retry same identity"| G2["Gateway B"]
+    G2 -->|"Refresh route if required"| M
+    G2 -->|"Forward same identity"| L
+    L -->|"Deduplicated original outcome"| G2
+    G2 -->|"Original result"| C
 ```
 
 The maximum request and response frame size is 16 MiB. Oversized request frames
@@ -1975,24 +1969,17 @@ transactions do not produce database commit records.
 ### Implemented single-node commit path
 
 ```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as SqlSession
-    participant T as Commit Coordinator
-    participant W as A-WAL
-    participant M as MVCC
-
-    C->>S: COMMIT
-    S->>T: Consume transaction
-    T->>M: Preflight complete batch
-    M-->>T: Validated, no mutation
-    T->>T: Allocate commit_ts
-    T->>W: Append SingleNodeTxnCommit
-    W->>W: Sync through exact end_lsn
-    W-->>T: Durable extent
-    T->>M: Atomically apply complete batch
-    M-->>S: Applied
-    S-->>C: Success
+flowchart TD
+    C["Client: COMMIT"] --> S["SQL session: consume transaction"]
+    S --> T["Commit coordinator: preflight complete batch"]
+    T --> V["MVCC: validated, no mutation"]
+    V --> A["Commit coordinator: allocate commit_ts"]
+    A --> W["A-WAL: append SingleNodeTxnCommit"]
+    W --> Y["A-WAL: sync through exact end_lsn"]
+    Y --> D["A-WAL: durable extent"]
+    D --> P["MVCC: atomically apply complete batch"]
+    P --> R["SQL session: applied"]
+    R --> O["Client: success"]
 ```
 
 Read-only commits contain no mutations, allocate no commit timestamp, and write
@@ -2048,23 +2035,16 @@ In replicated mode, the Raft log replaces the single-node transaction record as
 the authoritative commit decision.
 
 ```mermaid
-sequenceDiagram
-    participant G as Gateway
-    participant L as Tablet leader
-    participant W as A-WAL
-    participant F1 as Follower 1
-    participant F2 as Follower 2
-    participant S as Tablet state machine
-
-    G->>L: Propose command
-    L->>W: Persist local Raft entry
-    L->>F1: AppendEntries
-    L->>F2: AppendEntries
-    F1-->>L: Durable acknowledgement
-    F2-->>L: Durable acknowledgement
-    L->>L: Advance commit index
-    L->>S: Apply committed entry
-    S-->>G: Return applied result
+flowchart TD
+    G["Gateway: propose command"] --> L["Tablet leader"]
+    L --> W["A-WAL: persist local Raft entry"]
+    L --> F1["Follower 1: AppendEntries"]
+    L --> F2["Follower 2: AppendEntries"]
+    F1 -->|"Durable acknowledgement"| A["Tablet leader"]
+    F2 -->|"Durable acknowledgement"| A
+    A --> C["Advance commit index"]
+    C --> S["Tablet state machine: apply committed entry"]
+    S --> R["Gateway: return applied result"]
 ```
 
 The client receives success only after the leader has committed and applied the
