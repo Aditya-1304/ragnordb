@@ -1188,12 +1188,19 @@ pub struct CommitCommand {
 }
 
 impl CommitCommand {
-    pub fn to_proto(&self) -> Result<command::CommitCommand, &'static str> {
+    /// Validate the transaction identity, timestamp relationship, and complete
+    /// participant key batch before the command crosses a Raft or recovery
+    /// boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
         if self.commit_timestamp.0 <= self.start_timestamp.0 {
             return Err("commit timestamp must be greater than start timestamp");
         }
-        validate_keys(&self.keys)?;
+        validate_keys(&self.keys)
+    }
+
+    pub fn to_proto(&self) -> Result<command::CommitCommand, &'static str> {
+        self.validate()?;
         Ok(command::CommitCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
@@ -1203,7 +1210,7 @@ impl CommitCommand {
     }
 
     pub fn from_proto(proto: command::CommitCommand) -> Result<Self, &'static str> {
-        Ok(CommitCommand {
+        let command = CommitCommand {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
@@ -1212,7 +1219,9 @@ impl CommitCommand {
                 proto.commit_timestamp.ok_or("missing commit_timestamp")?,
             ),
             keys: proto.keys,
-        })
+        };
+        command.validate()?;
+        Ok(command)
     }
 }
 
@@ -1735,6 +1744,37 @@ mod tests {
         let proto = cmd.to_proto().unwrap();
         let decoded = CommitCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.commit_timestamp.0, 105);
+    }
+
+    #[test]
+    fn commit_from_proto_rejects_invalid_metadata() {
+        let command = CommitCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            commit_timestamp: Timestamp(105),
+            keys: vec![b"/table/1/pk/1".to_vec()],
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            CommitCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_timestamp = command.to_proto().unwrap();
+        invalid_timestamp.commit_timestamp = Some(Timestamp(100).to_proto());
+        assert_eq!(
+            CommitCommand::from_proto(invalid_timestamp),
+            Err("commit timestamp must be greater than start timestamp")
+        );
+
+        let mut empty_keys = command.to_proto().unwrap();
+        empty_keys.keys.clear();
+        assert_eq!(
+            CommitCommand::from_proto(empty_keys),
+            Err("participant command requires at least one row key")
+        );
     }
 
     #[test]

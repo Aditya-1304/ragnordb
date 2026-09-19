@@ -5,14 +5,16 @@
 //! the tablet layer checks this write set first to provide
 //! read-your-writes
 //!
-//! Distributed phase dispatch and transaction-status placement are implemented
-//! at their current milestone boundaries; commit, rollback, and intent
-//! resolution remain later protocol slices.
+//! Distributed phase dispatch, commit planning, and transaction-status
+//! placement are implemented at their current milestone boundaries; rollback
+//! and intent resolution remain later protocol slices.
+mod commit;
 mod coordinator;
 mod manager;
 mod prewrite;
 mod status;
 
+pub use commit::{CommitBatchPlan, CommitPhasePlan};
 pub use coordinator::{
     DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
     ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,

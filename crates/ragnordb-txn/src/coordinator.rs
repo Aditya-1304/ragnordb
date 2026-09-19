@@ -20,7 +20,9 @@ use ragnordb_storage::{
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit, WalMutation},
 };
 
-use crate::{CommitTimestampAllocator, Transaction, status::TransactionStatusLocation};
+use crate::{
+    CommitTimestampAllocator, Transaction, TransactionManager, status::TransactionStatusLocation,
+};
 
 /// Canonical logical identity for one transaction mutation or read key.
 ///
@@ -410,6 +412,15 @@ impl DistributedTransactionCoordinator {
     /// mutation, or transaction acknowledgement occurs here.
     pub fn plan_prewrite(&self, ttl_ms: u64) -> Result<Vec<crate::prewrite::PrewriteBatchPlan>> {
         crate::prewrite::plan_prewrite(self, ttl_ms)
+    }
+
+    /// Build the commit timestamp, durable status outcome, and primary-first
+    /// participant batches without dispatching any command.
+    pub fn plan_commit<M: TransactionManager>(
+        &self,
+        timestamp_manager: &mut M,
+    ) -> Result<crate::commit::CommitPhasePlan> {
+        crate::commit::plan_commit(self, timestamp_manager)
     }
 
     /// Dispatch every planned prewrite batch with bounded route-refresh
