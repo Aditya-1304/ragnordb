@@ -5,10 +5,10 @@
 //! the tablet layer checks this write set first to provide
 //! read-your-writes
 //!
-//! Distributed phase dispatch, commit planning, rollback planning, and
-//! transaction-status placement are implemented at their current milestone
-//! boundaries; rollback execution and intent resolution remain later protocol
-//! slices.
+//! Distributed phase dispatch, commit planning, rollback planning and
+//! execution, and transaction-status placement are implemented at their
+//! current milestone boundaries; intent resolution remains a later protocol
+//! slice.
 mod commit;
 mod coordinator;
 mod manager;
@@ -21,8 +21,8 @@ pub use coordinator::{
     CommitPhaseDispatcher, DistributedTransactionCoordinator, LogicalMutationId,
     OwnedMvccParticipant, ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
     ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
-    PrewriteBatchDispatcher, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
-    SingleNodeCommitParticipant,
+    PrewriteBatchDispatcher, RollbackPhaseDispatcher, SingleNodeCommitCoordinator,
+    SingleNodeCommitOutcome, SingleNodeCommitParticipant,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,
@@ -30,7 +30,7 @@ pub use manager::{
     TransactionManager,
 };
 pub use prewrite::PrewriteBatchPlan;
-pub use rollback::{RollbackBatchPlan, RollbackPhasePlan};
+pub use rollback::{RollbackBatchPlan, RollbackExecutionOutcome, RollbackPhasePlan};
 pub use status::{
     InMemoryTransactionStatusStore, TransactionStatusKey, TransactionStatusLocation,
     TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,

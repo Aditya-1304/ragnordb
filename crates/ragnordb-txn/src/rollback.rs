@@ -3,8 +3,10 @@
 //! Rollback planning fences the complete logical write set, including keys
 //! whose prewrite result may have been lost. Publishing a rollback marker for
 //! those keys prevents a delayed prewrite or commit message from resurrecting
-//! an aborted transaction. This module only builds validated plans; dispatch,
-//! durable status publication, and outcome recovery belong to Slice 2.
+//! an aborted transaction. This module builds validated plans and exposes the
+//! execution result shape; dispatch is owned by the coordinator's
+//! caller-supplied transport, while unknown-outcome recovery remains an
+//! explicit lookup concern for a later protocol slice.
 
 use std::collections::BTreeMap;
 
@@ -43,8 +45,9 @@ impl RollbackBatchPlan {
 
 /// Complete side-effect-free rollback decision plan.
 ///
-/// The primary batch is separated from secondary batches so Slice 2 can apply
-/// the chosen abort/status ordering without reconstructing the logical plan.
+/// The primary batch is separated from secondary batches so execution can
+/// enforce participant fencing before publishing the durable aborted status
+/// without reconstructing the logical plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollbackPhasePlan {
     pub status_key: TransactionStatusKey,
@@ -52,6 +55,15 @@ pub struct RollbackPhasePlan {
     pub status_record: TxnStatusRecord,
     pub primary: RollbackBatchPlan,
     pub secondary: Vec<RollbackBatchPlan>,
+}
+
+/// Result of a rollback phase after every participant batch and the durable
+/// aborted status record have reported success.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackExecutionOutcome<P, S, A> {
+    pub primary: P,
+    pub secondary: Vec<S>,
+    pub status: A,
 }
 
 struct BatchBuilder {

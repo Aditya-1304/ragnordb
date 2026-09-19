@@ -273,6 +273,36 @@ pub trait CommitPhaseDispatcher {
     ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError>;
 }
 
+/// Dispatch the rollback decision in participant-first order.
+///
+/// `dispatch_primary_rollback` and `dispatch_secondary_rollback` must return
+/// `Ok` only after their rollback command is durably replicated and applied at
+/// the participant boundary. `dispatch_status_abort` must return `Ok` only
+/// after the aborted transaction-status record is durably replicated. An
+/// `OutcomeUnknown` result is terminal because replaying a mutation whose
+/// apply result is unknown requires an explicit outcome lookup, not a fresh
+/// proposal.
+pub trait RollbackPhaseDispatcher {
+    type PrimaryOutput;
+    type SecondaryOutput;
+    type StatusOutput;
+
+    fn dispatch_primary_rollback(
+        &mut self,
+        plan: &crate::rollback::RollbackBatchPlan,
+    ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError>;
+
+    fn dispatch_secondary_rollback(
+        &mut self,
+        plan: &crate::rollback::RollbackBatchPlan,
+    ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError>;
+
+    fn dispatch_status_abort(
+        &mut self,
+        plan: &crate::rollback::RollbackPhasePlan,
+    ) -> std::result::Result<Self::StatusOutput, ParticipantDispatchError>;
+}
+
 /// Transaction-local coordinator state for the Phase 6.2 identity boundary.
 ///
 /// This type owns semantic transaction state and current route hints. It does
@@ -450,6 +480,231 @@ impl DistributedTransactionCoordinator {
     /// dispatching a command or mutating participant state.
     pub fn plan_rollback(&self) -> Result<crate::rollback::RollbackPhasePlan> {
         crate::rollback::plan_rollback(self)
+    }
+
+    /// Execute rollback batches before publishing the durable aborted status.
+    ///
+    /// A route refresh rebuilds the complete rollback plan from the stable
+    /// logical transaction state. If a secondary route changes after an
+    /// earlier batch succeeds, the participant phase restarts from the
+    /// primary; exact rollback command identities make already-applied
+    /// batches safe to replay at the participant's idempotent rollback
+    /// boundary. The aborted status is published only after all participant
+    /// batches report durable success. An unknown outcome is terminal and is
+    /// returned without a retry or status publication.
+    pub fn execute_rollback_with_retry<D, R>(
+        &mut self,
+        refresher: &mut R,
+        dispatcher: &mut D,
+        max_route_refreshes: usize,
+    ) -> Result<
+        crate::rollback::RollbackExecutionOutcome<
+            D::PrimaryOutput,
+            D::SecondaryOutput,
+            D::StatusOutput,
+        >,
+    >
+    where
+        D: RollbackPhaseDispatcher,
+        R: ParticipantRouteRefresher,
+    {
+        if max_route_refreshes == 0 {
+            return Err(Error::InvalidArgument(
+                "rollback route refresh budget must be non-zero".to_string(),
+            ));
+        }
+
+        let mut route_refreshes = 0;
+        let mut plan = self.plan_rollback()?;
+        let (primary_outcome, secondary_outcomes) = loop {
+            let primary_outcome = loop {
+                match dispatcher.dispatch_primary_rollback(&plan.primary) {
+                    Ok(outcome) => break outcome,
+                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                        self.refresh_rollback_batch_route(
+                            &plan.primary,
+                            refresher,
+                            true,
+                            &mut route_refreshes,
+                            max_route_refreshes,
+                            reason,
+                        )?;
+                        plan = self.plan_rollback()?;
+                    }
+                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                        return Err(self.rollback_outcome_unknown(&plan.primary, reason));
+                    }
+                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                        return Err(Error::WriteConflict(reason));
+                    }
+                    Err(ParticipantDispatchError::Rejected { reason }) => {
+                        return Err(Error::ConstraintViolation(reason));
+                    }
+                    Err(ParticipantDispatchError::Unavailable { reason }) => {
+                        return Err(Error::TabletUnavailable { reason });
+                    }
+                }
+            };
+
+            let mut secondary_outcomes = Vec::with_capacity(plan.secondary.len());
+            let mut restart_participant_phase = false;
+            for batch in plan.secondary.clone() {
+                match dispatcher.dispatch_secondary_rollback(&batch) {
+                    Ok(outcome) => secondary_outcomes.push(outcome),
+                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                        self.refresh_rollback_batch_route(
+                            &batch,
+                            refresher,
+                            false,
+                            &mut route_refreshes,
+                            max_route_refreshes,
+                            reason,
+                        )?;
+                        plan = self.plan_rollback()?;
+                        restart_participant_phase = true;
+                        break;
+                    }
+                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                        return Err(self.rollback_outcome_unknown(&batch, reason));
+                    }
+                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                        return Err(Error::WriteConflict(reason));
+                    }
+                    Err(ParticipantDispatchError::Rejected { reason }) => {
+                        return Err(Error::ConstraintViolation(reason));
+                    }
+                    Err(ParticipantDispatchError::Unavailable { reason }) => {
+                        return Err(Error::TabletUnavailable { reason });
+                    }
+                }
+            }
+
+            if restart_participant_phase {
+                continue;
+            }
+
+            break (primary_outcome, secondary_outcomes);
+        };
+
+        let status_outcome = loop {
+            match dispatcher.dispatch_status_abort(&plan) {
+                Ok(outcome) => break outcome,
+                Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                    self.refresh_rollback_batch_route(
+                        &plan.primary,
+                        refresher,
+                        true,
+                        &mut route_refreshes,
+                        max_route_refreshes,
+                        reason,
+                    )?;
+                    plan = self.plan_rollback()?;
+                }
+                Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                    return Err(self.rollback_status_outcome_unknown(&plan, reason));
+                }
+                Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                    return Err(Error::WriteConflict(reason));
+                }
+                Err(ParticipantDispatchError::Rejected { reason }) => {
+                    return Err(Error::ConstraintViolation(reason));
+                }
+                Err(ParticipantDispatchError::Unavailable { reason }) => {
+                    return Err(Error::TabletUnavailable { reason });
+                }
+            }
+        };
+
+        Ok(crate::rollback::RollbackExecutionOutcome {
+            primary: primary_outcome,
+            secondary: secondary_outcomes,
+            status: status_outcome,
+        })
+    }
+
+    fn refresh_rollback_batch_route<R>(
+        &mut self,
+        batch: &crate::rollback::RollbackBatchPlan,
+        refresher: &mut R,
+        update_status_route: bool,
+        route_refreshes: &mut usize,
+        max_route_refreshes: usize,
+        reason: String,
+    ) -> Result<()>
+    where
+        R: ParticipantRouteRefresher,
+    {
+        if *route_refreshes >= max_route_refreshes {
+            return Err(Error::TabletUnavailable {
+                reason: format!(
+                    "rollback route refresh budget exhausted for transaction {}: {reason}",
+                    self.transaction.id().0
+                ),
+            });
+        }
+
+        let anchor = batch.participant_plans.first().ok_or_else(|| {
+            Error::CorruptData("rollback batch has no participant command identity".to_string())
+        })?;
+        let refreshed_route = refresher
+            .refresh_participant_route(anchor.command_id.logical_mutation_id(), batch.route)?;
+        if refreshed_route == batch.route {
+            return Err(Error::TabletUnavailable {
+                reason: "rollback route refresh returned the unchanged route".to_string(),
+            });
+        }
+
+        for participant_plan in &batch.participant_plans {
+            self.set_participant_route(
+                participant_plan
+                    .command_id
+                    .logical_mutation_id()
+                    .as_key()
+                    .to_vec(),
+                refreshed_route,
+            )?;
+        }
+        if update_status_route {
+            self.set_status_route(refreshed_route)?;
+        }
+        *route_refreshes += 1;
+        Ok(())
+    }
+
+    fn rollback_outcome_unknown(
+        &self,
+        batch: &crate::rollback::RollbackBatchPlan,
+        reason: String,
+    ) -> Error {
+        let logical_command = batch
+            .participant_plans
+            .first()
+            .map(|plan| format!("{:?}", plan.logical_command_id))
+            .unwrap_or_else(|| "missing".to_string());
+        Error::RequestOutcomeUnknown {
+            identity: format!(
+                "transaction={} phase={:?} tablet={} logical_command={logical_command}: {reason}",
+                self.transaction.id().0,
+                ParticipantCommandPhase::Rollback,
+                batch.route.tablet_id.0,
+            ),
+        }
+    }
+
+    fn rollback_status_outcome_unknown(
+        &self,
+        plan: &crate::rollback::RollbackPhasePlan,
+        reason: String,
+    ) -> Error {
+        Error::RequestOutcomeUnknown {
+            identity: format!(
+                "transaction={} phase={:?} status_tablet={} status_key={:?}: {reason}",
+                self.transaction.id().0,
+                ParticipantCommandPhase::Rollback,
+                plan.status_route.tablet_id.0,
+                plan.status_key,
+            ),
+        }
     }
 
     /// Execute the commit decision with the primary/status commit point first.
