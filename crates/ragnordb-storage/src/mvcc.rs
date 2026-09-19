@@ -330,7 +330,7 @@ impl InMemoryMvcc {
     /// commit/catalog barrier. Flattening the ordered maps here fixes both the
     /// state image and its deterministic protobuf ordering before that barrier
     /// is released
-    pub fn capture_snapshot_state(&self) -> CapturedMvccState {
+    pub fn capture_snapshot_state(&self) -> Result<CapturedMvccState> {
         let default_values = self
             .default
             .iter()
@@ -348,27 +348,37 @@ impl InMemoryMvcc {
         let locks = self
             .locks
             .iter()
-            .map(|(key, record)| snapshot_proto::LockEntry {
-                key: key.clone(),
-                record: Some(record.to_proto()),
+            .map(|(key, record)| {
+                Ok(snapshot_proto::LockEntry {
+                    key: key.clone(),
+                    record: Some(record.to_proto().map_err(|error| {
+                        Error::CorruptData(format!(
+                            "in-memory lock record cannot be snapshotted: {error}"
+                        ))
+                    })?),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let writes = self
             .writes
             .iter()
             .flat_map(|(key, versions)| {
-                versions.iter().map(
-                    move |(write_timestamp, record)| snapshot_proto::WriteEntry {
+                versions.iter().map(move |(write_timestamp, record)| {
+                    Ok(snapshot_proto::WriteEntry {
                         key: key.clone(),
                         write_timestamp: Some(write_timestamp.to_proto()),
-                        record: Some(record.to_proto()),
-                    },
-                )
+                        record: Some(record.to_proto().map_err(|error| {
+                            Error::CorruptData(format!(
+                                "in-memory write record cannot be snapshotted: {error}"
+                            ))
+                        })?),
+                    })
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        CapturedMvccState::new(default_values, locks, writes)
+        Ok(CapturedMvccState::new(default_values, locks, writes))
     }
 
     /// Reconstruct one table's complete MVCC maps from snapshot entries.

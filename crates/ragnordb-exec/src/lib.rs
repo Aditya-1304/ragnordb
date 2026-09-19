@@ -1499,8 +1499,10 @@ impl LocalExecutor {
                     ))
                 })?;
 
-                let mvcc: CapturedMvccState =
-                    coordinator.participant().storage().capture_snapshot_state();
+                let mvcc: CapturedMvccState = coordinator
+                    .participant()
+                    .storage()
+                    .capture_snapshot_state()?;
 
                 Ok(mvcc.into_snapshot_table(schema.to_definition()))
             })

@@ -68,7 +68,7 @@ fn test_snapshot() -> snapshot_proto::DatabaseSnapshot {
             writes: vec![snapshot_proto::WriteEntry {
                 key,
                 write_timestamp: Some(Timestamp(90).to_proto()),
-                record: Some(write.to_proto()),
+                record: Some(write.to_proto().unwrap()),
             }],
         }],
     }

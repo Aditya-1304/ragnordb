@@ -128,6 +128,7 @@ pub fn generate_local_snapshot_with_removal_proof(
         .tablet()
         .storage()
         .capture_snapshot_state()
+        .map_err(|error| TabletSnapshotGenerationError::StateMachineSnapshot(error.to_string()))?
         .into_snapshot_entries();
 
     let payload = snapshot_proto::TabletSnapshotPayload {
