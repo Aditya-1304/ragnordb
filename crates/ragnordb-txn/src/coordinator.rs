@@ -446,6 +446,12 @@ impl DistributedTransactionCoordinator {
         crate::commit::plan_commit(self, timestamp_manager)
     }
 
+    /// Build a validated aborted status outcome and rollback batches without
+    /// dispatching a command or mutating participant state.
+    pub fn plan_rollback(&self) -> Result<crate::rollback::RollbackPhasePlan> {
+        crate::rollback::plan_rollback(self)
+    }
+
     /// Execute the commit decision with the primary/status commit point first.
     ///
     /// A route refresh rebuilds the physical plan while retaining the original

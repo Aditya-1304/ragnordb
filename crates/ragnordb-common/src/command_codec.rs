@@ -1237,9 +1237,15 @@ pub struct RollbackCommand {
 }
 
 impl RollbackCommand {
-    pub fn to_proto(&self) -> Result<command::RollbackCommand, &'static str> {
+    /// Validate the transaction identity and complete rollback key batch
+    /// before the command crosses a Raft or recovery boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
-        validate_keys(&self.keys)?;
+        validate_keys(&self.keys)
+    }
+
+    pub fn to_proto(&self) -> Result<command::RollbackCommand, &'static str> {
+        self.validate()?;
         Ok(command::RollbackCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
@@ -1248,13 +1254,15 @@ impl RollbackCommand {
     }
 
     pub fn from_proto(proto: command::RollbackCommand) -> Result<Self, &'static str> {
-        Ok(RollbackCommand {
+        let command = RollbackCommand {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
             keys: proto.keys,
-        })
+        };
+        command.validate()?;
+        Ok(command)
     }
 }
 
@@ -1787,6 +1795,36 @@ mod tests {
         let proto = cmd.to_proto().unwrap();
         let decoded = RollbackCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.txn_id.0, 1);
+    }
+
+    #[test]
+    fn rollback_from_proto_rejects_invalid_metadata() {
+        let command = RollbackCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            keys: vec![b"/table/1/pk/1".to_vec()],
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            RollbackCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_start_timestamp = command.to_proto().unwrap();
+        invalid_start_timestamp.start_timestamp = Some(Timestamp(0).to_proto());
+        assert_eq!(
+            RollbackCommand::from_proto(invalid_start_timestamp),
+            Err("transaction start timestamp must be non-zero")
+        );
+
+        let mut empty_keys = command.to_proto().unwrap();
+        empty_keys.keys.clear();
+        assert_eq!(
+            RollbackCommand::from_proto(empty_keys),
+            Err("participant command requires at least one row key")
+        );
     }
 
     #[test]

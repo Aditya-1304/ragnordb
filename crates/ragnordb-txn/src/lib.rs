@@ -5,13 +5,15 @@
 //! the tablet layer checks this write set first to provide
 //! read-your-writes
 //!
-//! Distributed phase dispatch, commit planning, and transaction-status
-//! placement are implemented at their current milestone boundaries; rollback
-//! and intent resolution remain later protocol slices.
+//! Distributed phase dispatch, commit planning, rollback planning, and
+//! transaction-status placement are implemented at their current milestone
+//! boundaries; rollback execution and intent resolution remain later protocol
+//! slices.
 mod commit;
 mod coordinator;
 mod manager;
 mod prewrite;
+mod rollback;
 mod status;
 
 pub use commit::{CommitBatchPlan, CommitExecutionOutcome, CommitPhasePlan};
@@ -28,6 +30,7 @@ pub use manager::{
     TransactionManager,
 };
 pub use prewrite::PrewriteBatchPlan;
+pub use rollback::{RollbackBatchPlan, RollbackPhasePlan};
 pub use status::{
     InMemoryTransactionStatusStore, TransactionStatusKey, TransactionStatusLocation,
     TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,
