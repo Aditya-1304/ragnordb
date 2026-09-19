@@ -6,8 +6,8 @@
 //! read-your-writes
 //!
 //! Distributed phase dispatch and transaction-status placement are implemented
-//! at their current milestone boundaries; prewrite, commit, rollback, and
-//! intent resolution remain later protocol slices.
+//! at their current milestone boundaries; commit, rollback, and intent
+//! resolution remain later protocol slices.
 mod coordinator;
 mod manager;
 mod prewrite;
@@ -17,7 +17,8 @@ pub use coordinator::{
     DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
     ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
     ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
-    SingleNodeCommitCoordinator, SingleNodeCommitOutcome, SingleNodeCommitParticipant,
+    PrewriteBatchDispatcher, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
+    SingleNodeCommitParticipant,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,

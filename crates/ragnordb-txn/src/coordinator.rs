@@ -202,6 +202,11 @@ pub enum ParticipantDispatchError {
     /// never safe to resubmit as a new mutation.
     OutcomeUnknown { reason: String },
 
+    /// The participant found a deterministic MVCC conflict. No later batch
+    /// may be dispatched because the transaction cannot complete its prewrite
+    /// phase without a rollback phase.
+    WriteConflict { reason: String },
+
     /// The participant rejected the command deterministically.
     Rejected { reason: String },
 
@@ -229,12 +234,26 @@ pub trait ParticipantPhaseDispatcher {
     ) -> std::result::Result<Self::Output, ParticipantDispatchError>;
 }
 
+/// Dispatch one complete prewrite batch to its current participant tablet.
+///
+/// The dispatcher owns the concrete tablet/RPC transport. The coordinator
+/// supplies a complete atomic batch plus the stable logical identities needed
+/// by that transport to deduplicate an exact retry.
+pub trait PrewriteBatchDispatcher {
+    type Output;
+
+    fn dispatch_prewrite(
+        &mut self,
+        plan: &crate::prewrite::PrewriteBatchPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError>;
+}
+
 /// Transaction-local coordinator state for the Phase 6.2 identity boundary.
 ///
 /// This type owns semantic transaction state and current route hints. It does
-/// not submit Raft commands or perform prewrite/commit yet; those dispatch
-/// responsibilities are deliberately reserved for the next slice so route
-/// refresh cannot accidentally become a second transaction authority.
+/// not own a concrete Raft or RPC transport; prewrite dispatch is performed
+/// through caller-supplied batch and route-refresh traits so transport cannot
+/// become a second transaction authority.
 #[derive(Debug)]
 pub struct DistributedTransactionCoordinator {
     transaction: Transaction,
@@ -393,6 +412,126 @@ impl DistributedTransactionCoordinator {
         crate::prewrite::plan_prewrite(self, ttl_ms)
     }
 
+    /// Dispatch every planned prewrite batch with bounded route-refresh
+    /// retries.
+    ///
+    /// A route refresh restarts the complete phase from a fresh grouping so a
+    /// topology change cannot leave the coordinator dispatching an old batch
+    /// layout. Previously applied batches may be presented again with their
+    /// original logical identities; the participant's durable deduplication
+    /// boundary must make that exact replay idempotent. An unknown outcome is
+    /// terminal for this call and is never replayed without an outcome lookup.
+    /// Rollback of earlier successful batches is intentionally Phase 6.6.
+    pub fn execute_prewrite_with_retry<D, R>(
+        &mut self,
+        ttl_ms: u64,
+        refresher: &mut R,
+        dispatcher: &mut D,
+        max_route_refreshes: usize,
+    ) -> Result<Vec<D::Output>>
+    where
+        D: PrewriteBatchDispatcher,
+        R: ParticipantRouteRefresher,
+    {
+        if max_route_refreshes == 0 {
+            return Err(Error::InvalidArgument(
+                "prewrite route refresh budget must be non-zero".to_string(),
+            ));
+        }
+
+        let mut route_refreshes = 0;
+        loop {
+            let batches = self.plan_prewrite(ttl_ms)?;
+            let mut outcomes = Vec::with_capacity(batches.len());
+            let mut restart_phase = false;
+
+            for batch in batches {
+                match dispatcher.dispatch_prewrite(&batch) {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                        if route_refreshes >= max_route_refreshes {
+                            return Err(Error::TabletUnavailable {
+                                reason: format!(
+                                    "prewrite route refresh budget exhausted for transaction {}: {reason}",
+                                    self.transaction.id().0
+                                ),
+                            });
+                        }
+
+                        let anchor = batch.participant_plans.first().ok_or_else(|| {
+                            Error::CorruptData(
+                                "prewrite batch has no participant command identity".to_string(),
+                            )
+                        })?;
+                        let refreshed_route = refresher.refresh_participant_route(
+                            anchor.command_id.logical_mutation_id(),
+                            batch.route,
+                        )?;
+                        if refreshed_route == batch.route {
+                            return Err(Error::TabletUnavailable {
+                                reason: "prewrite route refresh returned the unchanged route"
+                                    .to_string(),
+                            });
+                        }
+
+                        // All keys in this plan share one physical route. The
+                        // refresh therefore updates the complete batch before
+                        // regrouping; a future topology-aware resolver may
+                        // return different routes per logical key when a
+                        // split or merge is explicitly supported.
+                        for participant_plan in &batch.participant_plans {
+                            self.set_participant_route(
+                                participant_plan
+                                    .command_id
+                                    .logical_mutation_id()
+                                    .as_key()
+                                    .to_vec(),
+                                refreshed_route,
+                            )?;
+                        }
+
+                        route_refreshes += 1;
+                        restart_phase = true;
+                        break;
+                    }
+                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                        let logical_command_id = batch
+                            .participant_plans
+                            .first()
+                            .map(|plan| plan.logical_command_id)
+                            .ok_or_else(|| {
+                                Error::CorruptData(
+                                    "prewrite batch has no participant command identity"
+                                        .to_string(),
+                                )
+                            })?;
+                        return Err(Error::RequestOutcomeUnknown {
+                            identity: format!(
+                                "transaction={} phase={:?} tablet={} logical_command={logical_command_id:?}: {reason}",
+                                self.transaction.id().0,
+                                ParticipantCommandPhase::Prewrite,
+                                batch.route.tablet_id.0,
+                            ),
+                        });
+                    }
+                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                        return Err(Error::WriteConflict(reason));
+                    }
+                    Err(ParticipantDispatchError::Rejected { reason }) => {
+                        return Err(Error::ConstraintViolation(reason));
+                    }
+                    Err(ParticipantDispatchError::Unavailable { reason }) => {
+                        return Err(Error::TabletUnavailable { reason });
+                    }
+                }
+            }
+
+            if !restart_phase {
+                return Ok(outcomes);
+            }
+        }
+    }
+
     /// Execute one participant phase with bounded route-refresh retries.
     ///
     /// A route refresh only rebuilds the physical request view. If a dispatch
@@ -464,6 +603,9 @@ impl DistributedTransactionCoordinator {
                                 plan.logical_command_id
                             ),
                         });
+                    }
+                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                        return Err(Error::WriteConflict(reason));
                     }
                     Err(ParticipantDispatchError::Rejected { reason }) => {
                         return Err(Error::ConstraintViolation(reason));
