@@ -24,7 +24,7 @@ use std::{
 
 use ragnordb_common::{
     Error, Result,
-    codec::Row,
+    codec::{Row, TxnStatusRecord},
     encoding::{decode_row, encode_row},
     ids::{RowKey, TableId, TabletId, Timestamp},
 };
@@ -32,7 +32,11 @@ use ragnordb_storage::{
     key::{decode_row_key, encode_row_key},
     mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
-use ragnordb_txn::{SingleNodeCommitParticipant, Transaction};
+use ragnordb_txn::{
+    IntentResolutionDecision, ResolveIntentPlan, SingleNodeCommitParticipant, Transaction,
+    TransactionStatusLocation, TransactionStatusReader, TransactionStatusRouteResolver,
+    plan_intent_resolution,
+};
 
 /// One logical row mutation waiting to be added to a transaction.
 ///
@@ -56,6 +60,24 @@ pub struct TabletScanPage {
 
     /// Whether another visible row remains after the final returned key.
     pub has_more: bool,
+}
+
+/// Result of a point read that encountered a transaction intent.
+///
+/// Terminal intents are returned as a plan instead of being changed in place.
+/// The caller must dispatch that plan through the participant tablet's normal
+/// Raft path and retry the read after the command is applied. This preserves
+/// one replicated durability boundary for both foreground reads and cleanup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntentAwareRead {
+    /// The snapshot contains a row, or the row is absent.
+    Visible(Option<Row>),
+
+    /// The authoritative status is terminal and the intent can be resolved.
+    Resolve(ResolveIntentPlan),
+
+    /// The authoritative status is still pending; no resolve command is safe.
+    Pending { status: TxnStatusRecord },
 }
 
 /// A logical tablet backed by an MVCC storage implementation.
@@ -125,6 +147,97 @@ impl<S: MvccStorage> Tablet<S> {
             .read(&encoded_key, transaction.start_ts())?
             .map(|row| decode_row(&row))
             .transpose()
+    }
+
+    /// Read one row while exposing terminal intent resolution to the caller.
+    ///
+    /// The status record must already have been fetched from the authoritative
+    /// primary/status location. If the status is committed or aborted, this
+    /// method returns a deterministic `ResolveIntentPlan`; it never applies the
+    /// command locally. Pending status is returned explicitly so the caller can
+    /// apply its bounded wait/retry policy in the later liveness slice.
+    pub fn get_with_intent_status(
+        &self,
+        transaction: &Transaction,
+        key: &RowKey,
+        status: &TxnStatusRecord,
+    ) -> Result<IntentAwareRead> {
+        self.validate_row_key(key)?;
+
+        let encoded_key = encode_row_key(key)?;
+
+        if let Some(mutation) = transaction.pending_write(&encoded_key) {
+            return Ok(IntentAwareRead::Visible(decode_pending_mutation(mutation)?));
+        }
+
+        let Some(lock) = self
+            .storage
+            .intent_for_read(&encoded_key, transaction.start_ts())?
+        else {
+            let visible = self
+                .storage
+                .read(&encoded_key, transaction.start_ts())?
+                .map(|row| decode_row(&row))
+                .transpose()?;
+            return Ok(IntentAwareRead::Visible(visible));
+        };
+
+        match plan_intent_resolution(&encoded_key, &lock, status)? {
+            IntentResolutionDecision::Pending { status } => Ok(IntentAwareRead::Pending { status }),
+            IntentResolutionDecision::Resolve(plan) => Ok(IntentAwareRead::Resolve(plan)),
+        }
+    }
+
+    /// Read one row while resolving the transaction status through its current
+    /// primary/status route.
+    ///
+    /// Status lookup is bounded and route-refreshable. A missing status never
+    /// becomes an inferred abort, and a pending status is returned to the
+    /// caller for the later wait/retry policy. Terminal outcomes are still
+    /// returned as a plan so the caller can submit them through Raft.
+    pub fn get_with_intent_status_lookup<R, L>(
+        &self,
+        transaction: &Transaction,
+        key: &RowKey,
+        status_location: &mut TransactionStatusLocation,
+        route_resolver: &mut R,
+        status_reader: &mut L,
+        max_route_refreshes: usize,
+    ) -> Result<IntentAwareRead>
+    where
+        R: TransactionStatusRouteResolver,
+        L: TransactionStatusReader<Output = TxnStatusRecord>,
+    {
+        self.validate_row_key(key)?;
+        let encoded_key = encode_row_key(key)?;
+
+        if let Some(mutation) = transaction.pending_write(&encoded_key) {
+            return Ok(IntentAwareRead::Visible(decode_pending_mutation(mutation)?));
+        }
+
+        if self
+            .storage
+            .intent_for_read(&encoded_key, transaction.start_ts())?
+            .is_none()
+        {
+            let visible = self
+                .storage
+                .read(&encoded_key, transaction.start_ts())?
+                .map(|row| decode_row(&row))
+                .transpose()?;
+            return Ok(IntentAwareRead::Visible(visible));
+        }
+
+        let status = status_location
+            .lookup_with_retry(route_resolver, status_reader, max_route_refreshes)?
+            .ok_or_else(|| Error::TabletUnavailable {
+                reason: format!(
+                    "transaction status for intent owner {} is not currently visible",
+                    status_location.txn_id().0
+                ),
+            })?;
+
+        self.get_with_intent_status(transaction, key, &status)
     }
 
     /// Validate, encode, and atomically buffer one statement's row mutations.
@@ -638,8 +751,14 @@ fn tablet_scan_lower_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ragnordb_common::{codec::Value, ids::TxnId};
-    use ragnordb_storage::key::make_row_key;
+    use ragnordb_common::{
+        codec::{TxnStatus, TxnStatusRecord, Value},
+        ids::TxnId,
+    };
+    use ragnordb_storage::{
+        key::{encode_row_key, make_row_key},
+        mvcc::{Mutation, MvccStorage},
+    };
 
     fn key(id: i64) -> RowKey {
         key_for_table(TableId(1), id)
@@ -694,6 +813,125 @@ mod tests {
         let reader = transaction(2, 3);
 
         assert_eq!(tablet.get(&reader, &row_key).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn read_path_returns_a_terminal_resolution_plan_for_a_committed_intent() {
+        let mut tablet = tablet();
+        let row_key = key(1);
+        let encoded_key = encode_row_key(&row_key).unwrap();
+        let primary_key = encode_row_key(&key(2)).unwrap();
+        let encoded_row = encode_row(&row(1, "intent")).unwrap();
+
+        tablet
+            .storage
+            .prewrite(
+                TxnId(7),
+                Timestamp(100),
+                &encoded_key,
+                &Mutation::Put(encoded_row),
+                &primary_key,
+                30_000,
+            )
+            .unwrap();
+
+        let reader = transaction(8, 100);
+        let status = TxnStatusRecord {
+            txn_id: TxnId(7),
+            start_timestamp: Timestamp(100),
+            commit_timestamp: Some(Timestamp(110)),
+            status: TxnStatus::Committed,
+            primary_key,
+            participant_tablet_ids: vec![1],
+            last_heartbeat_timestamp: None,
+        };
+
+        let outcome = tablet
+            .get_with_intent_status(&reader, &row_key, &status)
+            .unwrap();
+
+        let IntentAwareRead::Resolve(plan) = outcome else {
+            panic!("committed intent must be surfaced for durable resolution");
+        };
+        assert_eq!(plan.command.resolved_status, TxnStatus::Committed);
+        assert_eq!(plan.command.commit_timestamp, Some(Timestamp(110)));
+        assert_eq!(plan.command.keys, vec![encoded_key]);
+    }
+
+    #[test]
+    fn read_path_returns_a_rollback_plan_for_an_aborted_intent() {
+        let mut tablet = tablet();
+        let row_key = key(3);
+        let encoded_key = encode_row_key(&row_key).unwrap();
+        let primary_key = encode_row_key(&key(4)).unwrap();
+
+        tablet
+            .storage
+            .prewrite(
+                TxnId(9),
+                Timestamp(120),
+                &encoded_key,
+                &Mutation::Put(encode_row(&row(3, "intent")).unwrap()),
+                &primary_key,
+                30_000,
+            )
+            .unwrap();
+
+        let status = TxnStatusRecord {
+            txn_id: TxnId(9),
+            start_timestamp: Timestamp(120),
+            commit_timestamp: None,
+            status: TxnStatus::Aborted,
+            primary_key,
+            participant_tablet_ids: vec![1],
+            last_heartbeat_timestamp: None,
+        };
+
+        let outcome = tablet
+            .get_with_intent_status(&transaction(10, 120), &row_key, &status)
+            .unwrap();
+
+        let IntentAwareRead::Resolve(plan) = outcome else {
+            panic!("aborted intent must be surfaced for durable rollback");
+        };
+        assert_eq!(plan.command.resolved_status, TxnStatus::Aborted);
+        assert_eq!(plan.command.commit_timestamp, None);
+    }
+
+    #[test]
+    fn read_path_keeps_pending_intents_out_of_terminal_resolution() {
+        let mut tablet = tablet();
+        let row_key = key(5);
+        let encoded_key = encode_row_key(&row_key).unwrap();
+        let primary_key = encode_row_key(&key(6)).unwrap();
+
+        tablet
+            .storage
+            .prewrite(
+                TxnId(11),
+                Timestamp(140),
+                &encoded_key,
+                &Mutation::Put(encode_row(&row(5, "pending")).unwrap()),
+                &primary_key,
+                30_000,
+            )
+            .unwrap();
+
+        let status = TxnStatusRecord {
+            txn_id: TxnId(11),
+            start_timestamp: Timestamp(140),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key,
+            participant_tablet_ids: vec![1],
+            last_heartbeat_timestamp: Some(Timestamp(145)),
+        };
+
+        let outcome = tablet
+            .get_with_intent_status(&transaction(12, 140), &row_key, &status)
+            .unwrap();
+
+        assert!(matches!(outcome, IntentAwareRead::Pending { .. }));
     }
 
     #[test]

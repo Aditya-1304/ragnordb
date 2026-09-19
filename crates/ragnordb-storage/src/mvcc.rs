@@ -24,9 +24,11 @@
 //!
 //! this commits buffered single tablet transaction directly after
 //! validating the entire batch.
-//! Distributed prewrite, lock resolution, transction status records
-//! Raft application, WAL durability, and garbage collection are
-//! intentionally deferred to their later milestones
+//! Distributed prewrite, terminal intent resolution, transaction status
+//! records, Raft application, WAL durability, and garbage collection are
+//! implemented at separate layer boundaries. Read-time resolution returns a
+//! durable command plan to the tablet/Raft owner; it never mutates MVCC state
+//! as a side effect of an ordinary read.
 //!
 //! the existing raft `WriteEntry` currently stores one `Value`,
 //! while `Mutation::Put` stores a complete canonical encoded row
@@ -111,6 +113,18 @@ pub struct MvccScanPage {
 pub trait MvccStorage {
     /// Read the row version visible at `read_ts`.
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>>;
+
+    /// Return the lock that conflicts with a snapshot read, if any.
+    ///
+    /// This is a read-only inspection boundary for intent resolution. The
+    /// caller must consult the authoritative transaction status and submit a
+    /// replicated resolve command; it must not mutate the backend directly
+    /// from this inspection method.
+    fn intent_for_read(&self, _key: &[u8], _read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        Err(Error::NotImplemented(
+            "intent inspection is not supported by this MVCC backend",
+        ))
+    }
 
     /// Scan the half-open encoded-key range `[start, end)` at `read_ts`.
     ///
@@ -827,6 +841,24 @@ impl MvccStorage for InMemoryMvcc {
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
         validate_encoded_key_argument(key, "read key")?;
         self.read_visible_version(key, read_ts)
+    }
+
+    fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        validate_encoded_key_argument(key, "intent read key")?;
+
+        let Some(lock) = self.locks.get(key) else {
+            return Ok(None);
+        };
+
+        if lock.start_timestamp > read_ts {
+            return Ok(None);
+        }
+
+        lock.validate().map_err(|error| {
+            Error::CorruptData(format!("intent lock cannot be used for a read: {error}"))
+        })?;
+
+        Ok(Some(lock.clone()))
     }
 
     fn scan(

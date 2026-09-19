@@ -13,6 +13,7 @@ mod commit;
 mod coordinator;
 mod manager;
 mod prewrite;
+mod resolve;
 mod rollback;
 mod status;
 
@@ -30,6 +31,10 @@ pub use manager::{
     TransactionManager,
 };
 pub use prewrite::PrewriteBatchPlan;
+pub use resolve::{
+    IntentResolutionDecision, IntentResolutionDispatcher, IntentResolutionOutcome,
+    ResolveIntentPlan, plan_intent_resolution, resolve_intent_with_status_lookup,
+};
 pub use rollback::{RollbackBatchPlan, RollbackExecutionOutcome, RollbackPhasePlan};
 pub use status::{
     InMemoryTransactionStatusStore, TransactionStatusKey, TransactionStatusLocation,
