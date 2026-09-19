@@ -150,6 +150,7 @@ pub(crate) fn plan_rollback(
         primary_key: coordinator.primary_key().to_vec(),
         participant_tablet_ids,
         last_heartbeat_timestamp: None,
+        lease_deadline_ms: None,
     };
     status_record
         .validate()

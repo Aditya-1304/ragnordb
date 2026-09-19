@@ -37,6 +37,8 @@ pub struct TxnStatusRecord {
     pub participant_tablet_ids: ::prost::alloc::vec::Vec<u64>,
     #[prost(message, optional, tag = "7")]
     pub last_heartbeat_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(uint64, tag = "8")]
+    pub lease_deadline_ms: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

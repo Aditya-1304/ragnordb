@@ -11,6 +11,7 @@
 //! and background scanning remain separate lifecycle responsibilities.
 mod commit;
 mod coordinator;
+mod heartbeat;
 mod manager;
 mod prewrite;
 mod resolve;
@@ -24,6 +25,11 @@ pub use coordinator::{
     ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
     PrewriteBatchDispatcher, RollbackPhaseDispatcher, SingleNodeCommitCoordinator,
     SingleNodeCommitOutcome, SingleNodeCommitParticipant,
+};
+pub use heartbeat::{
+    HeartbeatDecision, TransactionHeartbeatDispatcher, TransactionHeartbeatOutcome,
+    TransactionHeartbeatPlan, TransactionHeartbeatPolicy, heartbeat_with_status,
+    plan_transaction_heartbeat,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,

@@ -241,7 +241,9 @@ impl WriteRecord {
 /// participant_tablet_ids: the set of tablets involved, so
 ///   intent cleaners can find all keys that need resolution.
 /// last_heartbeat_timestamp: updated by the coordinator to
-///   prevent lock expiry on active transactions.
+///   identify the latest logical heartbeat update.
+/// lease_deadline_ms: fenced wall-clock deadline owned by the status
+///   authority; it must never be reconstructed from an MVCC timestamp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxnStatusRecord {
     pub txn_id: TxnId,
@@ -251,6 +253,7 @@ pub struct TxnStatusRecord {
     pub primary_key: Vec<u8>,
     pub participant_tablet_ids: Vec<u64>,
     pub last_heartbeat_timestamp: Option<Timestamp>,
+    pub lease_deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +319,9 @@ impl TxnStatusRecord {
         {
             return Err("last heartbeat timestamp must not precede start timestamp");
         }
+        if self.lease_deadline_ms.is_some_and(|deadline| deadline == 0) {
+            return Err("lease deadline must be non-zero when present");
+        }
 
         match (self.status, self.commit_timestamp) {
             (TxnStatus::Committed, Some(commit_timestamp))
@@ -357,6 +363,7 @@ impl TxnStatusRecord {
             last_heartbeat_timestamp: self
                 .last_heartbeat_timestamp
                 .map(|timestamp| timestamp.to_proto()),
+            lease_deadline_ms: self.lease_deadline_ms.unwrap_or_default(),
         })
     }
 
@@ -378,6 +385,7 @@ impl TxnStatusRecord {
             primary_key: proto.primary_key,
             participant_tablet_ids: proto.participant_tablet_ids,
             last_heartbeat_timestamp: proto.last_heartbeat_timestamp.map(Timestamp::from_proto),
+            lease_deadline_ms: (proto.lease_deadline_ms != 0).then_some(proto.lease_deadline_ms),
         };
 
         record.validate()?;
@@ -491,6 +499,7 @@ mod tests {
             primary_key: b"/table/1/pk/1".to_vec(),
             participant_tablet_ids: vec![1, 2, 3],
             last_heartbeat_timestamp: Some(Timestamp(205)),
+            lease_deadline_ms: Some(30_000),
         };
 
         let proto = record.to_proto().unwrap();
@@ -499,6 +508,7 @@ mod tests {
         assert_eq!(decoded.txn_id.0, 42);
         assert!(matches!(decoded.status, TxnStatus::Committed));
         assert_eq!(decoded.participant_tablet_ids, vec![1, 2, 3]);
+        assert_eq!(decoded.lease_deadline_ms, Some(30_000));
     }
 
     #[test]
@@ -611,6 +621,7 @@ mod tests {
             primary_key: b"/table/1/pk/1".to_vec(),
             participant_tablet_ids: vec![1, 2],
             last_heartbeat_timestamp: Some(Timestamp(100)),
+            lease_deadline_ms: Some(30_000),
         }
     }
 

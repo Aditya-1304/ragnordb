@@ -43,6 +43,7 @@ fn status(
         primary_key,
         participant_tablet_ids: vec![10],
         last_heartbeat_timestamp: Some(start_timestamp),
+        lease_deadline_ms: Some(30_000),
     }
 }
 

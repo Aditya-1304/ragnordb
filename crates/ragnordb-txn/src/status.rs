@@ -153,9 +153,40 @@ fn validate_status_update(existing: &TxnStatusRecord, next: &TxnStatusRecord) ->
     }
 
     match (existing.status, next.status) {
-        (TxnStatus::Pending, TxnStatus::Pending)
-        | (TxnStatus::Pending, TxnStatus::Committed)
-        | (TxnStatus::Pending, TxnStatus::Aborted) => Ok(()),
+        (TxnStatus::Pending, TxnStatus::Pending) => {
+            let existing_heartbeat = existing
+                .last_heartbeat_timestamp
+                .unwrap_or(existing.start_timestamp);
+            let next_heartbeat = next
+                .last_heartbeat_timestamp
+                .unwrap_or(next.start_timestamp);
+            if next_heartbeat < existing_heartbeat {
+                return Err(Error::WriteConflict(
+                    "transaction heartbeat timestamp moved backwards".to_string(),
+                ));
+            }
+
+            match (existing.lease_deadline_ms, next.lease_deadline_ms) {
+                (Some(existing_deadline), Some(next_deadline))
+                    if next_deadline < existing_deadline =>
+                {
+                    return Err(Error::WriteConflict(
+                        "transaction lease deadline moved backwards".to_string(),
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(Error::WriteConflict(
+                        "pending transaction heartbeat cannot clear its lease deadline".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+
+            Ok(())
+        }
+        (TxnStatus::Pending, TxnStatus::Committed) | (TxnStatus::Pending, TxnStatus::Aborted) => {
+            Ok(())
+        }
         (TxnStatus::Committed, TxnStatus::Committed) | (TxnStatus::Aborted, TxnStatus::Aborted)
             if existing.commit_timestamp == next.commit_timestamp =>
         {

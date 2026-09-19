@@ -965,6 +965,7 @@ mod tests {
             primary_key,
             participant_tablet_ids: vec![1],
             last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
         };
 
         let outcome = tablet
@@ -1006,6 +1007,7 @@ mod tests {
             primary_key,
             participant_tablet_ids: vec![1],
             last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
         };
 
         let outcome = tablet
@@ -1046,6 +1048,7 @@ mod tests {
             primary_key,
             participant_tablet_ids: vec![1],
             last_heartbeat_timestamp: Some(Timestamp(145)),
+            lease_deadline_ms: Some(20_000),
         };
 
         let outcome = tablet
@@ -1085,6 +1088,7 @@ mod tests {
             primary_key,
             participant_tablet_ids: vec![1],
             last_heartbeat_timestamp: Some(Timestamp(155)),
+            lease_deadline_ms: Some(20_000),
         };
         let lease = AuthoritativeTransactionLease::new(20_000, 10_000).unwrap();
 

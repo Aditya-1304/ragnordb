@@ -36,6 +36,7 @@ fn pending_record(txn_id: TxnId, primary_key: Vec<u8>) -> TxnStatusRecord {
         primary_key,
         participant_tablet_ids: vec![10, 5, 11],
         last_heartbeat_timestamp: Some(ragnordb_common::ids::Timestamp(100)),
+        lease_deadline_ms: Some(30_000),
     }
 }
 
