@@ -104,8 +104,8 @@ impl ParticipantRoute {
 ///
 /// This identity is the coordinator's source of truth for retries. It is
 /// derived only from the transaction, phase, and logical key, never from the
-/// current tablet route. Slice 2 will adapt it to concrete command envelopes
-/// and transport request IDs.
+/// current tablet route. Phase dispatchers adapt it to concrete command
+/// envelopes and transport request IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParticipantCommandId {
     txn_id: TxnId,
@@ -250,10 +250,33 @@ pub trait PrewriteBatchDispatcher {
     ) -> std::result::Result<Self::Output, ParticipantDispatchError>;
 }
 
+/// Dispatch the distributed commit decision in its required durability order.
+///
+/// `dispatch_primary` owns the primary/status commit point: an implementation
+/// must durably and replicably publish `plan.status_record` together with the
+/// primary commit batch before returning `Ok`. Secondary callbacks run only
+/// after that point. Returning `OutcomeUnknown` is terminal for the current
+/// call because resubmitting a commit whose apply result is unknown could
+/// bypass the caller's outcome-recovery boundary.
+pub trait CommitPhaseDispatcher {
+    type PrimaryOutput;
+    type SecondaryOutput;
+
+    fn dispatch_primary(
+        &mut self,
+        plan: &crate::commit::CommitPhasePlan,
+    ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError>;
+
+    fn dispatch_secondary(
+        &mut self,
+        plan: &crate::commit::CommitBatchPlan,
+    ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError>;
+}
+
 /// Transaction-local coordinator state for the Phase 6.2 identity boundary.
 ///
 /// This type owns semantic transaction state and current route hints. It does
-/// not own a concrete Raft or RPC transport; prewrite dispatch is performed
+/// not own a concrete Raft or RPC transport; phase dispatch is performed
 /// through caller-supplied batch and route-refresh traits so transport cannot
 /// become a second transaction authority.
 #[derive(Debug)]
@@ -421,6 +444,187 @@ impl DistributedTransactionCoordinator {
         timestamp_manager: &mut M,
     ) -> Result<crate::commit::CommitPhasePlan> {
         crate::commit::plan_commit(self, timestamp_manager)
+    }
+
+    /// Execute the commit decision with the primary/status commit point first.
+    ///
+    /// A route refresh rebuilds the physical plan while retaining the original
+    /// commit timestamp and logical command identities. If a secondary route
+    /// changes after an earlier secondary succeeded, the rebuilt phase may
+    /// present that exact logical command again; participant-side durable
+    /// deduplication makes that replay safe. An unknown outcome never retries.
+    pub fn execute_commit_with_retry<M, D, R>(
+        &mut self,
+        timestamp_manager: &mut M,
+        refresher: &mut R,
+        dispatcher: &mut D,
+        max_route_refreshes: usize,
+    ) -> Result<crate::commit::CommitExecutionOutcome<D::PrimaryOutput, D::SecondaryOutput>>
+    where
+        M: TransactionManager,
+        D: CommitPhaseDispatcher,
+        R: ParticipantRouteRefresher,
+    {
+        if max_route_refreshes == 0 {
+            return Err(Error::InvalidArgument(
+                "commit route refresh budget must be non-zero".to_string(),
+            ));
+        }
+
+        let mut route_refreshes = 0;
+        let mut plan = self.plan_commit(timestamp_manager)?;
+        let primary_outcome = loop {
+            match dispatcher.dispatch_primary(&plan) {
+                Ok(outcome) => break outcome,
+                Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                    self.refresh_commit_batch_route(
+                        &plan.primary,
+                        refresher,
+                        true,
+                        &mut route_refreshes,
+                        max_route_refreshes,
+                        reason,
+                    )?;
+                    plan = crate::commit::plan_commit_at_timestamp(self, plan.commit_timestamp)?;
+                }
+                Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                    return Err(self.commit_outcome_unknown(
+                        ParticipantCommandPhase::Commit,
+                        &plan.primary,
+                        reason,
+                    ));
+                }
+                Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                    return Err(Error::WriteConflict(reason));
+                }
+                Err(ParticipantDispatchError::Rejected { reason }) => {
+                    return Err(Error::ConstraintViolation(reason));
+                }
+                Err(ParticipantDispatchError::Unavailable { reason }) => {
+                    return Err(Error::TabletUnavailable { reason });
+                }
+            }
+        };
+
+        loop {
+            let mut secondary_outcomes = Vec::with_capacity(plan.secondary.len());
+            let mut restart_secondary_phase = false;
+
+            for batch in plan.secondary.clone() {
+                match dispatcher.dispatch_secondary(&batch) {
+                    Ok(outcome) => secondary_outcomes.push(outcome),
+                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                        self.refresh_commit_batch_route(
+                            &batch,
+                            refresher,
+                            false,
+                            &mut route_refreshes,
+                            max_route_refreshes,
+                            reason,
+                        )?;
+                        plan =
+                            crate::commit::plan_commit_at_timestamp(self, plan.commit_timestamp)?;
+                        restart_secondary_phase = true;
+                        break;
+                    }
+                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                        return Err(self.commit_outcome_unknown(
+                            ParticipantCommandPhase::Commit,
+                            &batch,
+                            reason,
+                        ));
+                    }
+                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                        return Err(Error::WriteConflict(reason));
+                    }
+                    Err(ParticipantDispatchError::Rejected { reason }) => {
+                        return Err(Error::ConstraintViolation(reason));
+                    }
+                    Err(ParticipantDispatchError::Unavailable { reason }) => {
+                        return Err(Error::TabletUnavailable { reason });
+                    }
+                }
+            }
+
+            if restart_secondary_phase {
+                continue;
+            }
+
+            return Ok(crate::commit::CommitExecutionOutcome {
+                commit_timestamp: plan.commit_timestamp,
+                primary: primary_outcome,
+                secondary: secondary_outcomes,
+            });
+        }
+    }
+
+    fn refresh_commit_batch_route<R>(
+        &mut self,
+        batch: &crate::commit::CommitBatchPlan,
+        refresher: &mut R,
+        update_status_route: bool,
+        route_refreshes: &mut usize,
+        max_route_refreshes: usize,
+        reason: String,
+    ) -> Result<()>
+    where
+        R: ParticipantRouteRefresher,
+    {
+        if *route_refreshes >= max_route_refreshes {
+            return Err(Error::TabletUnavailable {
+                reason: format!(
+                    "commit route refresh budget exhausted for transaction {}: {reason}",
+                    self.transaction.id().0
+                ),
+            });
+        }
+
+        let anchor = batch.participant_plans.first().ok_or_else(|| {
+            Error::CorruptData("commit batch has no participant command identity".to_string())
+        })?;
+        let refreshed_route = refresher
+            .refresh_participant_route(anchor.command_id.logical_mutation_id(), batch.route)?;
+        if refreshed_route == batch.route {
+            return Err(Error::TabletUnavailable {
+                reason: "commit route refresh returned the unchanged route".to_string(),
+            });
+        }
+
+        for participant_plan in &batch.participant_plans {
+            self.set_participant_route(
+                participant_plan
+                    .command_id
+                    .logical_mutation_id()
+                    .as_key()
+                    .to_vec(),
+                refreshed_route,
+            )?;
+        }
+        if update_status_route {
+            self.set_status_route(refreshed_route)?;
+        }
+        *route_refreshes += 1;
+        Ok(())
+    }
+
+    fn commit_outcome_unknown(
+        &self,
+        phase: ParticipantCommandPhase,
+        batch: &crate::commit::CommitBatchPlan,
+        reason: String,
+    ) -> Error {
+        let logical_command = batch
+            .participant_plans
+            .first()
+            .map(|plan| format!("{:?}", plan.logical_command_id))
+            .unwrap_or_else(|| "missing".to_string());
+        Error::RequestOutcomeUnknown {
+            identity: format!(
+                "transaction={} phase={phase:?} tablet={} logical_command={logical_command}: {reason}",
+                self.transaction.id().0,
+                batch.route.tablet_id.0,
+            ),
+        }
     }
 
     /// Dispatch every planned prewrite batch with bounded route-refresh

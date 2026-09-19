@@ -14,10 +14,10 @@ mod manager;
 mod prewrite;
 mod status;
 
-pub use commit::{CommitBatchPlan, CommitPhasePlan};
+pub use commit::{CommitBatchPlan, CommitExecutionOutcome, CommitPhasePlan};
 pub use coordinator::{
-    DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
-    ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
+    CommitPhaseDispatcher, DistributedTransactionCoordinator, LogicalMutationId,
+    OwnedMvccParticipant, ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
     ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
     PrewriteBatchDispatcher, SingleNodeCommitCoordinator, SingleNodeCommitOutcome,
     SingleNodeCommitParticipant,

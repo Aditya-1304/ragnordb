@@ -5,8 +5,11 @@ use ragnordb_common::{
     ids::{ClientRequestId, RaftGroupId, ReplicaId, TableId, TabletId, Timestamp, TxnId},
 };
 use ragnordb_storage::key::{encode_row_key, make_row_key};
+use std::collections::VecDeque;
+
 use ragnordb_txn::{
-    DistributedTransactionCoordinator, LocalTransactionManager, ParticipantRoute, Transaction,
+    CommitBatchPlan, CommitPhaseDispatcher, CommitPhasePlan, DistributedTransactionCoordinator,
+    LocalTransactionManager, ParticipantDispatchError, ParticipantRoute, Transaction,
 };
 
 fn key(value: i64) -> Vec<u8> {
@@ -64,6 +67,103 @@ fn coordinator() -> DistributedTransactionCoordinator {
     let mut coordinator = coordinator_without_status_route();
     coordinator.set_status_route(route(20, 4, 200)).unwrap();
     coordinator
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DispatchAction {
+    Success,
+    RouteRefresh,
+    OutcomeUnknown,
+}
+
+struct RecordingCommitDispatcher {
+    primary_actions: VecDeque<DispatchAction>,
+    secondary_actions: VecDeque<DispatchAction>,
+    primary_plans: Vec<CommitPhasePlan>,
+    secondary_plans: Vec<CommitBatchPlan>,
+}
+
+impl RecordingCommitDispatcher {
+    fn new(
+        primary_actions: impl IntoIterator<Item = DispatchAction>,
+        secondary_actions: impl IntoIterator<Item = DispatchAction>,
+    ) -> Self {
+        Self {
+            primary_actions: primary_actions.into_iter().collect(),
+            secondary_actions: secondary_actions.into_iter().collect(),
+            primary_plans: Vec::new(),
+            secondary_plans: Vec::new(),
+        }
+    }
+
+    fn action(actions: &mut VecDeque<DispatchAction>) -> DispatchAction {
+        actions.pop_front().unwrap_or(DispatchAction::Success)
+    }
+}
+
+impl CommitPhaseDispatcher for RecordingCommitDispatcher {
+    type PrimaryOutput = TabletId;
+    type SecondaryOutput = TabletId;
+
+    fn dispatch_primary(
+        &mut self,
+        plan: &CommitPhasePlan,
+    ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError> {
+        self.primary_plans.push(plan.clone());
+        match Self::action(&mut self.primary_actions) {
+            DispatchAction::Success => Ok(plan.primary.tablet_id()),
+            DispatchAction::RouteRefresh => Err(ParticipantDispatchError::RouteRefreshRequired {
+                reason: "primary route is stale".to_string(),
+            }),
+            DispatchAction::OutcomeUnknown => Err(ParticipantDispatchError::OutcomeUnknown {
+                reason: "primary durable outcome was lost".to_string(),
+            }),
+        }
+    }
+
+    fn dispatch_secondary(
+        &mut self,
+        plan: &CommitBatchPlan,
+    ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError> {
+        self.secondary_plans.push(plan.clone());
+        match Self::action(&mut self.secondary_actions) {
+            DispatchAction::Success => Ok(plan.tablet_id()),
+            DispatchAction::RouteRefresh => Err(ParticipantDispatchError::RouteRefreshRequired {
+                reason: "secondary route is stale".to_string(),
+            }),
+            DispatchAction::OutcomeUnknown => Err(ParticipantDispatchError::OutcomeUnknown {
+                reason: "secondary durable outcome was lost".to_string(),
+            }),
+        }
+    }
+}
+
+struct OneRouteRefresh {
+    refreshed_route: ParticipantRoute,
+    calls: usize,
+}
+
+impl ragnordb_txn::ParticipantRouteRefresher for OneRouteRefresh {
+    fn refresh_participant_route(
+        &mut self,
+        _logical_mutation_id: &ragnordb_txn::LogicalMutationId,
+        _previous_route: ParticipantRoute,
+    ) -> ragnordb_common::Result<ParticipantRoute> {
+        self.calls += 1;
+        Ok(self.refreshed_route)
+    }
+}
+
+struct UnexpectedRouteRefresh;
+
+impl ragnordb_txn::ParticipantRouteRefresher for UnexpectedRouteRefresh {
+    fn refresh_participant_route(
+        &mut self,
+        _logical_mutation_id: &ragnordb_txn::LogicalMutationId,
+        _previous_route: ParticipantRoute,
+    ) -> ragnordb_common::Result<ParticipantRoute> {
+        panic!("unknown commit outcomes must not refresh or retry")
+    }
 }
 
 #[test]
@@ -162,4 +262,146 @@ fn commit_plan_rejects_conflicting_route_hints_before_timestamp_allocation() {
         Err(Error::InvalidArgument(message)) if message.contains("conflicting route")
     ));
     assert_eq!(timestamps.last_allocated_timestamp(), Timestamp(0));
+}
+
+#[test]
+fn commit_execution_commits_primary_status_before_secondary_batches() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = UnexpectedRouteRefresh;
+    let mut dispatcher =
+        RecordingCommitDispatcher::new([DispatchAction::Success], [DispatchAction::Success]);
+
+    let outcome = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+
+    assert_eq!(outcome.commit_timestamp, Timestamp(101));
+    assert_eq!(outcome.primary, TabletId(20));
+    assert_eq!(outcome.secondary, vec![TabletId(10)]);
+    assert_eq!(dispatcher.primary_plans.len(), 1);
+    assert_eq!(dispatcher.secondary_plans.len(), 1);
+    assert_eq!(
+        dispatcher.primary_plans[0].status_record.commit_timestamp,
+        Some(Timestamp(101))
+    );
+    assert_eq!(dispatcher.primary_plans[0].status_route, route(20, 4, 200));
+    assert_eq!(dispatcher.secondary_plans[0].route, route(10, 5, 100));
+}
+
+#[test]
+fn primary_route_refresh_retries_primary_without_reallocating_commit_timestamp() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = OneRouteRefresh {
+        refreshed_route: route(21, 7, 210),
+        calls: 0,
+    };
+    let mut dispatcher = RecordingCommitDispatcher::new(
+        [DispatchAction::RouteRefresh, DispatchAction::Success],
+        [DispatchAction::Success],
+    );
+
+    let outcome = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+
+    assert_eq!(outcome.commit_timestamp, Timestamp(101));
+    assert_eq!(timestamps.last_allocated_timestamp(), Timestamp(101));
+    assert_eq!(refresher.calls, 1);
+    assert_eq!(dispatcher.primary_plans.len(), 2);
+    assert_eq!(dispatcher.primary_plans[0].primary.route, route(20, 4, 200));
+    assert_eq!(dispatcher.primary_plans[1].primary.route, route(21, 7, 210));
+    assert_eq!(dispatcher.primary_plans[1].status_route, route(21, 7, 210));
+    assert_eq!(dispatcher.primary_plans[1].commit_timestamp, Timestamp(101));
+}
+
+#[test]
+fn secondary_route_refresh_retries_only_after_primary_commit_and_keeps_identity() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = OneRouteRefresh {
+        refreshed_route: route(11, 8, 111),
+        calls: 0,
+    };
+    let mut dispatcher = RecordingCommitDispatcher::new(
+        [DispatchAction::Success],
+        [DispatchAction::RouteRefresh, DispatchAction::Success],
+    );
+
+    let outcome = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+
+    assert_eq!(outcome.commit_timestamp, Timestamp(101));
+    assert_eq!(outcome.primary, TabletId(20));
+    assert_eq!(outcome.secondary, vec![TabletId(11)]);
+    assert_eq!(dispatcher.primary_plans.len(), 1);
+    assert_eq!(dispatcher.secondary_plans.len(), 2);
+    assert_eq!(
+        dispatcher.secondary_plans[0].participant_plans[0].logical_command_id,
+        dispatcher.secondary_plans[1].participant_plans[0].logical_command_id
+    );
+    assert_eq!(
+        dispatcher.secondary_plans[1].participant_plans[0].command_id,
+        dispatcher.secondary_plans[0].participant_plans[0].command_id
+    );
+    assert_eq!(dispatcher.secondary_plans[1].route, route(11, 8, 111));
+    assert_eq!(
+        dispatcher.secondary_plans[1].command.commit_timestamp,
+        Timestamp(101)
+    );
+}
+
+#[test]
+fn unknown_primary_commit_outcome_stops_without_secondary_dispatch_or_refresh() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = UnexpectedRouteRefresh;
+    let mut dispatcher =
+        RecordingCommitDispatcher::new([DispatchAction::OutcomeUnknown], [DispatchAction::Success]);
+
+    let error = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 1)
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RequestOutcomeUnknown { .. }));
+    assert_eq!(dispatcher.primary_plans.len(), 1);
+    assert!(dispatcher.secondary_plans.is_empty());
+}
+
+#[test]
+fn unknown_secondary_commit_outcome_stops_without_retrying_later_batches() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = UnexpectedRouteRefresh;
+    let mut dispatcher =
+        RecordingCommitDispatcher::new([DispatchAction::Success], [DispatchAction::OutcomeUnknown]);
+
+    let error = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 1)
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RequestOutcomeUnknown { .. }));
+    assert_eq!(dispatcher.primary_plans.len(), 1);
+    assert_eq!(dispatcher.secondary_plans.len(), 1);
+}
+
+#[test]
+fn commit_execution_requires_a_nonzero_route_refresh_budget_before_planning() {
+    let mut coordinator = coordinator();
+    let mut timestamps = LocalTransactionManager::new();
+    let mut refresher = UnexpectedRouteRefresh;
+    let mut dispatcher = RecordingCommitDispatcher::new([], []);
+
+    let error = coordinator
+        .execute_commit_with_retry(&mut timestamps, &mut refresher, &mut dispatcher, 0)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::InvalidArgument(message) if message.contains("route refresh budget")
+    ));
+    assert_eq!(timestamps.last_allocated_timestamp(), Timestamp(0));
+    assert!(dispatcher.primary_plans.is_empty());
 }
