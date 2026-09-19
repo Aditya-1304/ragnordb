@@ -9,10 +9,16 @@
 //!
 //! This right now does not replicate commands or persist them to WAL.
 
+pub mod cleaner;
 pub mod command;
 pub mod read;
 pub mod router;
 pub mod snapshot;
+
+pub use cleaner::{
+    ExpiredTransactionAbortPlan, IntentCleanerDispatcher, IntentCleanerPolicy, IntentCleanupReport,
+    clean_intents,
+};
 
 pub use router::{
     HashTabletPartitioner, ScanProgress, ScanSpan, SpanSet, TabletRouter, TabletScanFragment,

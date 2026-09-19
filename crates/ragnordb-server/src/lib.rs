@@ -15,6 +15,7 @@ pub mod replicated_tablet;
 pub mod rpc;
 pub mod session;
 mod snapshot_transport;
+pub mod tasks;
 
 use std::sync::{
     Arc,

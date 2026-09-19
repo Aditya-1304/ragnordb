@@ -106,6 +106,16 @@ pub struct MvccScanPage {
     pub has_more: bool,
 }
 
+/// One bounded, ordered scan response over unresolved transaction intents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntentScanPage {
+    /// Canonical row keys paired with the validated lock records they own.
+    pub locks: Vec<(Vec<u8>, LockRecord)>,
+
+    /// Whether another intent remains after the final returned key.
+    pub has_more: bool,
+}
+
 /// Storage contract required by the transaction-aware tablet layer.
 ///
 /// All keys passed to this trait must be complete canonical row-key encodings
@@ -123,6 +133,25 @@ pub trait MvccStorage {
     fn intent_for_read(&self, _key: &[u8], _read_ts: Timestamp) -> Result<Option<LockRecord>> {
         Err(Error::NotImplemented(
             "intent inspection is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Scan unresolved intents in canonical key order using an exclusive
+    /// continuation key.
+    ///
+    /// The cleaner uses this read-only boundary to bound work per background
+    /// pass. It must never infer expiry from the local lock age; the caller
+    /// still has to consult the authoritative transaction-status record before
+    /// dispatching a replicated resolution command.
+    fn scan_intent_page(
+        &self,
+        _start: Option<&[u8]>,
+        _end: Option<&[u8]>,
+        _resume_after: Option<&[u8]>,
+        _max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        Err(Error::NotImplemented(
+            "intent scanning is not supported by this MVCC backend",
         ))
     }
 
@@ -859,6 +888,53 @@ impl MvccStorage for InMemoryMvcc {
         })?;
 
         Ok(Some(lock.clone()))
+    }
+
+    fn scan_intent_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        if max_locks == 0 {
+            return Err(Error::InvalidArgument(
+                "intent scan page max_locks must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "intent scan resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(IntentScanPage {
+                    locks: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut locks = Vec::new();
+        for (key, lock) in self.locks.range((lower, upper)) {
+            if locks.len() >= max_locks {
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            validate_encoded_key_argument(key, "intent scan key")?;
+            lock.validate().map_err(|error| {
+                Error::CorruptData(format!("intent scan found an invalid lock: {error}"))
+            })?;
+            locks.push((key.clone(), lock.clone()));
+        }
+
+        Ok(IntentScanPage {
+            locks,
+            has_more: false,
+        })
     }
 
     fn scan(
