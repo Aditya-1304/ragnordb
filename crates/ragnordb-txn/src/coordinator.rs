@@ -386,6 +386,13 @@ impl DistributedTransactionCoordinator {
             .collect()
     }
 
+    /// Build validated prewrite batches grouped by their current participant
+    /// tablet. This is a pure planning operation: no Raft proposal, tablet
+    /// mutation, or transaction acknowledgement occurs here.
+    pub fn plan_prewrite(&self, ttl_ms: u64) -> Result<Vec<crate::prewrite::PrewriteBatchPlan>> {
+        crate::prewrite::plan_prewrite(self, ttl_ms)
+    }
+
     /// Execute one participant phase with bounded route-refresh retries.
     ///
     /// A route refresh only rebuilds the physical request view. If a dispatch

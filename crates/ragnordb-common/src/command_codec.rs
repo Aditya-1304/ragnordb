@@ -1123,7 +1123,9 @@ pub struct PrewriteCommand {
 }
 
 impl PrewriteCommand {
-    pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
+    /// Validate the semantic metadata and complete mutation batch carried by
+    /// a prewrite command before it crosses a Raft or recovery boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
         validate_write_entries(&self.writes)?;
         if self.primary_key.is_empty() {
@@ -1132,6 +1134,12 @@ impl PrewriteCommand {
         if self.ttl_ms == 0 {
             return Err("prewrite lock TTL must be non-zero");
         }
+
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
+        self.validate()?;
 
         Ok(command::PrewriteCommand {
             txn_id: Some(self.txn_id.to_proto()),
@@ -1147,22 +1155,24 @@ impl PrewriteCommand {
     }
 
     pub fn from_proto(proto: command::PrewriteCommand) -> Result<Self, &'static str> {
+        let txn_id = TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?);
+        let start_timestamp =
+            Timestamp::from_proto(proto.start_timestamp.ok_or("missing start_timestamp")?);
         let writes = proto
             .writes
             .into_iter()
             .map(WriteEntry::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
-        validate_write_entries(&writes)?;
 
-        Ok(Self {
-            txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
-            start_timestamp: Timestamp::from_proto(
-                proto.start_timestamp.ok_or("missing start_timestamp")?,
-            ),
+        let command = Self {
+            txn_id,
+            start_timestamp,
             writes,
             primary_key: proto.primary_key,
             ttl_ms: proto.ttl_ms,
-        })
+        };
+        command.validate()?;
+        Ok(command)
     }
 }
 
@@ -1674,6 +1684,44 @@ mod tests {
         assert_eq!(decoded.start_timestamp.0, 100);
         assert_eq!(decoded.writes[0].row.as_ref().unwrap().values.len(), 2);
         assert_eq!(decoded.writes[0].op, WriteKind::Put);
+    }
+
+    #[test]
+    fn prewrite_from_proto_rejects_invalid_transaction_metadata() {
+        let command = PrewriteCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            writes: vec![WriteEntry {
+                key: b"/table/1/pk/1".to_vec(),
+                row: Some(Row {
+                    values: vec![Value::Int(1)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: b"/table/1/pk/1".to_vec(),
+            ttl_ms: 30_000,
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_primary = command.to_proto().unwrap();
+        invalid_primary.primary_key.clear();
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_primary),
+            Err("prewrite primary key must not be empty")
+        );
+
+        let mut invalid_ttl = command.to_proto().unwrap();
+        invalid_ttl.ttl_ms = 0;
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_ttl),
+            Err("prewrite lock TTL must be non-zero")
+        );
     }
 
     #[test]

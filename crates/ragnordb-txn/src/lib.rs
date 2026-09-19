@@ -10,6 +10,7 @@
 //! intent resolution remain later protocol slices.
 mod coordinator;
 mod manager;
+mod prewrite;
 mod status;
 
 pub use coordinator::{
@@ -23,6 +24,7 @@ pub use manager::{
     TimestampOracle, TimestampOracleStats, TimestampReservation, TimestampReservationProvider,
     TransactionManager,
 };
+pub use prewrite::PrewriteBatchPlan;
 pub use status::{
     InMemoryTransactionStatusStore, TransactionStatusKey, TransactionStatusLocation,
     TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,
