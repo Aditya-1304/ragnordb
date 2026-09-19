@@ -20,7 +20,7 @@ use ragnordb_storage::{
     wal::{DurableCommitLog, DurableWalExtent, SingleNodeTxnCommit, WalMutation},
 };
 
-use crate::{CommitTimestampAllocator, Transaction};
+use crate::{CommitTimestampAllocator, Transaction, status::TransactionStatusLocation};
 
 /// Canonical logical identity for one transaction mutation or read key.
 ///
@@ -95,34 +95,6 @@ impl ParticipantRoute {
             raft_group_id,
             leader_replica_id,
         })
-    }
-}
-
-/// Semantic location of a transaction's primary/status record.
-///
-/// The primary key is authoritative. The route is only a cacheable hint and
-/// is refreshed after topology changes, so a status lookup never depends on a
-/// tablet ID surviving a split or merge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransactionStatusLocation {
-    primary_key: LogicalMutationId,
-    route: Option<ParticipantRoute>,
-}
-
-impl TransactionStatusLocation {
-    fn new(primary_key: Vec<u8>) -> Result<Self> {
-        Ok(Self {
-            primary_key: LogicalMutationId::from_key(&primary_key)?,
-            route: None,
-        })
-    }
-
-    pub fn primary_key(&self) -> &[u8] {
-        self.primary_key.as_key()
-    }
-
-    pub fn route(&self) -> Option<ParticipantRoute> {
-        self.route
     }
 }
 
@@ -284,7 +256,8 @@ impl DistributedTransactionCoordinator {
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let primary_key = LogicalMutationId::from_key(&primary_key)?;
-        let status_location = TransactionStatusLocation::new(primary_key.as_key().to_vec())?;
+        let status_location =
+            TransactionStatusLocation::new(transaction.id(), primary_key.as_key().to_vec())?;
 
         Ok(Self {
             transaction,
@@ -367,8 +340,7 @@ impl DistributedTransactionCoordinator {
 
     /// Refresh the semantic status key's physical route hint.
     pub fn set_status_route(&mut self, route: ParticipantRoute) -> Result<()> {
-        self.status_location.route = Some(route);
-        Ok(())
+        self.status_location.set_route(route)
     }
 
     /// Derive a stable command identity for one transaction write key.

@@ -5,23 +5,28 @@
 //! the tablet layer checks this write set first to provide
 //! read-your-writes
 //!
-//! Distributed phase dispatch, heartbeats, transaction status records, and
-//! intent resolution remain later protocol slices. The coordinator module
-//! owns the current transaction state and topology-independent command IDs.
+//! Distributed phase dispatch and transaction-status placement are implemented
+//! at their current milestone boundaries; prewrite, commit, rollback, and
+//! intent resolution remain later protocol slices.
 mod coordinator;
 mod manager;
+mod status;
 
 pub use coordinator::{
     DistributedTransactionCoordinator, LogicalMutationId, OwnedMvccParticipant,
     ParticipantCommandId, ParticipantCommandPlan, ParticipantDispatchError,
     ParticipantPhaseDispatcher, ParticipantRoute, ParticipantRouteRefresher,
     SingleNodeCommitCoordinator, SingleNodeCommitOutcome, SingleNodeCommitParticipant,
-    TransactionStatusLocation,
 };
 pub use manager::{
     CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,
     TimestampOracle, TimestampOracleStats, TimestampReservation, TimestampReservationProvider,
     TransactionManager,
+};
+pub use status::{
+    InMemoryTransactionStatusStore, TransactionStatusKey, TransactionStatusLocation,
+    TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,
+    TransactionStatusStore,
 };
 
 use std::collections::BTreeMap;
