@@ -33,9 +33,10 @@ use ragnordb_storage::{
     mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
 use ragnordb_txn::{
-    IntentResolutionDecision, ResolveIntentPlan, SingleNodeCommitParticipant, Transaction,
+    AuthoritativeTransactionLease, IntentResolutionDecision, IntentResolutionLeasePolicy,
+    PendingIntentDecision, ResolveIntentPlan, SingleNodeCommitParticipant, Transaction,
     TransactionStatusLocation, TransactionStatusReader, TransactionStatusRouteResolver,
-    plan_intent_resolution,
+    classify_pending_intent, pending_intent_retry_after_ms, plan_intent_resolution,
 };
 
 /// One logical row mutation waiting to be added to a transaction.
@@ -77,7 +78,20 @@ pub enum IntentAwareRead {
     Resolve(ResolveIntentPlan),
 
     /// The authoritative status is still pending; no resolve command is safe.
-    Pending { status: TxnStatusRecord },
+    /// The retry interval is only a scheduling hint and does not imply that
+    /// the local reader may expire or abort the transaction.
+    Pending {
+        status: TxnStatusRecord,
+        retry_after_ms: u64,
+    },
+
+    /// The supplied authoritative lease elapsed while status was still
+    /// pending. The status tablet must publish `Aborted` before a rollback
+    /// command can be planned.
+    LeaseExpired {
+        status: TxnStatusRecord,
+        lease_deadline_ms: u64,
+    },
 }
 
 /// A logical tablet backed by an MVCC storage implementation.
@@ -154,13 +168,43 @@ impl<S: MvccStorage> Tablet<S> {
     /// The status record must already have been fetched from the authoritative
     /// primary/status location. If the status is committed or aborted, this
     /// method returns a deterministic `ResolveIntentPlan`; it never applies the
-    /// command locally. Pending status is returned explicitly so the caller can
-    /// apply its bounded wait/retry policy in the later liveness slice.
+    /// command locally. Pending status is returned explicitly with a bounded
+    /// retry hint.
     pub fn get_with_intent_status(
         &self,
         transaction: &Transaction,
         key: &RowKey,
         status: &TxnStatusRecord,
+    ) -> Result<IntentAwareRead> {
+        self.get_with_intent_status_at_lease(transaction, key, status, None, 0)
+    }
+
+    /// Read one row while applying an authoritative lease observation to a
+    /// pending intent.
+    ///
+    /// The lease is supplied by the transaction-status authority and uses a
+    /// wall-clock deadline. This method reports expiry but does not synthesize
+    /// an aborted status or mutate the participant. Once the status authority
+    /// durably publishes `Aborted`, the ordinary terminal resolution path can
+    /// create the replicated rollback command.
+    pub fn get_with_intent_status_and_lease(
+        &self,
+        transaction: &Transaction,
+        key: &RowKey,
+        status: &TxnStatusRecord,
+        lease: AuthoritativeTransactionLease,
+        now_ms: u64,
+    ) -> Result<IntentAwareRead> {
+        self.get_with_intent_status_at_lease(transaction, key, status, Some(lease), now_ms)
+    }
+
+    fn get_with_intent_status_at_lease(
+        &self,
+        transaction: &Transaction,
+        key: &RowKey,
+        status: &TxnStatusRecord,
+        lease: Option<AuthoritativeTransactionLease>,
+        now_ms: u64,
     ) -> Result<IntentAwareRead> {
         self.validate_row_key(key)?;
 
@@ -183,7 +227,31 @@ impl<S: MvccStorage> Tablet<S> {
         };
 
         match plan_intent_resolution(&encoded_key, &lock, status)? {
-            IntentResolutionDecision::Pending { status } => Ok(IntentAwareRead::Pending { status }),
+            IntentResolutionDecision::Pending { status } => {
+                let pending = match lease {
+                    Some(lease) => {
+                        classify_pending_intent(&encoded_key, &lock, &status, lease, now_ms)?
+                    }
+                    None => PendingIntentDecision::RetryableConflict {
+                        retry_after_ms: pending_intent_retry_after_ms(&lock)?,
+                    },
+                };
+
+                match pending {
+                    PendingIntentDecision::RetryableConflict { retry_after_ms } => {
+                        Ok(IntentAwareRead::Pending {
+                            status,
+                            retry_after_ms,
+                        })
+                    }
+                    PendingIntentDecision::Expired { lease_deadline_ms } => {
+                        Ok(IntentAwareRead::LeaseExpired {
+                            status,
+                            lease_deadline_ms,
+                        })
+                    }
+                }
+            }
             IntentResolutionDecision::Resolve(plan) => Ok(IntentAwareRead::Resolve(plan)),
         }
     }
@@ -193,7 +261,7 @@ impl<S: MvccStorage> Tablet<S> {
     ///
     /// Status lookup is bounded and route-refreshable. A missing status never
     /// becomes an inferred abort, and a pending status is returned to the
-    /// caller for the later wait/retry policy. Terminal outcomes are still
+    /// caller as a bounded retry conflict. Terminal outcomes are still
     /// returned as a plan so the caller can submit them through Raft.
     pub fn get_with_intent_status_lookup<R, L>(
         &self,
@@ -238,6 +306,59 @@ impl<S: MvccStorage> Tablet<S> {
             })?;
 
         self.get_with_intent_status(transaction, key, &status)
+    }
+
+    /// Read one row through the authoritative status route while applying a
+    /// fenced lease observation to pending intents.
+    pub fn get_with_intent_status_lookup_and_lease<R, L>(
+        &self,
+        transaction: &Transaction,
+        key: &RowKey,
+        status_location: &mut TransactionStatusLocation,
+        route_resolver: &mut R,
+        status_reader: &mut L,
+        policy: IntentResolutionLeasePolicy,
+    ) -> Result<IntentAwareRead>
+    where
+        R: TransactionStatusRouteResolver,
+        L: TransactionStatusReader<Output = TxnStatusRecord>,
+    {
+        self.validate_row_key(key)?;
+        let encoded_key = encode_row_key(key)?;
+
+        if let Some(mutation) = transaction.pending_write(&encoded_key) {
+            return Ok(IntentAwareRead::Visible(decode_pending_mutation(mutation)?));
+        }
+
+        if self
+            .storage
+            .intent_for_read(&encoded_key, transaction.start_ts())?
+            .is_none()
+        {
+            let visible = self
+                .storage
+                .read(&encoded_key, transaction.start_ts())?
+                .map(|row| decode_row(&row))
+                .transpose()?;
+            return Ok(IntentAwareRead::Visible(visible));
+        }
+
+        let status = status_location
+            .lookup_with_retry(route_resolver, status_reader, policy.max_route_refreshes)?
+            .ok_or_else(|| Error::TabletUnavailable {
+                reason: format!(
+                    "transaction status for intent owner {} is not currently visible",
+                    status_location.txn_id().0
+                ),
+            })?;
+
+        self.get_with_intent_status_at_lease(
+            transaction,
+            key,
+            &status,
+            Some(policy.lease),
+            policy.now_ms,
+        )
     }
 
     /// Validate, encode, and atomically buffer one statement's row mutations.
@@ -931,7 +1052,66 @@ mod tests {
             .get_with_intent_status(&transaction(12, 140), &row_key, &status)
             .unwrap();
 
-        assert!(matches!(outcome, IntentAwareRead::Pending { .. }));
+        let IntentAwareRead::Pending { retry_after_ms, .. } = outcome else {
+            panic!("pending intent must remain a retryable read conflict");
+        };
+        assert_eq!(retry_after_ms, 10_000);
+    }
+
+    #[test]
+    fn expired_lease_is_reported_without_local_rollback() {
+        let mut tablet = tablet();
+        let row_key = key(7);
+        let encoded_key = encode_row_key(&row_key).unwrap();
+        let primary_key = encode_row_key(&key(8)).unwrap();
+
+        tablet
+            .storage
+            .prewrite(
+                TxnId(13),
+                Timestamp(150),
+                &encoded_key,
+                &Mutation::Put(encode_row(&row(7, "expired")).unwrap()),
+                &primary_key,
+                30_000,
+            )
+            .unwrap();
+
+        let status = TxnStatusRecord {
+            txn_id: TxnId(13),
+            start_timestamp: Timestamp(150),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key,
+            participant_tablet_ids: vec![1],
+            last_heartbeat_timestamp: Some(Timestamp(155)),
+        };
+        let lease = AuthoritativeTransactionLease::new(20_000, 10_000).unwrap();
+
+        let outcome = tablet
+            .get_with_intent_status_and_lease(
+                &transaction(14, 150),
+                &row_key,
+                &status,
+                lease,
+                20_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            IntentAwareRead::LeaseExpired {
+                lease_deadline_ms: 20_000,
+                ..
+            }
+        ));
+        assert!(
+            tablet
+                .storage
+                .intent_for_read(&encoded_key, Timestamp(150))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

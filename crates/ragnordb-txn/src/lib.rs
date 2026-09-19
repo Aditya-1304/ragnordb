@@ -6,9 +6,9 @@
 //! read-your-writes
 //!
 //! Distributed phase dispatch, commit planning, rollback planning and
-//! execution, and transaction-status placement are implemented at their
-//! current milestone boundaries; intent resolution remains a later protocol
-//! slice.
+//! execution, transaction-status placement, and bounded intent resolution are
+//! implemented at their current milestone boundaries. Heartbeat publication
+//! and background scanning remain separate lifecycle responsibilities.
 mod commit;
 mod coordinator;
 mod manager;
@@ -32,8 +32,10 @@ pub use manager::{
 };
 pub use prewrite::PrewriteBatchPlan;
 pub use resolve::{
-    IntentResolutionDecision, IntentResolutionDispatcher, IntentResolutionOutcome,
-    ResolveIntentPlan, plan_intent_resolution, resolve_intent_with_status_lookup,
+    AuthoritativeTransactionLease, IntentResolutionDecision, IntentResolutionDispatcher,
+    IntentResolutionLeasePolicy, IntentResolutionOutcome, PendingIntentDecision, ResolveIntentPlan,
+    classify_pending_intent, pending_intent_retry_after_ms, plan_intent_resolution,
+    resolve_intent_with_status_lookup, resolve_intent_with_status_lookup_and_lease,
 };
 pub use rollback::{RollbackBatchPlan, RollbackExecutionOutcome, RollbackPhasePlan};
 pub use status::{

@@ -5,10 +5,12 @@ use ragnordb_common::{
 };
 use ragnordb_storage::key::{encode_row_key, make_row_key};
 use ragnordb_txn::{
-    IntentResolutionDecision, IntentResolutionDispatcher, IntentResolutionOutcome,
-    ParticipantDispatchError, ParticipantRoute, TransactionStatusKey, TransactionStatusLocation,
+    AuthoritativeTransactionLease, IntentResolutionDecision, IntentResolutionDispatcher,
+    IntentResolutionLeasePolicy, IntentResolutionOutcome, ParticipantDispatchError,
+    ParticipantRoute, PendingIntentDecision, TransactionStatusKey, TransactionStatusLocation,
     TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,
-    plan_intent_resolution, resolve_intent_with_status_lookup,
+    classify_pending_intent, plan_intent_resolution, resolve_intent_with_status_lookup,
+    resolve_intent_with_status_lookup_and_lease,
 };
 
 fn key(id: i64) -> Vec<u8> {
@@ -92,6 +94,54 @@ fn aborted_status_builds_a_terminal_rollback_plan() {
 }
 
 #[test]
+fn pending_intent_returns_a_bounded_retry_before_the_authoritative_lease_deadline() {
+    let primary_key = key(1);
+    let intent_key = key(2);
+    let lock = lock(TxnId(13), Timestamp(500), primary_key.clone());
+    let status = status(
+        TxnId(13),
+        Timestamp(500),
+        primary_key,
+        TxnStatus::Pending,
+        None,
+    );
+    let lease = AuthoritativeTransactionLease::new(20_000, 10_000).unwrap();
+
+    let decision = classify_pending_intent(&intent_key, &lock, &status, lease, 15_000).unwrap();
+
+    assert_eq!(
+        decision,
+        PendingIntentDecision::RetryableConflict {
+            retry_after_ms: 5_000,
+        }
+    );
+}
+
+#[test]
+fn expired_pending_intent_is_reported_without_inventing_an_abort() {
+    let primary_key = key(1);
+    let intent_key = key(2);
+    let lock = lock(TxnId(14), Timestamp(600), primary_key.clone());
+    let status = status(
+        TxnId(14),
+        Timestamp(600),
+        primary_key,
+        TxnStatus::Pending,
+        None,
+    );
+    let lease = AuthoritativeTransactionLease::new(20_000, 10_000).unwrap();
+
+    let decision = classify_pending_intent(&intent_key, &lock, &status, lease, 20_000).unwrap();
+
+    assert_eq!(
+        decision,
+        PendingIntentDecision::Expired {
+            lease_deadline_ms: 20_000,
+        }
+    );
+}
+
+#[test]
 fn status_identity_mismatch_fails_closed_before_resolution() {
     let primary_key = key(1);
     let intent_key = key(2);
@@ -145,6 +195,19 @@ struct RecordingDispatcher {
     plan: Option<ragnordb_txn::ResolveIntentPlan>,
 }
 
+struct FailingDispatcher;
+
+impl IntentResolutionDispatcher for FailingDispatcher {
+    type Output = ();
+
+    fn dispatch_intent_resolution(
+        &mut self,
+        _plan: &ragnordb_txn::ResolveIntentPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        panic!("pending intents must not dispatch terminal resolution");
+    }
+}
+
 impl IntentResolutionDispatcher for RecordingDispatcher {
     type Output = &'static str;
 
@@ -191,4 +254,96 @@ fn status_lookup_dispatches_only_the_authoritative_terminal_resolution() {
     };
     assert_eq!(output, "durably-applied");
     assert_eq!(dispatcher.plan, Some(plan));
+}
+
+#[test]
+fn pending_status_lookup_returns_retryable_conflict_without_dispatch() {
+    let primary_key = key(1);
+    let intent_key = key(2);
+    let lock = lock(TxnId(15), Timestamp(700), primary_key.clone());
+    let pending_status = status(
+        TxnId(15),
+        Timestamp(700),
+        primary_key.clone(),
+        TxnStatus::Pending,
+        None,
+    );
+    let mut location = TransactionStatusLocation::new(TxnId(15), primary_key).unwrap();
+    location.set_route(route()).unwrap();
+    let mut route_resolver = FixedRouteResolver;
+    let mut status_reader = FixedStatusReader {
+        status: pending_status.clone(),
+    };
+    let mut dispatcher = FailingDispatcher;
+    let policy = IntentResolutionLeasePolicy::new(
+        1,
+        AuthoritativeTransactionLease::new(30_000, 10_000).unwrap(),
+        20_000,
+    )
+    .unwrap();
+
+    let outcome = resolve_intent_with_status_lookup_and_lease(
+        &intent_key,
+        &lock,
+        &mut location,
+        &mut route_resolver,
+        &mut status_reader,
+        &mut dispatcher,
+        policy,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        IntentResolutionOutcome::RetryableConflict {
+            status: pending_status,
+            retry_after_ms: 10_000,
+        }
+    );
+}
+
+#[test]
+fn expired_status_lookup_reports_expiry_without_dispatching_rollback() {
+    let primary_key = key(1);
+    let intent_key = key(2);
+    let lock = lock(TxnId(16), Timestamp(800), primary_key.clone());
+    let pending_status = status(
+        TxnId(16),
+        Timestamp(800),
+        primary_key.clone(),
+        TxnStatus::Pending,
+        None,
+    );
+    let mut location = TransactionStatusLocation::new(TxnId(16), primary_key).unwrap();
+    location.set_route(route()).unwrap();
+    let mut route_resolver = FixedRouteResolver;
+    let mut status_reader = FixedStatusReader {
+        status: pending_status.clone(),
+    };
+    let mut dispatcher = FailingDispatcher;
+    let policy = IntentResolutionLeasePolicy::new(
+        1,
+        AuthoritativeTransactionLease::new(30_000, 10_000).unwrap(),
+        30_000,
+    )
+    .unwrap();
+
+    let outcome = resolve_intent_with_status_lookup_and_lease(
+        &intent_key,
+        &lock,
+        &mut location,
+        &mut route_resolver,
+        &mut status_reader,
+        &mut dispatcher,
+        policy,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        IntentResolutionOutcome::Expired {
+            status: pending_status,
+            lease_deadline_ms: 30_000,
+        }
+    );
 }

@@ -47,6 +47,92 @@ pub enum IntentResolutionDecision {
     Resolve(ResolveIntentPlan),
 }
 
+/// Fenced wall-clock lease information supplied by the transaction-status
+/// authority.
+///
+/// MVCC timestamps order versions; they do not measure elapsed milliseconds.
+/// The reader therefore accepts an expiry decision only when a status/lease
+/// authority provides an explicit deadline. The heartbeat interval is a
+/// bounded retry hint and is never used to infer that a transaction is dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthoritativeTransactionLease {
+    /// Wall-clock deadline after which the status authority may expire a lease.
+    pub deadline_ms: u64,
+
+    /// Maximum interval before a pending reader should check the authority
+    /// again while the lease remains valid.
+    pub heartbeat_interval_ms: u64,
+}
+
+impl AuthoritativeTransactionLease {
+    pub fn new(deadline_ms: u64, heartbeat_interval_ms: u64) -> Result<Self> {
+        if heartbeat_interval_ms == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction heartbeat interval must be non-zero".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            deadline_ms,
+            heartbeat_interval_ms,
+        })
+    }
+
+    fn retry_after_ms(self, now_ms: u64) -> u64 {
+        self.deadline_ms
+            .saturating_sub(now_ms)
+            .min(self.heartbeat_interval_ms)
+            .max(1)
+    }
+}
+
+/// Inputs that keep one lease-aware status lookup bounded and deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentResolutionLeasePolicy {
+    /// Maximum number of route refreshes allowed during the status lookup.
+    pub max_route_refreshes: usize,
+
+    /// Fenced lease state returned by the status authority.
+    pub lease: AuthoritativeTransactionLease,
+
+    /// Wall-clock observation used only for comparing against `lease.deadline_ms`.
+    pub now_ms: u64,
+}
+
+impl IntentResolutionLeasePolicy {
+    pub fn new(
+        max_route_refreshes: usize,
+        lease: AuthoritativeTransactionLease,
+        now_ms: u64,
+    ) -> Result<Self> {
+        if max_route_refreshes == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction status lookup retry budget must be non-zero".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            max_route_refreshes,
+            lease,
+            now_ms,
+        })
+    }
+}
+
+/// Action available while the authoritative transaction status remains
+/// pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingIntentDecision {
+    /// The reader must not resolve the intent and should retry after this
+    /// bounded interval.
+    RetryableConflict { retry_after_ms: u64 },
+
+    /// The fenced lease has elapsed, but the pending status still has to be
+    /// transitioned to `Aborted` by the status authority before a participant
+    /// may publish a rollback command.
+    Expired { lease_deadline_ms: u64 },
+}
+
 /// Build a terminal resolution command from one lock and its authoritative
 /// transaction status.
 ///
@@ -115,6 +201,44 @@ pub fn plan_intent_resolution(
     }))
 }
 
+/// Classify a pending intent using a lease decision supplied by the
+/// transaction-status authority.
+///
+/// Expiry is deliberately an observation, not an implicit abort. A participant
+/// cannot safely remove a lock merely because its local clock says the lock is
+/// old: the coordinator may have renewed the lease, or a prior heartbeat may
+/// already be durable on the status tablet. The caller must publish an
+/// authoritative aborted status and then call `plan_intent_resolution` again.
+pub fn classify_pending_intent(
+    key: &[u8],
+    lock: &LockRecord,
+    status: &TxnStatusRecord,
+    lease: AuthoritativeTransactionLease,
+    now_ms: u64,
+) -> Result<PendingIntentDecision> {
+    match plan_intent_resolution(key, lock, status)? {
+        IntentResolutionDecision::Pending { .. } if now_ms >= lease.deadline_ms => {
+            Ok(PendingIntentDecision::Expired {
+                lease_deadline_ms: lease.deadline_ms,
+            })
+        }
+        IntentResolutionDecision::Pending { .. } => Ok(PendingIntentDecision::RetryableConflict {
+            retry_after_ms: lease.retry_after_ms(now_ms),
+        }),
+        IntentResolutionDecision::Resolve(_) => Err(Error::InvalidArgument(
+            "pending intent classification requires a pending transaction status".to_string(),
+        )),
+    }
+}
+
+/// Return the recommended read retry interval for a lock that is still
+/// pending. This is only a scheduling hint; it is not an expiry decision.
+pub fn pending_intent_retry_after_ms(lock: &LockRecord) -> Result<u64> {
+    lock.validate()
+        .map_err(|error| Error::CorruptData(format!("invalid intent lock: {error}")))?;
+    Ok((lock.ttl_ms / 3).max(1))
+}
+
 /// Dispatch boundary for a terminal intent-resolution command.
 ///
 /// Implementations must return success only after the command has crossed the
@@ -134,8 +258,24 @@ pub trait IntentResolutionDispatcher {
 #[derive(Debug, Clone, PartialEq)]
 pub enum IntentResolutionOutcome<O> {
     /// The authoritative status is still pending, so no resolution command was
-    /// submitted and the reader must apply its pending-intent policy.
+    /// submitted. Callers using the lease-aware entry point receive the more
+    /// specific retryable or expired outcome below.
     Pending { status: TxnStatusRecord },
+
+    /// The status remains pending and the caller should retry the authoritative
+    /// status lookup after the returned bounded interval.
+    RetryableConflict {
+        status: TxnStatusRecord,
+        retry_after_ms: u64,
+    },
+
+    /// The authoritative lease deadline elapsed while the status still said
+    /// pending. No participant command was submitted; status ownership must
+    /// publish an aborted record before rollback is allowed.
+    Expired {
+        status: TxnStatusRecord,
+        lease_deadline_ms: u64,
+    },
 
     /// The terminal command was durably dispatched by the supplied boundary.
     Resolved { plan: ResolveIntentPlan, output: O },
@@ -157,21 +297,13 @@ where
     L: TransactionStatusReader<Output = TxnStatusRecord>,
     D: IntentResolutionDispatcher,
 {
-    if status_location.txn_id() != lock.txn_id || status_location.primary_key() != lock.primary_key
-    {
-        return Err(Error::CorruptData(
-            "status lookup location does not identify the intent owner".to_string(),
-        ));
-    }
-
-    let status = status_location
-        .lookup_with_retry(route_resolver, status_reader, max_route_refreshes)?
-        .ok_or_else(|| Error::TabletUnavailable {
-            reason: format!(
-                "transaction status for intent owner {} is not currently visible",
-                lock.txn_id.0
-            ),
-        })?;
+    let status = lookup_intent_status(
+        lock,
+        status_location,
+        route_resolver,
+        status_reader,
+        max_route_refreshes,
+    )?;
 
     match plan_intent_resolution(key, lock, &status)? {
         IntentResolutionDecision::Pending { status } => {
@@ -184,6 +316,84 @@ where
             Ok(IntentResolutionOutcome::Resolved { plan, output })
         }
     }
+}
+
+/// Look up an intent owner and apply the bounded pending/expiry policy using a
+/// fenced lease supplied by the status authority.
+pub fn resolve_intent_with_status_lookup_and_lease<R, L, D>(
+    key: &[u8],
+    lock: &LockRecord,
+    status_location: &mut TransactionStatusLocation,
+    route_resolver: &mut R,
+    status_reader: &mut L,
+    dispatcher: &mut D,
+    policy: IntentResolutionLeasePolicy,
+) -> Result<IntentResolutionOutcome<D::Output>>
+where
+    R: TransactionStatusRouteResolver,
+    L: TransactionStatusReader<Output = TxnStatusRecord>,
+    D: IntentResolutionDispatcher,
+{
+    let status = lookup_intent_status(
+        lock,
+        status_location,
+        route_resolver,
+        status_reader,
+        policy.max_route_refreshes,
+    )?;
+
+    match plan_intent_resolution(key, lock, &status)? {
+        IntentResolutionDecision::Pending { status } => {
+            match classify_pending_intent(key, lock, &status, policy.lease, policy.now_ms)? {
+                PendingIntentDecision::RetryableConflict { retry_after_ms } => {
+                    Ok(IntentResolutionOutcome::RetryableConflict {
+                        status,
+                        retry_after_ms,
+                    })
+                }
+                PendingIntentDecision::Expired { lease_deadline_ms } => {
+                    Ok(IntentResolutionOutcome::Expired {
+                        status,
+                        lease_deadline_ms,
+                    })
+                }
+            }
+        }
+        IntentResolutionDecision::Resolve(plan) => {
+            let output = dispatcher
+                .dispatch_intent_resolution(&plan)
+                .map_err(map_dispatch_error)?;
+            Ok(IntentResolutionOutcome::Resolved { plan, output })
+        }
+    }
+}
+
+fn lookup_intent_status<R, L>(
+    lock: &LockRecord,
+    status_location: &mut TransactionStatusLocation,
+    route_resolver: &mut R,
+    status_reader: &mut L,
+    max_route_refreshes: usize,
+) -> Result<TxnStatusRecord>
+where
+    R: TransactionStatusRouteResolver,
+    L: TransactionStatusReader<Output = TxnStatusRecord>,
+{
+    if status_location.txn_id() != lock.txn_id || status_location.primary_key() != lock.primary_key
+    {
+        return Err(Error::CorruptData(
+            "status lookup location does not identify the intent owner".to_string(),
+        ));
+    }
+
+    status_location
+        .lookup_with_retry(route_resolver, status_reader, max_route_refreshes)?
+        .ok_or_else(|| Error::TabletUnavailable {
+            reason: format!(
+                "transaction status for intent owner {} is not currently visible",
+                lock.txn_id.0
+            ),
+        })
 }
 
 fn map_dispatch_error(error: ParticipantDispatchError) -> Error {
