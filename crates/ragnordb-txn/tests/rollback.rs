@@ -319,7 +319,9 @@ fn primary_rollback_route_refresh_rebuilds_the_plan_before_retrying() {
         .execute_rollback_with_retry(&mut refresher, &mut dispatcher, 1)
         .unwrap();
 
-    assert_eq!(refresher.calls, 1);
+    // The old primary batch may span child tablets after a split, so every
+    // logical mutation in that batch must be resolved independently.
+    assert_eq!(refresher.calls, 2);
     assert_eq!(dispatcher.primary_plans.len(), 2);
     assert_eq!(dispatcher.primary_plans[1].route, route(21, 7, 210));
     assert_eq!(dispatcher.status_plans[0].status_route, route(21, 7, 210));
@@ -373,7 +375,9 @@ fn status_route_refresh_retries_only_status_after_participant_success() {
         .execute_rollback_with_retry(&mut refresher, &mut dispatcher, 1)
         .unwrap();
 
-    assert_eq!(refresher.calls, 1);
+    // Refresh the primary key's current owner as well as every sibling key
+    // before storing the refreshed status route.
+    assert_eq!(refresher.calls, 2);
     assert_eq!(
         dispatcher.events,
         vec!["primary", "secondary", "status", "status"]

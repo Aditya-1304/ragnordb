@@ -68,6 +68,26 @@ fn secondary_route() -> ParticipantRoute {
     .unwrap()
 }
 
+fn secondary_route_after_leader_move() -> ParticipantRoute {
+    ParticipantRoute::new(
+        SECONDARY_TABLET,
+        TABLET_EPOCH,
+        RaftGroupId(102),
+        ReplicaId(3),
+    )
+    .unwrap()
+}
+
+fn split_secondary_route() -> ParticipantRoute {
+    ParticipantRoute::new(
+        TabletId(3),
+        TABLET_EPOCH + 1,
+        RaftGroupId(103),
+        ReplicaId(3),
+    )
+    .unwrap()
+}
+
 fn stale_status_route() -> ParticipantRoute {
     ParticipantRoute::new(PRIMARY_TABLET, TABLET_EPOCH - 1, RaftGroupId(101), ReplicaId(1))
         .unwrap()
@@ -135,6 +155,7 @@ fn conf_state() -> TabletSnapshotConfState {
 struct DurableCluster {
     tablets: BTreeMap<TabletId, TabletStateMachine>,
     status_store: InMemoryTransactionStatusStore,
+    current_participant_routes: BTreeMap<Vec<u8>, ParticipantRoute>,
 }
 
 impl DurableCluster {
@@ -155,7 +176,20 @@ impl DurableCluster {
         Self {
             tablets: BTreeMap::from([(PRIMARY_TABLET, primary), (SECONDARY_TABLET, secondary)]),
             status_store: InMemoryTransactionStatusStore::new(),
+            current_participant_routes: BTreeMap::from([
+                (encoded_key(700), primary_route()),
+                (encoded_key(701), secondary_route()),
+            ]),
         }
+    }
+
+    fn current_participant_route(&self, logical_key: &[u8]) -> Result<ParticipantRoute> {
+        self.current_participant_routes
+            .get(logical_key)
+            .copied()
+            .ok_or_else(|| Error::TabletUnavailable {
+                reason: format!("no current participant descriptor owns key {logical_key:?}"),
+            })
     }
 
     fn publish_pending(&mut self, txn_id: TxnId, primary_key: Vec<u8>) {
@@ -185,6 +219,7 @@ impl DurableCluster {
                 .remove(&tablet_id)
                 .expect("tablet listed by the durable cluster must exist");
             let snapshot_id = 800 + offset as u64;
+            let tablet_epoch = previous.epoch();
             let image = generate_local_snapshot(
                 &previous,
                 "ragnordb-phase-6-9-gateway",
@@ -199,7 +234,7 @@ impl DurableCluster {
                 raft_group_id: previous.raft_group_id(),
                 tablet_id,
                 table_id: TABLE_ID,
-                tablet_epoch: TABLET_EPOCH,
+                tablet_epoch,
             };
             let restored = restore_verified_snapshot(&image, &target)
                 .unwrap()
@@ -218,6 +253,8 @@ struct GatewayProcess<'a> {
     fail_before_secondary_commit: bool,
     prewrite_dispatches: usize,
     status_route_refreshes: usize,
+    intent_resolution_routes: Vec<ParticipantRoute>,
+    intent_resolution_ids: Vec<LogicalCommandId>,
 }
 
 impl<'a> GatewayProcess<'a> {
@@ -232,6 +269,8 @@ impl<'a> GatewayProcess<'a> {
             fail_before_secondary_commit,
             prewrite_dispatches: 0,
             status_route_refreshes: 0,
+            intent_resolution_routes: Vec::new(),
+            intent_resolution_ids: Vec::new(),
         }
     }
 
@@ -316,7 +355,7 @@ impl<'a> GatewayProcess<'a> {
 
     fn recover_visible_intents(&mut self, now_ms: u64) -> Result<usize> {
         let mut resolved = 0;
-        let tablet_ids = [PRIMARY_TABLET, SECONDARY_TABLET];
+        let tablet_ids = self.cluster.tablets.keys().copied().collect::<Vec<_>>();
 
         for tablet_id in tablet_ids {
             let intents = self
@@ -363,11 +402,15 @@ impl<'a> GatewayProcess<'a> {
                         "recovery status remained pending after the lease transition".to_string(),
                     ));
                 };
-                let route = match tablet_id {
-                    PRIMARY_TABLET => primary_route(),
-                    SECONDARY_TABLET => secondary_route(),
-                    _ => unreachable!("recovery enumerates only known participant tablets"),
-                };
+                self.intent_resolution_ids.push(plan.logical_command_id);
+                let route = self.cluster.current_participant_route(&key)?;
+                if route.tablet_id != tablet_id {
+                    return Err(Error::CorruptData(format!(
+                        "intent key {key:?} is present on tablet {}, but its current descriptor routes to tablet {}",
+                        tablet_id.0, route.tablet_id.0
+                    )));
+                }
+                self.intent_resolution_routes.push(route);
                 self.apply_logical_command(
                     route,
                     plan.logical_command_id,
@@ -643,4 +686,174 @@ fn gateway_crash_after_primary_commit_restarts_and_resolves_secondary() {
         Some(row(701, "secondary"))
     );
 
+}
+
+/// Realistic bug caught: after the primary/status commit is durable, a split
+/// can retire the participant tablet while leaving its unresolved intent on a
+/// child. Recovery must find that intent through current ownership rather
+/// than treating the committed status record's old tablet list as authoritative.
+#[test]
+fn committed_intent_recovery_follows_a_child_created_after_primary_commit() {
+    let txn_id = TxnId(702);
+    let (mut coordinator, primary_key) = transaction_and_routes(txn_id);
+    let mut cluster = DurableCluster::new();
+    cluster.publish_pending(txn_id, primary_key);
+
+    {
+        let mut gateway = GatewayProcess::new(&mut cluster, false, false);
+        let mut refresher = UnexpectedRouteRefresh;
+        coordinator
+            .execute_prewrite_with_retry(30_000, &mut refresher, &mut gateway, 1)
+            .unwrap();
+    }
+
+    let commit_result = {
+        let mut gateway = GatewayProcess::new(&mut cluster, false, true);
+        let mut timestamps = LocalTransactionManager::new();
+        let mut refresher = UnexpectedRouteRefresh;
+        coordinator.execute_commit_with_retry(&mut timestamps, &mut refresher, &mut gateway, 1)
+    };
+    assert!(matches!(
+        commit_result,
+        Err(Error::RequestOutcomeUnknown { .. })
+    ));
+    let committed_status = cluster.status(txn_id);
+    assert_eq!(committed_status.status, TxnStatus::Committed);
+    assert_eq!(committed_status.commit_timestamp, Some(Timestamp(101)));
+    assert_eq!(committed_status.participant_tablet_ids, vec![1, 2]);
+
+    // Model the split's ownership handoff by replaying the already-durable
+    // prewrite payload onto a fresh child state machine, then retire the parent.
+    let secondary_prewrite = coordinator
+        .plan_prewrite(30_000)
+        .unwrap()
+        .into_iter()
+        .find(|plan| plan.route.tablet_id == SECONDARY_TABLET)
+        .unwrap();
+    let participant = &secondary_prewrite.participant_plans[0];
+    let child_route = split_secondary_route();
+    let child_request = RequestId {
+        client_id: participant.request_id.client_id,
+        sequence: participant.request_id.sequence,
+        raft_group_id: child_route.raft_group_id,
+    };
+    let mut child = TabletStateMachine::new(
+        Tablet::new(child_route.tablet_id, TABLE_ID).unwrap(),
+        child_route.tablet_epoch,
+        child_route.raft_group_id,
+    )
+    .unwrap();
+    let child_prewrite = TabletCommandEnvelope::new_with_logical_command_id(
+        child_request,
+        participant.logical_command_id,
+        child_route.tablet_id,
+        child_route.tablet_epoch,
+        TabletCommand::Prewrite(secondary_prewrite.command),
+    )
+    .unwrap();
+    child.apply(child_prewrite).unwrap();
+    cluster.tablets.remove(&SECONDARY_TABLET);
+    cluster.tablets.insert(child_route.tablet_id, child);
+    cluster
+        .current_participant_routes
+        .insert(encoded_key(701), child_route);
+    cluster.restart_participants();
+
+    let mut recovery = GatewayProcess::new(&mut cluster, false, false);
+    let resolved = recovery.recover_visible_intents(1_000).unwrap();
+
+    assert_eq!(resolved, 1);
+    assert_eq!(recovery.intent_resolution_routes, vec![child_route]);
+    assert_eq!(cluster.status(txn_id).status, TxnStatus::Committed);
+    assert!(!cluster.tablets.contains_key(&SECONDARY_TABLET));
+    assert_eq!(
+        cluster.tablets[&child_route.tablet_id]
+            .tablet()
+            .stats()
+            .locks,
+        0
+    );
+    let reader = Transaction::new(TxnId(9001), Timestamp(102)).unwrap();
+    assert_eq!(
+        cluster.tablets[&child_route.tablet_id]
+            .tablet()
+            .get(&reader, &row_key(701))
+            .unwrap(),
+        Some(row(701, "secondary"))
+    );
+}
+
+/// Realistic bug caught: a terminal intent may outlive the leader route that
+/// originally owned its tablet. Recovery must use the current replica route
+/// while keeping the topology-independent resolution command identity stable.
+#[test]
+fn committed_intent_recovery_uses_the_new_replica_route_and_same_command_id() {
+    let txn_id = TxnId(703);
+    let (mut coordinator, primary_key) = transaction_and_routes(txn_id);
+    let mut cluster = DurableCluster::new();
+    cluster.publish_pending(txn_id, primary_key);
+
+    {
+        let mut gateway = GatewayProcess::new(&mut cluster, false, false);
+        let mut refresher = UnexpectedRouteRefresh;
+        coordinator
+            .execute_prewrite_with_retry(30_000, &mut refresher, &mut gateway, 1)
+            .unwrap();
+    }
+
+    let commit_result = {
+        let mut gateway = GatewayProcess::new(&mut cluster, false, true);
+        let mut timestamps = LocalTransactionManager::new();
+        let mut refresher = UnexpectedRouteRefresh;
+        coordinator.execute_commit_with_retry(&mut timestamps, &mut refresher, &mut gateway, 1)
+    };
+    assert!(matches!(
+        commit_result,
+        Err(Error::RequestOutcomeUnknown { .. })
+    ));
+
+    let committed_status = cluster.status(txn_id);
+    let secondary_key = encoded_key(701);
+    let lock = cluster.tablets[&SECONDARY_TABLET]
+        .tablet()
+        .storage()
+        .intent_for_read(&secondary_key, Timestamp(101))
+        .unwrap()
+        .expect("secondary prewrite must survive the coordinator crash");
+    let ragnordb_txn::IntentResolutionDecision::Resolve(before_move) =
+        plan_intent_resolution(&secondary_key, &lock, &committed_status).unwrap()
+    else {
+        panic!("committed status must produce an intent resolution plan");
+    };
+
+    let moved_route = secondary_route_after_leader_move();
+    cluster
+        .current_participant_routes
+        .insert(secondary_key, moved_route);
+    cluster.restart_participants();
+
+    let (resolved, routes, logical_command_ids) = {
+        let mut recovery = GatewayProcess::new(&mut cluster, false, false);
+        let resolved = recovery.recover_visible_intents(1_000).unwrap();
+        (
+            resolved,
+            recovery.intent_resolution_routes.clone(),
+            recovery.intent_resolution_ids.clone(),
+        )
+    };
+
+    assert_eq!(resolved, 1);
+    assert_eq!(routes, vec![moved_route]);
+    assert_eq!(logical_command_ids, vec![before_move.logical_command_id]);
+    assert_eq!(cluster.status(txn_id).status, TxnStatus::Committed);
+    assert_eq!(cluster.tablets[&SECONDARY_TABLET].tablet().stats().locks, 0);
+
+    let reader = Transaction::new(TxnId(9002), Timestamp(102)).unwrap();
+    assert_eq!(
+        cluster.tablets[&SECONDARY_TABLET]
+            .tablet()
+            .get(&reader, &row_key(701))
+            .unwrap(),
+        Some(row(701, "secondary"))
+    );
 }

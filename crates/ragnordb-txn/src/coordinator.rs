@@ -218,6 +218,11 @@ pub enum ParticipantDispatchError {
 }
 
 /// Resolve a logical participant key to its current physical tablet route.
+///
+/// `previous_route` is only a cache hint from the last plan. Implementations
+/// must resolve ownership for the supplied logical key against the current
+/// tablet descriptors; keys that shared a former batch may now have different
+/// owners after a split or merge.
 pub trait ParticipantRouteRefresher {
     fn refresh_participant_route(
         &mut self,
@@ -643,32 +648,69 @@ impl DistributedTransactionCoordinator {
             });
         }
 
-        let anchor = batch.participant_plans.first().ok_or_else(|| {
-            Error::CorruptData("rollback batch has no participant command identity".to_string())
-        })?;
-        let refreshed_route = refresher
-            .refresh_participant_route(anchor.command_id.logical_mutation_id(), batch.route)?;
-        if refreshed_route == batch.route {
-            return Err(Error::TabletUnavailable {
-                reason: "rollback route refresh returned the unchanged route".to_string(),
-            });
-        }
-
-        for participant_plan in &batch.participant_plans {
-            self.set_participant_route(
-                participant_plan
-                    .command_id
-                    .logical_mutation_id()
-                    .as_key()
-                    .to_vec(),
-                refreshed_route,
-            )?;
-        }
+        let primary_route = self.refresh_participant_batch_routes(
+            &batch.participant_plans,
+            batch.route,
+            refresher,
+        )?;
         if update_status_route {
-            self.set_status_route(refreshed_route)?;
+            self.set_status_route(primary_route.ok_or_else(|| {
+                Error::CorruptData(
+                    "primary rollback batch omitted the primary logical key".to_string(),
+                )
+            })?)?;
         }
         *route_refreshes += 1;
         Ok(())
+    }
+
+    /// Resolve every logical mutation in a rejected batch against the current
+    /// ownership view before rebuilding that phase. A split can leave sibling
+    /// keys owned by different tablets, so propagating one anchor key's route
+    /// across the old batch would misroute some of its mutations.
+    fn refresh_participant_batch_routes<R>(
+        &mut self,
+        participant_plans: &[ParticipantCommandPlan],
+        previous_route: ParticipantRoute,
+        refresher: &mut R,
+    ) -> Result<Option<ParticipantRoute>>
+    where
+        R: ParticipantRouteRefresher,
+    {
+        if participant_plans.is_empty() {
+            return Err(Error::CorruptData(
+                "participant batch has no logical command identities".to_string(),
+            ));
+        }
+
+        // Resolve the full key set before mutating coordinator route hints. If
+        // metadata lookup fails partway through, the caller retains the old,
+        // coherent routing view instead of a partially refreshed transaction.
+        let mut refreshed_routes = Vec::with_capacity(participant_plans.len());
+        let mut any_route_changed = false;
+        let mut primary_route = None;
+        for participant_plan in participant_plans {
+            let logical_mutation_id = participant_plan.command_id.logical_mutation_id();
+            let route = refresher.refresh_participant_route(logical_mutation_id, previous_route)?;
+            any_route_changed |= route != previous_route;
+            if logical_mutation_id.as_key() == self.primary_key() {
+                primary_route = Some(route);
+            }
+            refreshed_routes.push((logical_mutation_id.as_key().to_vec(), route));
+        }
+
+        if !any_route_changed {
+            return Err(Error::TabletUnavailable {
+                reason: "participant route refresh returned the unchanged route for every key"
+                    .to_string(),
+            });
+        }
+
+        for (key, route) in refreshed_routes {
+            self.set_participant_route(key, route)?;
+        }
+
+        Ok(primary_route)
     }
 
     fn rollback_outcome_unknown(
@@ -840,29 +882,17 @@ impl DistributedTransactionCoordinator {
             });
         }
 
-        let anchor = batch.participant_plans.first().ok_or_else(|| {
-            Error::CorruptData("commit batch has no participant command identity".to_string())
-        })?;
-        let refreshed_route = refresher
-            .refresh_participant_route(anchor.command_id.logical_mutation_id(), batch.route)?;
-        if refreshed_route == batch.route {
-            return Err(Error::TabletUnavailable {
-                reason: "commit route refresh returned the unchanged route".to_string(),
-            });
-        }
-
-        for participant_plan in &batch.participant_plans {
-            self.set_participant_route(
-                participant_plan
-                    .command_id
-                    .logical_mutation_id()
-                    .as_key()
-                    .to_vec(),
-                refreshed_route,
-            )?;
-        }
+        let primary_route = self.refresh_participant_batch_routes(
+            &batch.participant_plans,
+            batch.route,
+            refresher,
+        )?;
         if update_status_route {
-            self.set_status_route(refreshed_route)?;
+            self.set_status_route(primary_route.ok_or_else(|| {
+                Error::CorruptData(
+                    "primary commit batch omitted the primary logical key".to_string(),
+                )
+            })?)?;
         }
         *route_refreshes += 1;
         Ok(())
@@ -934,37 +964,11 @@ impl DistributedTransactionCoordinator {
                             });
                         }
 
-                        let anchor = batch.participant_plans.first().ok_or_else(|| {
-                            Error::CorruptData(
-                                "prewrite batch has no participant command identity".to_string(),
-                            )
-                        })?;
-                        let refreshed_route = refresher.refresh_participant_route(
-                            anchor.command_id.logical_mutation_id(),
+                        self.refresh_participant_batch_routes(
+                            &batch.participant_plans,
                             batch.route,
+                            refresher,
                         )?;
-                        if refreshed_route == batch.route {
-                            return Err(Error::TabletUnavailable {
-                                reason: "prewrite route refresh returned the unchanged route"
-                                    .to_string(),
-                            });
-                        }
-
-                        // All keys in this plan share one physical route. The
-                        // refresh therefore updates the complete batch before
-                        // regrouping; a future topology-aware resolver may
-                        // return different routes per logical key when a
-                        // split or merge is explicitly supported.
-                        for participant_plan in &batch.participant_plans {
-                            self.set_participant_route(
-                                participant_plan
-                                    .command_id
-                                    .logical_mutation_id()
-                                    .as_key()
-                                    .to_vec(),
-                                refreshed_route,
-                            )?;
-                        }
 
                         route_refreshes += 1;
                         restart_phase = true;

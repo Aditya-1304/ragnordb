@@ -308,7 +308,9 @@ fn primary_route_refresh_retries_primary_without_reallocating_commit_timestamp()
 
     assert_eq!(outcome.commit_timestamp, Timestamp(101));
     assert_eq!(timestamps.last_allocated_timestamp(), Timestamp(101));
-    assert_eq!(refresher.calls, 1);
+    // Both logical keys in the rejected primary batch are refreshed so a
+    // topology split can assign them to different current owners.
+    assert_eq!(refresher.calls, 2);
     assert_eq!(dispatcher.primary_plans.len(), 2);
     assert_eq!(dispatcher.primary_plans[0].primary.route, route(20, 4, 200));
     assert_eq!(dispatcher.primary_plans[1].primary.route, route(21, 7, 210));
