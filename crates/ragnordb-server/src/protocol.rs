@@ -230,6 +230,7 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
         | Error::WalAppendNotStaged { .. }
         | Error::RecoveryRequired { .. }
         | Error::RecoveryFailed { .. }
+        | Error::RecoveryFailedWithSource { .. }
         | Error::SnapshotPublicationFailed { .. } => error_response(
             "INTERNAL_ERROR",
             "an internal database error occurred",

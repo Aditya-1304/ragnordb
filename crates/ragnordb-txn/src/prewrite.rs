@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use ragnordb_common::{
     Error, Result,
-    codec::WriteKind,
+    codec::{TxnStatus, TxnStatusRecord, WriteKind},
     command_codec::{PrewriteCommand, WriteEntry},
     encoding::decode_row,
     ids::{ParticipantCommandPhase, TabletId},
@@ -118,15 +118,38 @@ pub(crate) fn plan_prewrite(
         }
     }
 
+    let participant_tablets = groups.keys().copied().collect();
+    let participant_tablet_ids = coordinator
+        .status_location()
+        .ordered_participant_tablet_ids(&participant_tablets)?;
+    let pending_status = TxnStatusRecord {
+        txn_id: coordinator.transaction_id(),
+        start_timestamp: coordinator.start_timestamp(),
+        commit_timestamp: None,
+        status: TxnStatus::Pending,
+        primary_key: coordinator.primary_key().to_vec(),
+        participant_tablet_ids,
+        last_heartbeat_timestamp: None,
+        lease_deadline_ms: None,
+    };
+    pending_status
+        .validate()
+        .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+
     groups
         .into_values()
         .map(|batch| {
+            let includes_primary = batch
+                .writes
+                .iter()
+                .any(|write| write.key == coordinator.primary_key());
             let command = PrewriteCommand {
                 txn_id: coordinator.transaction_id(),
                 start_timestamp: coordinator.start_timestamp(),
                 writes: batch.writes,
                 primary_key: coordinator.primary_key().to_vec(),
                 ttl_ms,
+                pending_status: includes_primary.then(|| pending_status.clone()),
             };
             command
                 .validate()

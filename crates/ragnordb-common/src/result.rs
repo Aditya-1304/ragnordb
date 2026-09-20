@@ -199,6 +199,18 @@ pub enum Error {
         reason: String,
     },
 
+    /// physical A-WAL recovery failed and the original WAL error remains
+    /// available as a typed source for diagnosis and recovery tooling
+    #[error("WAL recovery failed: {context}: {source}")]
+    RecoveryFailedWithSource {
+        /// recovery operation that could not proceed
+        context: String,
+
+        /// concrete failure returned by A-WAL or another recovery dependency
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// a database snapshot could not be durably published to its final path
     ///
     /// The snapshot has not been referenced by WAL yet. Callers must not append
@@ -279,6 +291,7 @@ impl Error {
             | Self::WalAppendNotStaged { .. }
             | Self::RecoveryRequired { .. }
             | Self::RecoveryFailed { .. }
+            | Self::RecoveryFailedWithSource { .. }
             | Self::SnapshotPublicationFailed { .. } => RetryAction::None,
         }
     }

@@ -50,12 +50,12 @@ pub use status::{
     TransactionStatusStore,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error, Result,
     encoding::decode_row,
-    ids::{Timestamp, TxnId},
+    ids::{TableId, Timestamp, TxnId},
 };
 use ragnordb_storage::{key::decode_row_key, mvcc::Mutation};
 
@@ -65,6 +65,63 @@ pub struct Transaction {
     id: TxnId,
     start_ts: Timestamp,
     writes: BTreeMap<Vec<u8>, Mutation>,
+    read_keys: BTreeSet<Vec<u8>>,
+    read_spans: BTreeSet<TransactionReadSpan>,
+}
+
+/// A table-scoped logical read interval retained for transaction accounting.
+///
+/// Bounds use the same canonical encoded row-key bytes as the tablet routing
+/// layer. Recording this footprint does not add a new conflict or isolation
+/// rule; it gives the coordinator stable logical input for later limits and
+/// validation work.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransactionReadSpan {
+    pub table_id: TableId,
+    pub start_key: Option<Vec<u8>>,
+    pub end_key: Option<Vec<u8>>,
+}
+
+impl TransactionReadSpan {
+    pub fn new(
+        table_id: TableId,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
+    ) -> Result<Self> {
+        if table_id.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction read span table ID 0 is reserved".to_string(),
+            ));
+        }
+        for (name, key) in [("start", start_key.as_deref()), ("end", end_key.as_deref())] {
+            if let Some(key) = key {
+                let row_key = decode_row_key(key).map_err(|error| {
+                    Error::InvalidArgument(format!(
+                        "transaction read span {name} bound is not a canonical row key: {error}"
+                    ))
+                })?;
+                if row_key.table_id != table_id {
+                    return Err(Error::InvalidArgument(format!(
+                        "transaction read span {name} bound belongs to table {}, expected {}",
+                        row_key.table_id.0, table_id.0
+                    )));
+                }
+            }
+        }
+        if let (Some(start), Some(end)) = (&start_key, &end_key)
+            && start >= end
+        {
+            return Err(Error::InvalidArgument(
+                "transaction read span must be a non-empty half-open interval".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            table_id,
+            start_key,
+            end_key,
+        })
+    }
 }
 
 impl Transaction {
@@ -87,6 +144,8 @@ impl Transaction {
             id,
             start_ts,
             writes: BTreeMap::new(),
+            read_keys: BTreeSet::new(),
+            read_spans: BTreeSet::new(),
         })
     }
 
@@ -108,6 +167,33 @@ impl Transaction {
     /// Return the complete deterministic write set.
     pub fn write_set(&self) -> &BTreeMap<Vec<u8>, Mutation> {
         &self.writes
+    }
+
+    /// Return the canonical logical point keys read by this transaction.
+    pub fn read_keys(&self) -> &BTreeSet<Vec<u8>> {
+        &self.read_keys
+    }
+
+    /// Return table-scoped logical read spans retained for coordinator
+    /// bookkeeping and later footprint limits.
+    pub fn read_spans(&self) -> &BTreeSet<TransactionReadSpan> {
+        &self.read_spans
+    }
+
+    /// Record one logical point read exactly once.
+    pub fn record_read(&mut self, key: Vec<u8>) -> Result<()> {
+        decode_row_key(&key).map_err(|error| {
+            Error::InvalidArgument(format!(
+                "transaction read key is not a canonical encoded row key: {error}"
+            ))
+        })?;
+        self.read_keys.insert(key);
+        Ok(())
+    }
+
+    /// Record one logical range read exactly once.
+    pub fn record_read_span(&mut self, span: TransactionReadSpan) {
+        self.read_spans.insert(span);
     }
 
     /// Return the number of distinct rows modified by the transaction.

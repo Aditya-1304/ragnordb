@@ -23,6 +23,7 @@ mod result;
 mod session;
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -37,19 +38,21 @@ use ragnordb_common::{
     Error, Result,
     catalog_codec::DataType,
     catalog_codec::TableDefinition,
-    codec::{Row, Value, WriteKind},
+    codec::{LockRecord, Row, TxnStatusRecord, Value, WriteKind},
     command_codec::{
-        CachedTabletCommandOutcome, CachedTabletCommandRejectionKind, SingleShardCommitCommand,
-        TabletCommand, WriteEntry,
+        CachedTabletCommandOutcome, CachedTabletCommandRejectionKind, CommitCommand,
+        PrewriteCommand, PublishAbortedTransactionStatus, RollbackCommand,
+        SingleShardCommitCommand, TabletCommand, WriteEntry,
     },
     encoding::{decode_row, encode_row},
     ids::{
-        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, RaftGroupId, RequestId, RowKey,
-        TableId, TabletId, Timestamp,
+        ClientRequestId, ColumnId, CommandKind, LogicalCommandId, ParticipantCommandPhase,
+        RaftGroupId, RequestId, RowKey, TableId, TabletId, Timestamp, TxnId,
+        participant_logical_command_id, request_id_for_logical_command,
     },
     metadata_codec::{CreateTableRequest, MetadataCommandCodecError, TabletDescriptor},
     proto::snapshot as snapshot_proto,
-    rpc_codec::{TabletRoute, TabletScanBatch},
+    rpc_codec::{TabletPointReadInspection, TabletRoute, TabletScanBatch},
 };
 use ragnordb_sql::{
     BoundBinaryOperator, BoundColumnRef, BoundExpr, BoundExprKind, BoundTableRef, CreateTablePlan,
@@ -66,8 +69,11 @@ use ragnordb_storage::{
 use ragnordb_tablet::command::TabletCommandApplyOutcome;
 use ragnordb_tablet::{RowMutation, ScanProgress, ScanSpan, Tablet, TabletRouter};
 use ragnordb_txn::{
-    CommitTimestampAllocator, SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction,
-    TransactionManager,
+    CommitPhaseDispatcher, CommitTimestampAllocator, DistributedTransactionCoordinator,
+    IntentResolutionDecision, ParticipantCommandPlan, ParticipantDispatchError, ParticipantRoute,
+    ParticipantRouteRefresher, PrewriteBatchDispatcher, RollbackPhaseDispatcher,
+    SingleNodeCommitCoordinator, SingleNodeCommitOutcome, Transaction, TransactionManager,
+    TransactionReadSpan,
 };
 
 pub use result::{
@@ -82,6 +88,548 @@ pub use session::SqlSession;
 pub type SharedCommitLog = Arc<dyn DurableCommitLog + Send + Sync>;
 
 type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
+
+/// Routing refresher and phase dispatcher backed by the server-owned tablet
+/// gateway. It carries no transaction authority; durable decisions remain in
+/// the participant state machines and the coordinator only advances after the
+/// exact logical command outcome is known.
+struct GatewayTransactionDispatcher {
+    gateway: SharedTabletGateway,
+    timeout: Duration,
+    acknowledged_through: Option<u64>,
+    primary_prewrite_applied: bool,
+    primary_commit_applied: bool,
+    owner_change_after_pending: Cell<bool>,
+}
+
+struct GatewayParticipantRouteRefresher {
+    gateway: SharedTabletGateway,
+}
+
+impl ParticipantRouteRefresher for GatewayParticipantRouteRefresher {
+    fn refresh_participant_route(
+        &mut self,
+        logical_mutation_id: &ragnordb_txn::LogicalMutationId,
+        _previous_route: ParticipantRoute,
+    ) -> Result<ParticipantRoute> {
+        let row_key = decode_row_key(logical_mutation_id.as_key())?;
+        let route = self
+            .gateway
+            .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+        route
+            .validate()
+            .map_err(|error| Error::CorruptData(error.to_string()))?;
+        participant_route(&route)
+    }
+}
+
+impl GatewayTransactionDispatcher {
+    fn new(
+        gateway: SharedTabletGateway,
+        timeout: Duration,
+        acknowledged_through: Option<u64>,
+        primary_prewrite_applied: bool,
+    ) -> Self {
+        Self {
+            gateway,
+            timeout,
+            acknowledged_through,
+            primary_prewrite_applied,
+            primary_commit_applied: false,
+            owner_change_after_pending: Cell::new(false),
+        }
+    }
+
+    fn tablet_route_for_plan(
+        &self,
+        plan: &ParticipantCommandPlan,
+    ) -> std::result::Result<TabletRoute, ParticipantDispatchError> {
+        let row_key =
+            decode_row_key(plan.command_id.logical_mutation_id().as_key()).map_err(|error| {
+                ParticipantDispatchError::Rejected {
+                    reason: format!("participant logical key is invalid: {error}"),
+                }
+            })?;
+        let route = self
+            .gateway
+            .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)
+            .map_err(dispatch_error)?;
+        route
+            .validate()
+            .map_err(|error| ParticipantDispatchError::Rejected {
+                reason: format!("gateway returned an invalid tablet route: {error}"),
+            })?;
+        if !route_matches_participant(&route, plan.route) {
+            if self.primary_prewrite_applied
+                && (route.tablet_id != plan.route.tablet_id
+                    || route.raft_group_id != plan.route.raft_group_id)
+            {
+                self.owner_change_after_pending.set(true);
+                return Err(ParticipantDispatchError::Unavailable {
+                    reason: format!(
+                        "transaction {} participant ownership moved from tablet {} group {} to tablet {} group {} after Pending was durable; participant migration is required before continuing",
+                        plan.command_id.txn_id().0,
+                        plan.route.tablet_id.0,
+                        plan.route.raft_group_id.0,
+                        route.tablet_id.0,
+                        route.raft_group_id.0,
+                    ),
+                });
+            }
+            return Err(ParticipantDispatchError::RouteRefreshRequired {
+                reason: format!(
+                    "participant route changed from tablet {} epoch {} group {}",
+                    plan.route.tablet_id.0, plan.route.tablet_epoch, plan.route.raft_group_id.0
+                ),
+            });
+        }
+        Ok(route)
+    }
+
+    fn dispatch_one(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        command: TabletCommand,
+    ) -> std::result::Result<TabletCommandApplyOutcome, ParticipantDispatchError> {
+        submit_with_outcome_recovery(
+            self.gateway.as_ref(),
+            route,
+            request_id,
+            logical_command_id,
+            self.acknowledged_through,
+            command,
+            self.timeout,
+        )
+    }
+
+    fn dispatch_participant_key(
+        &self,
+        plan: &ParticipantCommandPlan,
+        command: TabletCommand,
+    ) -> std::result::Result<TabletCommandApplyOutcome, ParticipantDispatchError> {
+        let route = self.tablet_route_for_plan(plan)?;
+        self.dispatch_one(
+            &route,
+            plan.request_id.clone(),
+            plan.logical_command_id,
+            command,
+        )
+    }
+
+    fn dispatch_rollback_batch(
+        &self,
+        plan: &ragnordb_txn::RollbackBatchPlan,
+    ) -> std::result::Result<Vec<TabletCommandApplyOutcome>, ParticipantDispatchError> {
+        if plan.command.keys.len() != plan.participant_plans.len() {
+            return Err(ParticipantDispatchError::Rejected {
+                reason: "rollback command lost its per-key logical identities".to_string(),
+            });
+        }
+
+        let mut keys = plan
+            .command
+            .keys
+            .iter()
+            .zip(&plan.participant_plans)
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|(key, _)| key.as_slice() != plan.command.keys[0].as_slice());
+
+        keys.into_iter()
+            .map(|(key, participant)| {
+                let command = TabletCommand::Rollback(RollbackCommand {
+                    txn_id: plan.command.txn_id,
+                    start_timestamp: plan.command.start_timestamp,
+                    keys: vec![key.clone()],
+                });
+                self.dispatch_participant_key(participant, command)
+            })
+            .collect()
+    }
+}
+
+impl PrewriteBatchDispatcher for GatewayTransactionDispatcher {
+    type Output = Vec<TabletCommandApplyOutcome>;
+
+    fn dispatch_prewrite(
+        &mut self,
+        plan: &ragnordb_txn::PrewriteBatchPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        if plan.command.writes.len() != plan.participant_plans.len() {
+            return Err(ParticipantDispatchError::Rejected {
+                reason: "prewrite command lost its per-key logical identities".to_string(),
+            });
+        }
+
+        let mut writes = plan
+            .command
+            .writes
+            .iter()
+            .zip(&plan.participant_plans)
+            .collect::<Vec<_>>();
+        writes
+            .sort_by_key(|(write, _)| write.key.as_slice() != plan.command.primary_key.as_slice());
+
+        let mut outcomes = Vec::with_capacity(writes.len());
+        for (write, participant) in writes {
+            let is_primary = write.key == plan.command.primary_key;
+            let command = TabletCommand::Prewrite(PrewriteCommand {
+                txn_id: plan.command.txn_id,
+                start_timestamp: plan.command.start_timestamp,
+                writes: vec![write.clone()],
+                primary_key: plan.command.primary_key.clone(),
+                ttl_ms: plan.command.ttl_ms,
+                pending_status: if is_primary {
+                    plan.command.pending_status.clone()
+                } else {
+                    None
+                },
+            });
+            let outcome = self.dispatch_participant_key(participant, command)?;
+            if is_primary && plan.command.pending_status.is_some() {
+                self.primary_prewrite_applied = true;
+            }
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+}
+
+impl CommitPhaseDispatcher for GatewayTransactionDispatcher {
+    type PrimaryOutput = Vec<TabletCommandApplyOutcome>;
+    type SecondaryOutput = Vec<TabletCommandApplyOutcome>;
+
+    fn dispatch_primary(
+        &mut self,
+        plan: &ragnordb_txn::CommitPhasePlan,
+    ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError> {
+        self.dispatch_commit_batch(&plan.primary, Some(&plan.status_record), true)
+    }
+
+    fn dispatch_secondary(
+        &mut self,
+        plan: &ragnordb_txn::CommitBatchPlan,
+    ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError> {
+        self.dispatch_commit_batch(plan, None, false)
+    }
+}
+
+impl GatewayTransactionDispatcher {
+    fn dispatch_commit_batch(
+        &mut self,
+        plan: &ragnordb_txn::CommitBatchPlan,
+        committed_status: Option<&TxnStatusRecord>,
+        is_primary_batch: bool,
+    ) -> std::result::Result<Vec<TabletCommandApplyOutcome>, ParticipantDispatchError> {
+        if plan.command.keys.len() != plan.participant_plans.len() {
+            return Err(ParticipantDispatchError::Rejected {
+                reason: "commit command lost its per-key logical identities".to_string(),
+            });
+        }
+        let primary_key = committed_status.map(|status| status.primary_key.as_slice());
+        let mut keys = plan
+            .command
+            .keys
+            .iter()
+            .zip(&plan.participant_plans)
+            .collect::<Vec<_>>();
+        if let Some(primary_key) = primary_key {
+            keys.sort_by_key(|(key, _)| key.as_slice() != primary_key);
+        }
+
+        let mut outcomes = Vec::with_capacity(keys.len());
+        for (key, participant) in keys {
+            let is_primary_key = primary_key.is_some_and(|primary| key.as_slice() == primary);
+            let command = TabletCommand::Commit(CommitCommand {
+                txn_id: plan.command.txn_id,
+                start_timestamp: plan.command.start_timestamp,
+                commit_timestamp: plan.command.commit_timestamp,
+                keys: vec![key.clone()],
+                committed_status: is_primary_key.then(|| {
+                    committed_status
+                        .expect("primary key status is present")
+                        .clone()
+                }),
+            });
+            let outcome = self.dispatch_participant_key(participant, command)?;
+            if is_primary_batch && is_primary_key {
+                self.primary_commit_applied = true;
+            }
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+}
+
+impl RollbackPhaseDispatcher for GatewayTransactionDispatcher {
+    type PrimaryOutput = Vec<TabletCommandApplyOutcome>;
+    type SecondaryOutput = Vec<TabletCommandApplyOutcome>;
+    type StatusOutput = TabletCommandApplyOutcome;
+
+    fn dispatch_primary_rollback(
+        &mut self,
+        plan: &ragnordb_txn::RollbackBatchPlan,
+    ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError> {
+        self.dispatch_rollback_batch(plan)
+    }
+
+    fn dispatch_secondary_rollback(
+        &mut self,
+        plan: &ragnordb_txn::RollbackBatchPlan,
+    ) -> std::result::Result<Self::SecondaryOutput, ParticipantDispatchError> {
+        self.dispatch_rollback_batch(plan)
+    }
+
+    fn dispatch_status_abort(
+        &mut self,
+        plan: &ragnordb_txn::RollbackPhasePlan,
+    ) -> std::result::Result<Self::StatusOutput, ParticipantDispatchError> {
+        let primary_key = plan.status_record.primary_key.as_slice();
+        let row_key =
+            decode_row_key(primary_key).map_err(|error| ParticipantDispatchError::Rejected {
+                reason: format!("transaction status primary key is invalid: {error}"),
+            })?;
+        let route = self
+            .gateway
+            .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)
+            .map_err(dispatch_error)?;
+        if !route_matches_participant(&route, plan.status_route) {
+            if self.primary_prewrite_applied
+                && (route.tablet_id != plan.status_route.tablet_id
+                    || route.raft_group_id != plan.status_route.raft_group_id)
+            {
+                self.owner_change_after_pending.set(true);
+                return Err(ParticipantDispatchError::Unavailable {
+                    reason: format!(
+                        "transaction {} status authority moved from tablet {} group {} to tablet {} group {} after Pending was durable",
+                        plan.status_record.txn_id.0,
+                        plan.status_route.tablet_id.0,
+                        plan.status_route.raft_group_id.0,
+                        route.tablet_id.0,
+                        route.raft_group_id.0,
+                    ),
+                });
+            }
+            return Err(ParticipantDispatchError::RouteRefreshRequired {
+                reason: "transaction status route changed before abort publication".to_string(),
+            });
+        }
+
+        // Status publication is a separate logical command from rolling back
+        // the primary row. Its domain-separated mutation identity prevents the
+        // two different payloads from sharing one deduplication entry.
+        let mut identity_key = b"ragnordb/transaction-status-abort/v1".to_vec();
+        identity_key.extend_from_slice(plan.status_key.as_bytes());
+        let logical_command_id = participant_logical_command_id(
+            plan.status_record.txn_id,
+            ParticipantCommandPhase::Rollback,
+            &identity_key,
+        )
+        .map_err(|error| ParticipantDispatchError::Rejected {
+            reason: error.to_string(),
+        })?;
+        let request_id = request_id_for_logical_command(logical_command_id, route.raft_group_id)
+            .map_err(|error| ParticipantDispatchError::Rejected {
+                reason: error.to_string(),
+            })?;
+        self.dispatch_one(
+            &route,
+            request_id,
+            logical_command_id,
+            TabletCommand::PublishAbortedTransactionStatus(PublishAbortedTransactionStatus {
+                status_record: plan.status_record.clone(),
+            }),
+        )
+    }
+}
+
+fn participant_route(route: &TabletRoute) -> Result<ParticipantRoute> {
+    ParticipantRoute::new(
+        route.tablet_id,
+        route.tablet_epoch,
+        route.raft_group_id,
+        route.leader_replica_id,
+    )
+}
+
+fn route_matches_participant(route: &TabletRoute, participant: ParticipantRoute) -> bool {
+    route.tablet_id == participant.tablet_id
+        && route.tablet_epoch == participant.tablet_epoch
+        && route.raft_group_id == participant.raft_group_id
+        && route.leader_replica_id == participant.leader_replica_id
+}
+
+fn dispatch_error(error: Error) -> ParticipantDispatchError {
+    match error {
+        Error::StaleTabletEpoch {
+            expected_epoch,
+            current_epoch,
+        } => ParticipantDispatchError::RouteRefreshRequired {
+            reason: format!("tablet epoch changed from {expected_epoch} to {current_epoch}"),
+        },
+        Error::NotLeader { leader_id } => ParticipantDispatchError::RouteRefreshRequired {
+            reason: format!("participant leader changed to {leader_id:?}"),
+        },
+        Error::WriteConflict(reason) => ParticipantDispatchError::WriteConflict { reason },
+        Error::RequestOutcomeUnknown { identity } => {
+            ParticipantDispatchError::OutcomeUnknown { reason: identity }
+        }
+        Error::ProposalUnavailable { reason } | Error::TabletUnavailable { reason } => {
+            ParticipantDispatchError::Unavailable { reason }
+        }
+        Error::LeaderUnknown => ParticipantDispatchError::Unavailable {
+            reason: "participant leader is unknown".to_string(),
+        },
+        other => ParticipantDispatchError::Rejected {
+            reason: other.to_string(),
+        },
+    }
+}
+
+fn submit_with_outcome_recovery(
+    gateway: &dyn TabletGateway,
+    route: &TabletRoute,
+    request_id: RequestId,
+    logical_command_id: LogicalCommandId,
+    acknowledged_through: Option<u64>,
+    command: TabletCommand,
+    timeout: Duration,
+) -> std::result::Result<TabletCommandApplyOutcome, ParticipantDispatchError> {
+    match gateway.submit_command_with_identity_and_ack(
+        route,
+        request_id.clone(),
+        logical_command_id,
+        acknowledged_through,
+        command,
+        timeout,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(error @ (Error::RequestOutcomeUnknown { .. } | Error::ProposalUnavailable { .. })) => {
+            match gateway.query_original_outcome(route, request_id, logical_command_id, timeout) {
+                Ok(Some(CachedTabletCommandOutcome::Applied(result))) => {
+                    Ok(TabletCommandApplyOutcome {
+                        result: result.into(),
+                        deduplicated: true,
+                    })
+                }
+                Ok(Some(CachedTabletCommandOutcome::Rejected(rejection))) => {
+                    Err(match rejection.kind {
+                        CachedTabletCommandRejectionKind::WriteConflict => {
+                            ParticipantDispatchError::WriteConflict {
+                                reason: rejection.reason,
+                            }
+                        }
+                        CachedTabletCommandRejectionKind::InvalidCommand
+                        | CachedTabletCommandRejectionKind::UnsupportedCommand => {
+                            ParticipantDispatchError::Rejected {
+                                reason: rejection.reason,
+                            }
+                        }
+                    })
+                }
+                Ok(None) => Err(ParticipantDispatchError::OutcomeUnknown {
+                    reason: error.to_string(),
+                }),
+                Err(query_error) => Err(ParticipantDispatchError::OutcomeUnknown {
+                    reason: format!("{}; outcome lookup failed: {query_error}", error),
+                }),
+            }
+        }
+        Err(error) => Err(dispatch_error(error)),
+    }
+}
+
+/// Resolve one terminal intent only after consulting its authoritative primary
+/// status record. Pending or unavailable status never authorizes a local guess.
+fn resolve_foreground_intent(
+    gateway: &dyn TabletGateway,
+    row_key: &RowKey,
+    encoded_key: &[u8],
+    lock: &LockRecord,
+    request_context: &mut TabletRequestContext,
+) -> Result<()> {
+    let status_primary_key = decode_row_key(&lock.primary_key).map_err(|error| {
+        Error::CorruptData(format!(
+            "transaction {} intent has an invalid primary key: {error}",
+            lock.txn_id.0
+        ))
+    })?;
+    let status_route = gateway.lookup_tablet_route(
+        status_primary_key.table_id,
+        &status_primary_key.primary_key_bytes,
+    )?;
+    status_route
+        .validate()
+        .map_err(|error| Error::CorruptData(error.to_string()))?;
+    let status_request_id = request_context.next_read_request_id(status_route.raft_group_id)?;
+    let status = gateway
+        .transaction_status(
+            &status_route,
+            status_request_id,
+            lock.txn_id,
+            request_context.timeout(),
+        )?
+        .ok_or_else(|| Error::TabletUnavailable {
+            reason: format!(
+                "transaction status for intent owner {} is not currently visible",
+                lock.txn_id.0
+            ),
+        })?;
+    if status.primary_tablet_id().map_err(|reason| {
+        Error::CorruptData(format!(
+            "transaction status has invalid authority: {reason}"
+        ))
+    })? != status_route.tablet_id
+    {
+        return Err(Error::CorruptData(format!(
+            "transaction status authority route for transaction {} does not match its participant list",
+            lock.txn_id.0
+        )));
+    }
+
+    match ragnordb_txn::plan_intent_resolution(encoded_key, lock, &status)? {
+        IntentResolutionDecision::Pending { .. } => {
+            let retry_after_ms = ragnordb_txn::pending_intent_retry_after_ms(lock)?;
+            Err(Error::WriteConflict(format!(
+                "transaction {} has a pending intent on this row; retry after at most {retry_after_ms} ms",
+                lock.txn_id.0
+            )))
+        }
+        IntentResolutionDecision::Resolve(plan) => {
+            let participant_route =
+                gateway.lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+            participant_route
+                .validate()
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            let request_id = request_id_for_logical_command(
+                plan.logical_command_id,
+                participant_route.raft_group_id,
+            )
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+            let outcome = submit_with_outcome_recovery(
+                gateway,
+                &participant_route,
+                request_id,
+                plan.logical_command_id,
+                request_context.acknowledged_through(),
+                TabletCommand::ResolveIntent(plan.command),
+                request_context.timeout(),
+            )
+            .map_err(participant_dispatch_error_to_error)?;
+            if !matches!(
+                outcome.result,
+                ragnordb_tablet::command::TabletCommandApplyResult::ResolveIntent
+            ) {
+                return Err(Error::CorruptData(
+                    "tablet returned a non-resolution outcome for an intent-resolution command"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
 
 /// Process-wide catalog publication boundary.
 pub type SharedCatalogLog = Arc<dyn DurableCatalogLog + Send + Sync>;
@@ -209,6 +757,40 @@ pub type SharedMetadataTableCreator = Arc<dyn MetadataTableCreator>;
 /// a second logical mutation at the tablet.
 pub trait TabletGateway: Send + Sync {
     fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute>;
+
+    /// Inspect the visible MVCC value and any read-conflicting intent from one
+    /// participant apply frontier. Production implementations execute this
+    /// after a Raft read barrier so the row and lock cannot come from different
+    /// owner-thread states.
+    fn inspect_point(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        row_key: RowKey,
+        read_timestamp: Timestamp,
+        timeout: Duration,
+    ) -> Result<TabletPointReadInspection> {
+        Ok(TabletPointReadInspection {
+            visible_row: self.read_point(route, request_id, row_key, read_timestamp, timeout)?,
+            intent: None,
+        })
+    }
+
+    /// Read the durable status record from the tablet that owns the
+    /// transaction's primary key. Implementations must cross the same current
+    /// term/read barrier as a point read; absence is returned as `None` and
+    /// must never be interpreted as Aborted.
+    fn transaction_status(
+        &self,
+        _route: &TabletRoute,
+        _request_id: RequestId,
+        _txn_id: TxnId,
+        _timeout: Duration,
+    ) -> Result<Option<TxnStatusRecord>> {
+        Err(Error::NotImplemented(
+            "authoritative transaction status reads are unavailable",
+        ))
+    }
 
     fn read_point(
         &self,
@@ -371,6 +953,16 @@ impl TabletRequestContext {
 
     pub fn session_epoch(&self) -> u64 {
         self.session_epoch
+    }
+
+    /// Return the client request identity that owns logical participant
+    /// commands emitted for the current SQL root request.
+    pub fn root_request_id(&self) -> ClientRequestId {
+        ClientRequestId {
+            client_id: self.client_id,
+            session_epoch: self.session_epoch,
+            request_sequence: self.root_request_sequence,
+        }
     }
 
     pub fn acknowledged_through(&self) -> Option<u64> {
@@ -1096,11 +1688,291 @@ impl LocalExecutor {
     /// serialized compatibility commit path; metadata-owned transactions use
     /// the remote method below.
     pub fn transaction_targets_local_table(&self, transaction: &Transaction) -> Result<bool> {
-        let Some(encoded_key) = transaction.write_set().keys().next() else {
+        let mut targets_local_table = false;
+        let mut targets_metadata_table = false;
+
+        for encoded_key in transaction.write_set().keys() {
+            let row_key = decode_row_key(encoded_key)?;
+            let tablet_id = self.route_row_key(&row_key)?;
+            if self.is_local_compatibility_route(row_key.table_id, tablet_id) {
+                targets_local_table = true;
+            } else if self.metadata_table_ids.contains(&row_key.table_id) {
+                targets_metadata_table = true;
+            } else if self.tablets.contains_key(&row_key.table_id) {
+                targets_local_table = true;
+            }
+        }
+        if targets_local_table && targets_metadata_table {
+            return Err(Error::UnsupportedSql(
+                "a transaction cannot mix compatibility-local and metadata-owned tables"
+                    .to_string(),
+            ));
+        }
+
+        Ok(targets_local_table)
+    }
+
+    /// Return whether one metadata-owned SQL write set spans more than one
+    /// tablet. This is a routing decision only; the full route set is rebuilt
+    /// again when the coordinator is created so it cannot authorize a stale
+    /// write destination.
+    pub fn transaction_requires_distributed_coordination(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<bool> {
+        if transaction.is_empty() {
             return Ok(false);
+        }
+
+        let mut tablets = BTreeSet::new();
+        for encoded_key in transaction.write_set().keys() {
+            let row_key = decode_row_key(encoded_key)?;
+            let tablet_id = self.route_row_key(&row_key)?;
+            if self.metadata_table_ids.contains(&row_key.table_id)
+                && !self.is_local_compatibility_route(row_key.table_id, tablet_id)
+            {
+                tablets.insert(tablet_id);
+            }
+        }
+        Ok(tablets.len() > 1)
+    }
+
+    /// Install every current logical write-key route and durably prewrite a
+    /// metadata-owned transaction. The primary prewrite publishes Pending in
+    /// the same Raft apply as its first intent, then every later error either
+    /// leaves an explicitly unknown outcome for recovery or rolls all known
+    /// intents back before publishing Aborted.
+    pub fn prepare_distributed_transaction(
+        &self,
+        transaction: Transaction,
+        request_context: &TabletRequestContext,
+    ) -> Result<DistributedTransactionCoordinator> {
+        if transaction.is_empty() {
+            return Err(Error::InvalidArgument(
+                "distributed commit requires at least one write".to_string(),
+            ));
+        }
+
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql("metadata tablet gateway is not installed".to_string())
+        })?;
+        let primary_key = transaction
+            .write_set()
+            .keys()
+            .next()
+            .expect("non-empty transaction has a first key")
+            .clone();
+        let mut coordinator = DistributedTransactionCoordinator::new(
+            transaction,
+            request_context.root_request_id(),
+            primary_key.clone(),
+        )?;
+
+        let keys = coordinator.write_set().keys().cloned().collect::<Vec<_>>();
+        for encoded_key in keys {
+            let row_key = decode_row_key(&encoded_key)?;
+            if !self.metadata_table_ids.contains(&row_key.table_id) {
+                return Err(Error::UnsupportedSql(
+                    "distributed transactions may write only metadata-owned tables".to_string(),
+                ));
+            }
+            if self
+                .schema_snapshot()
+                .table_by_id(row_key.table_id)
+                .is_none()
+            {
+                return Err(Error::SchemaMismatch(format!(
+                    "transaction references unknown table ID {}",
+                    row_key.table_id.0
+                )));
+            }
+
+            let route =
+                gateway.lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+            route
+                .validate()
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            if route.tablet_id != self.route_row_key(&row_key)? {
+                return Err(Error::CorruptData(format!(
+                    "gateway route selected tablet {}, but SQL plan selected tablet {}",
+                    route.tablet_id.0,
+                    self.route_row_key(&row_key)?.0
+                )));
+            }
+            coordinator.set_participant_route(encoded_key.clone(), participant_route(&route)?)?;
+            if encoded_key == primary_key {
+                coordinator.set_status_route(participant_route(&route)?)?;
+            }
+        }
+
+        let mut dispatcher = GatewayTransactionDispatcher::new(
+            Arc::clone(&gateway),
+            request_context.timeout(),
+            request_context.acknowledged_through(),
+            false,
+        );
+        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        if let Err(prewrite_error) =
+            coordinator.execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 3)
+        {
+            if dispatcher.owner_change_after_pending.get() {
+                return Err(Error::RecoveryRequired {
+                    reason: format!(
+                        "transaction {} cannot be safely rolled back after participant ownership changed following Pending: {prewrite_error}",
+                        coordinator.transaction_id().0
+                    ),
+                });
+            }
+            if dispatcher.primary_prewrite_applied
+                && !matches!(prewrite_error, Error::RequestOutcomeUnknown { .. })
+            {
+                coordinator.execute_rollback_with_retry(&mut refresher, &mut dispatcher, 3)?;
+            }
+            return Err(prewrite_error);
+        }
+
+        Ok(coordinator)
+    }
+
+    /// Publish a previously prepared distributed transaction. The timestamp
+    /// is allocated by the caller only after all prewrites have applied. Once
+    /// the primary commit/status transition applies, secondary failures cannot
+    /// change the committed decision; their intents remain resolvable by SQL
+    /// reads from that authoritative status record.
+    pub fn commit_prepared_distributed_transaction(
+        &self,
+        mut coordinator: DistributedTransactionCoordinator,
+        commit_timestamp: Timestamp,
+        request_context: &TabletRequestContext,
+    ) -> Result<SingleNodeCommitOutcome> {
+        let transaction_id = coordinator.transaction_id();
+        let committed_writes = coordinator.transaction().len();
+        let mut timestamp_allocator = commit_timestamp;
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql("metadata tablet gateway is not installed".to_string())
+        })?;
+        let mut dispatcher = GatewayTransactionDispatcher::new(
+            Arc::clone(&gateway),
+            request_context.timeout(),
+            request_context.acknowledged_through(),
+            true,
+        );
+        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        let result = coordinator.execute_commit_with_retry(
+            &mut timestamp_allocator,
+            &mut refresher,
+            &mut dispatcher,
+            3,
+        );
+
+        match result {
+            Ok(outcome) => Ok(SingleNodeCommitOutcome {
+                transaction_id,
+                commit_timestamp: Some(outcome.commit_timestamp),
+                committed_writes,
+                wal_extent: None,
+            }),
+            Err(_error) if dispatcher.primary_commit_applied => Ok(SingleNodeCommitOutcome {
+                transaction_id,
+                commit_timestamp: Some(commit_timestamp),
+                committed_writes,
+                wal_extent: None,
+            }),
+            Err(error) if dispatcher.owner_change_after_pending.get() => {
+                Err(Error::RecoveryRequired {
+                    reason: format!(
+                        "transaction {} cannot continue because a participant moved after Pending became durable: {error}",
+                        transaction_id.0
+                    ),
+                })
+            }
+            Err(error) if matches!(error, Error::RequestOutcomeUnknown { .. }) => Err(error),
+            Err(commit_error) => {
+                coordinator.execute_rollback_with_retry(&mut refresher, &mut dispatcher, 3)?;
+                Err(commit_error)
+            }
+        }
+    }
+
+    /// Abort a transaction whose participants are prepared but which has not
+    /// crossed the primary commit/status point. This is used when timestamp
+    /// allocation fails after prewrite; the abort status is published only
+    /// after every participant rollback has reached exact apply.
+    pub fn rollback_prepared_distributed_transaction(
+        &self,
+        mut coordinator: DistributedTransactionCoordinator,
+        request_context: &TabletRequestContext,
+    ) -> Result<()> {
+        let gateway = self.tablet_gateway.clone().ok_or_else(|| {
+            Error::UnsupportedSql("metadata tablet gateway is not installed".to_string())
+        })?;
+        let mut dispatcher = GatewayTransactionDispatcher::new(
+            Arc::clone(&gateway),
+            request_context.timeout(),
+            request_context.acknowledged_through(),
+            true,
+        );
+        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        match coordinator.execute_rollback_with_retry(&mut refresher, &mut dispatcher, 3) {
+            Ok(_) => Ok(()),
+            Err(error) if dispatcher.owner_change_after_pending.get() => {
+                Err(Error::RecoveryRequired {
+                    reason: format!(
+                        "transaction {} cannot be rolled back because a participant moved after Pending became durable: {error}",
+                        coordinator.transaction_id().0
+                    ),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Commit a SQL transaction through the local one-tablet path or the
+    /// metadata-backed distributed coordinator. Distributed timestamps are
+    /// allocated strictly after every participant has durably prewritten.
+    pub fn commit_sql_transaction_outcome_with_request_context<M: TransactionManager>(
+        &mut self,
+        transaction: Transaction,
+        transaction_manager: &mut M,
+        request_context: &mut TabletRequestContext,
+    ) -> Result<SingleNodeCommitOutcome> {
+        if transaction.is_empty() {
+            return self.commit_transaction_outcome_with_request_context(
+                transaction,
+                transaction_manager,
+                request_context,
+            );
+        }
+
+        if self.transaction_targets_local_table(&transaction)?
+            || !self.transaction_requires_distributed_coordination(&transaction)?
+        {
+            return self.commit_transaction_outcome_with_request_context(
+                transaction,
+                transaction_manager,
+                request_context,
+            );
+        }
+
+        let start_timestamp = transaction.start_ts();
+        let coordinator = self.prepare_distributed_transaction(transaction, request_context)?;
+        let commit_timestamp = match transaction_manager.allocate_commit_timestamp(start_timestamp)
+        {
+            Ok(timestamp) => timestamp,
+            Err(error) => {
+                self.rollback_prepared_distributed_transaction(coordinator, request_context)?;
+                return Err(error);
+            }
         };
-        let row_key = decode_row_key(encoded_key)?;
-        Ok(self.tablets.contains_key(&row_key.table_id))
+        self.commit_prepared_distributed_transaction(coordinator, commit_timestamp, request_context)
+    }
+
+    fn is_local_compatibility_table(&self, table_id: TableId) -> bool {
+        !self.metadata_table_ids.contains(&table_id) && self.tablets.contains_key(&table_id)
+    }
+
+    fn is_local_compatibility_route(&self, table_id: TableId, tablet_id: TabletId) -> bool {
+        self.tablets.contains_key(&table_id) && tablet_id == TabletId(table_id.0)
     }
 
     /// Commit a transaction whose destination is metadata-owned without taking
@@ -1152,7 +2024,7 @@ impl LocalExecutor {
         let tablet_id = *tablet_ids
             .first()
             .expect("non-empty tablet-ID set was checked above");
-        if self.tablets.contains_key(&table_id) {
+        if self.is_local_compatibility_route(table_id, tablet_id) {
             return Err(Error::UnsupportedSql(
                 "compatibility tablet commits require the serialized local path".to_string(),
             ));
@@ -1640,10 +2512,12 @@ impl LocalExecutor {
                     emit(key, row)?;
                 }
             }
-            AccessPath::Scan if self.tablets.contains_key(&schema.id) => {
+            AccessPath::Scan if self.is_local_compatibility_table(schema.id) => {
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
                 self.local_scan_each_row(transaction, schema.id, &mut emit)?;
             }
             AccessPath::Scan => {
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
                 if transaction.is_empty() {
                     self.distributed_scan_each_row(
                         transaction,
@@ -1827,7 +2701,9 @@ impl LocalExecutor {
             .first()
             .expect("non-empty tablet-ID set was checked above");
 
-        if let Some(coordinator) = self.tablets.get_mut(&table_id) {
+        if self.is_local_compatibility_route(table_id, tablet_id)
+            && let Some(coordinator) = self.tablets.get_mut(&table_id)
+        {
             if tablet_id != TabletId(table_id.0) {
                 return Err(Error::UnsupportedSql(format!(
                     "tablet {} is not installed in the local single-tablet commit path",
@@ -2129,7 +3005,7 @@ impl LocalExecutor {
 
         let affected_rows = prepared.len();
 
-        if self.tablets.contains_key(&schema.id) {
+        if self.is_local_compatibility_route(schema.id, tablet_id) {
             let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
             tablet.buffer_batch(
                 transaction,
@@ -2157,7 +3033,7 @@ impl LocalExecutor {
     fn execute_select(
         &self,
         plan: SelectPlan,
-        transaction: &Transaction,
+        transaction: &mut Transaction,
         request_context: Option<&mut TabletRequestContext>,
     ) -> Result<ExecutionResult> {
         let SelectPlan {
@@ -2269,7 +3145,7 @@ impl LocalExecutor {
             let mutations = prepared
                 .into_iter()
                 .map(|(key, row)| RowMutation::Put { key, row });
-            if self.tablets.contains_key(&schema.id) {
+            if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
                 tablet.buffer_batch(transaction, mutations)?;
             } else {
@@ -2318,7 +3194,7 @@ impl LocalExecutor {
             let mutations = matching
                 .into_iter()
                 .map(|keyed_row| RowMutation::Delete { key: keyed_row.key });
-            if self.tablets.contains_key(&schema.id) {
+            if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
                 tablet.buffer_batch(transaction, mutations)?;
             } else {
@@ -2497,7 +3373,7 @@ impl LocalExecutor {
 
     fn matching_rows(
         &self,
-        transaction: &Transaction,
+        transaction: &mut Transaction,
         schema: &TableSchema,
         filter: Option<&BoundExpr>,
         mut request_context: Option<&mut TabletRequestContext>,
@@ -2511,7 +3387,8 @@ impl LocalExecutor {
                 .unwrap_or_default(),
 
             AccessPath::Scan => {
-                if self.tablets.contains_key(&schema.id) {
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
+                if self.is_local_compatibility_table(schema.id) {
                     self.local_scan_rows(transaction, schema.id)?
                 } else {
                     self.distributed_scan_rows(transaction, schema.id, &mut request_context)?
@@ -2624,9 +3501,62 @@ impl LocalExecutor {
         Ok(())
     }
 
-    fn distributed_scan_rows(
+    fn local_scan_batch(
         &self,
         transaction: &Transaction,
+        table_id: TableId,
+        span: &ScanSpan,
+        resume_after: Option<&[u8]>,
+        max_rows: u32,
+        max_bytes: u32,
+    ) -> Result<TabletScanBatch> {
+        let tablet_id = TabletId(table_id.0);
+        let tablet = self.local_tablet_for_route(table_id, tablet_id)?;
+        let start = span.start_key.as_ref().map(|key| RowKey {
+            table_id,
+            primary_key_bytes: key.clone(),
+        });
+        let end = span.end_key.as_ref().map(|key| RowKey {
+            table_id,
+            primary_key_bytes: key.clone(),
+        });
+        let resume = resume_after.map(|key| RowKey {
+            table_id,
+            primary_key_bytes: key.to_vec(),
+        });
+        let page = tablet.scan_page(
+            transaction,
+            start.as_ref(),
+            end.as_ref(),
+            resume.as_ref(),
+            max_rows as usize,
+            max_bytes as usize,
+        )?;
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|(key, row)| {
+                Ok(ragnordb_common::rpc_codec::TabletScanRow {
+                    key: key.primary_key_bytes,
+                    row: encode_row(&row)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next_resume_after = page
+            .has_more
+            .then(|| rows.last().map(|row| row.key.clone()))
+            .flatten();
+        Ok(TabletScanBatch {
+            rows,
+            intents: Vec::new(),
+            next_resume_after,
+            exhausted: !page.has_more,
+        })
+    }
+
+    fn distributed_scan_rows(
+        &self,
+        transaction: &mut Transaction,
         table_id: TableId,
         request_context: &mut Option<&mut TabletRequestContext>,
     ) -> Result<Vec<(RowKey, Row)>> {
@@ -2661,19 +3591,32 @@ impl LocalExecutor {
             .collect::<VecDeque<_>>();
         let mut progress = ScanProgress::new(transaction.start_ts(), logical_span.clone());
         let mut committed_rows = BTreeMap::<Vec<u8>, Row>::new();
+        let mut resolved_intents = 0usize;
 
         while let Some(mut pending) = work.pop_front() {
             let request_id = context.next_read_request_id(pending.route.route.raft_group_id)?;
-            let response = gateway.scan_page(
-                &pending.route.route,
-                request_id.clone(),
-                &pending.route.span,
-                pending.resume_after.as_deref(),
-                progress.read_ts,
-                TABLET_SCAN_PAGE_ROWS,
-                TABLET_SCAN_PAGE_BYTES,
-                context.timeout(),
-            );
+            let response =
+                if self.is_local_compatibility_route(table_id, pending.route.route.tablet_id) {
+                    self.local_scan_batch(
+                        transaction,
+                        table_id,
+                        &pending.route.span,
+                        pending.resume_after.as_deref(),
+                        TABLET_SCAN_PAGE_ROWS,
+                        TABLET_SCAN_PAGE_BYTES,
+                    )
+                } else {
+                    gateway.scan_page(
+                        &pending.route.route,
+                        request_id.clone(),
+                        &pending.route.span,
+                        pending.resume_after.as_deref(),
+                        progress.read_ts,
+                        TABLET_SCAN_PAGE_ROWS,
+                        TABLET_SCAN_PAGE_BYTES,
+                        context.timeout(),
+                    )
+                };
 
             let batch = match response {
                 Ok(batch) => batch,
@@ -2719,6 +3662,38 @@ impl LocalExecutor {
                     Error::CorruptData(error.to_string()),
                 )
             })?;
+            if !batch.intents.is_empty() {
+                resolved_intents = resolved_intents.saturating_add(batch.intents.len());
+                if resolved_intents > MAX_FOREGROUND_SCAN_INTENT_RESOLUTIONS {
+                    return Err(scan_failure(
+                        pending.route.route.tablet_id,
+                        Error::TabletUnavailable {
+                            reason: "foreground scan exceeded its bounded intent-resolution budget"
+                                .to_string(),
+                        },
+                    ));
+                }
+                for intent in &batch.intents {
+                    let row_key = RowKey {
+                        table_id,
+                        primary_key_bytes: intent.key.clone(),
+                    };
+                    let encoded_key = ragnordb_storage::key::encode_row_key(&row_key)?;
+                    resolve_foreground_intent(
+                        gateway.as_ref(),
+                        &row_key,
+                        &encoded_key,
+                        &intent.lock,
+                        context,
+                    )
+                    .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                }
+                // Intent-only responses deliberately carry no cursor. Re-read
+                // the same fragment after replicated resolution so newly
+                // committed rows cannot be skipped by advancing past a lock.
+                work.push_front(pending);
+                continue;
+            }
             if batch.rows.is_empty() && !batch.exhausted {
                 return Err(scan_failure(
                     pending.route.route.tablet_id,
@@ -2794,7 +3769,7 @@ impl LocalExecutor {
 
     fn distributed_scan_each_row(
         &self,
-        transaction: &Transaction,
+        transaction: &mut Transaction,
         table_id: TableId,
         request_context: &mut TabletRequestContext,
         emit: &mut dyn FnMut(RowKey, Row) -> Result<()>,
@@ -2827,20 +3802,34 @@ impl LocalExecutor {
             .collect::<VecDeque<_>>();
         let mut progress = ScanProgress::new(transaction.start_ts(), logical_span);
         let mut last_key = None::<Vec<u8>>;
+        let mut resolved_intents = 0usize;
 
         while let Some(mut pending) = work.pop_front() {
             let request_id =
                 request_context.next_read_request_id(pending.route.route.raft_group_id)?;
-            let batch = match gateway.scan_page(
-                &pending.route.route,
-                request_id.clone(),
-                &pending.route.span,
-                pending.resume_after.as_deref(),
-                progress.read_ts,
-                TABLET_SCAN_PAGE_ROWS,
-                TABLET_SCAN_PAGE_BYTES,
-                request_context.timeout(),
-            ) {
+            let response =
+                if self.is_local_compatibility_route(table_id, pending.route.route.tablet_id) {
+                    self.local_scan_batch(
+                        transaction,
+                        table_id,
+                        &pending.route.span,
+                        pending.resume_after.as_deref(),
+                        TABLET_SCAN_PAGE_ROWS,
+                        TABLET_SCAN_PAGE_BYTES,
+                    )
+                } else {
+                    gateway.scan_page(
+                        &pending.route.route,
+                        request_id.clone(),
+                        &pending.route.span,
+                        pending.resume_after.as_deref(),
+                        progress.read_ts,
+                        TABLET_SCAN_PAGE_ROWS,
+                        TABLET_SCAN_PAGE_BYTES,
+                        request_context.timeout(),
+                    )
+                };
+            let batch = match response {
                 Ok(batch) => batch,
                 Err(Error::StaleTabletEpoch { .. })
                     if pending.topology_refreshes < MAX_SCAN_TOPOLOGY_REFRESHES =>
@@ -2883,6 +3872,35 @@ impl LocalExecutor {
                     Error::CorruptData(error.to_string()),
                 )
             })?;
+            if !batch.intents.is_empty() {
+                resolved_intents = resolved_intents.saturating_add(batch.intents.len());
+                if resolved_intents > MAX_FOREGROUND_SCAN_INTENT_RESOLUTIONS {
+                    return Err(scan_failure(
+                        pending.route.route.tablet_id,
+                        Error::TabletUnavailable {
+                            reason: "foreground scan exceeded its bounded intent-resolution budget"
+                                .to_string(),
+                        },
+                    ));
+                }
+                for intent in &batch.intents {
+                    let row_key = RowKey {
+                        table_id,
+                        primary_key_bytes: intent.key.clone(),
+                    };
+                    let encoded_key = ragnordb_storage::key::encode_row_key(&row_key)?;
+                    resolve_foreground_intent(
+                        gateway.as_ref(),
+                        &row_key,
+                        &encoded_key,
+                        &intent.lock,
+                        request_context,
+                    )
+                    .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                }
+                work.push_front(pending);
+                continue;
+            }
             if batch.rows.is_empty() && !batch.exhausted {
                 return Err(scan_failure(
                     pending.route.route.tablet_id,
@@ -2932,11 +3950,12 @@ impl LocalExecutor {
     /// committed remote state.
     fn point_row(
         &self,
-        transaction: &Transaction,
+        transaction: &mut Transaction,
         row_key: &RowKey,
         request_context: &mut Option<&mut TabletRequestContext>,
     ) -> Result<Option<Row>> {
         let encoded_key = ragnordb_storage::key::encode_row_key(row_key)?;
+        transaction.record_read(encoded_key.clone())?;
         if let Some(mutation) = transaction.pending_write(&encoded_key) {
             return match mutation {
                 Mutation::Put(encoded_row) => decode_row(encoded_row).map(Some),
@@ -2945,7 +3964,7 @@ impl LocalExecutor {
         }
 
         let tablet_id = self.route_row_key(row_key)?;
-        if self.tablets.contains_key(&row_key.table_id) {
+        if self.is_local_compatibility_route(row_key.table_id, tablet_id) {
             return self
                 .local_tablet_for_route(row_key.table_id, tablet_id)?
                 .get(transaction, row_key);
@@ -2976,17 +3995,63 @@ impl LocalExecutor {
                 ));
             }
         };
-        let request_id = request_context.next_read_request_id(route.raft_group_id)?;
-        gateway
-            .read_point(
+        let encoded_key = ragnordb_storage::key::encode_row_key(row_key)?;
+        for resolution_attempt in 0..=MAX_FOREGROUND_INTENT_RESOLUTIONS {
+            let route =
+                gateway.lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+            route
+                .validate()
+                .map_err(|error| Error::CorruptData(error.to_string()))?;
+            let inspection = gateway.inspect_point(
                 &route,
-                request_id,
+                request_context.next_read_request_id(route.raft_group_id)?,
                 row_key.clone(),
                 transaction.start_ts(),
                 request_context.timeout(),
-            )?
-            .map(|encoded_row| decode_row(&encoded_row))
-            .transpose()
+            )?;
+
+            let Some(lock) = inspection.intent else {
+                return inspection
+                    .visible_row
+                    .map(|encoded_row| decode_row(&encoded_row))
+                    .transpose();
+            };
+
+            if resolution_attempt == MAX_FOREGROUND_INTENT_RESOLUTIONS {
+                return Err(Error::TabletUnavailable {
+                    reason: format!(
+                        "row {} repeatedly acquired a new intent during foreground resolution",
+                        lock.txn_id.0
+                    ),
+                });
+            }
+            resolve_foreground_intent(
+                gateway.as_ref(),
+                row_key,
+                &encoded_key,
+                &lock,
+                request_context,
+            )?;
+        }
+
+        Err(Error::TabletUnavailable {
+            reason: "foreground intent resolution exceeded its bounded attempt count".to_string(),
+        })
+    }
+}
+
+const MAX_FOREGROUND_INTENT_RESOLUTIONS: usize = 3;
+const MAX_FOREGROUND_SCAN_INTENT_RESOLUTIONS: usize = 256;
+
+fn participant_dispatch_error_to_error(error: ParticipantDispatchError) -> Error {
+    match error {
+        ParticipantDispatchError::RouteRefreshRequired { reason }
+        | ParticipantDispatchError::Unavailable { reason } => Error::TabletUnavailable { reason },
+        ParticipantDispatchError::OutcomeUnknown { reason } => {
+            Error::RequestOutcomeUnknown { identity: reason }
+        }
+        ParticipantDispatchError::WriteConflict { reason } => Error::WriteConflict(reason),
+        ParticipantDispatchError::Rejected { reason } => Error::ConstraintViolation(reason),
     }
 }
 
@@ -3079,7 +4144,12 @@ fn resume_scan_routes(
 }
 
 fn scan_failure(tablet_id: TabletId, error: Error) -> Error {
-    if matches!(error, Error::DistributedScanFailed { .. }) {
+    if matches!(
+        error,
+        Error::DistributedScanFailed { .. } | Error::WriteConflict(_)
+    ) {
+        // A transaction conflict carries restart-transaction semantics and
+        // must not be flattened into the scan transport retry contract.
         return error;
     }
     let retryable = error.retry_action() == ragnordb_common::RetryAction::RetrySameRequest;
@@ -3717,6 +4787,40 @@ mod tests {
         scan_tablets: Mutex<Vec<TabletId>>,
     }
 
+    struct MovingRouteGateway {
+        route: Mutex<TabletRoute>,
+    }
+
+    impl TabletGateway for MovingRouteGateway {
+        fn lookup_tablet_route(&self, _table_id: TableId, _key: &[u8]) -> Result<TabletRoute> {
+            Ok(self.route.lock().unwrap().clone())
+        }
+
+        fn read_point(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            _row_key: RowKey,
+            _read_timestamp: Timestamp,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn submit_command(
+            &self,
+            _route: &TabletRoute,
+            _request_id: RequestId,
+            _command: TabletCommand,
+            _timeout: Duration,
+        ) -> Result<TabletCommandApplyOutcome> {
+            Ok(TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::SingleShardCommit,
+                deduplicated: false,
+            })
+        }
+    }
+
     impl TabletGateway for RecordingScanGateway {
         fn lookup_tablet_route(&self, _table_id: TableId, _key: &[u8]) -> Result<TabletRoute> {
             Err(Error::NotImplemented(
@@ -3806,12 +4910,14 @@ mod tests {
                 let next_resume_after = rows.last().map(|row| row.key.clone());
                 TabletScanBatch {
                     rows,
+                    intents: Vec::new(),
                     next_resume_after,
                     exhausted: false,
                 }
             } else {
                 TabletScanBatch {
                     rows,
+                    intents: Vec::new(),
                     next_resume_after: None,
                     exhausted: true,
                 }
@@ -3898,6 +5004,72 @@ mod tests {
                 CachedTabletCommandResult::SingleShardCommit,
             )))
         }
+    }
+
+    fn tablet_route(tablet_id: TabletId, raft_group_id: RaftGroupId) -> TabletRoute {
+        TabletRoute {
+            raft_group_id,
+            tablet_id,
+            tablet_epoch: 1,
+            leader_replica_id: ReplicaId(1),
+            replicas: vec![ReplicaRoute {
+                replica_id: ReplicaId(1),
+                node_id: NodeId(1),
+            }]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn participant_owner_move_after_pending_fails_closed_before_dispatch() {
+        let table_id = TableId(42);
+        let key = ragnordb_storage::key::encode_row_key(
+            &make_row_key(table_id, &[Value::Int(5)]).unwrap(),
+        )
+        .unwrap();
+        let old_route = tablet_route(TabletId(142), RaftGroupId(242));
+        let new_route = tablet_route(TabletId(143), RaftGroupId(243));
+        let gateway: SharedTabletGateway = Arc::new(MovingRouteGateway {
+            route: Mutex::new(new_route),
+        });
+        let mut transaction = Transaction::new(TxnId(700), Timestamp(10)).unwrap();
+        transaction
+            .buffer_put(
+                key.clone(),
+                encode_row(&Row {
+                    values: vec![Value::Int(5), Value::Text("five".to_string())],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut coordinator = DistributedTransactionCoordinator::new(
+            transaction,
+            ClientRequestId {
+                client_id: 700,
+                session_epoch: 1,
+                request_sequence: 1,
+            },
+            key.clone(),
+        )
+        .unwrap();
+        let old_participant = participant_route(&old_route).unwrap();
+        coordinator
+            .set_participant_route(key.clone(), old_participant)
+            .unwrap();
+        coordinator.set_status_route(old_participant).unwrap();
+        let plan = coordinator
+            .participant_command_plan(ParticipantCommandPhase::Prewrite, &key)
+            .unwrap();
+        let dispatcher =
+            GatewayTransactionDispatcher::new(gateway, Duration::from_secs(1), None, true);
+
+        let error = dispatcher.tablet_route_for_plan(&plan).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParticipantDispatchError::Unavailable { .. }
+        ));
+        assert!(dispatcher.owner_change_after_pending.get());
     }
 
     fn remote_executor() -> (LocalExecutor, Arc<RecordingGateway>, RowKey) {

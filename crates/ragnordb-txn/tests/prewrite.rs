@@ -58,6 +58,7 @@ fn three_key_coordinator() -> DistributedTransactionCoordinator {
     coordinator
         .set_participant_route(key(3), route(20, 4, 200))
         .unwrap();
+    coordinator.set_status_route(route(20, 4, 200)).unwrap();
     coordinator
 }
 
@@ -103,6 +104,7 @@ fn prewrite_planner_rejects_missing_routes_and_primary_not_in_write_set() {
     missing_route
         .set_participant_route(key(1), route(10, 4, 100))
         .unwrap();
+    missing_route.set_status_route(route(10, 4, 100)).unwrap();
 
     assert!(matches!(
         missing_route.plan_prewrite(30_000),
@@ -147,11 +149,13 @@ fn prewrite_plan_keeps_logical_identity_when_route_is_refreshed() {
     coordinator
         .set_participant_route(primary_key.clone(), route(10, 4, 100))
         .unwrap();
+    coordinator.set_status_route(route(10, 4, 100)).unwrap();
 
     let before = coordinator.plan_prewrite(30_000).unwrap();
     coordinator
         .set_participant_route(primary_key, route(20, 9, 200))
         .unwrap();
+    coordinator.set_status_route(route(20, 9, 200)).unwrap();
     let after = coordinator.plan_prewrite(30_000).unwrap();
 
     assert_eq!(
@@ -212,7 +216,7 @@ impl PrewriteBatchDispatcher for RefreshingBatchDispatcher {
 fn prewrite_execution_refreshes_and_rebuilds_the_phase_with_stable_identities() {
     let mut coordinator = three_key_coordinator();
     let mut refresher = BatchRefreshOnce {
-        refreshed_route: route(10, 6, 110),
+        refreshed_route: route(30, 6, 110),
         calls: 0,
     };
     let mut dispatcher = RefreshingBatchDispatcher {
@@ -224,12 +228,21 @@ fn prewrite_execution_refreshes_and_rebuilds_the_phase_with_stable_identities() 
         .execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 1)
         .unwrap();
 
-    assert_eq!(outcomes, vec![TabletId(10), TabletId(20)]);
-    assert_eq!(refresher.calls, 1);
+    assert_eq!(outcomes, vec![TabletId(30), TabletId(10)]);
+    assert_eq!(refresher.calls, 2);
     assert_eq!(dispatcher.attempts.len(), 3);
-    assert_eq!(dispatcher.attempts[0].route, route(10, 5, 100));
-    assert_eq!(dispatcher.attempts[1].route, route(10, 6, 110));
-    assert_eq!(dispatcher.attempts[2].route, route(20, 4, 200));
+    assert_eq!(dispatcher.attempts[0].route, route(20, 4, 200));
+    assert_eq!(dispatcher.attempts[1].route, route(30, 6, 110));
+    assert_eq!(dispatcher.attempts[2].route, route(10, 5, 100));
+    assert_eq!(
+        dispatcher.attempts[1]
+            .command
+            .pending_status
+            .as_ref()
+            .expect("the primary retry must carry the Pending status")
+            .participant_tablet_ids,
+        vec![30, 10]
+    );
     assert_eq!(
         dispatcher.attempts[0].participant_plans[0].command_id,
         dispatcher.attempts[1].participant_plans[0].command_id
@@ -378,7 +391,7 @@ fn prewrite_execution_bounds_route_refreshes_before_dispatching_again() {
 
     assert!(matches!(error, Error::TabletUnavailable { reason } if reason.contains("budget")));
     assert_eq!(dispatcher.calls, 2);
-    assert_eq!(refresher.calls, 1);
+    assert_eq!(refresher.calls, 2);
 }
 
 #[test]

@@ -41,6 +41,7 @@ use std::{
 };
 
 use crate::key::decode_row_key;
+use prost::Message;
 
 use ragnordb_common::{
     Error, Result,
@@ -152,6 +153,24 @@ pub trait MvccStorage {
     ) -> Result<IntentScanPage> {
         Err(Error::NotImplemented(
             "intent scanning is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Inspect a bounded page of intents that conflict with a foreground
+    /// snapshot read. The tablet owner invokes this before returning visible
+    /// scan rows so lock-only inserts and old committed values cannot hide a
+    /// read-conflicting intent.
+    fn scan_conflicting_intents(
+        &self,
+        _start: Option<&[u8]>,
+        _end: Option<&[u8]>,
+        _resume_after: Option<&[u8]>,
+        _read_ts: Timestamp,
+        _max_locks: usize,
+        _max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        Err(Error::NotImplemented(
+            "foreground scan intent inspection is not supported by this MVCC backend",
         ))
     }
 
@@ -928,6 +947,89 @@ impl MvccStorage for InMemoryMvcc {
             lock.validate().map_err(|error| {
                 Error::CorruptData(format!("intent scan found an invalid lock: {error}"))
             })?;
+            locks.push((key.clone(), lock.clone()));
+        }
+
+        Ok(IntentScanPage {
+            locks,
+            has_more: false,
+        })
+    }
+
+    fn scan_conflicting_intents(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        if max_locks == 0 {
+            return Err(Error::InvalidArgument(
+                "foreground scan intent max_locks must be greater than zero".to_string(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "foreground scan intent max_bytes must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "foreground scan intent resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(IntentScanPage {
+                    locks: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut locks = Vec::new();
+        let mut encoded_bytes = 0usize;
+        for (key, lock) in self.locks.range((lower, upper)) {
+            validate_encoded_key_argument(key, "foreground scan intent key")?;
+            lock.validate().map_err(|error| {
+                Error::CorruptData(format!("foreground scan found an invalid lock: {error}"))
+            })?;
+            if lock.start_timestamp > read_ts {
+                continue;
+            }
+
+            if locks.len() >= max_locks {
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            let encoded_lock = lock
+                .to_proto()
+                .map_err(|error| Error::CorruptData(error.to_string()))?
+                .encoded_len();
+            let entry_bytes = key.len().checked_add(encoded_lock).ok_or_else(|| {
+                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+            })?;
+            let next_bytes = encoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+            })?;
+            if next_bytes > max_bytes {
+                if locks.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "foreground scan intent byte budget is smaller than the first encoded lock"
+                            .to_string(),
+                    ));
+                }
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            encoded_bytes = next_bytes;
             locks.push((key.clone(), lock.clone()));
         }
 
@@ -2154,6 +2256,50 @@ mod tests {
             byte_budget
         );
         assert!(byte_page.has_more);
+    }
+
+    #[test]
+    fn foreground_intent_scan_finds_lock_only_keys_and_filters_future_locks() {
+        // A visible-row scan omits a newly inserted key until its transaction
+        // commits. Foreground range reads need this bounded lock view to avoid
+        // returning a silently incomplete result.
+        let keys = [encoded_key(1), encoded_key(2), encoded_key(3)];
+        let mut engine = InMemoryMvcc::new();
+        for (index, (key, start_timestamp)) in keys.iter().zip([3, 4, 9]).enumerate() {
+            engine.locks.insert(
+                key.clone(),
+                LockRecord {
+                    txn_id: TxnId(index as u64 + 1),
+                    primary_key: key.clone(),
+                    start_timestamp: Timestamp(start_timestamp),
+                    ttl_ms: 1_000,
+                    op: WriteKind::Put,
+                },
+            );
+        }
+
+        let first = engine
+            .scan_conflicting_intents(None, None, None, Timestamp(5), 1, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            first.locks,
+            vec![(keys[0].clone(), engine.locks[&keys[0]].clone())]
+        );
+        assert!(first.has_more);
+
+        let second = engine
+            .scan_conflicting_intents(None, None, Some(&keys[0]), Timestamp(5), 1, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            second.locks,
+            vec![(keys[1].clone(), engine.locks[&keys[1]].clone())]
+        );
+        assert!(!second.has_more);
+
+        let error = engine
+            .scan_conflicting_intents(None, None, None, Timestamp(5), 1, 1)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
     }
 
     #[test]

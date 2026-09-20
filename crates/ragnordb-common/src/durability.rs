@@ -173,6 +173,7 @@ impl DurabilityGate {
                 ..
             }
             | Error::RecoveryFailed { .. }
+            | Error::RecoveryFailedWithSource { .. }
             | Error::SnapshotPublicationFailed { .. } => None,
         };
 

@@ -36,7 +36,7 @@ pub struct TabletCommandBatchEnvelope {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommand {
-    #[prost(oneof = "tablet_command::Command", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "tablet_command::Command", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub command: ::core::option::Option<tablet_command::Command>,
 }
 /// Nested message and enum types in `TabletCommand`.
@@ -57,6 +57,8 @@ pub mod tablet_command {
         CatalogUpdate(super::CatalogCommand),
         #[prost(message, tag = "7")]
         Noop(super::NoopCommand),
+        #[prost(message, tag = "8")]
+        PublishAbortedTransactionStatus(super::PublishAbortedTransactionStatus),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -71,6 +73,10 @@ pub struct PrewriteCommand {
     pub ttl_ms: u64,
     #[prost(message, repeated, tag = "9")]
     pub writes: ::prost::alloc::vec::Vec<WriteEntry>,
+    /// Present only on the primary participant. The state machine installs
+    /// this pending decision atomically with the primary intent batch.
+    #[prost(message, optional, tag = "10")]
+    pub pending_status: ::core::option::Option<super::mvcc::TxnStatusRecord>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommitCommand {
@@ -82,6 +88,17 @@ pub struct CommitCommand {
     pub commit_timestamp: ::core::option::Option<super::ids::Timestamp>,
     #[prost(bytes = "vec", repeated, tag = "5")]
     pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Present only on the primary participant. Publication is atomic with
+    /// committing the primary intent.
+    #[prost(message, optional, tag = "6")]
+    pub committed_status: ::core::option::Option<super::mvcc::TxnStatusRecord>,
+}
+/// Publish a terminal abort decision after the coordinator has applied rollback
+/// on every participant. This command changes status state only.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishAbortedTransactionStatus {
+    #[prost(message, optional, tag = "1")]
+    pub status_record: ::core::option::Option<super::mvcc::TxnStatusRecord>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RollbackCommand {
@@ -166,6 +183,9 @@ pub struct TabletStateMachineSnapshot {
     pub logical_client_retry_horizons: ::prost::alloc::vec::Vec<
         LogicalClientRetryHorizon,
     >,
+    /// Old snapshots omit this field and restore with no durable status entries.
+    #[prost(message, repeated, tag = "8")]
+    pub transaction_statuses: ::prost::alloc::vec::Vec<super::mvcc::TxnStatusRecord>,
 }
 /// last applied request and cached result for one client in this Raft group
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -259,6 +279,7 @@ pub enum CachedTabletCommandResult {
     Commit = 4,
     Rollback = 5,
     ResolveIntent = 6,
+    PublishAbortedTransactionStatus = 7,
 }
 impl CachedTabletCommandResult {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -274,6 +295,9 @@ impl CachedTabletCommandResult {
             Self::Commit => "CACHED_TABLET_COMMAND_RESULT_COMMIT",
             Self::Rollback => "CACHED_TABLET_COMMAND_RESULT_ROLLBACK",
             Self::ResolveIntent => "CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT",
+            Self::PublishAbortedTransactionStatus => {
+                "CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -288,6 +312,9 @@ impl CachedTabletCommandResult {
             "CACHED_TABLET_COMMAND_RESULT_COMMIT" => Some(Self::Commit),
             "CACHED_TABLET_COMMAND_RESULT_ROLLBACK" => Some(Self::Rollback),
             "CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT" => Some(Self::ResolveIntent),
+            "CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS" => {
+                Some(Self::PublishAbortedTransactionStatus)
+            }
             _ => None,
         }
     }

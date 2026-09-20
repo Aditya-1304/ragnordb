@@ -8,7 +8,9 @@ use ragnordb_common::{
     },
 };
 use ragnordb_storage::key::{encode_row_key, make_row_key};
-use ragnordb_txn::{DistributedTransactionCoordinator, ParticipantRoute, Transaction};
+use ragnordb_txn::{
+    DistributedTransactionCoordinator, ParticipantRoute, Transaction, TransactionReadSpan,
+};
 use ragnordb_txn::{
     ParticipantCommandPlan, ParticipantDispatchError, ParticipantPhaseDispatcher,
     ParticipantRouteRefresher,
@@ -77,10 +79,17 @@ fn routed_coordinator() -> DistributedTransactionCoordinator {
 fn coordinator_tracks_transaction_state_and_route_hints() {
     let primary_key = key(1);
     let read_key = key(9);
+    let mut transaction = transaction();
+    transaction.record_read(read_key.clone()).unwrap();
+    let read_span = TransactionReadSpan::new(TableId(1), None, None).unwrap();
+    transaction.record_read_span(read_span.clone());
     let mut coordinator =
-        DistributedTransactionCoordinator::new(transaction(), root_request(), primary_key.clone())
+        DistributedTransactionCoordinator::new(transaction, root_request(), primary_key.clone())
             .unwrap();
 
+    // Re-recording a point read at the coordinator boundary remains a set
+    // insert, while reads collected by SQL before coordinator construction are
+    // carried through unchanged.
     coordinator.record_read(read_key.clone()).unwrap();
     coordinator
         .set_participant_route(primary_key.clone(), route(10, 4, 100))
@@ -95,6 +104,10 @@ fn coordinator_tracks_transaction_state_and_route_hints() {
     assert_eq!(coordinator.root_request_id(), root_request());
     assert_eq!(coordinator.primary_key(), primary_key.as_slice());
     assert_eq!(coordinator.read_set().len(), 1);
+    assert_eq!(
+        coordinator.read_spans().iter().cloned().collect::<Vec<_>>(),
+        [read_span]
+    );
     assert_eq!(coordinator.write_set().len(), 2);
     assert_eq!(
         coordinator

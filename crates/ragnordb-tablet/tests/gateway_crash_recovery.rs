@@ -25,10 +25,10 @@ use ragnordb_tablet::{
 use ragnordb_txn::{
     CommitBatchPlan, CommitPhaseDispatcher, CommitPhasePlan, DistributedTransactionCoordinator,
     InMemoryTransactionStatusStore, LocalTransactionManager, ParticipantCommandPlan,
-    ParticipantDispatchError, ParticipantRoute, ParticipantRouteRefresher,
-    PrewriteBatchDispatcher, PrewriteBatchPlan, Transaction, TransactionStatusKey,
-    TransactionStatusLocation, TransactionStatusLookupError, TransactionStatusReader,
-    TransactionStatusRouteResolver, TransactionStatusStore, plan_intent_resolution,
+    ParticipantDispatchError, ParticipantRoute, ParticipantRouteRefresher, PrewriteBatchDispatcher,
+    PrewriteBatchPlan, Transaction, TransactionStatusKey, TransactionStatusLocation,
+    TransactionStatusLookupError, TransactionStatusReader, TransactionStatusRouteResolver,
+    TransactionStatusStore, plan_intent_resolution,
 };
 
 const TABLE_ID: TableId = TableId(1);
@@ -89,8 +89,13 @@ fn split_secondary_route() -> ParticipantRoute {
 }
 
 fn stale_status_route() -> ParticipantRoute {
-    ParticipantRoute::new(PRIMARY_TABLET, TABLET_EPOCH - 1, RaftGroupId(101), ReplicaId(1))
-        .unwrap()
+    ParticipantRoute::new(
+        PRIMARY_TABLET,
+        TABLET_EPOCH - 1,
+        RaftGroupId(101),
+        ReplicaId(1),
+    )
+    .unwrap()
 }
 
 fn root_request() -> ClientRequestId {
@@ -101,9 +106,7 @@ fn root_request() -> ClientRequestId {
     }
 }
 
-fn transaction_and_routes(
-    txn_id: TxnId,
-) -> (DistributedTransactionCoordinator, Vec<u8>) {
+fn transaction_and_routes(txn_id: TxnId) -> (DistributedTransactionCoordinator, Vec<u8>) {
     let primary_key = encoded_key(700);
     let secondary_key = encoded_key(701);
     let mut transaction = Transaction::new(txn_id, Timestamp(100)).unwrap();
@@ -114,12 +117,9 @@ fn transaction_and_routes(
         .buffer_put(secondary_key.clone(), encoded_row(701, "secondary"))
         .unwrap();
 
-    let mut coordinator = DistributedTransactionCoordinator::new(
-        transaction,
-        root_request(),
-        primary_key.clone(),
-    )
-    .unwrap();
+    let mut coordinator =
+        DistributedTransactionCoordinator::new(transaction, root_request(), primary_key.clone())
+            .unwrap();
     coordinator
         .set_participant_route(primary_key.clone(), primary_route())
         .unwrap();
@@ -314,14 +314,17 @@ impl<'a> GatewayProcess<'a> {
                 reason: format!("tablet {} is unavailable", route.tablet_id.0),
             })?;
 
-        state_machine.apply(envelope).map(|_| ()).map_err(|error| match error {
-            TabletCommandApplyError::WriteConflict { reason } => {
-                ParticipantDispatchError::WriteConflict { reason }
-            }
-            other => ParticipantDispatchError::Rejected {
-                reason: other.to_string(),
-            },
-        })
+        state_machine
+            .apply(envelope)
+            .map(|_| ())
+            .map_err(|error| match error {
+                TabletCommandApplyError::WriteConflict { reason } => {
+                    ParticipantDispatchError::WriteConflict { reason }
+                }
+                other => ParticipantDispatchError::Rejected {
+                    reason: other.to_string(),
+                },
+            })
     }
 
     fn lookup_status(
@@ -333,7 +336,10 @@ impl<'a> GatewayProcess<'a> {
             .status_store
             .read_status(location.status_key())?
             .ok_or_else(|| Error::TabletUnavailable {
-                reason: format!("status for transaction {} is unavailable", location.txn_id().0),
+                reason: format!(
+                    "status for transaction {} is unavailable",
+                    location.txn_id().0
+                ),
             })?;
         let mut resolver = RestartRouteResolver {
             current: primary_route(),
@@ -371,13 +377,16 @@ impl<'a> GatewayProcess<'a> {
                 .locks;
 
             for (key, lock) in intents {
-                let mut location = TransactionStatusLocation::new(lock.txn_id, lock.primary_key.clone())?;
+                let mut location =
+                    TransactionStatusLocation::new(lock.txn_id, lock.primary_key.clone())?;
                 let mut status = self.lookup_status(&mut location)?;
 
                 if status.status == TxnStatus::Pending {
-                    let deadline = status.lease_deadline_ms.ok_or_else(|| Error::CorruptData(
-                        "pending recovery status has no lease deadline".to_string(),
-                    ))?;
+                    let deadline = status.lease_deadline_ms.ok_or_else(|| {
+                        Error::CorruptData(
+                            "pending recovery status has no lease deadline".to_string(),
+                        )
+                    })?;
                     if now_ms < deadline {
                         return Err(Error::TabletUnavailable {
                             reason: format!(
@@ -440,12 +449,12 @@ impl PrewriteBatchDispatcher for GatewayProcess<'_> {
         plan: &PrewriteBatchPlan,
     ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
         self.prewrite_dispatches += 1;
-        let participant_plan = plan
-            .participant_plans
-            .first()
-            .ok_or_else(|| ParticipantDispatchError::Rejected {
-                reason: "prewrite batch has no participant identity".to_string(),
-            })?;
+        let participant_plan =
+            plan.participant_plans
+                .first()
+                .ok_or_else(|| ParticipantDispatchError::Rejected {
+                    reason: "prewrite batch has no participant identity".to_string(),
+                })?;
         self.apply_planned_command(
             plan.route,
             participant_plan,
@@ -470,13 +479,11 @@ impl CommitPhaseDispatcher for GatewayProcess<'_> {
         &mut self,
         plan: &CommitPhasePlan,
     ) -> std::result::Result<Self::PrimaryOutput, ParticipantDispatchError> {
-        let participant_plan = plan
-            .primary
-            .participant_plans
-            .first()
-            .ok_or_else(|| ParticipantDispatchError::Rejected {
+        let participant_plan = plan.primary.participant_plans.first().ok_or_else(|| {
+            ParticipantDispatchError::Rejected {
                 reason: "primary commit batch has no participant identity".to_string(),
-            })?;
+            }
+        })?;
         self.apply_planned_command(
             plan.primary.route,
             participant_plan,
@@ -505,12 +512,12 @@ impl CommitPhaseDispatcher for GatewayProcess<'_> {
             });
         }
 
-        let participant_plan = plan
-            .participant_plans
-            .first()
-            .ok_or_else(|| ParticipantDispatchError::Rejected {
-                reason: "secondary commit batch has no participant identity".to_string(),
-            })?;
+        let participant_plan =
+            plan.participant_plans
+                .first()
+                .ok_or_else(|| ParticipantDispatchError::Rejected {
+                    reason: "secondary commit batch has no participant identity".to_string(),
+                })?;
         self.apply_planned_command(
             plan.route,
             participant_plan,
@@ -589,10 +596,7 @@ fn gateway_crash_after_prewrite_restarts_and_recovers_all_participants() {
         coordinator.execute_prewrite_with_retry(30_000, &mut refresher, &mut gateway, 1)
     };
 
-    assert!(matches!(
-        result,
-        Err(Error::RequestOutcomeUnknown { .. })
-    ));
+    assert!(matches!(result, Err(Error::RequestOutcomeUnknown { .. })));
     assert_eq!(
         cluster
             .tablets
@@ -614,14 +618,18 @@ fn gateway_crash_after_prewrite_restarts_and_recovers_all_participants() {
     assert_eq!(resolved, 2);
     assert_eq!(refreshes, 2);
     assert_eq!(cluster.status(txn_id).status, TxnStatus::Aborted);
-    assert!(cluster
-        .tablets
-        .values()
-        .all(|tablet| tablet.tablet().stats().locks == 0));
-    assert!(cluster
-        .tablets
-        .values()
-        .all(|tablet| tablet.tablet().stats().write_records == 1));
+    assert!(
+        cluster
+            .tablets
+            .values()
+            .all(|tablet| tablet.tablet().stats().locks == 0)
+    );
+    assert!(
+        cluster
+            .tablets
+            .values()
+            .all(|tablet| tablet.tablet().stats().write_records == 1)
+    );
 }
 
 #[test]
@@ -643,19 +651,17 @@ fn gateway_crash_after_primary_commit_restarts_and_resolves_secondary() {
         let mut gateway = GatewayProcess::new(&mut cluster, false, true);
         let mut timestamps = LocalTransactionManager::new();
         let mut refresher = UnexpectedRouteRefresh;
-        coordinator.execute_commit_with_retry(
-            &mut timestamps,
-            &mut refresher,
-            &mut gateway,
-            1,
-        )
+        coordinator.execute_commit_with_retry(&mut timestamps, &mut refresher, &mut gateway, 1)
     };
     assert!(matches!(
         commit_result,
         Err(Error::RequestOutcomeUnknown { .. })
     ));
     assert_eq!(cluster.status(txn_id).status, TxnStatus::Committed);
-    assert_eq!(cluster.status(txn_id).commit_timestamp, Some(Timestamp(101)));
+    assert_eq!(
+        cluster.status(txn_id).commit_timestamp,
+        Some(Timestamp(101))
+    );
 
     cluster.restart_participants();
     let (resolved, refreshes) = {
@@ -685,7 +691,6 @@ fn gateway_crash_after_primary_commit_restarts_and_resolves_secondary() {
             .unwrap(),
         Some(row(701, "secondary"))
     );
-
 }
 
 /// Realistic bug caught: after the primary/status commit is durable, a split

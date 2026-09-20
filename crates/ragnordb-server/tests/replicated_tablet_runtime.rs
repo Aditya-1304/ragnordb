@@ -1,27 +1,33 @@
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use ragnordb_common::{
-    Error,
+    Error, Result,
     catalog_codec::{ColumnDefinition, DataType},
-    codec::{Row, Value, WriteKind},
-    command_codec::{SingleShardCommitCommand, TabletCommand, WriteEntry},
+    codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
+    command_codec::{PrewriteCommand, SingleShardCommitCommand, TabletCommand, WriteEntry},
     encoding::decode_row,
     ids::{
         ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
-        RequestId, Timestamp, TxnId,
+        RequestId, TableId, Timestamp, TxnId,
     },
     metadata_codec::CreateTableRequest,
+    rpc_codec::{TabletPointReadInspection, TabletRoute, TabletScanBatch},
 };
-use ragnordb_exec::{ExecutionResult, SqlSession};
+use ragnordb_exec::{ExecutionResult, SqlSession, TabletGateway, TabletScanRoute};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
     data_directory_lock::DataDirectoryLock,
     database::{LocalDatabase, SharedLocalDatabase},
-    multiraft_runtime::MultiRaftRuntime,
+    multiraft_runtime::{MetadataTimestampReservationClient, MultiRaftRuntime},
+    rpc::TabletRpcClient,
 };
 use ragnordb_storage::key::make_row_key;
 use tempfile::TempDir;
@@ -34,7 +40,376 @@ fn unused_address() -> std::net::SocketAddr {
 struct TestNode {
     database: SharedLocalDatabase,
     runtime: MultiRaftRuntime,
-    _data: TempDir,
+    _data: Arc<TempDir>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCommandIdentity {
+    route: TabletRoute,
+    request_id: RequestId,
+    logical_command_id: LogicalCommandId,
+}
+
+#[derive(Default)]
+struct RuntimeFaultState {
+    primary_prewrite_txn: Option<TxnId>,
+    primary_prewrite_tablet: Option<ragnordb_common::ids::TabletId>,
+    primary_prewrite_identity: Option<CapturedCommandIdentity>,
+    primary_commit_txn: Option<TxnId>,
+    primary_commit_tablet: Option<ragnordb_common::ids::TabletId>,
+    primary_commit_status: Option<TxnStatusRecord>,
+    primary_commit_identity: Option<CapturedCommandIdentity>,
+    secondary_commit_attempts: Vec<(ragnordb_common::ids::TabletId, Timestamp)>,
+    resolved_intents: Vec<(TxnId, Option<Timestamp>, LogicalCommandId)>,
+    events: Vec<RuntimeCommandEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCommandEvent {
+    PrewriteApplied {
+        txn_id: TxnId,
+        tablet_id: ragnordb_common::ids::TabletId,
+    },
+    CommitApplied {
+        txn_id: TxnId,
+        tablet_id: ragnordb_common::ids::TabletId,
+        commit_timestamp: Timestamp,
+        primary: bool,
+    },
+    RollbackApplied {
+        txn_id: TxnId,
+        tablet_id: ragnordb_common::ids::TabletId,
+    },
+    AbortStatusApplied {
+        txn_id: TxnId,
+        tablet_id: ragnordb_common::ids::TabletId,
+    },
+    IntentResolutionApplied {
+        txn_id: TxnId,
+        tablet_id: ragnordb_common::ids::TabletId,
+    },
+}
+
+/// Production-gateway wrapper used by runtime tests to stop at exact
+/// participant boundaries while leaving every successful operation on the
+/// real tablet RPC, Raft, and A-WAL path.
+struct RuntimeFaultGateway {
+    inner: TabletRpcClient,
+    state: Mutex<RuntimeFaultState>,
+    leader_overrides: Mutex<BTreeMap<RaftGroupId, ReplicaId>>,
+    fail_secondary_prewrite_once: AtomicBool,
+    fail_secondary_commit_once: AtomicBool,
+}
+
+impl RuntimeFaultGateway {
+    fn new(
+        inner: TabletRpcClient,
+        fail_secondary_prewrite_once: bool,
+        fail_secondary_commit_once: bool,
+    ) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(RuntimeFaultState::default()),
+            leader_overrides: Mutex::new(BTreeMap::new()),
+            fail_secondary_prewrite_once: AtomicBool::new(fail_secondary_prewrite_once),
+            fail_secondary_commit_once: AtomicBool::new(fail_secondary_commit_once),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RuntimeFaultState> {
+        self.state.lock().unwrap()
+    }
+
+    fn set_leader_hint(&self, group_id: RaftGroupId, leader: ReplicaId) {
+        self.leader_overrides
+            .lock()
+            .unwrap()
+            .insert(group_id, leader);
+    }
+}
+
+impl TabletGateway for RuntimeFaultGateway {
+    fn lookup_tablet_route(&self, table_id: TableId, key: &[u8]) -> Result<TabletRoute> {
+        let mut route = TabletGateway::lookup_tablet_route(&self.inner, table_id, key)?;
+        if let Some(leader) = self
+            .leader_overrides
+            .lock()
+            .unwrap()
+            .get(&route.raft_group_id)
+            .copied()
+        {
+            route.leader_replica_id = leader;
+        }
+        Ok(route)
+    }
+
+    fn inspect_point(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        row_key: ragnordb_common::ids::RowKey,
+        read_timestamp: Timestamp,
+        timeout: Duration,
+    ) -> Result<TabletPointReadInspection> {
+        TabletGateway::inspect_point(
+            &self.inner,
+            route,
+            request_id,
+            row_key,
+            read_timestamp,
+            timeout,
+        )
+    }
+
+    fn transaction_status(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        txn_id: TxnId,
+        timeout: Duration,
+    ) -> Result<Option<TxnStatusRecord>> {
+        TabletGateway::transaction_status(&self.inner, route, request_id, txn_id, timeout)
+    }
+
+    fn read_point(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        row_key: ragnordb_common::ids::RowKey,
+        read_timestamp: Timestamp,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        TabletGateway::read_point(
+            &self.inner,
+            route,
+            request_id,
+            row_key,
+            read_timestamp,
+            timeout,
+        )
+    }
+
+    fn lookup_scan_routes(
+        &self,
+        table_id: TableId,
+        span: &ragnordb_tablet::ScanSpan,
+    ) -> Result<Vec<TabletScanRoute>> {
+        TabletGateway::lookup_scan_routes(&self.inner, table_id, span)
+    }
+
+    fn scan_page(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        span: &ragnordb_tablet::ScanSpan,
+        resume_after: Option<&[u8]>,
+        read_timestamp: Timestamp,
+        max_rows: u32,
+        max_bytes: u32,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        TabletGateway::scan_page(
+            &self.inner,
+            route,
+            request_id,
+            span,
+            resume_after,
+            read_timestamp,
+            max_rows,
+            max_bytes,
+            timeout,
+        )
+    }
+
+    fn submit_command(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<ragnordb_tablet::command::TabletCommandApplyOutcome> {
+        TabletGateway::submit_command(&self.inner, route, request_id, command, timeout)
+    }
+
+    fn submit_command_with_identity(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<ragnordb_tablet::command::TabletCommandApplyOutcome> {
+        self.submit_command_with_identity_and_ack(
+            route,
+            request_id,
+            logical_command_id,
+            None,
+            command,
+            timeout,
+        )
+    }
+
+    fn submit_command_with_identity_and_ack(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        acknowledged_through: Option<u64>,
+        command: TabletCommand,
+        timeout: Duration,
+    ) -> Result<ragnordb_tablet::command::TabletCommandApplyOutcome> {
+        let identity = CapturedCommandIdentity {
+            route: route.clone(),
+            request_id: request_id.clone(),
+            logical_command_id,
+        };
+
+        let secondary_prewrite = match &command {
+            TabletCommand::Prewrite(prewrite) if prewrite.pending_status.is_none() => {
+                let state = self.state();
+                state
+                    .primary_prewrite_txn
+                    .filter(|txn_id| *txn_id == prewrite.txn_id)
+                    .zip(state.primary_prewrite_tablet)
+                    .filter(|(_, primary_tablet)| *primary_tablet != route.tablet_id)
+                    .map(|_| prewrite.txn_id)
+            }
+            _ => None,
+        };
+        if secondary_prewrite.is_some()
+            && self
+                .fail_secondary_prewrite_once
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(Error::WriteConflict(format!(
+                "injected secondary prewrite conflict for transaction {}",
+                secondary_prewrite.unwrap().0
+            )));
+        }
+
+        let secondary_commit = match &command {
+            TabletCommand::Commit(commit) if commit.committed_status.is_none() => {
+                let mut state = self.state();
+                let candidate = state
+                    .primary_commit_txn
+                    .filter(|txn_id| *txn_id == commit.txn_id)
+                    .zip(state.primary_commit_tablet)
+                    .filter(|(_, primary_tablet)| *primary_tablet != route.tablet_id)
+                    .map(|_| (route.tablet_id, commit.commit_timestamp));
+                if let Some(candidate) = candidate {
+                    state.secondary_commit_attempts.push(candidate);
+                }
+                candidate
+            }
+            _ => None,
+        };
+        let primary_commit_applied =
+            secondary_commit.is_some_and(|_| self.state().primary_commit_status.is_some());
+        if primary_commit_applied
+            && self
+                .fail_secondary_commit_once
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(Error::TabletUnavailable {
+                reason: "injected stop after primary commit and before secondary commit"
+                    .to_string(),
+            });
+        }
+
+        let outcome = TabletGateway::submit_command_with_identity_and_ack(
+            &self.inner,
+            route,
+            request_id,
+            logical_command_id,
+            acknowledged_through,
+            command.clone(),
+            timeout,
+        )?;
+
+        let mut state = self.state();
+        match command {
+            TabletCommand::Prewrite(prewrite) if prewrite.pending_status.is_some() => {
+                state.primary_prewrite_txn = Some(prewrite.txn_id);
+                state.primary_prewrite_tablet = Some(route.tablet_id);
+                state.primary_prewrite_identity = Some(identity);
+                state.events.push(RuntimeCommandEvent::PrewriteApplied {
+                    txn_id: prewrite.txn_id,
+                    tablet_id: route.tablet_id,
+                });
+            }
+            TabletCommand::Prewrite(prewrite) => {
+                state.events.push(RuntimeCommandEvent::PrewriteApplied {
+                    txn_id: prewrite.txn_id,
+                    tablet_id: route.tablet_id,
+                });
+            }
+            TabletCommand::Commit(commit) if commit.committed_status.is_some() => {
+                state.primary_commit_txn = Some(commit.txn_id);
+                state.primary_commit_tablet = Some(route.tablet_id);
+                state.primary_commit_status = commit.committed_status;
+                state.primary_commit_identity = Some(identity);
+                state.events.push(RuntimeCommandEvent::CommitApplied {
+                    txn_id: commit.txn_id,
+                    tablet_id: route.tablet_id,
+                    commit_timestamp: commit.commit_timestamp,
+                    primary: true,
+                });
+            }
+            TabletCommand::Commit(commit) => {
+                state.events.push(RuntimeCommandEvent::CommitApplied {
+                    txn_id: commit.txn_id,
+                    tablet_id: route.tablet_id,
+                    commit_timestamp: commit.commit_timestamp,
+                    primary: false,
+                });
+            }
+            TabletCommand::Rollback(rollback) => {
+                state.events.push(RuntimeCommandEvent::RollbackApplied {
+                    txn_id: rollback.txn_id,
+                    tablet_id: route.tablet_id,
+                });
+            }
+            TabletCommand::PublishAbortedTransactionStatus(abort) => {
+                state.events.push(RuntimeCommandEvent::AbortStatusApplied {
+                    txn_id: abort.status_record.txn_id,
+                    tablet_id: route.tablet_id,
+                });
+            }
+            TabletCommand::ResolveIntent(resolve) => {
+                state.resolved_intents.push((
+                    resolve.txn_id,
+                    resolve.commit_timestamp,
+                    logical_command_id,
+                ));
+                state
+                    .events
+                    .push(RuntimeCommandEvent::IntentResolutionApplied {
+                        txn_id: resolve.txn_id,
+                        tablet_id: route.tablet_id,
+                    });
+            }
+            _ => {}
+        }
+        Ok(outcome)
+    }
+
+    fn query_original_outcome(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        logical_command_id: LogicalCommandId,
+        timeout: Duration,
+    ) -> Result<Option<ragnordb_common::command_codec::CachedTabletCommandOutcome>> {
+        TabletGateway::query_original_outcome(
+            &self.inner,
+            route,
+            request_id,
+            logical_command_id,
+            timeout,
+        )
+    }
 }
 
 fn start_failover_test_node(
@@ -42,7 +417,20 @@ fn start_failover_test_node(
     all_seeds: Vec<SeedNodeConfig>,
     cluster_id: String,
 ) -> TestNode {
-    let data = tempfile::tempdir().unwrap();
+    start_failover_test_node_with_data(
+        Arc::new(tempfile::tempdir().unwrap()),
+        seed,
+        all_seeds,
+        cluster_id,
+    )
+}
+
+fn start_failover_test_node_with_data(
+    data: Arc<TempDir>,
+    seed: SeedNodeConfig,
+    all_seeds: Vec<SeedNodeConfig>,
+    cluster_id: String,
+) -> TestNode {
     let config = NodeConfig {
         node_id: seed.id,
         data_dir: data.path().to_path_buf(),
@@ -79,12 +467,29 @@ fn start_failover_test_node(
     let runtime =
         MultiRaftRuntime::start_from_shared_recovery(&config, wal, database.clone(), recovered)
             .unwrap();
+    install_test_timestamp_manager(&database, &runtime);
 
     TestNode {
         database,
         runtime,
         _data: data,
     }
+}
+
+/// Install the same metadata-backed timestamp allocator used by production
+/// server startup so recovered SQL reads cannot reuse a timestamp below the
+/// durable frontier of any replicated tablet.
+fn install_test_timestamp_manager(database: &SharedLocalDatabase, runtime: &MultiRaftRuntime) {
+    let durable_frontier = runtime
+        .metadata_handle()
+        .state_snapshot()
+        .timestamp_reserved_until();
+    let provider =
+        MetadataTimestampReservationClient::new(runtime.metadata_control(), Duration::from_secs(5));
+    database
+        .blocking_lock()
+        .install_reserved_timestamp_manager(provider, durable_frontier, 1_024, 256)
+        .expect("metadata-backed timestamp allocation must install");
 }
 
 async fn start_failover_test_nodes() -> Vec<TestNode> {
@@ -154,6 +559,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
             storage_class: "default".to_string(),
         })
         .collect::<Vec<_>>();
+    let cluster_id = "runtime-test".to_string();
     // Replicated startup waits for metadata initialization to commit and apply.
     // Start every configured node together so the metadata Raft group can form
     // its initial quorum before any startup call waits for completion.
@@ -162,9 +568,10 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
         .cloned()
         .map(|seed| {
             let all_seeds = seeds.clone();
+            let cluster_id = cluster_id.clone();
 
             tokio::task::spawn_blocking(move || {
-                let data = tempfile::tempdir().unwrap();
+                let data = Arc::new(tempfile::tempdir().unwrap());
                 let config = NodeConfig {
                     node_id: seed.id,
                     data_dir: data.path().to_path_buf(),
@@ -174,7 +581,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
                     statement_timeout_ms: 5_000,
                     shutdown_grace_period_ms: 1_000,
                     statement_logging: ragnordb_server::config::StatementLogging::Off,
-                    cluster_id: Some("runtime-test".to_string()),
+                    cluster_id: Some(cluster_id),
                     bootstrap: true,
                     seed_nodes: all_seeds,
                     snapshot_interval_entries: 100_000,
@@ -206,6 +613,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
                     recovered,
                 )
                 .unwrap();
+                install_test_timestamp_manager(&database, &runtime);
 
                 TestNode {
                     database,
@@ -299,6 +707,7 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert!(topology.definition.table_id > 1);
+    let users_table_id = TableId(topology.definition.table_id);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if nodes
@@ -346,16 +755,816 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
         "ReadIndex barriers must not append one no-op per latest-read waiter"
     );
 
-    let leader_catalog = nodes[leader].database.clone();
-    tokio::task::spawn_blocking(move || {
-        leader_catalog.blocking_lock().execute_sql(
-            &mut SqlSession::new(),
-            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)",
+    for node in &nodes {
+        let creator = node.runtime.metadata_table_creator();
+        node.database
+            .lock()
+            .await
+            .replace_metadata_table_creator(creator);
+    }
+
+    // A transaction spanning two metadata-owned tables exercises two real
+    // tablet Raft groups while keeping online split/merge outside this test.
+    let create_secondary_table_database = nodes[leader].database.clone();
+    let secondary_table = tokio::task::spawn_blocking(move || {
+        create_secondary_table_database
+            .blocking_lock()
+            .execute_sql_with_metadata_request(
+                &mut SqlSession::with_client_id(7002),
+                "CREATE TABLE metadata_orders (id INT PRIMARY KEY, description TEXT NOT NULL)",
+                Some(RequestId {
+                    client_id: 0x7002,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(2),
+                }),
+                Duration::from_secs(5),
+            )
+    })
+    .await
+    .unwrap()
+    .expect("the second metadata-owned table must be created through metadata Raft");
+    let ExecutionResult::CreatedTable {
+        table_id: secondary_table_id,
+    } = secondary_table
+    else {
+        panic!("second metadata table creation must return its assigned table ID");
+    };
+    let secondary_descriptors = nodes[leader]
+        .runtime
+        .metadata_table_creator()
+        .table_descriptors(secondary_table_id)
+        .expect("metadata must publish the second table's tablet descriptor");
+    assert_eq!(secondary_descriptors.len(), 1);
+    let secondary_group_id = secondary_descriptors[0].raft_group_id;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if nodes.iter().all(|node| {
+                node.runtime
+                    .host_status()
+                    .groups
+                    .iter()
+                    .any(|group| group.identity.raft_group_id == secondary_group_id)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every assigned node must materialize the second metadata tablet group");
+
+    let commit_fault_gateway = Arc::new(RuntimeFaultGateway::new(
+        nodes[leader].runtime.tablet_rpc_client(),
+        false,
+        true,
+    ));
+    nodes[leader]
+        .database
+        .lock()
+        .await
+        .replace_tablet_gateway(commit_fault_gateway.clone());
+
+    let cross_table_database = nodes[leader].database.clone();
+    let cross_table_result = tokio::task::spawn_blocking(move || {
+        let mut database = cross_table_database.blocking_lock();
+        let mut session = SqlSession::with_client_id(7003);
+        database.execute_sql(&mut session, "BEGIN")?;
+        database.execute_sql(
+            &mut session,
+            "INSERT INTO metadata_users (id, name) VALUES (8, 'txn-user')",
+        )?;
+        database.execute_sql(
+            &mut session,
+            "INSERT INTO metadata_orders (id, description) VALUES (8, 'txn-order')",
+        )?;
+        let commit = database.execute_sql(&mut session, "COMMIT")?;
+        let user = database.execute_sql(
+            &mut session,
+            "SELECT id, name FROM metadata_users WHERE id = 8",
+        )?;
+        Ok::<_, Error>((commit, user))
+    })
+    .await
+    .unwrap();
+    let (cross_table_commit, cross_table_user) =
+        cross_table_result.expect("production SQL must commit writes across two tablet groups");
+    let ExecutionResult::TransactionCommitted {
+        commit_ts: Some(cross_table_commit_ts),
+        committed_writes: 2,
+        ..
+    } = cross_table_commit
+    else {
+        panic!("two-tablet SQL transaction must report its applied commit timestamp");
+    };
+    assert!(cross_table_commit_ts.0 > 0);
+    assert_eq!(
+        cross_table_user,
+        ExecutionResult::Query(ragnordb_exec::ResultSet {
+            columns: vec![
+                ragnordb_exec::ResultColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                ragnordb_exec::ResultColumn {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            rows: vec![ragnordb_common::codec::Row {
+                values: vec![Value::Int(8), Value::Text("txn-user".to_string())],
+            }],
+        })
+    );
+    let (
+        committed_txn_id,
+        committed_status,
+        primary_prewrite_identity,
+        primary_commit_identity,
+        secondary_commit_attempts,
+    ) = {
+        let state = commit_fault_gateway.state();
+        (
+            state
+                .primary_commit_txn
+                .expect("the primary commit must be observed"),
+            state
+                .primary_commit_status
+                .clone()
+                .expect("the primary status must be durable"),
+            state
+                .primary_prewrite_identity
+                .clone()
+                .expect("the primary prewrite identity must be captured"),
+            state
+                .primary_commit_identity
+                .clone()
+                .expect("the primary commit identity must be captured"),
+            state.secondary_commit_attempts.clone(),
         )
+    };
+    assert_eq!(committed_status.txn_id, committed_txn_id);
+    assert_eq!(committed_status.status, TxnStatus::Committed);
+    assert_eq!(
+        committed_status.commit_timestamp,
+        Some(cross_table_commit_ts)
+    );
+    assert_eq!(
+        primary_prewrite_identity.logical_command_id.kind,
+        CommandKind::Prewrite
+    );
+    assert_eq!(
+        primary_commit_identity.logical_command_id.kind,
+        CommandKind::Commit
+    );
+    assert_eq!(
+        secondary_commit_attempts,
+        vec![(secondary_descriptors[0].tablet_id, cross_table_commit_ts)],
+        "every participant must use the same commit timestamp"
+    );
+
+    let primary_key = make_row_key(users_table_id, &[Value::Int(8)]).unwrap();
+    let secondary_key = make_row_key(secondary_table_id, &[Value::Int(8)]).unwrap();
+    let secondary_route = TabletGateway::lookup_tablet_route(
+        commit_fault_gateway.as_ref(),
+        secondary_table_id,
+        &secondary_key.primary_key_bytes,
+    )
+    .expect("metadata must route the secondary transaction key");
+    let secondary_inspection = TabletGateway::inspect_point(
+        commit_fault_gateway.as_ref(),
+        &secondary_route,
+        RequestId {
+            client_id: 0x7007,
+            sequence: 1,
+            raft_group_id: secondary_route.raft_group_id,
+        },
+        secondary_key.clone(),
+        Timestamp(u64::MAX),
+        Duration::from_secs(5),
+    )
+    .expect("the participant must report the unresolved secondary intent");
+    assert_eq!(
+        secondary_inspection.intent.as_ref().map(|lock| lock.txn_id),
+        Some(committed_txn_id)
+    );
+
+    let primary_group_id = topology.tablets[0].raft_group_id;
+    let restart_index = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(index) = nodes.iter().position(|node| {
+                node.runtime
+                    .host_status()
+                    .groups
+                    .iter()
+                    .find(|group| group.identity.raft_group_id == primary_group_id)
+                    .is_some_and(|group| group.leader_replica_id == Some(group.identity.replica_id))
+            }) {
+                break index;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the primary status tablet must have a hosted leader");
+    let restart_group_frontiers = [primary_group_id, secondary_group_id].map(|group_id| {
+        nodes[restart_index]
+            .runtime
+            .host_status()
+            .groups
+            .iter()
+            .find(|group| group.identity.raft_group_id == group_id)
+            .map(|group| group.applied_index)
+            .expect("the restarting node must host each transaction participant")
+    });
+
+    // Reopen one node from its retained A-WAL while two Raft peers remain
+    // live. The client then reads the still-locked secondary through the real
+    // gateway, which consults the recovered primary status and replicates its
+    // terminal resolution.
+    nodes[leader]
+        .database
+        .lock()
+        .await
+        .replace_tablet_gateway(Arc::new(nodes[leader].runtime.tablet_rpc_client()));
+    drop(commit_fault_gateway);
+    let retained_data = nodes[restart_index]._data.clone();
+    let stopped_node = nodes.remove(restart_index);
+    let TestNode {
+        database: stopped_database,
+        runtime: stopped_runtime,
+        _data: stopped_data,
+    } = stopped_node;
+    drop(stopped_runtime);
+    drop(stopped_database);
+    drop(stopped_data);
+
+    let seed = seeds[restart_index].clone();
+    let all_seeds = seeds.clone();
+    let recovery_cluster_id = cluster_id.clone();
+    let reopened_node = tokio::task::spawn_blocking(move || {
+        start_failover_test_node_with_data(retained_data, seed, all_seeds, recovery_cluster_id)
+    })
+    .await
+    .expect("A-WAL recovery task must not panic");
+    let handle = reopened_node.runtime.handle();
+    let recovery_gateway = Arc::new(RuntimeFaultGateway::new(
+        reopened_node.runtime.tablet_rpc_client(),
+        false,
+        false,
+    ));
+    let metadata_creator = reopened_node.runtime.metadata_table_creator();
+    {
+        let mut database = reopened_node.database.lock().await;
+        database.replace_commit_log(handle.clone());
+        database.replace_catalog_log(handle);
+        database.replace_metadata_table_creator(metadata_creator);
+        database.replace_tablet_gateway(recovery_gateway.clone());
+    }
+    nodes.insert(restart_index, reopened_node);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let groups = nodes[restart_index].runtime.host_status().groups;
+            let recovered = [primary_group_id, secondary_group_id]
+                .into_iter()
+                .zip(restart_group_frontiers)
+                .all(|(group_id, previous_index)| {
+                    groups
+                        .iter()
+                        .find(|group| group.identity.raft_group_id == group_id)
+                        .is_some_and(|group| group.applied_index >= previous_index)
+                });
+            if recovered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restarted tablet groups must recover their applied A-WAL frontiers");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let serving_primary_leader = nodes.iter().any(|node| {
+                node.runtime
+                    .tablet_rpc_client()
+                    .tablet_status(primary_group_id)
+                    .is_some_and(|status| status.serving_leader)
+            });
+            let serving_secondary_leader = nodes.iter().any(|node| {
+                node.runtime
+                    .tablet_rpc_client()
+                    .tablet_status(secondary_group_id)
+                    .is_some_and(|status| status.serving_leader)
+            });
+            if serving_primary_leader && serving_secondary_leader {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("recovered participant groups must cross serving-leader activation");
+
+    let recovered_primary_route = TabletGateway::lookup_tablet_route(
+        recovery_gateway.as_ref(),
+        users_table_id,
+        &primary_key.primary_key_bytes,
+    )
+    .expect("recovered metadata must route the status authority");
+    let (leader_replica_id, leader_node_id) = nodes
+        .iter()
+        .zip(&seeds)
+        .find_map(|(node, seed)| {
+            node.runtime
+                .tablet_rpc_client()
+                .tablet_status(primary_group_id)
+                .filter(|status| status.serving_leader)
+                .and_then(|status| {
+                    status
+                        .leader_replica_id
+                        .map(|replica_id| (ReplicaId(replica_id), seed.id))
+                })
+        })
+        .expect("the primary group must have an activated leader");
+    let leader_replica = recovered_primary_route
+        .replicas
+        .iter()
+        .find(|replica| {
+            replica.replica_id == leader_replica_id && replica.node_id == leader_node_id
+        })
+        .expect("the active primary leader must be present in the recovered route")
+        .clone();
+    let leader_node_index = seeds
+        .iter()
+        .position(|seed| seed.id == leader_node_id)
+        .expect("the primary leader must be one of the runtime nodes");
+    let mut leader_local_route = recovered_primary_route.clone();
+    leader_local_route.leader_replica_id = leader_replica_id;
+    leader_local_route.replicas = Arc::from(vec![leader_replica]);
+    let leader_gateway = nodes[leader_node_index].runtime.tablet_rpc_client();
+    let local_request_group_id = recovered_primary_route.raft_group_id;
+    let local_status = tokio::task::spawn_blocking(move || {
+        TabletGateway::transaction_status(
+            &leader_gateway,
+            &leader_local_route,
+            RequestId {
+                client_id: 0x7008,
+                sequence: 1,
+                raft_group_id: local_request_group_id,
+            },
+            committed_txn_id,
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .expect("leader-local status query must not panic")
+    .expect("the current leader must serve its durable transaction status");
+    assert_eq!(local_status, Some(committed_status.clone()));
+
+    let recovering_node_id = seeds[restart_index].id;
+    let mut status_route = recovered_primary_route.clone();
+    status_route.leader_replica_id = leader_replica_id;
+    if status_route.replicas.iter().any(|replica| {
+        replica.replica_id == status_route.leader_replica_id
+            && replica.node_id == recovering_node_id
+    }) {
+        // When recovery reopened the current leader, keep the route focused on
+        // that local replica so an unsuccessful local ReadIndex is not hidden
+        // by a later remote retry in the gateway client.
+        let leader_replica_id = status_route.leader_replica_id;
+        status_route.replicas = Arc::from(
+            status_route
+                .replicas
+                .iter()
+                .filter(|replica| replica.replica_id == leader_replica_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+    }
+    let recovered_status_result = TabletGateway::transaction_status(
+        recovery_gateway.as_ref(),
+        &status_route,
+        RequestId {
+            client_id: 0x7008,
+            sequence: 1,
+            raft_group_id: recovered_primary_route.raft_group_id,
+        },
+        committed_txn_id,
+        Duration::from_secs(5),
+    );
+    let replica_statuses = nodes
+        .iter()
+        .zip(&seeds)
+        .map(|(node, seed)| {
+            (
+                seed.id,
+                node.runtime
+                    .tablet_rpc_client()
+                    .tablet_status(primary_group_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    let recovered_status = recovered_status_result
+        .unwrap_or_else(|error| {
+            panic!(
+                "the recovered primary status must be readable; recovering_node_id={recovering_node_id:?}, route={status_route:?}, replica_statuses={replica_statuses:?}, error={error}"
+            )
+        })
+        .expect("the committed status must survive A-WAL reopen");
+    assert_eq!(recovered_status, committed_status);
+    for identity in [&primary_prewrite_identity, &primary_commit_identity] {
+        assert!(matches!(
+            TabletGateway::query_original_outcome(
+                recovery_gateway.as_ref(),
+                &recovered_primary_route,
+                identity.request_id.clone(),
+                identity.logical_command_id,
+                Duration::from_secs(5),
+            )
+            .expect("recovered command identity must be queryable"),
+            Some(ragnordb_common::command_codec::CachedTabletCommandOutcome::Applied(_))
+        ));
+        assert_eq!(identity.route.raft_group_id, primary_group_id);
+    }
+
+    let recovered_secondary_route = TabletGateway::lookup_tablet_route(
+        recovery_gateway.as_ref(),
+        secondary_table_id,
+        &secondary_key.primary_key_bytes,
+    )
+    .expect("secondary metadata route must survive A-WAL recovery");
+    let recovered_secondary_inspection = TabletGateway::inspect_point(
+        recovery_gateway.as_ref(),
+        &recovered_secondary_route,
+        RequestId {
+            client_id: 0x7009,
+            sequence: 1,
+            raft_group_id: recovered_secondary_route.raft_group_id,
+        },
+        secondary_key.clone(),
+        Timestamp(u64::MAX),
+        Duration::from_secs(5),
+    )
+    .expect("recovered participant state must expose its unresolved intent");
+    assert_eq!(
+        recovered_secondary_inspection
+            .intent
+            .as_ref()
+            .map(|lock| lock.txn_id),
+        Some(committed_txn_id),
+        "the committed secondary intent must survive A-WAL reopen until a reader resolves it"
+    );
+
+    let read_timestamp_database = nodes[restart_index].database.clone();
+    let recovered_read_timestamp = tokio::task::spawn_blocking(move || {
+        let mut session = SqlSession::with_client_id(0x700A);
+        let mut database = read_timestamp_database.blocking_lock();
+        let started = database.execute_sql(&mut session, "BEGIN")?;
+        let ExecutionResult::TransactionStarted { start_ts, .. } = started else {
+            panic!("recovered read timestamp probe must begin a transaction");
+        };
+        database.execute_sql(&mut session, "ROLLBACK")?;
+        Ok::<_, Error>(start_ts)
+    })
+    .await
+    .expect("recovered timestamp probe must not panic")
+    .expect("the restarted node must allocate a read timestamp");
+    assert!(
+        recovered_read_timestamp > cross_table_commit_ts,
+        "a restarted SQL reader must allocate above committed tablet state; read_ts={recovered_read_timestamp:?}, commit_ts={cross_table_commit_ts:?}"
+    );
+
+    let read_secondary_database = nodes[restart_index].database.clone();
+    let recovered_secondary = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            read_secondary_database.blocking_lock().execute_sql(
+                &mut SqlSession::with_client_id(7009),
+                "SELECT id, description FROM metadata_orders WHERE id = 8",
+            )
+        }),
+    )
+    .await
+    .expect("foreground intent recovery must complete within its bound")
+    .unwrap()
+    .expect("the reader must roll the committed secondary intent forward");
+    assert_eq!(
+        recovered_secondary,
+        ExecutionResult::Query(ragnordb_exec::ResultSet {
+            columns: vec![
+                ragnordb_exec::ResultColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                ragnordb_exec::ResultColumn {
+                    name: "description".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                },
+            ],
+            rows: vec![Row {
+                values: vec![Value::Int(8), Value::Text("txn-order".to_string())],
+            }],
+        })
+    );
+    let recovered_resolution = recovery_gateway
+        .state()
+        .resolved_intents
+        .iter()
+        .find(|(txn_id, _, _)| *txn_id == committed_txn_id)
+        .cloned()
+        .expect("the SQL read must submit a replicated intent resolution");
+    assert_eq!(recovered_resolution.1, Some(cross_table_commit_ts));
+    assert_eq!(recovered_resolution.2.kind, CommandKind::ResolveIntent);
+
+    let resolved_secondary_route = TabletGateway::lookup_tablet_route(
+        recovery_gateway.as_ref(),
+        secondary_table_id,
+        &secondary_key.primary_key_bytes,
+    )
+    .expect("secondary route must remain available after resolution");
+    let resolved_secondary = TabletGateway::inspect_point(
+        recovery_gateway.as_ref(),
+        &resolved_secondary_route,
+        RequestId {
+            client_id: 0x7010,
+            sequence: 1,
+            raft_group_id: resolved_secondary_route.raft_group_id,
+        },
+        secondary_key,
+        Timestamp(u64::MAX),
+        Duration::from_secs(5),
+    )
+    .expect("the resolved row must be visible without an intent");
+    assert!(resolved_secondary.intent.is_none());
+    assert_eq!(
+        decode_row(
+            &resolved_secondary
+                .visible_row
+                .expect("the committed secondary row must be visible")
+        )
+        .unwrap(),
+        Row {
+            values: vec![Value::Int(8), Value::Text("txn-order".to_string())],
+        }
+    );
+
+    // A deterministic conflict on the second participant must roll back every
+    // prewritten key before the primary publishes Aborted.
+    let prewrite_fault_gateway = Arc::new(RuntimeFaultGateway::new(
+        nodes[restart_index].runtime.tablet_rpc_client(),
+        true,
+        false,
+    ));
+    nodes[restart_index]
+        .database
+        .lock()
+        .await
+        .replace_tablet_gateway(prewrite_fault_gateway.clone());
+    let failing_database = nodes[restart_index].database.clone();
+    let failed_commit = tokio::task::spawn_blocking(move || {
+        let mut database = failing_database.blocking_lock();
+        let mut session = SqlSession::with_client_id(7011);
+        database.execute_sql(&mut session, "BEGIN")?;
+        database.execute_sql(
+            &mut session,
+            "INSERT INTO metadata_users (id, name) VALUES (10, 'will-abort')",
+        )?;
+        database.execute_sql(
+            &mut session,
+            "INSERT INTO metadata_orders (id, description) VALUES (10, 'will-abort')",
+        )?;
+        database.execute_sql(&mut session, "COMMIT")
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(failed_commit, Err(Error::WriteConflict(_))),
+        "secondary prewrite conflict must fail the SQL transaction, got {failed_commit:?}"
+    );
+    let (aborted_txn_id, primary_tablet_id, events) = {
+        let state = prewrite_fault_gateway.state();
+        (
+            state
+                .primary_prewrite_txn
+                .expect("the primary Pending prewrite must have applied"),
+            state
+                .primary_prewrite_tablet
+                .expect("the pending status has a primary tablet"),
+            state.events.clone(),
+        )
+    };
+    let aborted_primary_key = make_row_key(users_table_id, &[Value::Int(10)]).unwrap();
+    let aborted_primary_route = TabletGateway::lookup_tablet_route(
+        prewrite_fault_gateway.as_ref(),
+        users_table_id,
+        &aborted_primary_key.primary_key_bytes,
+    )
+    .expect("metadata must route the aborted status authority");
+    let aborted_status = TabletGateway::transaction_status(
+        prewrite_fault_gateway.as_ref(),
+        &aborted_primary_route,
+        RequestId {
+            client_id: 0x7012,
+            sequence: 1,
+            raft_group_id: aborted_primary_route.raft_group_id,
+        },
+        aborted_txn_id,
+        Duration::from_secs(5),
+    )
+    .expect("the aborted status must be readable")
+    .expect("the primary must publish a terminal abort decision");
+    assert_eq!(aborted_status.status, TxnStatus::Aborted);
+    let abort_event_index = events
+        .iter()
+        .position(|event| {
+            *event
+                == RuntimeCommandEvent::AbortStatusApplied {
+                    txn_id: aborted_txn_id,
+                    tablet_id: primary_tablet_id,
+                }
+        })
+        .expect("the aborted status command must apply through Raft");
+    let rollback_tablets_before_abort = events[..abort_event_index]
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeCommandEvent::RollbackApplied { txn_id, tablet_id }
+                if *txn_id == aborted_txn_id =>
+            {
+                Some(*tablet_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rollback_tablets_before_abort.len(),
+        2,
+        "both participant rollback commands must apply before Aborted is published"
+    );
+    assert!(rollback_tablets_before_abort.contains(&primary_tablet_id));
+    assert!(rollback_tablets_before_abort.contains(&secondary_descriptors[0].tablet_id));
+
+    let aborted_secondary_key = make_row_key(secondary_table_id, &[Value::Int(10)]).unwrap();
+    for (client_id, key) in [
+        (0x7013, aborted_primary_key),
+        (0x7014, aborted_secondary_key),
+    ] {
+        let route = TabletGateway::lookup_tablet_route(
+            prewrite_fault_gateway.as_ref(),
+            key.table_id,
+            &key.primary_key_bytes,
+        )
+        .expect("metadata must route each rolled-back participant");
+        let inspection = TabletGateway::inspect_point(
+            prewrite_fault_gateway.as_ref(),
+            &route,
+            RequestId {
+                client_id,
+                sequence: 1,
+                raft_group_id: route.raft_group_id,
+            },
+            key,
+            Timestamp(u64::MAX),
+            Duration::from_secs(5),
+        )
+        .expect("rolled-back participants must not retain a live intent");
+        assert!(inspection.intent.is_none());
+        assert!(inspection.visible_row.is_none());
+    }
+    nodes[restart_index]
+        .database
+        .lock()
+        .await
+        .replace_tablet_gateway(Arc::new(nodes[restart_index].runtime.tablet_rpc_client()));
+
+    // A pending write to a key with no committed version must still block a
+    // range read. The old scan path returned other visible rows and silently
+    // skipped this lock-only insertion.
+    let pending_key = make_row_key(users_table_id, &[Value::Int(9)]).unwrap();
+    let tablet_client = nodes[leader].runtime.tablet_rpc_client();
+    let pending_route = tablet_client
+        .lookup_tablet_route(users_table_id, &pending_key.primary_key_bytes)
+        .expect("metadata must route the pending intent key");
+    let encoded_pending_key = ragnordb_storage::key::encode_row_key(&pending_key).unwrap();
+    let pending_txn_id = TxnId(0x7004);
+    let pending_start_ts = Timestamp(1);
+    let pending_status = TxnStatusRecord {
+        txn_id: pending_txn_id,
+        start_timestamp: pending_start_ts,
+        commit_timestamp: None,
+        status: TxnStatus::Pending,
+        primary_key: encoded_pending_key.clone(),
+        participant_tablet_ids: vec![pending_route.tablet_id.0],
+        last_heartbeat_timestamp: None,
+        lease_deadline_ms: None,
+    };
+    let pending_command = TabletCommand::Prewrite(PrewriteCommand {
+        txn_id: pending_txn_id,
+        start_timestamp: pending_start_ts,
+        writes: vec![WriteEntry {
+            key: encoded_pending_key.clone(),
+            row: Some(Row {
+                values: vec![Value::Int(9), Value::Text("pending".to_string())],
+            }),
+            op: WriteKind::Put,
+        }],
+        primary_key: encoded_pending_key,
+        ttl_ms: 60_000,
+        pending_status: Some(pending_status),
+    });
+    let pending_client_request = ClientRequestId {
+        client_id: 0x7004,
+        session_epoch: 1,
+        request_sequence: 1,
+    };
+    tablet_client
+        .submit_command_with_identity_and_ack(
+            &pending_route,
+            RequestId {
+                client_id: pending_client_request.client_id,
+                sequence: 1,
+                raft_group_id: pending_route.raft_group_id,
+            },
+            Some(LogicalCommandId {
+                client_request_id: pending_client_request,
+                command_ordinal: 1,
+                kind: CommandKind::Prewrite,
+            }),
+            None,
+            pending_command,
+            Duration::from_secs(5),
+        )
+        .expect("the real participant Raft group must apply the pending prewrite");
+
+    let scan_database = nodes[leader].database.clone();
+    let pending_scan = tokio::task::spawn_blocking(move || {
+        scan_database.blocking_lock().execute_sql(
+            &mut SqlSession::with_client_id(7005),
+            "SELECT id, name FROM metadata_users",
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(pending_scan, Err(Error::WriteConflict(_))),
+        "a range read must surface an unresolved insert intent as retryable conflict, got {pending_scan:?}"
+    );
+
+    let leader_catalog = nodes[leader].database.clone();
+    let users_table = tokio::task::spawn_blocking(move || {
+        leader_catalog
+            .blocking_lock()
+            .execute_sql_with_metadata_request(
+                &mut SqlSession::new(),
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                Some(RequestId {
+                    client_id: 7006,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(2),
+                }),
+                Duration::from_secs(5),
+            )
     })
     .await
     .unwrap()
     .expect("catalog success must also be resolved from replicated apply");
+    let ExecutionResult::CreatedTable {
+        table_id: users_table_id,
+    } = users_table
+    else {
+        panic!("replicated CREATE TABLE must return its assigned table ID");
+    };
+    let users_descriptors = nodes[leader]
+        .runtime
+        .metadata_table_creator()
+        .table_descriptors(users_table_id)
+        .expect("metadata must publish the users tablet descriptor");
+    let users_group_id = users_descriptors[0].raft_group_id;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let leaders = nodes
+                .iter()
+                .filter_map(|node| {
+                    node.runtime
+                        .host_status()
+                        .groups
+                        .iter()
+                        .find(|group| group.identity.raft_group_id == users_group_id)
+                        .and_then(|group| group.leader_replica_id)
+                })
+                .collect::<Vec<_>>();
+            if leaders.len() == nodes.len() && leaders.windows(2).all(|pair| pair[0] == pair[1]) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the users tablet group must publish a stable leader before SQL writes");
 
     let leader_database = nodes[leader].database.clone();
     tokio::task::spawn_blocking(move || {
@@ -403,14 +1612,6 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     })
     .await
     .expect("a follower SQL mirror must observe the applied Raft commit");
-
-    for node in &nodes {
-        let creator = node.runtime.metadata_table_creator();
-        node.database
-            .lock()
-            .await
-            .replace_metadata_table_creator(creator);
-    }
 
     let routed_group_id = topology.tablets[0].raft_group_id;
     let routed_leader_replica = tokio::time::timeout(Duration::from_secs(5), async {

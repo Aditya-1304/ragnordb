@@ -261,7 +261,7 @@ impl SqlSession {
                 return Err(error);
             }
         };
-        let _ = executor.commit_transaction_outcome_with_request_context(
+        let _ = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,
@@ -438,7 +438,7 @@ impl SqlSession {
             )
         })?;
 
-        let outcome = executor.commit_transaction_outcome_with_request_context(
+        let outcome = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,
@@ -514,7 +514,7 @@ impl SqlSession {
         // The implicit statement already has its client-facing result. The
         // commit outcome is consumed here as the required durability and MVCC
         // publication gate before that statement result can be acknowledged.
-        let _commit_outcome = executor.commit_transaction_outcome_with_request_context(
+        let _commit_outcome = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,

@@ -16,7 +16,7 @@ use ragnordb_common::{
 };
 
 use crate::{
-    TransactionManager,
+    CommitTimestampAllocator,
     coordinator::{DistributedTransactionCoordinator, ParticipantCommandPlan, ParticipantRoute},
     status::TransactionStatusKey,
 };
@@ -187,11 +187,16 @@ fn build_commit_plan(
         .batches
         .into_values()
         .map(|batch| {
+            let is_primary = batch
+                .keys
+                .iter()
+                .any(|key| key.as_slice() == coordinator.primary_key());
             let command = CommitCommand {
                 txn_id: coordinator.transaction_id(),
                 start_timestamp: coordinator.start_timestamp(),
                 commit_timestamp,
                 keys: batch.keys,
+                committed_status: is_primary.then(|| status_record.clone()),
             };
             command
                 .validate()
@@ -226,13 +231,13 @@ fn build_commit_plan(
 
 /// Validate the current participant view, allocate a strictly newer commit
 /// timestamp, and construct primary-before-secondary commit batches.
-pub(crate) fn plan_commit<M: TransactionManager>(
+pub(crate) fn plan_commit<M: CommitTimestampAllocator>(
     coordinator: &DistributedTransactionCoordinator,
     timestamp_manager: &mut M,
 ) -> Result<CommitPhasePlan> {
     let prepared = prepare_commit_plan(coordinator)?;
     let commit_timestamp =
-        timestamp_manager.allocate_commit_timestamp(coordinator.start_timestamp())?;
+        timestamp_manager.finalize_commit_timestamp(coordinator.start_timestamp())?;
     build_commit_plan(coordinator, prepared, commit_timestamp)
 }
 

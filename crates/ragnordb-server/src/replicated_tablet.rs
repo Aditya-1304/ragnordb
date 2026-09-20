@@ -31,7 +31,7 @@ use raft::{
 use ragnordb_catalog::{CatalogLogExtent, CatalogLogRecord, DurableCatalogLog};
 use ragnordb_common::{
     Error, Result,
-    codec::WriteKind,
+    codec::{TxnStatusRecord, WriteKind},
     command_codec::{
         CachedTabletCommandOutcome, MAX_TABLET_COMMAND_BATCH_BYTES,
         MAX_TABLET_COMMAND_BATCH_COMMANDS, NoopCommand, SingleShardCommitCommand, TabletCommand,
@@ -42,8 +42,9 @@ use ragnordb_common::{
     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, TxnId},
     raft_bootstrap::RaftGroupBootstrap,
     rpc_codec::{
-        TabletCommandRequest, TabletOutcomeQueryRequest, TabletReadRequest, TabletScanBatch,
-        TabletScanRequest, TabletScanRow,
+        TabletCommandRequest, TabletOutcomeQueryRequest, TabletPointInspectionRequest,
+        TabletPointReadInspection, TabletReadRequest, TabletScanBatch, TabletScanIntent,
+        TabletScanRequest, TabletScanRow, TabletTransactionStatusRequest,
     },
 };
 use ragnordb_multiraft::{
@@ -79,6 +80,10 @@ use ragnordb_multiraft::{
 use prost::Message as ProstMessage;
 use ragnordb_storage::wal::{
     DurableCommitLog, DurableWalExtent, RagnorDbWalAdapter, SingleNodeTxnCommit, WalMutation,
+};
+use ragnordb_storage::{
+    key::{decode_row_key, encode_row_key},
+    mvcc::MvccStorage,
 };
 use ragnordb_tablet::{
     command::{TabletCommandApplyError, TabletCommandApplyOutcome},
@@ -220,6 +225,8 @@ pub struct ReplicatedTabletStatus {
 pub(crate) enum TabletRpcCompletion {
     Command(Result<TabletCommandApplyOutcome>),
     Read(Result<Option<Vec<u8>>>),
+    TransactionStatus(Result<Option<TxnStatusRecord>>),
+    PointInspection(Result<TabletPointReadInspection>),
     Scan(Result<TabletScanBatch>),
     Outcome(Result<Option<CachedTabletCommandOutcome>>),
 }
@@ -256,6 +263,16 @@ enum HostRequest {
         reply: mpsc::SyncSender<Result<Option<Vec<u8>>>>,
         deadline: Instant,
     },
+    TransactionStatus {
+        request: TabletTransactionStatusRequest,
+        reply: mpsc::SyncSender<Result<Option<TxnStatusRecord>>>,
+        deadline: Instant,
+    },
+    PointInspection {
+        request: TabletPointInspectionRequest,
+        reply: mpsc::SyncSender<Result<TabletPointReadInspection>>,
+        deadline: Instant,
+    },
     Scan {
         request: TabletScanRequest,
         reply: mpsc::SyncSender<Result<TabletScanBatch>>,
@@ -274,6 +291,18 @@ enum HostRequest {
     },
     RpcReadPoint {
         request: TabletReadRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
+    RpcTransactionStatus {
+        request: TabletTransactionStatusRequest,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        token: u64,
+        deadline: Instant,
+    },
+    RpcPointInspection {
+        request: TabletPointInspectionRequest,
         completion: Arc<dyn TabletRpcCompletionSink>,
         token: u64,
         deadline: Instant,
@@ -582,6 +611,8 @@ impl MailboxSized for HostRequest {
                 .map(|encoded| encoded.encoded_len())
                 .unwrap_or_else(|_| std::mem::size_of_val(request)),
             Self::ReadPoint { request, .. } => request.to_proto().encoded_len(),
+            Self::TransactionStatus { request, .. } => request.to_proto().encoded_len(),
+            Self::PointInspection { request, .. } => request.to_proto().encoded_len(),
             Self::Scan { request, .. } => request.to_proto().encoded_len(),
             Self::OutcomeQuery { request, .. } => request.to_proto().encoded_len(),
             Self::RpcCommand { request, .. } => request
@@ -589,6 +620,8 @@ impl MailboxSized for HostRequest {
                 .map(|encoded| encoded.encoded_len())
                 .unwrap_or_else(|_| std::mem::size_of_val(request)),
             Self::RpcReadPoint { request, .. } => request.to_proto().encoded_len(),
+            Self::RpcTransactionStatus { request, .. } => request.to_proto().encoded_len(),
+            Self::RpcPointInspection { request, .. } => request.to_proto().encoded_len(),
             Self::RpcScan { request, .. } => request.to_proto().encoded_len(),
             Self::RpcOutcomeQuery { request, .. } => request.to_proto().encoded_len(),
         };
@@ -700,6 +733,18 @@ enum ClientReply {
         token: u64,
         completion: Arc<dyn TabletRpcCompletionSink>,
         request: TabletReadRequest,
+        deadline: Instant,
+    },
+    RpcTransactionStatus {
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        request: TabletTransactionStatusRequest,
+        deadline: Instant,
+    },
+    RpcPointInspection {
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+        request: TabletPointInspectionRequest,
         deadline: Instant,
     },
     RpcScan {
@@ -1669,6 +1714,73 @@ impl ReplicatedTabletHandle {
             })
     }
 
+    /// Enqueue an authoritative transaction-status query through the tablet
+    /// owner's existing linearizable read barrier.
+    pub(crate) fn enqueue_rpc_transaction_status(
+        &self,
+        request: TabletTransactionStatusRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "transaction status deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcTransactionStatus {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet read admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
+    }
+
+    /// Enqueue one participant intent inspection through the tablet owner's
+    /// existing linearizable read barrier. This operation is read-only; any
+    /// resulting resolution must be submitted as a separate Raft command.
+    pub(crate) fn enqueue_rpc_point_inspection(
+        &self,
+        request: TabletPointInspectionRequest,
+        deadline: Instant,
+        token: u64,
+        completion: Arc<dyn TabletRpcCompletionSink>,
+    ) -> Result<()> {
+        if deadline <= Instant::now() {
+            return Err(Error::ProposalUnavailable {
+                reason: "point inspection deadline elapsed before admission".to_string(),
+            });
+        }
+        self.requests
+            .try_send(HostRequest::RpcPointInspection {
+                request,
+                completion,
+                token,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet read admission queue is full".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })
+    }
+
     /// Enqueue one bounded scan page without waiting on the reactor. The
     /// scan remains a single tablet-owner operation, so snapshot/epoch and
     /// MVCC checks cannot race a concurrent state-machine transition.
@@ -1818,6 +1930,81 @@ impl ReplicatedTabletHandle {
             .recv_timeout(remaining)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet read deadline elapsed before execution".to_string(),
+            })?
+    }
+
+    /// Read an authoritative transaction-status record after the caller has
+    /// established the current-term read barrier for this tablet.
+    pub(crate) fn transaction_status_until(
+        &self,
+        request: TabletTransactionStatusRequest,
+        deadline: Instant,
+    ) -> Result<Option<TxnStatusRecord>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::ProposalUnavailable {
+                reason: "transaction status deadline elapsed before execution".to_string(),
+            });
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(HostRequest::TransactionStatus {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet status admission queue is full before deadline".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })?;
+        response
+            .recv_timeout(remaining)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "tablet status deadline elapsed before execution".to_string(),
+            })?
+    }
+
+    /// Inspect one participant key after the caller has established the
+    /// current-term read barrier. Visible row and read-conflicting lock are
+    /// captured together on the owner thread.
+    pub(crate) fn point_inspection_until(
+        &self,
+        request: TabletPointInspectionRequest,
+        deadline: Instant,
+    ) -> Result<TabletPointReadInspection> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::ProposalUnavailable {
+                reason: "point inspection deadline elapsed before execution".to_string(),
+            });
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(HostRequest::PointInspection {
+                request,
+                reply,
+                deadline,
+            })
+            .map_err(|error| Error::ProposalUnavailable {
+                reason: match error {
+                    mpsc::TrySendError::Full(_) => {
+                        "tablet read admission queue is full before deadline".to_string()
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "replicated tablet runtime has stopped".to_string()
+                    }
+                },
+            })?;
+        response
+            .recv_timeout(remaining)
+            .map_err(|_| Error::ProposalUnavailable {
+                reason: "point inspection deadline elapsed before execution".to_string(),
             })?
     }
 
@@ -3727,6 +3914,32 @@ where
                         reply,
                         deadline,
                     ),
+                    HostRequest::TransactionStatus {
+                        request,
+                        reply,
+                        deadline,
+                    } => admit_transaction_status_request(
+                        request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        &identity,
+                        reply,
+                        deadline,
+                    ),
+                    HostRequest::PointInspection {
+                        request,
+                        reply,
+                        deadline,
+                    } => admit_point_inspection_request(
+                        request,
+                        &tablet,
+                        serving_leader,
+                        ready_loop.raft().leader_id().map(|id| id.get()),
+                        &identity,
+                        reply,
+                        deadline,
+                    ),
                     HostRequest::Scan {
                         request,
                         reply,
@@ -3759,6 +3972,52 @@ where
                         deadline,
                     } => admit_read_barrier(
                         ClientReply::RpcReadPoint {
+                            token,
+                            completion,
+                            request,
+                            deadline,
+                        },
+                        deadline,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                        &mut pending_read_barriers,
+                        &mut next_read_index_context,
+                    ),
+                    HostRequest::RpcTransactionStatus {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    } => admit_read_barrier(
+                        ClientReply::RpcTransactionStatus {
+                            token,
+                            completion,
+                            request,
+                            deadline,
+                        },
+                        deadline,
+                        &mut ready_loop,
+                        &tablet,
+                        &mut registry,
+                        &mut clients,
+                        serving_leader,
+                        &mut internal_barrier_allocator,
+                        &identity,
+                        &mut pending_read_barriers,
+                        &mut next_read_index_context,
+                    ),
+                    HostRequest::RpcPointInspection {
+                        request,
+                        completion,
+                        token,
+                        deadline,
+                    } => admit_read_barrier(
+                        ClientReply::RpcPointInspection {
                             token,
                             completion,
                             request,
@@ -4636,6 +4895,18 @@ fn admit_request<W, LS, SS>(
             )));
             return;
         }
+        HostRequest::TransactionStatus { reply, .. } => {
+            let _ = reply.send(Err(Error::InvalidArgument(
+                "transaction status queries must use the read admission path".to_string(),
+            )));
+            return;
+        }
+        HostRequest::PointInspection { reply, .. } => {
+            let _ = reply.send(Err(Error::InvalidArgument(
+                "point inspections must use the read admission path".to_string(),
+            )));
+            return;
+        }
         HostRequest::Scan { reply, .. } => {
             let _ = reply.send(Err(Error::InvalidArgument(
                 "tablet scans must use the scan admission path".to_string(),
@@ -4649,6 +4920,8 @@ fn admit_request<W, LS, SS>(
             return;
         }
         HostRequest::RpcReadPoint { .. }
+        | HostRequest::RpcTransactionStatus { .. }
+        | HostRequest::RpcPointInspection { .. }
         | HostRequest::RpcScan { .. }
         | HostRequest::RpcOutcomeQuery { .. } => {
             unreachable!("RPC read requests use their dedicated admission paths")
@@ -4886,6 +5159,42 @@ fn complete_read_barrier_reply(
                 )
             });
             completion.publish(token, TabletRpcCompletion::Read(result));
+        }
+        ClientReply::RpcTransactionStatus {
+            token,
+            completion,
+            request,
+            ..
+        } => {
+            let result = barrier_result.and_then(|()| {
+                evaluate_transaction_status_request(
+                    request,
+                    tablet,
+                    serving_leader,
+                    leader_replica_id,
+                    identity,
+                    deadline,
+                )
+            });
+            completion.publish(token, TabletRpcCompletion::TransactionStatus(result));
+        }
+        ClientReply::RpcPointInspection {
+            token,
+            completion,
+            request,
+            ..
+        } => {
+            let result = barrier_result.and_then(|()| {
+                evaluate_point_inspection_request(
+                    request,
+                    tablet,
+                    serving_leader,
+                    leader_replica_id,
+                    identity,
+                    deadline,
+                )
+            });
+            completion.publish(token, TabletRpcCompletion::PointInspection(result));
         }
         ClientReply::RpcScan {
             token,
@@ -5147,6 +5456,193 @@ fn evaluate_point_read(
         .and_then(|row| row.map(|row| encode_row(&row)).transpose())
 }
 
+fn evaluate_transaction_status_request<S: MvccStorage>(
+    request: TabletTransactionStatusRequest,
+    tablet: &TabletCommandApplier<S>,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) -> Result<Option<TxnStatusRecord>> {
+    if deadline <= Instant::now() {
+        return Err(Error::ProposalUnavailable {
+            reason: "transaction status deadline elapsed before admission".to_string(),
+        });
+    }
+    if !serving_leader {
+        return Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        });
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        return Err(Error::InvalidArgument(
+            "transaction status request targets a different Raft group".to_string(),
+        ));
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        return Err(Error::InvalidArgument(
+            "transaction status request targets a different tablet".to_string(),
+        ));
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        return Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        });
+    }
+    if request.request_id.client_id == 0
+        || request.request_id.sequence == 0
+        || request.txn_id.0 == 0
+    {
+        return Err(Error::InvalidArgument(
+            "transaction status request contains a reserved zero value".to_string(),
+        ));
+    }
+
+    tablet
+        .state_machine()
+        .transaction_status(request.txn_id)
+        .map(|status| status.cloned())
+        .map_err(|error| Error::CorruptData(error.to_string()))
+}
+
+fn evaluate_point_inspection_request<S: MvccStorage>(
+    request: TabletPointInspectionRequest,
+    tablet: &TabletCommandApplier<S>,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    deadline: Instant,
+) -> Result<TabletPointReadInspection> {
+    if deadline <= Instant::now() {
+        return Err(Error::ProposalUnavailable {
+            reason: "point inspection deadline elapsed before admission".to_string(),
+        });
+    }
+    if !serving_leader {
+        return Err(Error::NotLeader {
+            leader_id: leader_replica_id,
+        });
+    }
+    if request.request_id.raft_group_id != identity.target.raft_group_id {
+        return Err(Error::InvalidArgument(
+            "point inspection request targets a different Raft group".to_string(),
+        ));
+    }
+    if request.tablet_id != identity.target.tablet_id {
+        return Err(Error::InvalidArgument(
+            "point inspection request targets a different tablet".to_string(),
+        ));
+    }
+    if request.tablet_epoch != identity.target.tablet_epoch {
+        return Err(Error::StaleTabletEpoch {
+            current_epoch: identity.target.tablet_epoch,
+            expected_epoch: request.tablet_epoch,
+        });
+    }
+    if request.request_id.client_id == 0
+        || request.request_id.sequence == 0
+        || request.read_timestamp.0 == 0
+    {
+        return Err(Error::InvalidArgument(
+            "point inspection request contains a reserved zero value".to_string(),
+        ));
+    }
+    if request.row_key.table_id != identity.target.table_id {
+        return Err(Error::InvalidArgument(
+            "point inspection row key targets a different table".to_string(),
+        ));
+    }
+
+    let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
+    let transaction = ragnordb_txn::Transaction::new(transaction_id, request.read_timestamp)?;
+    let encoded_key = encode_row_key(&request.row_key)?;
+    let intent = tablet
+        .state_machine()
+        .tablet()
+        .storage()
+        .intent_for_read(&encoded_key, request.read_timestamp)?;
+    // A read-conflicting lock makes the key unavailable until status is
+    // resolved. Return the intent without exposing any older version as a
+    // successful read; the caller retries after the replicated resolution.
+    let visible_row = if intent.is_some() {
+        None
+    } else {
+        tablet
+            .state_machine()
+            .tablet()
+            .get(&transaction, &request.row_key)?
+            .map(|row| encode_row(&row))
+            .transpose()?
+    };
+
+    Ok(TabletPointReadInspection {
+        visible_row,
+        intent,
+    })
+}
+
+const MAX_TABLET_SCAN_INTENTS: usize = 64;
+
+/// Return a retry-same-cursor response when the requested range contains a
+/// conflicting intent. This runs on the serialized tablet owner so lock
+/// inspection and the later MVCC page read cannot cross an apply transition.
+fn scan_conflicting_intent_batch<S: MvccStorage>(
+    storage: &S,
+    request: &TabletScanRequest,
+    table_id: TableId,
+    start: Option<&ragnordb_common::ids::RowKey>,
+    end: Option<&ragnordb_common::ids::RowKey>,
+    resume_after: Option<&ragnordb_common::ids::RowKey>,
+) -> Result<Option<TabletScanBatch>> {
+    let start = start.map(encode_row_key).transpose()?;
+    let end = end.map(encode_row_key).transpose()?;
+    let resume_after = resume_after.map(encode_row_key).transpose()?;
+    let page = storage.scan_conflicting_intents(
+        start.as_deref(),
+        end.as_deref(),
+        resume_after.as_deref(),
+        request.read_timestamp,
+        (request.max_rows as usize).min(MAX_TABLET_SCAN_INTENTS),
+        request.max_bytes as usize,
+    )?;
+    if page.locks.is_empty() {
+        if page.has_more {
+            return Err(Error::CorruptData(
+                "foreground intent scan made no progress while reporting more locks".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let intents = page
+        .locks
+        .into_iter()
+        .map(|(encoded_key, lock)| {
+            let row_key = decode_row_key(&encoded_key)?;
+            if row_key.table_id != table_id {
+                return Err(Error::CorruptData(
+                    "foreground intent scan returned a key for a different table".to_string(),
+                ));
+            }
+            Ok(TabletScanIntent {
+                key: row_key.primary_key_bytes,
+                lock,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch = TabletScanBatch {
+        rows: Vec::new(),
+        intents,
+        next_resume_after: None,
+        exhausted: false,
+    };
+    batch
+        .validate_for(request)
+        .map_err(|error| Error::CorruptData(error.to_string()))?;
+    Ok(Some(batch))
+}
+
 fn evaluate_scan_request(
     request: TabletScanRequest,
     tablet: &TabletCommandApplier,
@@ -5211,6 +5707,17 @@ fn evaluate_scan_request(
                 primary_key_bytes: primary_key_bytes.clone(),
             });
 
+    if let Some(batch) = scan_conflicting_intent_batch(
+        tablet.state_machine().tablet().storage(),
+        &request,
+        table_id,
+        start.as_ref(),
+        end.as_ref(),
+        resume_after.as_ref(),
+    )? {
+        return Ok(batch);
+    }
+
     tablet
         .state_machine()
         .tablet()
@@ -5239,6 +5746,7 @@ fn evaluate_scan_request(
                 .flatten();
             let batch = TabletScanBatch {
                 rows,
+                intents: Vec::new(),
                 next_resume_after,
                 exhausted: !page.has_more,
             };
@@ -5325,6 +5833,46 @@ fn admit_read_request(
     let _ = reply.send(result);
 }
 
+fn admit_transaction_status_request<S: MvccStorage>(
+    request: TabletTransactionStatusRequest,
+    tablet: &TabletCommandApplier<S>,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    reply: mpsc::SyncSender<Result<Option<TxnStatusRecord>>>,
+    deadline: Instant,
+) {
+    let result = evaluate_transaction_status_request(
+        request,
+        tablet,
+        serving_leader,
+        leader_replica_id,
+        identity,
+        deadline,
+    );
+    let _ = reply.send(result);
+}
+
+fn admit_point_inspection_request<S: MvccStorage>(
+    request: TabletPointInspectionRequest,
+    tablet: &TabletCommandApplier<S>,
+    serving_leader: bool,
+    leader_replica_id: Option<u64>,
+    identity: &TabletRuntimeIdentity,
+    reply: mpsc::SyncSender<Result<TabletPointReadInspection>>,
+    deadline: Instant,
+) {
+    let result = evaluate_point_inspection_request(
+        request,
+        tablet,
+        serving_leader,
+        leader_replica_id,
+        identity,
+        deadline,
+    );
+    let _ = reply.send(result);
+}
+
 /// Execute a bounded range page after the same Ready-owner admission checks
 /// used by point reads. No scan request can bypass leader activation, target
 /// identity, tablet epoch, or the caller's fixed MVCC timestamp.
@@ -5405,42 +5953,55 @@ fn admit_scan_request(
                 primary_key_bytes: primary_key_bytes.clone(),
             });
 
-    let result = tablet
-        .state_machine()
-        .tablet()
-        .scan_page(
-            &transaction,
-            start.as_ref(),
-            end.as_ref(),
-            resume_after.as_ref(),
-            request.max_rows as usize,
-            request.max_bytes as usize,
-        )
-        .and_then(|page| {
-            let rows = page
-                .rows
-                .into_iter()
-                .map(|(key, row)| {
-                    Ok(TabletScanRow {
-                        key: key.primary_key_bytes,
-                        row: encode_row(&row)?,
+    let intent_batch = scan_conflicting_intent_batch(
+        tablet.state_machine().tablet().storage(),
+        &request,
+        table_id,
+        start.as_ref(),
+        end.as_ref(),
+        resume_after.as_ref(),
+    );
+    let result = match intent_batch {
+        Ok(Some(batch)) => Ok(batch),
+        Err(error) => Err(error),
+        Ok(None) => tablet
+            .state_machine()
+            .tablet()
+            .scan_page(
+                &transaction,
+                start.as_ref(),
+                end.as_ref(),
+                resume_after.as_ref(),
+                request.max_rows as usize,
+                request.max_bytes as usize,
+            )
+            .and_then(|page| {
+                let rows = page
+                    .rows
+                    .into_iter()
+                    .map(|(key, row)| {
+                        Ok(TabletScanRow {
+                            key: key.primary_key_bytes,
+                            row: encode_row(&row)?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let next_resume_after = page
-                .has_more
-                .then(|| rows.last().map(|row| row.key.clone()))
-                .flatten();
-            let batch = TabletScanBatch {
-                rows,
-                next_resume_after,
-                exhausted: !page.has_more,
-            };
-            batch
-                .validate_for(&request)
-                .map_err(|error| Error::CorruptData(error.to_string()))?;
-            Ok(batch)
-        });
+                    .collect::<Result<Vec<_>>>()?;
+                let next_resume_after = page
+                    .has_more
+                    .then(|| rows.last().map(|row| row.key.clone()))
+                    .flatten();
+                let batch = TabletScanBatch {
+                    rows,
+                    intents: Vec::new(),
+                    next_resume_after,
+                    exhausted: !page.has_more,
+                };
+                batch
+                    .validate_for(&request)
+                    .map_err(|error| Error::CorruptData(error.to_string()))?;
+                Ok(batch)
+            }),
+    };
     let _ = reply.send(result);
 }
 
@@ -6289,6 +6850,42 @@ fn forward_completion(
                     )),
                 );
             }
+            ClientReply::RpcTransactionStatus {
+                token,
+                completion,
+                request,
+                deadline,
+            } => {
+                completion.publish(
+                    token,
+                    TabletRpcCompletion::TransactionStatus(evaluate_transaction_status_request(
+                        request,
+                        tablet,
+                        serving_leader,
+                        leader_replica_id,
+                        identity,
+                        deadline,
+                    )),
+                );
+            }
+            ClientReply::RpcPointInspection {
+                token,
+                completion,
+                request,
+                deadline,
+            } => {
+                completion.publish(
+                    token,
+                    TabletRpcCompletion::PointInspection(evaluate_point_inspection_request(
+                        request,
+                        tablet,
+                        serving_leader,
+                        leader_replica_id,
+                        identity,
+                        deadline,
+                    )),
+                );
+            }
             ClientReply::RpcScan {
                 token,
                 completion,
@@ -6361,6 +6958,12 @@ fn reply_error(request: HostRequest, error: Error) {
         HostRequest::ReadPoint { reply, .. } => {
             let _ = reply.send(Err(error));
         }
+        HostRequest::TransactionStatus { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        HostRequest::PointInspection { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
         HostRequest::Scan { reply, .. } => {
             let _ = reply.send(Err(error));
         }
@@ -6373,6 +6976,12 @@ fn reply_error(request: HostRequest, error: Error) {
         HostRequest::RpcReadPoint {
             completion, token, ..
         } => completion.publish(token, TabletRpcCompletion::Read(Err(error))),
+        HostRequest::RpcTransactionStatus {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::TransactionStatus(Err(error))),
+        HostRequest::RpcPointInspection {
+            completion, token, ..
+        } => completion.publish(token, TabletRpcCompletion::PointInspection(Err(error))),
         HostRequest::RpcScan {
             completion, token, ..
         } => completion.publish(token, TabletRpcCompletion::Scan(Err(error))),
@@ -6402,6 +7011,12 @@ fn send_client_error(reply: ClientReply, error: Error) {
         ClientReply::RpcReadPoint {
             token, completion, ..
         } => completion.publish(token, TabletRpcCompletion::Read(Err(error))),
+        ClientReply::RpcTransactionStatus {
+            token, completion, ..
+        } => completion.publish(token, TabletRpcCompletion::TransactionStatus(Err(error))),
+        ClientReply::RpcPointInspection {
+            token, completion, ..
+        } => completion.publish(token, TabletRpcCompletion::PointInspection(Err(error))),
         ClientReply::RpcScan {
             token, completion, ..
         } => completion.publish(token, TabletRpcCompletion::Scan(Err(error))),
@@ -6501,7 +7116,11 @@ mod tests {
     use super::*;
     use ragnordb_common::{
         catalog_codec::TableDefinition,
-        command_codec::{CatalogCommand, CatalogOperation, CreateTableOperation},
+        codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
+        command_codec::{
+            CatalogCommand, CatalogOperation, CreateTableOperation, PrewriteCommand, TabletCommand,
+            TabletCommandEnvelope, WriteEntry,
+        },
         ids::{RowKey, Timestamp},
     };
     use ragnordb_multiraft::{proposal::ProposalPosition, tablet_apply::AppliedTabletCommand};
@@ -6764,6 +7383,131 @@ mod tests {
                 current_epoch: 7,
                 expected_epoch: 6,
             })
+        ));
+    }
+
+    #[test]
+    /// Realistic bug caught: SQL needs to read the authoritative pending
+    /// decision and participant intent through the RPC read boundary after
+    /// apply; querying a different tablet must not expose that status record.
+    fn transaction_status_and_intent_are_exposed_only_by_the_owner_read_path() {
+        let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+            cluster_id: "cluster".to_string(),
+            raft_group_id: RaftGroupId(9),
+            tablet_id: TabletId(3),
+            table_id: TableId(3),
+            tablet_epoch: 7,
+        });
+        let key = ragnordb_storage::key::make_row_key(TableId(3), &[Value::Int(1)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let status = TxnStatusRecord {
+            txn_id: TxnId(31),
+            start_timestamp: Timestamp(10),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: encoded_key.clone(),
+            participant_tablet_ids: vec![3],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new(
+            ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap(),
+            7,
+            RaftGroupId(9),
+        )
+        .unwrap();
+        state_machine
+            .apply(
+                TabletCommandEnvelope::new(
+                    RequestId {
+                        client_id: 100,
+                        sequence: 1,
+                        raft_group_id: RaftGroupId(9),
+                    },
+                    TabletId(3),
+                    7,
+                    TabletCommand::Prewrite(PrewriteCommand {
+                        txn_id: status.txn_id,
+                        start_timestamp: status.start_timestamp,
+                        writes: vec![WriteEntry {
+                            key: encoded_key,
+                            row: Some(Row {
+                                values: vec![Value::Text("pending".to_string())],
+                            }),
+                            op: WriteKind::Put,
+                        }],
+                        primary_key: status.primary_key.clone(),
+                        ttl_ms: 30_000,
+                        pending_status: Some(status.clone()),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status_request = TabletTransactionStatusRequest {
+            request_id: RequestId {
+                client_id: 101,
+                sequence: 1,
+                raft_group_id: RaftGroupId(9),
+            },
+            tablet_id: TabletId(3),
+            tablet_epoch: 7,
+            txn_id: status.txn_id,
+            deadline_remaining_ms: None,
+        };
+        assert_eq!(
+            evaluate_transaction_status_request(
+                status_request.clone(),
+                &applier,
+                true,
+                Some(1),
+                &identity,
+                deadline,
+            )
+            .unwrap(),
+            Some(status.clone())
+        );
+
+        let point_request = TabletPointInspectionRequest {
+            request_id: RequestId {
+                client_id: 102,
+                sequence: 1,
+                raft_group_id: RaftGroupId(9),
+            },
+            tablet_id: TabletId(3),
+            tablet_epoch: 7,
+            row_key: key.clone(),
+            read_timestamp: Timestamp(20),
+            deadline_remaining_ms: None,
+        };
+        let inspection = evaluate_point_inspection_request(
+            point_request,
+            &applier,
+            true,
+            Some(1),
+            &identity,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(inspection.visible_row, None);
+        assert_eq!(inspection.intent.unwrap().txn_id, status.txn_id);
+
+        let wrong_owner_request = TabletTransactionStatusRequest {
+            tablet_id: TabletId(4),
+            ..status_request
+        };
+        assert!(matches!(
+            evaluate_transaction_status_request(
+                wrong_owner_request,
+                &applier,
+                true,
+                Some(1),
+                &identity,
+                deadline,
+            ),
+            Err(Error::InvalidArgument(reason)) if reason.contains("different tablet")
         ));
     }
 

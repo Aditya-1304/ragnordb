@@ -373,20 +373,24 @@ impl DatabaseServices {
             });
         }
 
-        let commit_timestamp = {
-            let mut transaction_manager = self
-                .transaction_manager
-                .lock()
+        let (local_target, distributed_target) = {
+            let executor = self
+                .executor
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+            (
+                executor.transaction_targets_local_table(&transaction)?,
+                executor.transaction_requires_distributed_coordination(&transaction)?,
+            )
         };
-
-        let local_target = self
-            .executor
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .transaction_targets_local_table(&transaction)?;
         if local_target {
+            let commit_timestamp = {
+                let mut transaction_manager = self
+                    .transaction_manager
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+            };
             let mut executor = self
                 .executor
                 .write()
@@ -400,11 +404,45 @@ impl DatabaseServices {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 executor.detached_remote_execution_view()
             };
-            executor.commit_remote_transaction_outcome_with_timestamp(
-                transaction,
-                commit_timestamp,
-                request_context,
-            )
+            if distributed_target {
+                let start_timestamp = transaction.start_ts();
+                let coordinator =
+                    executor.prepare_distributed_transaction(transaction, request_context)?;
+                let commit_timestamp = {
+                    let mut transaction_manager = self
+                        .transaction_manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    transaction_manager.allocate_commit_timestamp(start_timestamp)
+                };
+                match commit_timestamp {
+                    Ok(commit_timestamp) => executor.commit_prepared_distributed_transaction(
+                        coordinator,
+                        commit_timestamp,
+                        request_context,
+                    ),
+                    Err(error) => {
+                        executor.rollback_prepared_distributed_transaction(
+                            coordinator,
+                            request_context,
+                        )?;
+                        Err(error)
+                    }
+                }
+            } else {
+                let commit_timestamp = {
+                    let mut transaction_manager = self
+                        .transaction_manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+                };
+                executor.commit_remote_transaction_outcome_with_timestamp(
+                    transaction,
+                    commit_timestamp,
+                    request_context,
+                )
+            }
         }
     }
 
@@ -747,8 +785,11 @@ impl LocalDatabase {
         let directory = FsSegmentDirectory::new(wal_dir);
 
         let (wal, recovery_report) =
-            WalHandle::open(directory, wal_config, ()).map_err(|source| Error::RecoveryFailed {
-                reason: format!("failed to open and physically recover A-WAL: {source}"),
+            WalHandle::open(directory, wal_config, ()).map_err(|source| {
+                Error::RecoveryFailedWithSource {
+                    context: "failed to open and physically recover A-WAL".to_string(),
+                    source: Box::new(source),
+                }
             })?;
 
         // recovery begins at the first retained record rather than assuming that
@@ -757,11 +798,12 @@ impl LocalDatabase {
 
         let recovery_pin = wal
             .acquire_retention_pin("ragnordb-startup-recovery", first_retained_lsn)
-            .map_err(|source| Error::RecoveryFailed {
-                reason: format!(
-                    "failed to pin WAL retention at startup LSN {}: {source}",
+            .map_err(|source| Error::RecoveryFailedWithSource {
+                context: format!(
+                    "failed to pin WAL retention at startup LSN {}",
                     first_retained_lsn.as_u64()
                 ),
+                source: Box::new(source),
             })?;
 
         let checkpoint_stream = scan_recovery_records(&wal, first_retained_lsn)?;
@@ -797,19 +839,21 @@ impl LocalDatabase {
 
         let (recovered_state, recovered_raft) = match configurations {
             Some(configurations) => {
-                let mut replay_stream =
-                    wal.iter_from(first_retained_lsn)
-                        .map_err(|source| Error::RecoveryFailed {
-                            reason: format!("open shared database/Raft recovery stream: {source}"),
-                        })?;
+                let mut replay_stream = wal.iter_from(first_retained_lsn).map_err(|source| {
+                    Error::RecoveryFailedWithSource {
+                        context: "open shared database/Raft recovery stream".to_string(),
+                        source: Box::new(source),
+                    }
+                })?;
                 let recovered = recover_shared_storage_from_state(
                     &mut replay_stream,
                     recovered_state,
                     replay_from_lsn,
                     configurations,
                 )
-                .map_err(|source| Error::RecoveryFailed {
-                    reason: source.to_string(),
+                .map_err(|source| Error::RecoveryFailedWithSource {
+                    context: "replay shared database/Raft recovery stream".to_string(),
+                    source: Box::new(source),
                 })?;
                 (recovered.database, Some(recovered.raft))
             }

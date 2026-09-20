@@ -600,6 +600,12 @@ impl TransactionManager for LocalTransactionManager {
     }
 }
 
+impl CommitTimestampAllocator for LocalTransactionManager {
+    fn finalize_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.allocate_commit_timestamp(start_ts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,7 +21,7 @@ use ragnordb_storage::{
 };
 
 use crate::{
-    CommitTimestampAllocator, Transaction, TransactionManager, status::TransactionStatusLocation,
+    CommitTimestampAllocator, Transaction, TransactionReadSpan, status::TransactionStatusLocation,
 };
 
 /// Canonical logical identity for one transaction mutation or read key.
@@ -320,6 +320,7 @@ pub struct DistributedTransactionCoordinator {
     root_request_id: ClientRequestId,
     primary_key: LogicalMutationId,
     read_set: BTreeSet<LogicalMutationId>,
+    read_spans: BTreeSet<TransactionReadSpan>,
     participant_routes: BTreeMap<LogicalMutationId, ParticipantRoute>,
     status_location: TransactionStatusLocation,
 }
@@ -337,12 +338,19 @@ impl DistributedTransactionCoordinator {
         let primary_key = LogicalMutationId::from_key(&primary_key)?;
         let status_location =
             TransactionStatusLocation::new(transaction.id(), primary_key.as_key().to_vec())?;
+        let read_set = transaction
+            .read_keys()
+            .iter()
+            .map(|key| LogicalMutationId::from_key(key))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let read_spans = transaction.read_spans().clone();
 
         Ok(Self {
             transaction,
             root_request_id,
             primary_key,
-            read_set: BTreeSet::new(),
+            read_set,
+            read_spans,
             participant_routes: BTreeMap::new(),
             status_location,
         })
@@ -373,6 +381,14 @@ impl DistributedTransactionCoordinator {
         &self.read_set
     }
 
+    /// Logical table ranges read by the transaction before commit planning.
+    ///
+    /// The coordinator retains these spans for later footprint accounting;
+    /// this milestone does not use them to change conflict semantics.
+    pub fn read_spans(&self) -> &BTreeSet<TransactionReadSpan> {
+        &self.read_spans
+    }
+
     pub fn write_set(&self) -> &BTreeMap<Vec<u8>, Mutation> {
         self.transaction.write_set()
     }
@@ -385,6 +401,11 @@ impl DistributedTransactionCoordinator {
     pub fn record_read(&mut self, key: Vec<u8>) -> Result<()> {
         self.read_set.insert(LogicalMutationId::from_key(&key)?);
         Ok(())
+    }
+
+    /// Add a logical range to the coordinator's transaction footprint.
+    pub fn record_read_span(&mut self, span: TransactionReadSpan) {
+        self.read_spans.insert(span);
     }
 
     /// Replace the current route hint for one write participant.
@@ -474,7 +495,7 @@ impl DistributedTransactionCoordinator {
 
     /// Build the commit timestamp, durable status outcome, and primary-first
     /// participant batches without dispatching any command.
-    pub fn plan_commit<M: TransactionManager>(
+    pub fn plan_commit<M: CommitTimestampAllocator>(
         &self,
         timestamp_manager: &mut M,
     ) -> Result<crate::commit::CommitPhasePlan> {
@@ -764,7 +785,7 @@ impl DistributedTransactionCoordinator {
         max_route_refreshes: usize,
     ) -> Result<crate::commit::CommitExecutionOutcome<D::PrimaryOutput, D::SecondaryOutput>>
     where
-        M: TransactionManager,
+        M: CommitTimestampAllocator,
         D: CommitPhaseDispatcher,
         R: ParticipantRouteRefresher,
     {
@@ -947,7 +968,13 @@ impl DistributedTransactionCoordinator {
 
         let mut route_refreshes = 0;
         loop {
-            let batches = self.plan_prewrite(ttl_ms)?;
+            let mut batches = self.plan_prewrite(ttl_ms)?;
+            let primary_key = self.primary_key().to_vec();
+            batches.sort_by_key(|batch| {
+                !batch.participant_plans.iter().any(|plan| {
+                    plan.command_id.logical_mutation_id().as_key() == primary_key.as_slice()
+                })
+            });
             let mut outcomes = Vec::with_capacity(batches.len());
             let mut restart_phase = false;
 
@@ -964,11 +991,22 @@ impl DistributedTransactionCoordinator {
                             });
                         }
 
-                        self.refresh_participant_batch_routes(
+                        let refreshes_primary = batch.participant_plans.iter().any(|plan| {
+                            plan.command_id.logical_mutation_id().as_key() == self.primary_key()
+                        });
+                        let primary_route = self.refresh_participant_batch_routes(
                             &batch.participant_plans,
                             batch.route,
                             refresher,
                         )?;
+                        if refreshes_primary {
+                            self.set_status_route(primary_route.ok_or_else(|| {
+                                Error::CorruptData(
+                                    "primary prewrite batch omitted the primary logical key"
+                                        .to_string(),
+                                )
+                            })?)?;
+                        }
 
                         route_refreshes += 1;
                         restart_phase = true;

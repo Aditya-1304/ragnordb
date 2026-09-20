@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ragnordb_common::{
     Error,
-    codec::{TxnStatus, WriteKind},
+    codec::{TxnStatus, TxnStatusRecord, WriteKind},
     command_codec::{
         CachedTabletCommandOutcome, CachedTabletCommandRejection, CachedTabletCommandRejectionKind,
         CachedTabletCommandResult, ClientDeduplicationSnapshot, CommitCommand, PrewriteCommand,
-        ResolveIntentCommand, RollbackCommand, SingleShardCommitCommand, TabletCommand,
-        TabletCommandEnvelope, TabletCommandEnvelopeError, TabletStateMachineSnapshot,
-        TabletStateMachineSnapshotError,
+        PublishAbortedTransactionStatus, ResolveIntentCommand, RollbackCommand,
+        SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
+        TabletStateMachineSnapshot, TabletStateMachineSnapshotError,
     },
     encoding::encode_row,
     ids::{LogicalCommandId, RaftGroupId, TabletId},
@@ -50,6 +50,10 @@ pub struct TabletStateMachine<S = InMemoryMvcc> {
     /// after outcome compaction so an acknowledged request cannot be mistaken
     /// for a new command after a restart or tablet move.
     logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
+    /// Authoritative transaction decisions for transactions whose primary key
+    /// is owned by this tablet. This state is replicated and snapshotted with
+    /// the primary intent transitions.
+    transaction_statuses: BTreeMap<ragnordb_common::ids::TxnId, TxnStatusRecord>,
 }
 
 impl<S: MvccStorage> TabletStateMachine<S> {
@@ -74,6 +78,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             client_deduplication: BTreeMap::new(),
             logical_command_deduplication: BTreeMap::new(),
             logical_client_retry_horizons: BTreeMap::new(),
+            transaction_statuses: BTreeMap::new(),
         })
     }
 
@@ -90,6 +95,47 @@ impl<S: MvccStorage> TabletStateMachine<S> {
     /// return the Raft group that owns this tablet state machine
     pub fn raft_group_id(&self) -> RaftGroupId {
         self.raft_group_id
+    }
+
+    /// Read a transaction decision only after validating the durable record
+    /// against its map key and status invariants.
+    pub fn transaction_status(
+        &self,
+        txn_id: ragnordb_common::ids::TxnId,
+    ) -> Result<Option<&TxnStatusRecord>, TabletCommandApplyError> {
+        let Some(status) = self.transaction_statuses.get(&txn_id) else {
+            return Ok(None);
+        };
+        status
+            .validate()
+            .map_err(|reason| TabletCommandApplyError::CorruptState {
+                reason: format!("stored transaction status is invalid: {reason}"),
+            })?;
+        if status.txn_id != txn_id {
+            return Err(TabletCommandApplyError::CorruptState {
+                reason: format!(
+                    "transaction status map key {txn_id:?} differs from record ID {:?}",
+                    status.txn_id
+                ),
+            });
+        }
+        let primary_tablet_id =
+            status
+                .primary_tablet_id()
+                .map_err(|reason| TabletCommandApplyError::CorruptState {
+                    reason: format!("stored transaction status authority is invalid: {reason}"),
+                })?;
+        let primary_key_matches_table = decode_row_key(&status.primary_key)
+            .is_ok_and(|key| key.table_id == self.tablet.table_id());
+        if primary_tablet_id != self.tablet.id() || !primary_key_matches_table {
+            return Err(TabletCommandApplyError::CorruptState {
+                reason: format!(
+                    "stored transaction status {txn_id:?} is not owned by tablet {}",
+                    self.tablet.id().0
+                ),
+            });
+        }
+        Ok(Some(status))
     }
 
     /// return the next admissible request sequence for one client in this
@@ -132,7 +178,8 @@ impl<S: MvccStorage> TabletStateMachine<S> {
     /// Encode replicated command metadata that must accompany a tablet snapshot.
     ///
     /// MVCC data is intentionally owned by the surrounding tablet snapshot. This
-    /// image contains only tablet-generation and retry-deduplication state
+    /// image contains the tablet generation, retry-deduplication state, and
+    /// primary transaction decisions needed to interpret restored intents.
     pub fn encode_snapshot_state(&self) -> Result<Vec<u8>, TabletStateMachineSnapshotError> {
         let clients = self
             .client_deduplication
@@ -164,13 +211,14 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             })
             .collect();
 
-        TabletStateMachineSnapshot::new_with_logical_commands_and_horizons(
+        TabletStateMachineSnapshot::new_with_logical_commands_and_horizons_and_transaction_statuses(
             self.tablet.id(),
             self.epoch,
             self.raft_group_id,
             clients,
             logical_commands,
             self.logical_client_retry_horizons.clone(),
+            self.transaction_statuses.clone(),
         )?
         .encode()
     }
@@ -189,6 +237,23 @@ impl<S: MvccStorage> TabletStateMachine<S> {
                 local_tablet_id,
                 snapshot_tablet_id: snapshot.tablet_id,
             });
+        }
+
+        for status in snapshot.transaction_statuses.values() {
+            let primary_row_key = decode_row_key(&status.primary_key).map_err(|_| {
+                TabletStateMachineRestoreError::InvalidSnapshot(
+                    TabletStateMachineSnapshotError::InvalidTxnStatus(
+                        "transaction primary key is not a valid encoded row key",
+                    ),
+                )
+            })?;
+            if primary_row_key.table_id != tablet.table_id() {
+                return Err(TabletStateMachineRestoreError::InvalidSnapshot(
+                    TabletStateMachineSnapshotError::InvalidTxnStatus(
+                        "transaction primary key belongs to a different table",
+                    ),
+                ));
+            }
         }
 
         let client_deduplication = snapshot
@@ -229,6 +294,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             client_deduplication,
             logical_command_deduplication,
             logical_client_retry_horizons: snapshot.logical_client_retry_horizons,
+            transaction_statuses: snapshot.transaction_statuses,
         })
     }
 
@@ -269,6 +335,9 @@ impl<S: MvccStorage> TabletStateMachine<S> {
                 for write in &command.writes {
                     self.validate_owned_key(&write.key)?;
                 }
+                if let Some(status) = &command.pending_status {
+                    self.validate_status_authority(status)?;
+                }
             }
             TabletCommand::SingleShardCommit(command) => {
                 for write in &command.writes {
@@ -277,12 +346,18 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             }
             TabletCommand::Commit(command) => {
                 self.validate_owned_key_slice(&command.keys)?;
+                if let Some(status) = &command.committed_status {
+                    self.validate_status_authority(status)?;
+                }
             }
             TabletCommand::Rollback(command) => {
                 self.validate_owned_key_slice(&command.keys)?;
             }
             TabletCommand::ResolveIntent(command) => {
                 self.validate_owned_key_slice(&command.keys)?;
+            }
+            TabletCommand::PublishAbortedTransactionStatus(command) => {
+                self.validate_status_authority(&command.status_record)?;
             }
             TabletCommand::Catalog(_) | TabletCommand::Noop(_) => {}
         }
@@ -496,6 +571,9 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             TabletCommand::SingleShardCommit(command) => self.apply_single_shard_commit(command),
             TabletCommand::Prewrite(command) => self.apply_prewrite(command),
             TabletCommand::Commit(command) => self.apply_commit(command),
+            TabletCommand::PublishAbortedTransactionStatus(command) => {
+                self.apply_publish_aborted_transaction_status(command)
+            }
             TabletCommand::Rollback(command) => self.apply_rollback(command),
             TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
             // Catalog publication is materialized by the server catalog owner.
@@ -546,6 +624,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &mut self,
         command: PrewriteCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        let txn_id = command.txn_id;
+        let start_timestamp = command.start_timestamp;
+        let primary_key = command.primary_key.clone();
+        let pending_status = command.pending_status.clone();
         let mut mutations = BTreeMap::new();
         for write in command.writes {
             self.validate_owned_key(&write.key)?;
@@ -557,6 +639,14 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             }
         }
 
+        let status_transition = self.validate_prewrite_status_transition(
+            txn_id,
+            start_timestamp,
+            &primary_key,
+            &mutations,
+            pending_status.as_ref(),
+        )?;
+
         self.tablet
             .storage
             .prewrite_batch(
@@ -567,6 +657,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
                 command.ttl_ms,
             )
             .map_err(map_database_error)?;
+
+        if let Some(status) = status_transition {
+            self.transaction_statuses.insert(txn_id, status);
+        }
 
         Ok(TabletCommandApplyResult::Prewrite)
     }
@@ -599,6 +693,32 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             })
     }
 
+    fn validate_status_authority(
+        &self,
+        status: &TxnStatusRecord,
+    ) -> Result<(), TabletCommandApplyError> {
+        status
+            .validate()
+            .map_err(|reason| TabletCommandApplyError::InvalidCommand {
+                reason: format!("invalid transaction status record: {reason}"),
+            })?;
+        let primary_tablet_id = status.primary_tablet_id().map_err(|reason| {
+            TabletCommandApplyError::InvalidCommand {
+                reason: format!("invalid transaction status authority: {reason}"),
+            }
+        })?;
+        if primary_tablet_id != self.tablet.id() {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: format!(
+                    "transaction status belongs to primary tablet {}, but this state machine owns {}",
+                    primary_tablet_id.0,
+                    self.tablet.id().0
+                ),
+            });
+        }
+        self.validate_owned_key(&status.primary_key)
+    }
+
     fn validate_owned_key_slice(&self, keys: &[Vec<u8>]) -> Result<(), TabletCommandApplyError> {
         for key in keys {
             self.validate_owned_key(key)?;
@@ -610,7 +730,18 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         &mut self,
         command: CommitCommand,
     ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        let txn_id = command.txn_id;
+        let start_timestamp = command.start_timestamp;
+        let commit_timestamp = command.commit_timestamp;
+        let committed_status = command.committed_status.clone();
         let keys = self.validate_owned_keys(command.keys)?;
+        let status_transition = self.validate_commit_status_transition(
+            txn_id,
+            start_timestamp,
+            commit_timestamp,
+            &keys,
+            committed_status.as_ref(),
+        )?;
 
         self.tablet
             .storage
@@ -622,7 +753,169 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             )
             .map_err(map_database_error)?;
 
+        if let Some(status) = status_transition {
+            self.transaction_statuses.insert(txn_id, status);
+        }
+
         Ok(TabletCommandApplyResult::Commit)
+    }
+
+    fn apply_publish_aborted_transaction_status(
+        &mut self,
+        command: PublishAbortedTransactionStatus,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        let status = command.status_record;
+        self.validate_status_authority(&status)?;
+        let should_replace = self.validate_abort_status_transition(&status)?;
+        if should_replace {
+            self.transaction_statuses.insert(status.txn_id, status);
+        }
+        Ok(TabletCommandApplyResult::PublishAbortedTransactionStatus)
+    }
+
+    fn validate_prewrite_status_transition(
+        &self,
+        txn_id: ragnordb_common::ids::TxnId,
+        start_timestamp: ragnordb_common::ids::Timestamp,
+        primary_key: &[u8],
+        writes: &BTreeMap<Vec<u8>, Mutation>,
+        status: Option<&TxnStatusRecord>,
+    ) -> Result<Option<TxnStatusRecord>, TabletCommandApplyError> {
+        let existing = self.transaction_statuses.get(&txn_id);
+        let Some(status) = status else {
+            if existing.is_some_and(|record| {
+                record.primary_key.as_slice() == primary_key
+                    && writes.contains_key(&record.primary_key)
+            }) {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "primary prewrite is missing its pending status record".to_string(),
+                });
+            }
+            return Ok(None);
+        };
+
+        self.validate_status_authority(status)?;
+        if status.txn_id != txn_id || status.start_timestamp != start_timestamp {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "pending status identity does not match prewrite".to_string(),
+            });
+        }
+        if status.primary_key != primary_key || !writes.contains_key(&status.primary_key) {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "pending status primary key must be included in primary prewrite"
+                    .to_string(),
+            });
+        }
+
+        match existing {
+            None => Ok(Some(status.clone())),
+            Some(existing) if existing == status => Ok(None),
+            Some(existing) if !same_status_identity(existing, status) => {
+                Err(TabletCommandApplyError::CorruptState {
+                    reason: format!(
+                        "transaction status identity changed for transaction {txn_id:?}"
+                    ),
+                })
+            }
+            Some(existing) if existing.status != TxnStatus::Pending => {
+                Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "terminal transaction status cannot return to pending".to_string(),
+                })
+            }
+            Some(_) => Err(TabletCommandApplyError::InvalidCommand {
+                reason: "pending transaction status changed after publication".to_string(),
+            }),
+        }
+    }
+
+    fn validate_commit_status_transition(
+        &self,
+        txn_id: ragnordb_common::ids::TxnId,
+        start_timestamp: ragnordb_common::ids::Timestamp,
+        commit_timestamp: ragnordb_common::ids::Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+        status: Option<&TxnStatusRecord>,
+    ) -> Result<Option<TxnStatusRecord>, TabletCommandApplyError> {
+        let existing = self.transaction_statuses.get(&txn_id);
+        let Some(status) = status else {
+            if let Some(existing) = existing
+                && keys.contains(&existing.primary_key)
+            {
+                return Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "primary commit is missing its committed status record".to_string(),
+                });
+            }
+            return Ok(None);
+        };
+
+        self.validate_status_authority(status)?;
+        if status.txn_id != txn_id
+            || status.start_timestamp != start_timestamp
+            || status.commit_timestamp != Some(commit_timestamp)
+        {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "committed status identity does not match commit".to_string(),
+            });
+        }
+        if !keys.contains(&status.primary_key) {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "primary commit must include its status record primary key".to_string(),
+            });
+        }
+
+        match existing {
+            None => Err(TabletCommandApplyError::InvalidCommand {
+                reason: "committed status requires an existing pending status".to_string(),
+            }),
+            Some(existing) if !same_status_identity(existing, status) => {
+                Err(TabletCommandApplyError::CorruptState {
+                    reason: format!(
+                        "transaction status identity changed for transaction {txn_id:?}"
+                    ),
+                })
+            }
+            Some(existing) if existing.status == TxnStatus::Pending => Ok(Some(status.clone())),
+            Some(existing) if existing == status => Ok(None),
+            Some(existing) if existing.status == TxnStatus::Aborted => {
+                Err(TabletCommandApplyError::InvalidCommand {
+                    reason: "aborted transaction cannot be committed".to_string(),
+                })
+            }
+            Some(_) => Err(TabletCommandApplyError::InvalidCommand {
+                reason: "committed transaction status conflicts with the existing decision"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn validate_abort_status_transition(
+        &self,
+        status: &TxnStatusRecord,
+    ) -> Result<bool, TabletCommandApplyError> {
+        let Some(existing) = self.transaction_statuses.get(&status.txn_id) else {
+            return Err(TabletCommandApplyError::InvalidCommand {
+                reason: "aborted status requires an existing pending status".to_string(),
+            });
+        };
+        if !same_status_identity(existing, status) {
+            return Err(TabletCommandApplyError::CorruptState {
+                reason: format!(
+                    "transaction status identity changed for transaction {:?}",
+                    status.txn_id
+                ),
+            });
+        }
+        match existing.status {
+            TxnStatus::Pending => Ok(true),
+            TxnStatus::Aborted if existing == status => Ok(false),
+            TxnStatus::Aborted => Err(TabletCommandApplyError::InvalidCommand {
+                reason: "aborted transaction status conflicts with the existing decision"
+                    .to_string(),
+            }),
+            TxnStatus::Committed => Err(TabletCommandApplyError::InvalidCommand {
+                reason: "committed transaction cannot be aborted".to_string(),
+            }),
+        }
     }
 
     fn apply_rollback(
@@ -706,6 +999,13 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         }
         Ok(unique)
     }
+}
+
+fn same_status_identity(existing: &TxnStatusRecord, next: &TxnStatusRecord) -> bool {
+    existing.txn_id == next.txn_id
+        && existing.start_timestamp == next.start_timestamp
+        && existing.primary_key == next.primary_key
+        && existing.participant_tablet_ids == next.participant_tablet_ids
 }
 
 fn mutation_from_command(
@@ -850,6 +1150,10 @@ pub enum TabletCommandApplyResult {
 
     /// One intent was resolved according to the durable transaction status.
     ResolveIntent,
+
+    /// One pending transaction was durably marked aborted after participant
+    /// rollback completed.
+    PublishAbortedTransactionStatus,
 }
 
 impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
@@ -861,6 +1165,9 @@ impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
             TabletCommandApplyResult::Commit => Self::Commit,
             TabletCommandApplyResult::Rollback => Self::Rollback,
             TabletCommandApplyResult::ResolveIntent => Self::ResolveIntent,
+            TabletCommandApplyResult::PublishAbortedTransactionStatus => {
+                Self::PublishAbortedTransactionStatus
+            }
         }
     }
 }
@@ -874,6 +1181,9 @@ impl From<CachedTabletCommandResult> for TabletCommandApplyResult {
             CachedTabletCommandResult::Commit => Self::Commit,
             CachedTabletCommandResult::Rollback => Self::Rollback,
             CachedTabletCommandResult::ResolveIntent => Self::ResolveIntent,
+            CachedTabletCommandResult::PublishAbortedTransactionStatus => {
+                Self::PublishAbortedTransactionStatus
+            }
         }
     }
 }
@@ -989,10 +1299,11 @@ pub enum TabletCommandApplyError {
 mod tests {
     use ragnordb_common::{
         Error,
-        codec::{Row, TxnStatus, Value, WriteKind},
+        codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
         command_codec::{
-            CommitCommand, NoopCommand, PrewriteCommand, ResolveIntentCommand, RollbackCommand,
-            SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
+            CommitCommand, NoopCommand, PrewriteCommand, PublishAbortedTransactionStatus,
+            ResolveIntentCommand, RollbackCommand, SingleShardCommitCommand, TabletCommand,
+            TabletCommandEnvelope, WriteEntry,
         },
         ids::{
             ClientRequestId, CommandKind, LogicalCommandId, RaftGroupId, RequestId, TableId,
@@ -1407,6 +1718,7 @@ mod tests {
                 }],
                 primary_key: malformed,
                 ttl_ms: 30_000,
+                pending_status: None,
             }),
         );
 
@@ -1558,6 +1870,7 @@ mod tests {
             }],
             primary_key: encoded_key,
             ttl_ms: 30_000,
+            pending_status: None,
         };
 
         let outcome = state_machine
@@ -1574,6 +1887,203 @@ mod tests {
             state_machine.tablet().get(&reader, &key),
             Err(Error::WriteConflict(_))
         ));
+    }
+
+    /// Realistic bug caught: when Raft compacts the entries that published a
+    /// primary decision, restoring only request deduplication loses the status
+    /// readers need to resolve the surviving MVCC intent safely.
+    #[test]
+    fn primary_transaction_status_survives_snapshot_restore_and_terminal_apply() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(74)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let pending_status = TxnStatusRecord {
+            txn_id: TxnId(123),
+            start_timestamp: Timestamp(440),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: encoded_key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0, 42],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: pending_status.txn_id,
+                    start_timestamp: pending_status.start_timestamp,
+                    writes: vec![WriteEntry {
+                        key: encoded_key.clone(),
+                        row: Some(test_row(74, "pending")),
+                        op: WriteKind::Put,
+                    }],
+                    primary_key: encoded_key.clone(),
+                    ttl_ms: 30_000,
+                    pending_status: Some(pending_status.clone()),
+                }),
+            ))
+            .unwrap();
+
+        let pending_snapshot = state_machine.encode_snapshot_state().unwrap();
+        let restored_pending = TabletStateMachine::restore_from_snapshot(
+            Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap(),
+            &pending_snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored_pending
+                .transaction_status(pending_status.txn_id)
+                .unwrap(),
+            Some(&pending_status)
+        );
+
+        let mismatched_commit_status = TxnStatusRecord {
+            commit_timestamp: Some(Timestamp(450)),
+            status: TxnStatus::Committed,
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0, 43],
+            ..pending_status.clone()
+        };
+        assert!(matches!(
+            state_machine.apply(command_envelope(
+                2,
+                TabletCommand::Commit(CommitCommand {
+                    txn_id: mismatched_commit_status.txn_id,
+                    start_timestamp: mismatched_commit_status.start_timestamp,
+                    commit_timestamp: Timestamp(450),
+                    keys: vec![encoded_key.clone()],
+                    committed_status: Some(mismatched_commit_status),
+                }),
+            )),
+            Err(TabletCommandApplyError::CorruptState { .. })
+        ));
+        assert_eq!(state_machine.tablet().stats().locks, 1);
+        assert_eq!(state_machine.tablet().stats().write_records, 0);
+
+        let committed_status = TxnStatusRecord {
+            commit_timestamp: Some(Timestamp(450)),
+            status: TxnStatus::Committed,
+            ..pending_status.clone()
+        };
+        state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::Commit(CommitCommand {
+                    txn_id: committed_status.txn_id,
+                    start_timestamp: committed_status.start_timestamp,
+                    commit_timestamp: Timestamp(450),
+                    keys: vec![encoded_key],
+                    committed_status: Some(committed_status.clone()),
+                }),
+            ))
+            .unwrap();
+
+        let committed_snapshot = state_machine.encode_snapshot_state().unwrap();
+        let restored_committed = TabletStateMachine::restore_from_snapshot(
+            Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap(),
+            &committed_snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored_committed
+                .transaction_status(committed_status.txn_id)
+                .unwrap(),
+            Some(&committed_status)
+        );
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(state_machine.tablet().stats().write_records, 1);
+    }
+
+    #[test]
+    fn abort_status_requires_pending_identity_and_is_terminal() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(75)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let pending = TxnStatusRecord {
+            txn_id: TxnId(124),
+            start_timestamp: Timestamp(460),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: encoded_key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0, 42],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: pending.txn_id,
+                    start_timestamp: pending.start_timestamp,
+                    writes: vec![WriteEntry {
+                        key: encoded_key.clone(),
+                        row: Some(test_row(75, "aborted")),
+                        op: WriteKind::Put,
+                    }],
+                    primary_key: encoded_key.clone(),
+                    ttl_ms: 30_000,
+                    pending_status: Some(pending.clone()),
+                }),
+            ))
+            .unwrap();
+
+        // This primary participant has durably applied its rollback before the
+        // separate command publishes the terminal status decision.
+        state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::Rollback(RollbackCommand {
+                    txn_id: pending.txn_id,
+                    start_timestamp: pending.start_timestamp,
+                    keys: vec![encoded_key.clone()],
+                }),
+            ))
+            .unwrap();
+        let aborted = TxnStatusRecord {
+            status: TxnStatus::Aborted,
+            ..pending.clone()
+        };
+        let abort_command =
+            TabletCommand::PublishAbortedTransactionStatus(PublishAbortedTransactionStatus {
+                status_record: aborted.clone(),
+            });
+        state_machine
+            .apply(command_envelope(3, abort_command.clone()))
+            .unwrap();
+        assert_eq!(
+            state_machine.transaction_status(aborted.txn_id).unwrap(),
+            Some(&aborted)
+        );
+
+        // A new request carrying the same terminal decision is idempotent,
+        // while a later committed decision cannot replace it.
+        state_machine
+            .apply(command_envelope(4, abort_command))
+            .unwrap();
+        let conflicting_commit = TxnStatusRecord {
+            commit_timestamp: Some(Timestamp(470)),
+            status: TxnStatus::Committed,
+            ..pending
+        };
+        assert!(matches!(
+            state_machine.apply(command_envelope(
+                5,
+                TabletCommand::Commit(CommitCommand {
+                    txn_id: conflicting_commit.txn_id,
+                    start_timestamp: conflicting_commit.start_timestamp,
+                    commit_timestamp: Timestamp(470),
+                    keys: vec![encoded_key],
+                    committed_status: Some(conflicting_commit),
+                }),
+            )),
+            Err(TabletCommandApplyError::InvalidCommand { .. })
+        ));
+        assert_eq!(state_machine.tablet().stats().locks, 0);
+        assert_eq!(
+            state_machine.transaction_status(aborted.txn_id).unwrap(),
+            Some(&aborted)
+        );
     }
 
     /// Realistic bug caught: a coordinator sends one phase request for two
@@ -1607,6 +2117,7 @@ mod tests {
                     ],
                     primary_key: first_encoded.clone(),
                     ttl_ms: 30_000,
+                    pending_status: None,
                 }),
             ))
             .unwrap();
@@ -1620,6 +2131,7 @@ mod tests {
                     start_timestamp: Timestamp(400),
                     commit_timestamp: Timestamp(410),
                     keys: vec![first_encoded, second_encoded],
+                    committed_status: None,
                 }),
             ))
             .unwrap();
@@ -1653,6 +2165,7 @@ mod tests {
                     }],
                     primary_key: second_encoded.clone(),
                     ttl_ms: 30_000,
+                    pending_status: None,
                 }),
             ))
             .unwrap();
@@ -1676,6 +2189,7 @@ mod tests {
                 ],
                 primary_key: encode_row_key(&first_key).unwrap(),
                 ttl_ms: 30_000,
+                pending_status: None,
             }),
         );
 
@@ -1718,6 +2232,7 @@ mod tests {
                     }],
                     primary_key: encoded_key.clone(),
                     ttl_ms: 30_000,
+                    pending_status: None,
                 }),
             ))
             .unwrap();
@@ -1727,6 +2242,7 @@ mod tests {
             start_timestamp: Timestamp(60),
             commit_timestamp: Timestamp(70),
             keys: vec![encoded_key],
+            committed_status: None,
         };
 
         let outcome = state_machine
@@ -1770,6 +2286,7 @@ mod tests {
             }],
             primary_key: encoded_key.clone(),
             ttl_ms: 30_000,
+            pending_status: None,
         };
 
         state_machine
@@ -1843,6 +2360,7 @@ mod tests {
                     }],
                     primary_key: encoded_key.clone(),
                     ttl_ms: 30_000,
+                    pending_status: None,
                 }),
             ))
             .unwrap();
