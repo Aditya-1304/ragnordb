@@ -175,6 +175,10 @@ pub fn internal_error_response(error: &Error) -> JsonValue {
     match error {
         Error::WriteConflict(_) => error_response("WRITE_CONFLICT", &error.to_string(), true),
 
+        Error::SnapshotTooOld { .. } => {
+            error_response("SNAPSHOT_TOO_OLD", &error.to_string(), false)
+        }
+
         Error::ConstraintViolation(_) => {
             error_response("CONSTRAINT_VIOLATION", &error.to_string(), false)
         }

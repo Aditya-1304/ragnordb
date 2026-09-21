@@ -82,7 +82,7 @@ fn coordinator_tracks_transaction_state_and_route_hints() {
     let mut transaction = transaction();
     transaction.record_read(read_key.clone()).unwrap();
     let read_span = TransactionReadSpan::new(TableId(1), None, None).unwrap();
-    transaction.record_read_span(read_span.clone());
+    transaction.record_read_span(read_span.clone()).unwrap();
     let mut coordinator =
         DistributedTransactionCoordinator::new(transaction, root_request(), primary_key.clone())
             .unwrap();

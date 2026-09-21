@@ -11,7 +11,8 @@ use ragnordb_common::{
     codec::{TxnStatus, TxnStatusRecord, WriteKind},
     command_codec::{
         CachedTabletCommandOutcome, CachedTabletCommandRejection, CachedTabletCommandRejectionKind,
-        CachedTabletCommandResult, ClientDeduplicationSnapshot, CommitCommand, PrewriteCommand,
+        CachedTabletCommandResult, ClientDeduplicationSnapshot, CommitCommand,
+        ExpirePendingTransactionStatus, HeartbeatTransactionStatus, PrewriteCommand,
         PublishAbortedTransactionStatus, ResolveIntentCommand, RollbackCommand,
         SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletCommandEnvelopeError,
         TabletStateMachineSnapshot, TabletStateMachineSnapshotError,
@@ -359,6 +360,13 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             TabletCommand::PublishAbortedTransactionStatus(command) => {
                 self.validate_status_authority(&command.status_record)?;
             }
+            TabletCommand::HeartbeatTransactionStatus(command) => {
+                self.validate_status_authority(&command.expected_status)?;
+                self.validate_status_authority(&command.next_status)?;
+            }
+            TabletCommand::ExpirePendingTransactionStatus(command) => {
+                self.validate_status_authority(&command.expected_status)?;
+            }
             TabletCommand::Catalog(_) | TabletCommand::Noop(_) => {}
         }
 
@@ -574,6 +582,12 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             TabletCommand::PublishAbortedTransactionStatus(command) => {
                 self.apply_publish_aborted_transaction_status(command)
             }
+            TabletCommand::HeartbeatTransactionStatus(command) => {
+                self.apply_heartbeat_transaction_status(command)
+            }
+            TabletCommand::ExpirePendingTransactionStatus(command) => {
+                self.apply_expire_pending_transaction_status(command)
+            }
             TabletCommand::Rollback(command) => self.apply_rollback(command),
             TabletCommand::ResolveIntent(command) => self.apply_resolve_intent(command),
             // Catalog publication is materialized by the server catalog owner.
@@ -770,6 +784,67 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         if should_replace {
             self.transaction_statuses.insert(status.txn_id, status);
         }
+        Ok(TabletCommandApplyResult::PublishAbortedTransactionStatus)
+    }
+
+    fn apply_heartbeat_transaction_status(
+        &mut self,
+        command: HeartbeatTransactionStatus,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        command
+            .validate()
+            .map_err(|reason| TabletCommandApplyError::InvalidCommand {
+                reason: reason.to_string(),
+            })?;
+
+        let expected = &command.expected_status;
+        let Some(current) = self.transaction_statuses.get(&expected.txn_id) else {
+            return Err(TabletCommandApplyError::WriteConflict {
+                reason: "transaction status disappeared before heartbeat apply".to_string(),
+            });
+        };
+        if current != expected {
+            return Err(TabletCommandApplyError::WriteConflict {
+                reason: "transaction status changed before heartbeat apply".to_string(),
+            });
+        }
+
+        self.transaction_statuses
+            .insert(expected.txn_id, command.next_status);
+        Ok(TabletCommandApplyResult::HeartbeatTransactionStatus)
+    }
+
+    fn apply_expire_pending_transaction_status(
+        &mut self,
+        command: ExpirePendingTransactionStatus,
+    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
+        command
+            .validate()
+            .map_err(|reason| TabletCommandApplyError::InvalidCommand {
+                reason: reason.to_string(),
+            })?;
+
+        let expected = &command.expected_status;
+        let aborted = TxnStatusRecord {
+            status: TxnStatus::Aborted,
+            commit_timestamp: None,
+            ..expected.clone()
+        };
+        let Some(current) = self.transaction_statuses.get(&expected.txn_id) else {
+            return Err(TabletCommandApplyError::WriteConflict {
+                reason: "transaction status disappeared before expiry apply".to_string(),
+            });
+        };
+        if current == &aborted {
+            return Ok(TabletCommandApplyResult::PublishAbortedTransactionStatus);
+        }
+        if current != expected {
+            return Err(TabletCommandApplyError::WriteConflict {
+                reason: "transaction status changed before expiry apply".to_string(),
+            });
+        }
+
+        self.transaction_statuses.insert(expected.txn_id, aborted);
         Ok(TabletCommandApplyResult::PublishAbortedTransactionStatus)
     }
 
@@ -1154,6 +1229,9 @@ pub enum TabletCommandApplyResult {
     /// One pending transaction was durably marked aborted after participant
     /// rollback completed.
     PublishAbortedTransactionStatus,
+
+    /// One pending transaction lease was durably extended at its status tablet.
+    HeartbeatTransactionStatus,
 }
 
 impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
@@ -1167,6 +1245,9 @@ impl From<TabletCommandApplyResult> for CachedTabletCommandResult {
             TabletCommandApplyResult::ResolveIntent => Self::ResolveIntent,
             TabletCommandApplyResult::PublishAbortedTransactionStatus => {
                 Self::PublishAbortedTransactionStatus
+            }
+            TabletCommandApplyResult::HeartbeatTransactionStatus => {
+                Self::HeartbeatTransactionStatus
             }
         }
     }
@@ -1183,6 +1264,9 @@ impl From<CachedTabletCommandResult> for TabletCommandApplyResult {
             CachedTabletCommandResult::ResolveIntent => Self::ResolveIntent,
             CachedTabletCommandResult::PublishAbortedTransactionStatus => {
                 Self::PublishAbortedTransactionStatus
+            }
+            CachedTabletCommandResult::HeartbeatTransactionStatus => {
+                Self::HeartbeatTransactionStatus
             }
         }
     }
@@ -1301,9 +1385,10 @@ mod tests {
         Error,
         codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
         command_codec::{
-            CommitCommand, NoopCommand, PrewriteCommand, PublishAbortedTransactionStatus,
-            ResolveIntentCommand, RollbackCommand, SingleShardCommitCommand, TabletCommand,
-            TabletCommandEnvelope, WriteEntry,
+            CommitCommand, ExpirePendingTransactionStatus, HeartbeatTransactionStatus, NoopCommand,
+            PrewriteCommand, PublishAbortedTransactionStatus, ResolveIntentCommand,
+            RollbackCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope,
+            WriteEntry,
         },
         ids::{
             ClientRequestId, CommandKind, LogicalCommandId, RaftGroupId, RequestId, TableId,
@@ -2084,6 +2169,110 @@ mod tests {
             state_machine.transaction_status(aborted.txn_id).unwrap(),
             Some(&aborted)
         );
+    }
+
+    /// Realistic bug caught: a cleaner that reads an expired record must not
+    /// abort after a concurrent heartbeat has extended the same transaction.
+    #[test]
+    fn heartbeat_and_expiry_commands_serialize_on_the_exact_pending_status() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(76)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let pending = TxnStatusRecord {
+            txn_id: TxnId(125),
+            start_timestamp: Timestamp(480),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: encoded_key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0, 42],
+            last_heartbeat_timestamp: Some(Timestamp(480)),
+            lease_deadline_ms: Some(100),
+        };
+        state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(PrewriteCommand {
+                    txn_id: pending.txn_id,
+                    start_timestamp: pending.start_timestamp,
+                    writes: vec![WriteEntry {
+                        key: encoded_key.clone(),
+                        row: Some(test_row(76, "leased")),
+                        op: WriteKind::Put,
+                    }],
+                    primary_key: encoded_key,
+                    ttl_ms: 30_000,
+                    pending_status: Some(pending.clone()),
+                }),
+            ))
+            .unwrap();
+
+        let renewed = TxnStatusRecord {
+            last_heartbeat_timestamp: Some(Timestamp(481)),
+            lease_deadline_ms: Some(200),
+            ..pending.clone()
+        };
+        state_machine
+            .apply(command_envelope(
+                2,
+                TabletCommand::HeartbeatTransactionStatus(HeartbeatTransactionStatus {
+                    expected_status: pending.clone(),
+                    next_status: renewed.clone(),
+                    now_ms: 99,
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            state_machine.transaction_status(pending.txn_id).unwrap(),
+            Some(&renewed)
+        );
+
+        assert!(matches!(
+            state_machine.apply(command_envelope(
+                3,
+                TabletCommand::ExpirePendingTransactionStatus(ExpirePendingTransactionStatus {
+                    expected_status: pending,
+                    now_ms: 100,
+                },),
+            )),
+            Err(TabletCommandApplyError::WriteConflict { .. })
+        ));
+        assert_eq!(
+            state_machine.transaction_status(renewed.txn_id).unwrap(),
+            Some(&renewed)
+        );
+
+        state_machine
+            .apply(command_envelope(
+                4,
+                TabletCommand::ExpirePendingTransactionStatus(ExpirePendingTransactionStatus {
+                    expected_status: renewed.clone(),
+                    now_ms: 200,
+                }),
+            ))
+            .unwrap();
+        let aborted = TxnStatusRecord {
+            status: TxnStatus::Aborted,
+            ..renewed.clone()
+        };
+        assert_eq!(
+            state_machine.transaction_status(renewed.txn_id).unwrap(),
+            Some(&aborted)
+        );
+        assert!(matches!(
+            state_machine.apply(command_envelope(
+                5,
+                TabletCommand::HeartbeatTransactionStatus(HeartbeatTransactionStatus {
+                    expected_status: renewed.clone(),
+                    next_status: TxnStatusRecord {
+                        last_heartbeat_timestamp: Some(Timestamp(482)),
+                        lease_deadline_ms: Some(300),
+                        ..renewed.clone()
+                    },
+                    now_ms: 150,
+                }),
+            )),
+            Err(TabletCommandApplyError::WriteConflict { .. })
+        ));
     }
 
     /// Realistic bug caught: a coordinator sends one phase request for two

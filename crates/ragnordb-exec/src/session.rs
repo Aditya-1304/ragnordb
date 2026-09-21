@@ -102,6 +102,12 @@ impl SqlSession {
         self.current_transaction.as_ref().map(Transaction::id)
     }
 
+    /// Borrow the current transaction so the server can install durable
+    /// transaction policies before the session is allowed to execute SQL.
+    pub fn current_transaction_mut(&mut self) -> Option<&mut Transaction> {
+        self.current_transaction.as_mut()
+    }
+
     /// Begin an explicit transaction for the shared distributed SQL owner.
     ///
     /// The allocator is borrowed only for the identity allocation itself; the
@@ -392,6 +398,11 @@ impl SqlSession {
             // SHOW TABLES reads catalog metadata and does not require an MVCC
             // transaction. An existing explicit transaction remains attached.
             Plan::ShowTables => executor.execute(Plan::ShowTables, None),
+
+            // Replicated servers replace this with their bounded lifecycle
+            // snapshot before the executor boundary. The local compatibility
+            // executor has no shared distributed lifecycle registry.
+            Plan::ShowTransactions => executor.execute(Plan::ShowTransactions, None),
 
             plan @ (Plan::Insert(_) | Plan::Select(_) | Plan::Update(_) | Plan::Delete(_)) => {
                 self.execute_data_plan(plan, executor, transaction_manager)

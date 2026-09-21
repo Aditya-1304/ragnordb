@@ -138,6 +138,10 @@ pub struct TabletScanRequest {
     /// The receiver never reconstructs a deadline from its wall clock.
     #[prost(uint64, optional, tag = "11")]
     pub deadline_remaining_ms: ::core::option::Option<u64>,
+    /// Cleaner-only mode streams every intent in a bounded page. It does
+    /// not return MVCC rows or enforce a snapshot timestamp.
+    #[prost(bool, tag = "12")]
+    pub intent_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletScanRow {

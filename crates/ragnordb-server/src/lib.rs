@@ -16,6 +16,7 @@ pub mod rpc;
 pub mod session;
 mod snapshot_transport;
 pub mod tasks;
+pub mod transaction_lifecycle;
 
 use std::sync::{
     Arc,
@@ -43,6 +44,10 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use transaction_lifecycle::{
+    IntentCleanerProgress, LifecycleTabletGateway, TransactionRuntime, TransactionRuntimeConfig,
+    clean_intents_once, run_gc_safe_point_loop, run_transaction_heartbeat_loop,
+};
 
 #[derive(Debug)]
 pub struct Server {
@@ -103,6 +108,13 @@ impl Server {
         // no session can allocate identifiers or observe state while physical
         // WAL recovery, semantic replay, or allocator restoration is incomplete
         let replicated = self.config.cluster_id.is_some() && !self.config.seed_nodes.is_empty();
+        let transaction_runtime_config = if replicated {
+            Some(TransactionRuntimeConfig::from_environment(
+                statement_timeout_ms,
+            )?)
+        } else {
+            None
+        };
         let (database, recovery_report, recovered_raft) = if replicated {
             // Acquire process ownership before touching any bootstrap or WAL
             // state. The same guard is transferred into LocalDatabase and held
@@ -140,6 +152,7 @@ impl Server {
         );
 
         let database = database.into_shared();
+        let mut transaction_runtime = None;
         let replicated_runtime = match (replicated_wal, recovered_raft) {
             (Some(wal), Some(recovered)) => {
                 let runtime = MultiRaftRuntime::start_from_shared_recovery(
@@ -154,10 +167,19 @@ impl Server {
                     .lock()
                     .await
                     .replace_metadata_table_creator(runtime.metadata_table_creator());
-                database
-                    .lock()
-                    .await
-                    .replace_tablet_gateway(Arc::new(runtime.tablet_rpc_client()));
+                let transaction_services = Arc::new(TransactionRuntime::new(
+                    self.config.node_id,
+                    transaction_runtime_config.expect("replicated runtime has transaction config"),
+                    runtime.metadata_handle(),
+                    runtime.metadata_control(),
+                )?);
+                database.lock().await.replace_tablet_gateway(Arc::new(
+                    LifecycleTabletGateway::new(
+                        runtime.tablet_rpc_client(),
+                        transaction_services.lifecycle.clone(),
+                    ),
+                ));
+                transaction_runtime = Some(transaction_services);
                 Some(runtime)
             }
             (None, None) => None,
@@ -180,8 +202,13 @@ impl Server {
                 256,
             )?;
         }
-        let database_services = if replicated_runtime.is_some() {
-            Some(database.lock().await.database_services())
+        let database_services = if let Some(transaction_runtime) = transaction_runtime.as_ref() {
+            Some(
+                database
+                    .lock()
+                    .await
+                    .database_services_with_transaction_runtime(transaction_runtime.clone()),
+            )
         } else {
             None
         };
@@ -208,6 +235,7 @@ impl Server {
             replicated_tablet: replicated_handle.clone(),
             multiraft_status,
             node_lifecycle,
+            transaction_runtime: transaction_runtime.clone(),
         });
 
         info!(
@@ -228,9 +256,78 @@ impl Server {
 
         let admin_shutdown = CancellationToken::new();
         let server_shutdown = CancellationToken::new();
+        let background_shutdown = CancellationToken::new();
         let admin_task_shutdown = admin_shutdown.clone();
         let mut connection_tasks = JoinSet::new();
+        let mut background_tasks = JoinSet::new();
         let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
+
+        if let (Some(transaction_runtime), Some(replicated_runtime)) =
+            (transaction_runtime.clone(), replicated_runtime.as_ref())
+        {
+            let heartbeat_shutdown = background_shutdown.clone();
+            let heartbeat_gateway = replicated_runtime.tablet_rpc_client();
+            let heartbeat_runtime = transaction_runtime.clone();
+            background_tasks.spawn(async move {
+                if let Err(error) = run_transaction_heartbeat_loop(
+                    heartbeat_runtime,
+                    heartbeat_gateway,
+                    heartbeat_shutdown,
+                )
+                .await
+                {
+                    warn!(error = %error, "transaction heartbeat loop stopped with an error");
+                }
+            });
+
+            let gc_shutdown = background_shutdown.clone();
+            let gc_runtime = transaction_runtime.clone();
+            background_tasks.spawn(async move {
+                if let Err(error) = run_gc_safe_point_loop(gc_runtime, gc_shutdown).await {
+                    warn!(error = %error, "MVCC GC safe-point loop stopped with an error");
+                }
+            });
+
+            let cleaner_shutdown = background_shutdown.clone();
+            let cleaner_gateway = replicated_runtime.tablet_rpc_client();
+            let cleaner_progress =
+                Arc::new(std::sync::Mutex::new(IntentCleanerProgress::default()));
+            let cleaner_schedule =
+                tasks::IntentCleanerSchedule::new(transaction_runtime.config.cleaner_interval)?;
+            let cleaner_policy = transaction_runtime.config.cleaner_policy;
+            background_tasks.spawn(async move {
+                let callback_shutdown = cleaner_shutdown.clone();
+                if let Err(error) =
+                    tasks::run_intent_cleaner_loop(cleaner_schedule, cleaner_shutdown, move || {
+                        let gateway = cleaner_gateway.clone();
+                        let progress = cleaner_progress.clone();
+                        let shutdown = callback_shutdown.clone();
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let mut progress = progress
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                clean_intents_once(
+                                    &gateway,
+                                    &mut progress,
+                                    cleaner_policy,
+                                    &shutdown,
+                                )
+                            })
+                            .await
+                            .map_err(|error| {
+                                Error::Configuration(format!(
+                                    "intent cleaner worker failed: {error}"
+                                ))
+                            })?
+                        }
+                    })
+                    .await
+                {
+                    warn!(error = %error, "intent cleaner loop stopped with an error");
+                }
+            });
+        }
 
         let admin_task = tokio::spawn(async move {
             admin::serve_admin(admin_listener, admin_state, admin_task_shutdown).await
@@ -380,6 +477,16 @@ impl Server {
             );
             connection_tasks.abort_all();
             while connection_tasks.join_next().await.is_some() {}
+        }
+
+        // Maintenance remains available while SQL requests drain. Once client
+        // work has stopped, cancel these bounded loops and wait for their
+        // in-flight operations before releasing the Raft and WAL owners.
+        background_shutdown.cancel();
+        while let Some(join_result) = background_tasks.join_next().await {
+            if let Err(join_error) = join_result {
+                warn!(error = %join_error, "transaction maintenance task failed during shutdown");
+            }
         }
 
         match admin_task.await {

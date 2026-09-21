@@ -404,8 +404,10 @@ impl DistributedTransactionCoordinator {
     }
 
     /// Add a logical range to the coordinator's transaction footprint.
-    pub fn record_read_span(&mut self, span: TransactionReadSpan) {
+    pub fn record_read_span(&mut self, span: TransactionReadSpan) -> Result<()> {
+        self.transaction.record_read_span(span.clone())?;
         self.read_spans.insert(span);
+        Ok(())
     }
 
     /// Replace the current route hint for one write participant.
@@ -491,6 +493,18 @@ impl DistributedTransactionCoordinator {
     /// mutation, or transaction acknowledgement occurs here.
     pub fn plan_prewrite(&self, ttl_ms: u64) -> Result<Vec<crate::prewrite::PrewriteBatchPlan>> {
         crate::prewrite::plan_prewrite(self, ttl_ms)
+    }
+
+    /// Return the validated footprint for the current routes and request
+    /// envelope. This is the same pure check execution repeats immediately
+    /// before dispatch, so diagnostics and admission use identical accounting.
+    pub fn preflight_footprint(
+        &self,
+        ttl_ms: u64,
+        acknowledged_through: Option<u64>,
+    ) -> Result<crate::TransactionFootprint> {
+        let batches = self.plan_prewrite(ttl_ms)?;
+        crate::prewrite::preflight_prewrite_commands(self, &batches, acknowledged_through, true)
     }
 
     /// Build the commit timestamp, durable status outcome, and primary-first
@@ -960,6 +974,29 @@ impl DistributedTransactionCoordinator {
         D: PrewriteBatchDispatcher,
         R: ParticipantRouteRefresher,
     {
+        self.execute_prewrite_with_retry_and_ack(
+            ttl_ms,
+            None,
+            refresher,
+            dispatcher,
+            max_route_refreshes,
+        )
+    }
+
+    /// Execute prewrite only after the complete set of per-key serialized
+    /// commands passes the transaction's configured admission limits.
+    pub fn execute_prewrite_with_retry_and_ack<D, R>(
+        &mut self,
+        ttl_ms: u64,
+        acknowledged_through: Option<u64>,
+        refresher: &mut R,
+        dispatcher: &mut D,
+        max_route_refreshes: usize,
+    ) -> Result<Vec<D::Output>>
+    where
+        D: PrewriteBatchDispatcher,
+        R: ParticipantRouteRefresher,
+    {
         if max_route_refreshes == 0 {
             return Err(Error::InvalidArgument(
                 "prewrite route refresh budget must be non-zero".to_string(),
@@ -967,8 +1004,15 @@ impl DistributedTransactionCoordinator {
         }
 
         let mut route_refreshes = 0;
+        let mut any_batch_dispatched = false;
         loop {
             let mut batches = self.plan_prewrite(ttl_ms)?;
+            crate::prewrite::preflight_prewrite_commands(
+                self,
+                &batches,
+                acknowledged_through,
+                !any_batch_dispatched,
+            )?;
             let primary_key = self.primary_key().to_vec();
             batches.sort_by_key(|batch| {
                 !batch.participant_plans.iter().any(|plan| {
@@ -980,7 +1024,10 @@ impl DistributedTransactionCoordinator {
 
             for batch in batches {
                 match dispatcher.dispatch_prewrite(&batch) {
-                    Ok(outcome) => outcomes.push(outcome),
+                    Ok(outcome) => {
+                        any_batch_dispatched = true;
+                        outcomes.push(outcome);
+                    }
                     Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
                         if route_refreshes >= max_route_refreshes {
                             return Err(Error::TabletUnavailable {

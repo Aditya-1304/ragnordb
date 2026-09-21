@@ -26,7 +26,7 @@ pub struct MetadataCommand {
     pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
     #[prost(
         oneof = "metadata_command::Command",
-        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16"
+        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
@@ -69,6 +69,16 @@ pub mod metadata_command {
         /// allocations are served from the committed interval in memory.
         #[prost(message, tag = "16")]
         ReserveTimestamps(super::ReserveTimestamps),
+        /// Leased protection for an MVCC history timestamp. These records are
+        /// metadata state and do not control Raft log or WAL retention.
+        #[prost(message, tag = "17")]
+        RegisterGcProtection(super::RegisterGcProtection),
+        #[prost(message, tag = "18")]
+        RenewGcProtection(super::RenewGcProtection),
+        #[prost(message, tag = "19")]
+        ReleaseGcProtection(super::ReleaseGcProtection),
+        #[prost(message, tag = "20")]
+        AdvanceGcSafePoint(super::AdvanceGcSafePoint),
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -76,6 +86,44 @@ pub struct ReserveTimestamps {
     /// Highest MVCC timestamp covered by the durable reservation.
     #[prost(uint64, tag = "1")]
     pub reserved_until: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterGcProtection {
+    #[prost(bytes = "vec", tag = "1")]
+    pub owner_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub protection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub protected_timestamp: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_deadline_ms: u64,
+    #[prost(uint64, tag = "5")]
+    pub now_ms: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewGcProtection {
+    #[prost(bytes = "vec", tag = "1")]
+    pub owner_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub protection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub lease_deadline_ms: u64,
+    #[prost(uint64, tag = "4")]
+    pub now_ms: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReleaseGcProtection {
+    #[prost(bytes = "vec", tag = "1")]
+    pub owner_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub protection_id: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AdvanceGcSafePoint {
+    #[prost(uint64, tag = "1")]
+    pub candidate_timestamp: u64,
+    #[prost(uint64, tag = "2")]
+    pub now_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClusterInitialized {
@@ -355,6 +403,23 @@ pub struct MetadataSnapshot {
     /// value is valid for legacy snapshots created before Phase 6.1.
     #[prost(uint64, tag = "12")]
     pub timestamp_reserved_until: u64,
+    /// Monotonic MVCC history boundary and its durable, expiring readers.
+    /// These fields are absent in snapshots before format version 3.
+    #[prost(uint64, tag = "13")]
+    pub gc_safe_point: u64,
+    #[prost(message, repeated, tag = "14")]
+    pub gc_protections: ::prost::alloc::vec::Vec<GcProtection>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GcProtection {
+    #[prost(bytes = "vec", tag = "1")]
+    pub owner_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub protection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub protected_timestamp: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_deadline_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientSession {

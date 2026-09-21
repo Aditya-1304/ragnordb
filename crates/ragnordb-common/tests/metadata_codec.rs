@@ -5,9 +5,9 @@ use ragnordb_common::{
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         LEGACY_METADATA_SNAPSHOT_VERSION, METADATA_SNAPSHOT_VERSION, MetadataAllocatorState,
-        MetadataCommand, MetadataCommandCodecError, MetadataCommandEnvelope, MetadataSnapshot,
-        NodeDescriptor, NodeLifecycle, PartitionSpec, PlacementPolicy, RetiredReplicaLifetime,
-        TabletDescriptor,
+        MetadataCommand, MetadataCommandCodecError, MetadataCommandEnvelope, MetadataGcProtection,
+        MetadataSnapshot, NodeDescriptor, NodeLifecycle, PREVIOUS_METADATA_SNAPSHOT_VERSION,
+        PartitionSpec, PlacementPolicy, RetiredReplicaLifetime, TabletDescriptor,
     },
     rpc_codec::MetadataProposalOutcome,
 };
@@ -310,6 +310,8 @@ fn metadata_snapshot_roundtrips_retired_replica_lifetimes() {
         },
 
         timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -335,6 +337,8 @@ fn metadata_snapshot_rejects_noncanonical_node_order() {
         allocator: MetadataAllocatorState::initial(),
 
         timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -368,6 +372,8 @@ fn phase_5_1_snapshot_without_allocator_derives_safe_high_water_marks() {
         },
 
         timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -405,6 +411,8 @@ fn current_metadata_snapshot_requires_allocator_state() {
         allocator: MetadataAllocatorState::initial(),
 
         timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -441,6 +449,8 @@ fn transitional_v1_snapshot_with_allocator_state_remains_readable() {
         },
 
         timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
 
         request_deduplication: Vec::new(),
         client_sessions: Vec::new(),
@@ -467,4 +477,152 @@ fn reserve_timestamps_command_roundtrips_with_a_nonzero_frontier() {
     let decoded = MetadataCommand::decode(&command.encode().unwrap()).unwrap();
 
     assert_eq!(decoded, command);
+}
+
+#[test]
+fn gc_protection_and_safe_point_commands_roundtrip() {
+    let commands = [
+        MetadataCommand::RegisterGcProtection {
+            owner_id: 0x0102,
+            protection_id: 0x0304,
+            protected_timestamp: Timestamp(50),
+            lease_deadline_ms: 900,
+            now_ms: 100,
+        },
+        MetadataCommand::RenewGcProtection {
+            owner_id: 0x0102,
+            protection_id: 0x0304,
+            lease_deadline_ms: 1_000,
+            now_ms: 900,
+        },
+        MetadataCommand::ReleaseGcProtection {
+            owner_id: 0x0102,
+            protection_id: 0x0304,
+        },
+        MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: 900,
+        },
+    ];
+
+    for command in commands {
+        assert_eq!(
+            MetadataCommand::decode(&command.encode().unwrap()).unwrap(),
+            command,
+        );
+    }
+}
+
+#[test]
+fn gc_lease_commands_reject_zero_and_expired_deadlines() {
+    // These invalid leases could otherwise protect history indefinitely or
+    // create a protection that has already expired at its Raft apply time.
+    assert_eq!(
+        MetadataCommand::RegisterGcProtection {
+            owner_id: 0,
+            protection_id: 2,
+            protected_timestamp: Timestamp(50),
+            lease_deadline_ms: 900,
+            now_ms: 100,
+        }
+        .validate()
+        .unwrap_err(),
+        MetadataCommandCodecError::ZeroGcOwnerId,
+    );
+    assert_eq!(
+        MetadataCommand::RegisterGcProtection {
+            owner_id: 1,
+            protection_id: 2,
+            protected_timestamp: Timestamp(50),
+            lease_deadline_ms: 100,
+            now_ms: 100,
+        }
+        .validate()
+        .unwrap_err(),
+        MetadataCommandCodecError::ExpiredGcProtectionLease {
+            deadline_ms: 100,
+            now_ms: 100,
+        },
+    );
+    assert_eq!(
+        MetadataCommand::RenewGcProtection {
+            owner_id: 1,
+            protection_id: 2,
+            lease_deadline_ms: 0,
+            now_ms: 100,
+        }
+        .validate()
+        .unwrap_err(),
+        MetadataCommandCodecError::ZeroGcProtectionLease,
+    );
+}
+
+#[test]
+fn gc_snapshot_roundtrips_and_rejects_protection_below_safe_point() {
+    let snapshot = MetadataSnapshot {
+        cluster_id: Some("cluster-a".to_string()),
+        nodes: Vec::new(),
+        tables: Vec::new(),
+        tablets: Vec::new(),
+        desired_placements: Vec::new(),
+        retired_replicas: Vec::new(),
+        allocator: MetadataAllocatorState::initial(),
+        timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(40),
+        gc_protections: vec![MetadataGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            protected_timestamp: Timestamp(40),
+            lease_deadline_ms: 1_000,
+        }],
+        request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
+    };
+
+    assert_eq!(
+        MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap(),
+        snapshot,
+    );
+
+    let invalid = MetadataSnapshot {
+        gc_protections: vec![MetadataGcProtection {
+            protected_timestamp: Timestamp(39),
+            ..snapshot.gc_protections[0]
+        }],
+        ..snapshot
+    };
+    assert_eq!(
+        invalid.encode().unwrap_err(),
+        MetadataCommandCodecError::GcProtectionBelowSafePoint {
+            protected: Timestamp(39),
+            safe_point: Timestamp(40),
+        },
+    );
+}
+
+#[test]
+fn previous_snapshot_version_decodes_with_empty_gc_state() {
+    let snapshot = MetadataSnapshot {
+        cluster_id: Some("cluster-a".to_string()),
+        nodes: vec![node(11, 7001)],
+        tables: Vec::new(),
+        tablets: Vec::new(),
+        desired_placements: Vec::new(),
+        retired_replicas: Vec::new(),
+        allocator: MetadataAllocatorState::initial(),
+        timestamp_reserved_until: Timestamp(0),
+        gc_safe_point: Timestamp(0),
+        gc_protections: Vec::new(),
+        request_deduplication: Vec::new(),
+        client_sessions: Vec::new(),
+    };
+    let mut proto = ragnordb_common::proto::metadata::MetadataSnapshot::decode(
+        snapshot.encode().unwrap().as_slice(),
+    )
+    .unwrap();
+    proto.format_version = PREVIOUS_METADATA_SNAPSHOT_VERSION;
+
+    let decoded = MetadataSnapshot::decode(&proto.encode_to_vec()).unwrap();
+    assert_eq!(decoded.gc_safe_point, Timestamp(0));
+    assert!(decoded.gc_protections.is_empty());
 }

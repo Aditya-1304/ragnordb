@@ -480,6 +480,7 @@ pub enum CachedTabletCommandResult {
     Rollback,
     ResolveIntent,
     PublishAbortedTransactionStatus,
+    HeartbeatTransactionStatus,
 }
 
 impl CachedTabletCommandResult {
@@ -493,6 +494,9 @@ impl CachedTabletCommandResult {
             Self::ResolveIntent => command::CachedTabletCommandResult::ResolveIntent,
             Self::PublishAbortedTransactionStatus => {
                 command::CachedTabletCommandResult::PublishAbortedTransactionStatus
+            }
+            Self::HeartbeatTransactionStatus => {
+                command::CachedTabletCommandResult::HeartbeatTransactionStatus
             }
         }
     }
@@ -509,6 +513,9 @@ impl CachedTabletCommandResult {
             command::CachedTabletCommandResult::ResolveIntent => Ok(Self::ResolveIntent),
             command::CachedTabletCommandResult::PublishAbortedTransactionStatus => {
                 Ok(Self::PublishAbortedTransactionStatus)
+            }
+            command::CachedTabletCommandResult::HeartbeatTransactionStatus => {
+                Ok(Self::HeartbeatTransactionStatus)
             }
             command::CachedTabletCommandResult::Unspecified => {
                 Err(TabletStateMachineSnapshotError::UnspecifiedCachedResult)
@@ -1414,6 +1421,145 @@ impl PublishAbortedTransactionStatus {
     }
 }
 
+/// Fenced renewal of a pending transaction lease at its status authority.
+///
+/// The command carries both the observed and proposed status plus one fixed
+/// wall-clock sample. Replicated apply therefore rejects stale heartbeats,
+/// terminal decisions, and renewals submitted after the old lease expired.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartbeatTransactionStatus {
+    pub expected_status: TxnStatusRecord,
+    pub next_status: TxnStatusRecord,
+    pub now_ms: u64,
+}
+
+impl HeartbeatTransactionStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected_status.validate()?;
+        self.next_status.validate()?;
+        if self.now_ms == 0 {
+            return Err("heartbeat apply time must be non-zero");
+        }
+        if self.expected_status.status != TxnStatus::Pending
+            || self.next_status.status != TxnStatus::Pending
+            || self.expected_status.commit_timestamp.is_some()
+            || self.next_status.commit_timestamp.is_some()
+        {
+            return Err("heartbeat requires pending status records");
+        }
+        if !same_transaction_status_identity(&self.expected_status, &self.next_status) {
+            return Err("heartbeat changed transaction status identity");
+        }
+        let current_deadline = self
+            .expected_status
+            .lease_deadline_ms
+            .ok_or("heartbeat requires an existing lease deadline")?;
+        if self.now_ms >= current_deadline {
+            return Err("heartbeat apply time is at or after the current lease deadline");
+        }
+        let next_deadline = self
+            .next_status
+            .lease_deadline_ms
+            .ok_or("heartbeat requires a next lease deadline")?;
+        if next_deadline < current_deadline {
+            return Err("heartbeat lease deadline must not regress");
+        }
+        let previous_timestamp = self
+            .expected_status
+            .last_heartbeat_timestamp
+            .unwrap_or(self.expected_status.start_timestamp);
+        let next_timestamp = self
+            .next_status
+            .last_heartbeat_timestamp
+            .ok_or("heartbeat requires a next heartbeat timestamp")?;
+        if next_timestamp <= previous_timestamp {
+            return Err("heartbeat timestamp must advance monotonically");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::HeartbeatTransactionStatus, &'static str> {
+        self.validate()?;
+        Ok(command::HeartbeatTransactionStatus {
+            expected_status: Some(self.expected_status.to_proto()?),
+            next_status: Some(self.next_status.to_proto()?),
+            now_ms: self.now_ms,
+        })
+    }
+
+    pub fn from_proto(proto: command::HeartbeatTransactionStatus) -> Result<Self, &'static str> {
+        let heartbeat = Self {
+            expected_status: TxnStatusRecord::from_proto(
+                proto.expected_status.ok_or("missing expected_status")?,
+            )?,
+            next_status: TxnStatusRecord::from_proto(
+                proto.next_status.ok_or("missing next_status")?,
+            )?,
+            now_ms: proto.now_ms,
+        };
+        heartbeat.validate()?;
+        Ok(heartbeat)
+    }
+}
+
+/// Publish a replicated abort decision only if the observed pending lease is
+/// still the current, expired status record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpirePendingTransactionStatus {
+    pub expected_status: TxnStatusRecord,
+    pub now_ms: u64,
+}
+
+impl ExpirePendingTransactionStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected_status.validate()?;
+        if self.now_ms == 0 {
+            return Err("expiry apply time must be non-zero");
+        }
+        if self.expected_status.status != TxnStatus::Pending
+            || self.expected_status.commit_timestamp.is_some()
+        {
+            return Err("expiry requires a pending status record");
+        }
+        let deadline = self
+            .expected_status
+            .lease_deadline_ms
+            .ok_or("expiry requires an existing lease deadline")?;
+        if self.now_ms < deadline {
+            return Err("expiry apply time precedes the pending lease deadline");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::ExpirePendingTransactionStatus, &'static str> {
+        self.validate()?;
+        Ok(command::ExpirePendingTransactionStatus {
+            expected_status: Some(self.expected_status.to_proto()?),
+            now_ms: self.now_ms,
+        })
+    }
+
+    pub fn from_proto(
+        proto: command::ExpirePendingTransactionStatus,
+    ) -> Result<Self, &'static str> {
+        let expiry = Self {
+            expected_status: TxnStatusRecord::from_proto(
+                proto.expected_status.ok_or("missing expected_status")?,
+            )?,
+            now_ms: proto.now_ms,
+        };
+        expiry.validate()?;
+        Ok(expiry)
+    }
+}
+
+fn same_transaction_status_identity(left: &TxnStatusRecord, right: &TxnStatusRecord) -> bool {
+    left.txn_id == right.txn_id
+        && left.start_timestamp == right.start_timestamp
+        && left.primary_key == right.primary_key
+        && left.participant_tablet_ids == right.participant_tablet_ids
+}
+
 /// roll back every key owned by one tablet participant
 ///
 /// removes lock/{key} and writes a rollback record so
@@ -1775,6 +1921,8 @@ pub enum TabletCommand {
     Catalog(CatalogCommand),
     Noop(NoopCommand),
     PublishAbortedTransactionStatus(PublishAbortedTransactionStatus),
+    HeartbeatTransactionStatus(HeartbeatTransactionStatus),
+    ExpirePendingTransactionStatus(ExpirePendingTransactionStatus),
 }
 
 impl TabletCommand {
@@ -1804,6 +1952,8 @@ impl TabletCommand {
             TabletCommand::PublishAbortedTransactionStatus(_) => {
                 "publish-aborted-transaction-status"
             }
+            TabletCommand::HeartbeatTransactionStatus(_) => "heartbeat-transaction-status",
+            TabletCommand::ExpirePendingTransactionStatus(_) => "expire-pending-transaction-status",
         }
     }
 
@@ -1833,6 +1983,14 @@ impl TabletCommand {
             }
             TabletCommand::PublishAbortedTransactionStatus(command) => Some(
                 command::tablet_command::Command::PublishAbortedTransactionStatus(
+                    command.to_proto()?,
+                ),
+            ),
+            TabletCommand::HeartbeatTransactionStatus(command) => Some(
+                command::tablet_command::Command::HeartbeatTransactionStatus(command.to_proto()?),
+            ),
+            TabletCommand::ExpirePendingTransactionStatus(command) => Some(
+                command::tablet_command::Command::ExpirePendingTransactionStatus(
                     command.to_proto()?,
                 ),
             ),
@@ -1867,6 +2025,16 @@ impl TabletCommand {
             Some(command::tablet_command::Command::PublishAbortedTransactionStatus(c)) => {
                 Ok(TabletCommand::PublishAbortedTransactionStatus(
                     PublishAbortedTransactionStatus::from_proto(c)?,
+                ))
+            }
+            Some(command::tablet_command::Command::HeartbeatTransactionStatus(c)) => {
+                Ok(TabletCommand::HeartbeatTransactionStatus(
+                    HeartbeatTransactionStatus::from_proto(c)?,
+                ))
+            }
+            Some(command::tablet_command::Command::ExpirePendingTransactionStatus(c)) => {
+                Ok(TabletCommand::ExpirePendingTransactionStatus(
+                    ExpirePendingTransactionStatus::from_proto(c)?,
                 ))
             }
             None => Err("missing tablet command"),

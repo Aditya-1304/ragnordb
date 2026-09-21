@@ -171,4 +171,5 @@ pub enum BoundStatement {
     Commit,
     Rollback,
     ShowTables,
+    ShowTransactions,
 }

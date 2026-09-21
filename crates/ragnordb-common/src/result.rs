@@ -57,6 +57,11 @@ pub enum Error {
     #[error("write conflict: {0}")]
     WriteConflict(String),
 
+    /// The requested MVCC snapshot predates the cluster's published history
+    /// boundary and cannot be served without silently omitting versions.
+    #[error("snapshot too old: {reason}")]
+    SnapshotTooOld { reason: String },
+
     /// The SQL parser could not construct an AST from the client input
     #[error("SQL parse error: {0}")]
     SqlParse(String),
@@ -285,6 +290,7 @@ impl Error {
             | Self::UnsupportedSql(_)
             | Self::SchemaMismatch(_)
             | Self::Configuration(_)
+            | Self::SnapshotTooOld { .. }
             | Self::DistributedScanFailed {
                 retryable: false, ..
             }

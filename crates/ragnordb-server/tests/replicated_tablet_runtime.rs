@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     net::TcpListener,
     sync::{
-        Arc, Barrier, Mutex,
+        Arc, Barrier, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -32,9 +32,16 @@ use ragnordb_server::{
 use ragnordb_storage::key::make_row_key;
 use tempfile::TempDir;
 
-fn unused_address() -> std::net::SocketAddr {
+fn unused_address(reservations: &mut Vec<TcpListener>) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    let address = listener.local_addr().unwrap();
+    reservations.push(listener);
+    address
+}
+
+fn endpoint_fixture_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 struct TestNode {
@@ -118,13 +125,6 @@ impl RuntimeFaultGateway {
 
     fn state(&self) -> std::sync::MutexGuard<'_, RuntimeFaultState> {
         self.state.lock().unwrap()
-    }
-
-    fn set_leader_hint(&self, group_id: RaftGroupId, leader: ReplicaId) {
-        self.leader_overrides
-            .lock()
-            .unwrap()
-            .insert(group_id, leader);
     }
 }
 
@@ -493,19 +493,25 @@ fn install_test_timestamp_manager(database: &SharedLocalDatabase, runtime: &Mult
 }
 
 async fn start_failover_test_nodes() -> Vec<TestNode> {
+    // Serialize port selection through all transport binds. The old helper
+    // dropped each ephemeral listener immediately, allowing parallel runtime
+    // tests to advertise the same address before either bootstrap bound it.
+    let _fixture_guard = endpoint_fixture_lock().lock().await;
+    let mut reservations = Vec::new();
     let seeds = (1..=3)
         .map(|id| SeedNodeConfig {
             id: NodeId(id),
-            raft_addr: unused_address(),
-            snapshot_addr: unused_address(),
-            sql_addr: unused_address(),
-            admin_addr: unused_address(),
+            raft_addr: unused_address(&mut reservations),
+            snapshot_addr: unused_address(&mut reservations),
+            sql_addr: unused_address(&mut reservations),
+            admin_addr: unused_address(&mut reservations),
             region: None,
             zone: None,
             rack: None,
             storage_class: "default".to_string(),
         })
         .collect::<Vec<_>>();
+    drop(reservations);
     let cluster_id = "runtime-stale-route-failover".to_string();
     let startup_handles = seeds
         .iter()
@@ -546,19 +552,22 @@ async fn start_failover_test_nodes() -> Vec<TestNode> {
 /// is still awaiting apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit() {
+    let _fixture_guard = endpoint_fixture_lock().lock().await;
+    let mut reservations = Vec::new();
     let seeds = (1..=3)
         .map(|id| SeedNodeConfig {
             id: NodeId(id),
-            raft_addr: unused_address(),
-            snapshot_addr: unused_address(),
-            sql_addr: unused_address(),
-            admin_addr: unused_address(),
+            raft_addr: unused_address(&mut reservations),
+            snapshot_addr: unused_address(&mut reservations),
+            sql_addr: unused_address(&mut reservations),
+            admin_addr: unused_address(&mut reservations),
             region: None,
             zone: None,
             rack: None,
             storage_class: "default".to_string(),
         })
         .collect::<Vec<_>>();
+    drop(reservations);
     let cluster_id = "runtime-test".to_string();
     // Replicated startup waits for metadata initialization to commit and apply.
     // Start every configured node together so the metadata Raft group can form

@@ -81,6 +81,34 @@ pub use result::{
 };
 pub use session::SqlSession;
 
+/// Columns shared by the local empty result and the server's bounded
+/// transaction-lifecycle snapshot. The projection contains operational
+/// metadata only and never includes keys or row values.
+pub fn transaction_diagnostic_columns() -> Vec<ResultColumn> {
+    [
+        ("transaction_id", DataType::Int, false),
+        ("status", DataType::Text, false),
+        ("age_ms", DataType::Int, false),
+        ("participant_tablets", DataType::Int, false),
+        ("write_keys", DataType::Int, false),
+        ("write_bytes", DataType::Int, false),
+        ("read_spans", DataType::Int, false),
+        ("intent_accounting_bytes", DataType::Int, false),
+        ("participant_command_bytes", DataType::Int, false),
+        ("lease_deadline_ms", DataType::Int, true),
+        ("lease_remaining_ms", DataType::Int, true),
+        ("last_heartbeat_timestamp", DataType::Int, true),
+        ("last_heartbeat_age_ms", DataType::Int, true),
+    ]
+    .into_iter()
+    .map(|(name, data_type, nullable)| ResultColumn {
+        name: name.to_string(),
+        data_type,
+        nullable,
+    })
+    .collect()
+}
+
 /// Process-wide semantic commit boundary used by every local tablet.
 ///
 /// The trait object lets server startup replace the initial A-WAL sink with the
@@ -1812,9 +1840,13 @@ impl LocalExecutor {
             false,
         );
         let mut refresher = GatewayParticipantRouteRefresher { gateway };
-        if let Err(prewrite_error) =
-            coordinator.execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 3)
-        {
+        if let Err(prewrite_error) = coordinator.execute_prewrite_with_retry_and_ack(
+            30_000,
+            request_context.acknowledged_through(),
+            &mut refresher,
+            &mut dispatcher,
+            3,
+        ) {
             if dispatcher.owner_change_after_pending.get() {
                 return Err(Error::RecoveryRequired {
                     reason: format!(
@@ -1845,6 +1877,10 @@ impl LocalExecutor {
         commit_timestamp: Timestamp,
         request_context: &TabletRequestContext,
     ) -> Result<SingleNodeCommitOutcome> {
+        if let Err(error) = coordinator.transaction().validate_age() {
+            self.rollback_prepared_distributed_transaction(coordinator, request_context)?;
+            return Err(error);
+        }
         let transaction_id = coordinator.transaction_id();
         let committed_writes = coordinator.transaction().len();
         let mut timestamp_allocator = commit_timestamp;
@@ -1993,6 +2029,8 @@ impl LocalExecutor {
                 wal_extent: None,
             });
         }
+
+        transaction.validate_age()?;
 
         let mut table_ids = BTreeSet::new();
         let mut tablet_ids = BTreeSet::new();
@@ -2513,11 +2551,11 @@ impl LocalExecutor {
                 }
             }
             AccessPath::Scan if self.is_local_compatibility_table(schema.id) => {
-                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
                 self.local_scan_each_row(transaction, schema.id, &mut emit)?;
             }
             AccessPath::Scan => {
-                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
                 if transaction.is_empty() {
                     self.distributed_scan_each_row(
                         transaction,
@@ -2589,6 +2627,14 @@ impl LocalExecutor {
             ),
 
             Plan::ShowTables => self.execute_show_tables(),
+
+            // The distributed server replaces this with its bounded registry
+            // snapshot. The local compatibility executor has no durable
+            // transaction lifecycle entries, so its accurate result is empty.
+            Plan::ShowTransactions => Ok(ExecutionResult::Query(ResultSet {
+                columns: transaction_diagnostic_columns(),
+                rows: Vec::new(),
+            })),
 
             Plan::Begin | Plan::Commit | Plan::Rollback => Err(Error::NotImplemented(
                 "transaction-control plans are handled by the \
@@ -2662,6 +2708,8 @@ impl LocalExecutor {
                 wal_extent: None,
             });
         }
+
+        transaction.validate_age()?;
 
         let mut table_ids = BTreeSet::new();
         let mut tablet_ids = BTreeSet::new();
@@ -3387,7 +3435,7 @@ impl LocalExecutor {
                 .unwrap_or_default(),
 
             AccessPath::Scan => {
-                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?);
+                transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
                 if self.is_local_compatibility_table(schema.id) {
                     self.local_scan_rows(transaction, schema.id)?
                 } else {
@@ -3653,6 +3701,7 @@ impl LocalExecutor {
                 read_timestamp: progress.read_ts,
                 max_rows: TABLET_SCAN_PAGE_ROWS,
                 max_bytes: TABLET_SCAN_PAGE_BYTES,
+                intent_only: false,
                 rpc_attempt_id: None,
                 deadline_remaining_ms: None,
             };
@@ -3863,6 +3912,7 @@ impl LocalExecutor {
                 read_timestamp: progress.read_ts,
                 max_rows: TABLET_SCAN_PAGE_ROWS,
                 max_bytes: TABLET_SCAN_PAGE_BYTES,
+                intent_only: false,
                 rpc_attempt_id: None,
                 deadline_remaining_ms: None,
             };
@@ -4691,7 +4741,7 @@ mod tests {
     };
     use ragnordb_sql::{analyze, parse_one, plan};
     use ragnordb_tablet::command::TabletCommandApplyResult;
-    use ragnordb_txn::{LocalTransactionManager, TransactionManager};
+    use ragnordb_txn::{LocalTransactionManager, TransactionFootprintPolicy, TransactionManager};
 
     #[test]
     fn ddl_publishes_coherent_schema_and_routing_snapshots() {
@@ -5143,6 +5193,36 @@ mod tests {
         executor.refresh_metadata_catalog().unwrap();
         executor.replace_tablet_gateway(gateway.clone());
         (executor, gateway, row_key)
+    }
+
+    #[test]
+    fn oversized_participant_command_is_rejected_before_any_proposal() {
+        // This catches partial transaction durability when a later participant
+        // command exceeds its serialized size cap after the primary was sent.
+        let (executor, gateway, row_key) = remote_executor();
+        let key = ragnordb_storage::key::encode_row_key(&row_key).unwrap();
+        let row = encode_row(&Row {
+            values: vec![Value::Int(7), Value::Text("command-size-check".to_string())],
+        })
+        .unwrap();
+        let mut transaction = Transaction::new_with_policy(
+            TxnId(701),
+            Timestamp(10),
+            TransactionFootprintPolicy {
+                max_participant_command_bytes: 1,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        transaction.buffer_put(key, row).unwrap();
+        let request_context = TabletRequestContext::new(701).unwrap();
+
+        let error = executor
+            .prepare_distributed_transaction(transaction, &request_context)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(gateway.commands.lock().unwrap().is_empty());
     }
 
     fn remote_scan_executor(

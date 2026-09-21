@@ -24,8 +24,8 @@ use ragnordb_common::{
     codec::TxnStatusRecord,
     command_codec::{CachedTabletCommandOutcome, TabletCommand},
     ids::{
-        LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, Timestamp,
-        TxnId,
+        LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, RowKey, TableId, TabletId,
+        Timestamp, TxnId,
     },
     metadata_codec::DesiredReplicaRole,
     proto::{mvcc, rpc},
@@ -511,6 +511,9 @@ pub struct TabletRpcClient {
 struct RoutingSnapshot {
     generation: u64,
     tables: BTreeMap<TableId, TableRoutingSnapshot>,
+    /// Global ordered index lets background workers seek directly to a route
+    /// cursor instead of rescanning every route on every bounded page.
+    routes_by_tablet: BTreeMap<(TableId, TabletId), TabletRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +537,7 @@ impl TabletRpcClient {
             routing_snapshot: Arc::new(RwLock::new(Arc::new(RoutingSnapshot {
                 generation: 0,
                 tables: BTreeMap::new(),
+                routes_by_tablet: BTreeMap::new(),
             }))),
             route_cache: Arc::new(RwLock::new(TabletRouteCache::new())),
         }
@@ -646,6 +650,65 @@ impl TabletRpcClient {
                 })
             })
             .collect()
+    }
+
+    /// Return one route for every tablet in the current committed metadata
+    /// view. Background lifecycle workers use this snapshot to schedule bounded
+    /// per-tablet work without enumerating physical Raft groups independently.
+    pub fn all_tablet_routes(&self) -> Result<Vec<(TableId, TabletRoute)>> {
+        self.all_tablet_routes_with_generation()
+            .map(|(_, routes)| routes)
+    }
+
+    pub fn all_tablet_routes_with_generation(&self) -> Result<(u64, Vec<(TableId, TabletRoute)>)> {
+        let snapshot = self.routing_snapshot()?;
+        let routes = snapshot
+            .routes_by_tablet
+            .iter()
+            .map(|((table_id, _tablet_id), route)| {
+                Ok((*table_id, self.route_with_leader_hint(route)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((snapshot.generation, routes))
+    }
+
+    /// Return one bounded, lexicographically ordered page of committed tablet
+    /// routes. Cleaner scheduling uses this cursor instead of cloning every
+    /// route into a per-pass work list.
+    pub fn tablet_route_page_with_generation(
+        &self,
+        after: Option<(TableId, TabletId)>,
+        limit: usize,
+    ) -> Result<(u64, Vec<(TableId, TabletRoute)>, bool)> {
+        if limit == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet route page limit must be non-zero".into(),
+            ));
+        }
+        let snapshot = self.routing_snapshot()?;
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let candidates = match after {
+            Some(cursor) => snapshot
+                .routes_by_tablet
+                .range((Excluded(cursor), Unbounded))
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>(),
+            None => snapshot
+                .routes_by_tablet
+                .iter()
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>(),
+        };
+        let has_more = candidates.len() > limit;
+        let routes = candidates
+            .into_iter()
+            .take(limit)
+            .map(|((table_id, _tablet_id), route)| {
+                Ok((*table_id, self.route_with_leader_hint(route)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((snapshot.generation, routes, has_more))
     }
 
     /// Return the local tablet lifecycle status when this node hosts the
@@ -928,6 +991,7 @@ impl TabletRpcClient {
         read_timestamp: ragnordb_common::ids::Timestamp,
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
+        ensure_snapshot_not_collected(&self.metadata, read_timestamp)?;
         route
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
@@ -1155,6 +1219,7 @@ impl TabletRpcClient {
         read_timestamp: Timestamp,
         timeout: Duration,
     ) -> Result<TabletPointReadInspection> {
+        ensure_snapshot_not_collected(&self.metadata, read_timestamp)?;
         route
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
@@ -1279,7 +1344,7 @@ impl TabletRpcClient {
         route
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
-        let mut request = TabletScanRequest {
+        let request = TabletScanRequest {
             request_id,
             tablet_id: route.tablet_id,
             tablet_epoch: route.tablet_epoch,
@@ -1291,7 +1356,57 @@ impl TabletRpcClient {
             max_bytes,
             rpc_attempt_id: None,
             deadline_remaining_ms: None,
+            intent_only: false,
         };
+        self.scan_request(route, request, timeout)
+    }
+
+    /// Enumerate a bounded page of tablet intents for the background cleaner.
+    /// The distinct request mode returns lock metadata only and never reads or
+    /// changes MVCC rows on behalf of the cleaner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_intents_page(
+        &self,
+        route: &TabletRoute,
+        request_id: RequestId,
+        span: &ScanSpan,
+        resume_after: Option<&[u8]>,
+        max_rows: u32,
+        max_bytes: u32,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        route
+            .validate()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let request = TabletScanRequest {
+            request_id,
+            tablet_id: route.tablet_id,
+            tablet_epoch: route.tablet_epoch,
+            start_key: span.start_key.clone(),
+            end_key: span.end_key.clone(),
+            resume_after: resume_after.map(ToOwned::to_owned),
+            read_timestamp: Timestamp(1),
+            max_rows,
+            max_bytes,
+            rpc_attempt_id: None,
+            deadline_remaining_ms: None,
+            intent_only: true,
+        };
+        self.scan_request(route, request, timeout)
+    }
+
+    fn scan_request(
+        &self,
+        route: &TabletRoute,
+        mut request: TabletScanRequest,
+        timeout: Duration,
+    ) -> Result<TabletScanBatch> {
+        if !request.intent_only {
+            ensure_snapshot_not_collected(&self.metadata, request.read_timestamp)?;
+        }
+        route
+            .validate()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         request
             .validate()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
@@ -1490,6 +1605,12 @@ impl TabletRpcClient {
             TabletCommand::ResolveIntent(command) => command.keys.first()?.as_slice(),
             TabletCommand::PublishAbortedTransactionStatus(command) => {
                 command.status_record.primary_key.as_slice()
+            }
+            TabletCommand::HeartbeatTransactionStatus(command) => {
+                command.expected_status.primary_key.as_slice()
+            }
+            TabletCommand::ExpirePendingTransactionStatus(command) => {
+                command.expected_status.primary_key.as_slice()
             }
             TabletCommand::Catalog(_) | TabletCommand::Noop(_) => return None,
         };
@@ -1793,6 +1914,7 @@ impl TabletRpcClient {
 
 fn build_routing_snapshot(generation: u64, state: &MetadataState) -> Result<RoutingSnapshot> {
     let mut tables = BTreeMap::new();
+    let mut global_routes_by_tablet = BTreeMap::new();
     for schema in state.list_tables() {
         let table_id = schema.id;
         let descriptors = state.tablets_for_table(table_id);
@@ -1841,11 +1963,20 @@ fn build_routing_snapshot(generation: u64, state: &MetadataState) -> Result<Rout
                 .validate()
                 .map_err(|error| Error::CorruptData(error.to_string()))?;
             if routes_by_tablet
-                .insert(descriptor.tablet_id, route)
+                .insert(descriptor.tablet_id, route.clone())
                 .is_some()
             {
                 return Err(Error::CorruptData(format!(
                     "metadata contains duplicate tablet {} in table {}",
+                    descriptor.tablet_id.0, table_id.0
+                )));
+            }
+            if global_routes_by_tablet
+                .insert((table_id, descriptor.tablet_id), route)
+                .is_some()
+            {
+                return Err(Error::CorruptData(format!(
+                    "metadata contains duplicate route for tablet {} in table {}",
                     descriptor.tablet_id.0, table_id.0
                 )));
             }
@@ -1860,7 +1991,11 @@ fn build_routing_snapshot(generation: u64, state: &MetadataState) -> Result<Rout
         );
     }
 
-    Ok(RoutingSnapshot { generation, tables })
+    Ok(RoutingSnapshot {
+        generation,
+        tables,
+        routes_by_tablet: global_routes_by_tablet,
+    })
 }
 
 impl TabletGateway for TabletRpcClient {
@@ -2013,6 +2148,7 @@ pub(crate) fn spawn_dispatcher(
     host_wake: HostWake,
     shutdown: Arc<AtomicBool>,
 ) -> (TabletRpcClient, thread::JoinHandle<()>) {
+    let dispatch_metadata = metadata.clone();
     let client = TabletRpcClient::new(
         transport.clone(),
         handles.clone(),
@@ -2041,6 +2177,7 @@ pub(crate) fn spawn_dispatcher(
                         &metadata_requests,
                         &join_requests,
                         &host_wake,
+                        &dispatch_metadata,
                         message.source_node_id,
                         message.frame,
                     );
@@ -2446,6 +2583,7 @@ fn dispatch_message(
     metadata_requests: &mpsc::SyncSender<MetadataHostRequest>,
     join_requests: &mpsc::SyncSender<ReplicaJoinAdmission>,
     host_wake: &HostWake,
+    metadata: &MetadataRuntimeHandle,
     source: NodeId,
     frame: RpcFrame,
 ) {
@@ -2602,6 +2740,16 @@ fn dispatch_message(
                             "tablet read request group does not match its frame".to_string(),
                         ),
                     ),
+                );
+                return;
+            }
+            if let Err(error) = ensure_snapshot_not_collected(metadata, request.read_timestamp) {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
                 );
                 return;
             }
@@ -2792,6 +2940,16 @@ fn dispatch_message(
                 );
                 return;
             }
+            if let Err(error) = ensure_snapshot_not_collected(metadata, request.read_timestamp) {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
+                );
+                return;
+            }
             let deadline = match remote_read_deadline(request.deadline_remaining_ms) {
                 Ok(deadline) => deadline,
                 Err(error) => {
@@ -2882,6 +3040,18 @@ fn dispatch_message(
                             "tablet scan request group does not match its frame".to_string(),
                         ),
                     ),
+                );
+                return;
+            }
+            if !request.intent_only
+                && let Err(error) = ensure_snapshot_not_collected(metadata, request.read_timestamp)
+            {
+                send_response(
+                    transport,
+                    source,
+                    frame.raft_group_id,
+                    attempt_id,
+                    error_response(request_id, error),
                 );
                 return;
             }
@@ -3561,6 +3731,7 @@ fn error_response(request_id: RequestId, error: Error) -> TabletCommandResponse 
         Error::RequestIdExpired { .. } => ("REQUEST_ID_EXPIRED", false, None),
         Error::ClientSessionExpired { .. } => ("CLIENT_SESSION_EXPIRED", false, None),
         Error::WriteConflict(_) => ("WRITE_CONFLICT", false, None),
+        Error::SnapshotTooOld { .. } => ("SNAPSHOT_TOO_OLD", false, None),
         Error::RecoveryRequired { .. } => ("RECOVERY_REQUIRED", false, None),
         Error::InvalidArgument(_) => ("INVALID_ARGUMENT", false, None),
         _ => ("TABLET_ERROR", false, None),
@@ -3631,6 +3802,11 @@ fn response_error(response: TabletCommandResponse) -> Error {
     if response.error_code == "WRITE_CONFLICT" {
         return Error::WriteConflict(response.error_message);
     }
+    if response.error_code == "SNAPSHOT_TOO_OLD" {
+        return Error::SnapshotTooOld {
+            reason: response.error_message,
+        };
+    }
     Error::InvalidArgument(response.error_message)
 }
 
@@ -3686,6 +3862,28 @@ fn remote_read_deadline(deadline_remaining_ms: Option<u64>) -> Result<Instant> {
     Instant::now()
         .checked_add(Duration::from_millis(deadline_remaining_ms))
         .ok_or_else(|| Error::InvalidArgument("forwarded latest read deadline overflowed".into()))
+}
+
+fn ensure_snapshot_not_collected(
+    metadata: &MetadataRuntimeHandle,
+    read_timestamp: Timestamp,
+) -> Result<()> {
+    ensure_read_timestamp_not_collected(read_timestamp, metadata.state_snapshot().gc_safe_point())
+}
+
+fn ensure_read_timestamp_not_collected(
+    read_timestamp: Timestamp,
+    gc_safe_point: Timestamp,
+) -> Result<()> {
+    if read_timestamp < gc_safe_point {
+        return Err(Error::SnapshotTooOld {
+            reason: format!(
+                "requested timestamp {} is below GC safe point {}",
+                read_timestamp.0, gc_safe_point.0
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn apply_leader_hint(route: &mut TabletRoute, leader: ReplicaId) -> bool {
@@ -3779,6 +3977,7 @@ fn decode_command_outcome(bytes: &[u8]) -> Result<TabletCommandApplyOutcome> {
         4 => TabletCommandApplyResult::Rollback,
         5 => TabletCommandApplyResult::ResolveIntent,
         6 => TabletCommandApplyResult::PublishAbortedTransactionStatus,
+        7 => TabletCommandApplyResult::HeartbeatTransactionStatus,
         _ => {
             return Err(Error::CorruptData(
                 "tablet command response contains an unknown result".to_string(),
@@ -3800,6 +3999,7 @@ const fn command_result_code(result: TabletCommandApplyResult) -> u8 {
         TabletCommandApplyResult::Rollback => 4,
         TabletCommandApplyResult::ResolveIntent => 5,
         TabletCommandApplyResult::PublishAbortedTransactionStatus => 6,
+        TabletCommandApplyResult::HeartbeatTransactionStatus => 7,
     }
 }
 
@@ -3807,6 +4007,26 @@ const fn command_result_code(result: TabletCommandApplyResult) -> u8 {
 mod tests {
     use super::*;
     use ragnordb_common::ids::TabletId;
+
+    #[test]
+    fn historical_reads_at_the_safe_point_pass_and_older_reads_fail_closed() {
+        assert!(ensure_read_timestamp_not_collected(Timestamp(40), Timestamp(40)).is_ok());
+        let error = ensure_read_timestamp_not_collected(Timestamp(39), Timestamp(40)).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::SnapshotTooOld { reason } if reason.contains("below GC safe point")
+        ));
+        let response = error_response(
+            RequestId {
+                client_id: 9,
+                sequence: 1,
+                raft_group_id: RaftGroupId(7),
+            },
+            error,
+        );
+        assert_eq!(response.error_code, "SNAPSHOT_TOO_OLD");
+        assert!(!response.retryable);
+    }
 
     #[test]
     fn command_outcome_wire_roundtrip_preserves_deduplication() {

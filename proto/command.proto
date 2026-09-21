@@ -43,6 +43,8 @@ message TabletCommand {
         CatalogCommand catalog_update = 6;
         NoopCommand noop = 7;
         PublishAbortedTransactionStatus publish_aborted_transaction_status = 8;
+        HeartbeatTransactionStatus heartbeat_transaction_status = 9;
+        ExpirePendingTransactionStatus expire_pending_transaction_status = 10;
     }
 }
 
@@ -73,6 +75,21 @@ message CommitCommand {
 // on every participant. This command changes status state only.
 message PublishAbortedTransactionStatus {
     ragnordb.mvcc.TxnStatusRecord status_record = 1;
+}
+
+// Extend a pending lease only when the exact observed status is still current.
+// The supplied wall-clock sample keeps replicated apply deterministic.
+message HeartbeatTransactionStatus {
+    ragnordb.mvcc.TxnStatusRecord expected_status = 1;
+    ragnordb.mvcc.TxnStatusRecord next_status = 2;
+    uint64 now_ms = 3;
+}
+
+// Commit an expiry decision only when the exact pending status observed by
+// the cleaner is still current and its durable deadline has elapsed.
+message ExpirePendingTransactionStatus {
+    ragnordb.mvcc.TxnStatusRecord expected_status = 1;
+    uint64 now_ms = 2;
 }
 
 message RollbackCommand {
@@ -182,4 +199,5 @@ enum CachedTabletCommandResult {
     CACHED_TABLET_COMMAND_RESULT_ROLLBACK = 5;
     CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT = 6;
     CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS = 7;
+    CACHED_TABLET_COMMAND_RESULT_HEARTBEAT_TRANSACTION_STATUS = 8;
 }

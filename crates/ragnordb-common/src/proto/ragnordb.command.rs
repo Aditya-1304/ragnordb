@@ -36,7 +36,7 @@ pub struct TabletCommandBatchEnvelope {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommand {
-    #[prost(oneof = "tablet_command::Command", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "tablet_command::Command", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub command: ::core::option::Option<tablet_command::Command>,
 }
 /// Nested message and enum types in `TabletCommand`.
@@ -59,6 +59,10 @@ pub mod tablet_command {
         Noop(super::NoopCommand),
         #[prost(message, tag = "8")]
         PublishAbortedTransactionStatus(super::PublishAbortedTransactionStatus),
+        #[prost(message, tag = "9")]
+        HeartbeatTransactionStatus(super::HeartbeatTransactionStatus),
+        #[prost(message, tag = "10")]
+        ExpirePendingTransactionStatus(super::ExpirePendingTransactionStatus),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -99,6 +103,26 @@ pub struct CommitCommand {
 pub struct PublishAbortedTransactionStatus {
     #[prost(message, optional, tag = "1")]
     pub status_record: ::core::option::Option<super::mvcc::TxnStatusRecord>,
+}
+/// Extend a pending lease only when the exact observed status is still current.
+/// The supplied wall-clock sample keeps replicated apply deterministic.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HeartbeatTransactionStatus {
+    #[prost(message, optional, tag = "1")]
+    pub expected_status: ::core::option::Option<super::mvcc::TxnStatusRecord>,
+    #[prost(message, optional, tag = "2")]
+    pub next_status: ::core::option::Option<super::mvcc::TxnStatusRecord>,
+    #[prost(uint64, tag = "3")]
+    pub now_ms: u64,
+}
+/// Commit an expiry decision only when the exact pending status observed by
+/// the cleaner is still current and its durable deadline has elapsed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExpirePendingTransactionStatus {
+    #[prost(message, optional, tag = "1")]
+    pub expected_status: ::core::option::Option<super::mvcc::TxnStatusRecord>,
+    #[prost(uint64, tag = "2")]
+    pub now_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RollbackCommand {
@@ -280,6 +304,7 @@ pub enum CachedTabletCommandResult {
     Rollback = 5,
     ResolveIntent = 6,
     PublishAbortedTransactionStatus = 7,
+    HeartbeatTransactionStatus = 8,
 }
 impl CachedTabletCommandResult {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -298,6 +323,9 @@ impl CachedTabletCommandResult {
             Self::PublishAbortedTransactionStatus => {
                 "CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS"
             }
+            Self::HeartbeatTransactionStatus => {
+                "CACHED_TABLET_COMMAND_RESULT_HEARTBEAT_TRANSACTION_STATUS"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -314,6 +342,9 @@ impl CachedTabletCommandResult {
             "CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT" => Some(Self::ResolveIntent),
             "CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS" => {
                 Some(Self::PublishAbortedTransactionStatus)
+            }
+            "CACHED_TABLET_COMMAND_RESULT_HEARTBEAT_TRANSACTION_STATUS" => {
+                Some(Self::HeartbeatTransactionStatus)
             }
             _ => None,
         }

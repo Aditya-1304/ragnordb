@@ -25,6 +25,7 @@ pub enum Plan {
     Commit,
     Rollback,
     ShowTables,
+    ShowTransactions,
 }
 
 /// validate new table definition
@@ -90,6 +91,7 @@ pub fn plan(statement: BoundStatement) -> Plan {
         BoundStatement::Commit => Plan::Commit,
         BoundStatement::Rollback => Plan::Rollback,
         BoundStatement::ShowTables => Plan::ShowTables,
+        BoundStatement::ShowTransactions => Plan::ShowTransactions,
     }
 }
 
@@ -275,5 +277,6 @@ mod tests {
         assert_eq!(build("COMMIT"), Plan::Commit);
         assert_eq!(build("ROLLBACK"), Plan::Rollback);
         assert_eq!(build("SHOW TABLES"), Plan::ShowTables);
+        assert_eq!(build("SHOW TRANSACTIONS"), Plan::ShowTransactions);
     }
 }

@@ -41,6 +41,15 @@ use crate::parser::Statement;
 /// returned value contains no `sqlparser` statements, expressions, operators,
 /// identifiers, or literal values.
 pub fn analyze(statement: &Statement, catalog: &dyn Catalog) -> Result<BoundStatement> {
+    // sqlparser represents this command as an unsupported SHOW variant. Keep
+    // the accepted syntax deliberately narrow until transaction filters or
+    // ordering clauses have explicit bound semantics.
+    let raw = statement.raw.trim();
+    let raw = raw.strip_suffix(';').unwrap_or(raw).trim();
+    if raw.eq_ignore_ascii_case("SHOW TRANSACTIONS") {
+        return Ok(BoundStatement::ShowTransactions);
+    }
+
     match &statement.ast {
         SqlStatement::CreateTable(create) => analyze_create_table(create, catalog),
         SqlStatement::Insert(insert) => analyze_insert(insert, catalog),
@@ -2237,6 +2246,17 @@ mod tests {
         assert!(matches!(
             analyze(&parse("SHOW TABLES"), &catalog).unwrap(),
             BoundStatement::ShowTables
+        ));
+    }
+
+    #[test]
+    fn show_transactions_is_accepted_without_catalog_rows() {
+        let catalog = MemoryCatalog::new();
+        let statement = parse("SHOW TRANSACTIONS");
+
+        assert!(matches!(
+            analyze(&statement, &catalog).unwrap(),
+            BoundStatement::ShowTransactions
         ));
     }
 

@@ -214,6 +214,9 @@ pub struct MultiRaftGroupStatus {
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
     pub pending_work: bool,
+    /// Client proposals admitted by this group that still await an applied,
+    /// rejected, or retryable terminal outcome.
+    pub pending_proposals: usize,
     /// Incrementally tracked state-machine work waiting behind the contiguous
     /// applied frontier. These counters are diagnostic and also expose when
     /// admission is being throttled by the apply boundary.
@@ -285,6 +288,7 @@ pub struct MultiRaftHostStatus {
 pub struct MultiRaftGroupLoad {
     pub identity: RaftReplicaIdentity,
     pub role: Option<MultiRaftRole>,
+    pub pending_proposals: usize,
     pub pending_messages: usize,
     pub pending_message_bytes: usize,
 }
@@ -299,6 +303,7 @@ pub struct MultiRaftHostSummary {
     pub pending_persistence_groups: usize,
     pub pending_persistence_records: usize,
     pub pending_persistence_bytes: usize,
+    pub pending_proposal_count: usize,
     pub group_count: usize,
     pub leader_count: usize,
     pub candidate_count: usize,
@@ -315,10 +320,15 @@ impl MultiRaftHostStatus {
         let mut top_groups = self
             .groups
             .iter()
-            .filter(|group| group.pending_messages != 0 || group.pending_message_bytes != 0)
+            .filter(|group| {
+                group.pending_proposals != 0
+                    || group.pending_messages != 0
+                    || group.pending_message_bytes != 0
+            })
             .map(|group| MultiRaftGroupLoad {
                 identity: group.identity,
                 role: group.role,
+                pending_proposals: group.pending_proposals,
                 pending_messages: group.pending_messages,
                 pending_message_bytes: group.pending_message_bytes,
             })
@@ -328,6 +338,7 @@ impl MultiRaftHostStatus {
                 .pending_message_bytes
                 .cmp(&left.pending_message_bytes)
                 .then_with(|| right.pending_messages.cmp(&left.pending_messages))
+                .then_with(|| right.pending_proposals.cmp(&left.pending_proposals))
                 .then_with(|| {
                     left.identity
                         .raft_group_id
@@ -345,6 +356,11 @@ impl MultiRaftHostStatus {
             pending_persistence_groups: self.pending_persistence_groups,
             pending_persistence_records: self.pending_persistence_records,
             pending_persistence_bytes: self.pending_persistence_bytes,
+            pending_proposal_count: self
+                .groups
+                .iter()
+                .map(|group| group.pending_proposals)
+                .sum(),
             group_count: self.groups.len(),
             leader_count: self
                 .groups
@@ -1040,6 +1056,7 @@ pub trait HostedRaftGroup: Send {
             uncommitted_bytes: 0,
             replication_inflight_bytes: 0,
             pending_work: self.has_pending_work(),
+            pending_proposals: 0,
             apply_backlog_entries: 0,
             apply_backlog_bytes: 0,
             apply_backlog_age_ms: 0,
@@ -1459,6 +1476,7 @@ where
             uncommitted_bytes: raft.uncommitted_bytes(),
             replication_inflight_bytes,
             pending_work: self.has_pending_work(),
+            pending_proposals: 0,
             apply_backlog_entries: apply_backlog.entries,
             apply_backlog_bytes: apply_backlog.bytes,
             apply_backlog_age_ms: apply_backlog.age_ms,
@@ -5018,7 +5036,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_summary_caps_top_groups_while_preserving_aggregates() {
+    fn bounded_summary_caps_top_groups_and_includes_pending_proposals() {
         let mut status = MultiRaftHostStatus {
             node_id: NodeId(7),
             state: MultiRaftHostState::Active,
@@ -5042,6 +5060,7 @@ mod tests {
                 uncommitted_bytes: 0,
                 replication_inflight_bytes: 0,
                 pending_work: false,
+                pending_proposals: 0,
                 apply_backlog_entries: 0,
                 apply_backlog_bytes: 0,
                 apply_backlog_age_ms: 0,
@@ -5067,6 +5086,19 @@ mod tests {
         assert_eq!(summary.top_groups.len(), 8);
         assert_eq!(summary.top_groups[0].pending_message_bytes, 320);
         assert_eq!(summary.top_groups[7].pending_message_bytes, 250);
+
+        // This catches proposal-only load disappearing from the bounded view
+        // when the same group has no queued network messages.
+        for group in &mut status.groups {
+            group.pending_messages = 0;
+            group.pending_message_bytes = 0;
+        }
+        status.groups[0].pending_proposals = 2;
+
+        let proposal_only_summary = status.bounded_summary(8);
+        assert_eq!(proposal_only_summary.pending_proposal_count, 2);
+        assert_eq!(proposal_only_summary.top_groups.len(), 1);
+        assert_eq!(proposal_only_summary.top_groups[0].pending_proposals, 2);
     }
 
     /// Realistic bug caught: after local destruction, a delayed envelope must

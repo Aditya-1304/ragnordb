@@ -481,6 +481,7 @@ fn prewrite_command(
             }],
             primary_key: encoded_key,
             ttl_ms: 30_000,
+            pending_status: None,
         }),
     )
     .unwrap()

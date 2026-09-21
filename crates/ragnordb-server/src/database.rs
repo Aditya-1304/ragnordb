@@ -19,13 +19,14 @@ use std::{
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
+use crate::transaction_lifecycle::TransactionRuntime;
 use raft::types::ConfState;
 use ragnordb_catalog::Catalog;
 use ragnordb_common::{
     Error, Result,
     command_codec::SingleShardCommitCommand,
     durability::DurabilityGate,
-    ids::{NodeId, RequestId, TableId, Timestamp},
+    ids::{NodeId, RequestId, TableId, Timestamp, TxnId},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
@@ -87,6 +88,7 @@ pub struct DatabaseServices {
     timestamp_reservations_reported: AtomicU64,
     timestamp_allocation_latency_reported: AtomicU64,
     timestamp_reservation_latency_reported: AtomicU64,
+    transaction_runtime: Option<Arc<TransactionRuntime>>,
 }
 
 impl fmt::Debug for DatabaseServices {
@@ -240,9 +242,41 @@ impl DatabaseServices {
                     .transaction_manager
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                session.begin_with_transaction_manager(&mut *transaction_manager)
+                self.observe_gc_safe_point(&mut **transaction_manager);
+                let started = session.begin_with_transaction_manager(&mut *transaction_manager)?;
+                drop(transaction_manager);
+                let transaction = session.current_transaction_mut().ok_or_else(|| {
+                    Error::CorruptData("BEGIN did not retain its allocated transaction".into())
+                })?;
+                transaction.set_footprint_policy(
+                    self.transaction_runtime
+                        .as_ref()
+                        .map_or_else(Default::default, |runtime| runtime.config.footprint),
+                )?;
+                if let Some(runtime) = &self.transaction_runtime {
+                    if let Err(error) =
+                        runtime.register_gc_protection(transaction.id(), transaction.start_ts())
+                    {
+                        let _ = session.rollback_current_transaction();
+                        return Err(error);
+                    }
+                }
+                Ok(started)
             }
-            Plan::Rollback => session.rollback_current_transaction(),
+            Plan::Rollback => {
+                let txn_id = session.current_transaction_id();
+                let result = session.rollback_current_transaction();
+                if result.is_ok() {
+                    if let (Some(runtime), Some(txn_id)) = (&self.transaction_runtime, txn_id) {
+                        release_gc_protection_best_effort(runtime, txn_id);
+                    }
+                }
+                result
+            }
+            Plan::ShowTransactions => {
+                let snapshot = self.transaction_status_snapshot(100);
+                Ok(ExecutionResult::Query(snapshot.into_result_set()))
+            }
             Plan::ShowTables => {
                 let executor = self
                     .executor
@@ -291,8 +325,12 @@ impl DatabaseServices {
             }
             Plan::Commit => {
                 let transaction = session.take_transaction_for_commit()?;
+                let transaction_id = transaction.id();
                 let outcome =
                     self.commit_transaction(transaction, session.request_context_mut())?;
+                if let Some(runtime) = &self.transaction_runtime {
+                    release_gc_protection_best_effort(runtime, transaction_id);
+                }
                 Ok(ExecutionResult::TransactionCommitted {
                     transaction_id: outcome.transaction_id,
                     commit_ts: outcome.commit_timestamp,
@@ -325,8 +363,18 @@ impl DatabaseServices {
                             .transaction_manager
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        self.observe_gc_safe_point(&mut **transaction_manager);
                         transaction_manager.begin_transaction()?
                     };
+                    transaction.set_footprint_policy(
+                        self.transaction_runtime
+                            .as_ref()
+                            .map_or_else(Default::default, |runtime| runtime.config.footprint),
+                    )?;
+                    if let Some(runtime) = &self.transaction_runtime {
+                        runtime.register_gc_protection(transaction.id(), transaction.start_ts())?;
+                    }
+                    let transaction_id = transaction.id();
                     let statement_result = {
                         if let Some(executor) = detached_executor.as_ref() {
                             executor.execute_data_plan_with_request_context(
@@ -347,6 +395,9 @@ impl DatabaseServices {
                         }
                     }?;
                     let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+                    if let Some(runtime) = &self.transaction_runtime {
+                        release_gc_protection_best_effort(runtime, transaction_id);
+                    }
                     Ok(statement_result)
                 }
             }
@@ -360,6 +411,39 @@ impl DatabaseServices {
     }
 
     fn commit_transaction(
+        &self,
+        transaction: ragnordb_txn::Transaction,
+        request_context: &mut ragnordb_exec::TabletRequestContext,
+    ) -> Result<ragnordb_txn::SingleNodeCommitOutcome> {
+        let transaction_id = transaction.id();
+        if let Some(runtime) = &self.transaction_runtime
+            && !transaction.is_empty()
+        {
+            if let Err(error) = runtime
+                .lifecycle
+                .record_transaction_footprint(transaction.id(), transaction.footprint())
+            {
+                release_gc_protection_best_effort(runtime, transaction_id);
+                return Err(error);
+            }
+        }
+
+        let result = self.commit_transaction_inner(transaction, request_context);
+        if result.is_err()
+            && let Some(runtime) = &self.transaction_runtime
+            && !runtime.lifecycle.is_active(transaction_id)
+        {
+            // A definite pre-admission rejection has no durable participant
+            // state to protect. Clear its bounded registry reservation and
+            // release the history pin; uncertain or prepared outcomes remain
+            // active and keep both protections until authoritative resolution.
+            runtime.lifecycle.unregister(transaction_id);
+            release_gc_protection_best_effort(runtime, transaction_id);
+        }
+        result
+    }
+
+    fn commit_transaction_inner(
         &self,
         transaction: ragnordb_txn::Transaction,
         request_context: &mut ragnordb_exec::TabletRequestContext,
@@ -446,6 +530,29 @@ impl DatabaseServices {
         }
     }
 
+    fn observe_gc_safe_point(&self, transaction_manager: &mut dyn TransactionManager) {
+        if let Some(runtime) = &self.transaction_runtime {
+            transaction_manager.observe_replicated_high_water(
+                ragnordb_common::ids::TxnId(0),
+                runtime.gc_safe_point(),
+            );
+        }
+    }
+
+    pub fn transaction_status_snapshot(
+        &self,
+        limit: usize,
+    ) -> crate::transaction_lifecycle::TransactionStatusSnapshot {
+        self.transaction_runtime.as_ref().map_or(
+            crate::transaction_lifecycle::TransactionStatusSnapshot {
+                active_count: 0,
+                truncated: false,
+                transactions: Vec::new(),
+            },
+            |runtime| runtime.lifecycle.status_snapshot(limit),
+        )
+    }
+
     /// Execute a bounded streaming SELECT through the same split ownership
     /// contract as materialized statements.
     pub fn execute_sql_streaming(
@@ -495,8 +602,18 @@ impl DatabaseServices {
                     .transaction_manager
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.observe_gc_safe_point(&mut **transaction_manager);
                 transaction_manager.begin_transaction()?
             };
+            transaction.set_footprint_policy(
+                self.transaction_runtime
+                    .as_ref()
+                    .map_or_else(Default::default, |runtime| runtime.config.footprint),
+            )?;
+            if let Some(runtime) = &self.transaction_runtime {
+                runtime.register_gc_protection(transaction.id(), transaction.start_ts())?;
+            }
+            let transaction_id = transaction.id();
             let summary = {
                 if let Some(executor) = detached_executor.as_ref() {
                     executor.execute_select_streaming(
@@ -523,6 +640,9 @@ impl DatabaseServices {
                 }
             };
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+            if let Some(runtime) = &self.transaction_runtime {
+                release_gc_protection_best_effort(runtime, transaction_id);
+            }
             Ok(summary)
         };
         self.record_timestamp_metrics();
@@ -552,6 +672,14 @@ fn take_counter_delta(counter: &AtomicU64, current: u64) -> u64 {
         {
             return current - previous;
         }
+    }
+}
+
+fn release_gc_protection_best_effort(runtime: &TransactionRuntime, txn_id: TxnId) {
+    if let Err(error) = runtime.release_gc_protection(txn_id) {
+        crate::metrics::counter_inc("ragnordb_txn_gc_protection_release_failures_total");
+        tracing::warn!(transaction_id = txn_id.0, error = %error,
+            "failed to release durable transaction GC protection; its lease will expire safely");
     }
 }
 
@@ -938,6 +1066,22 @@ impl LocalDatabase {
     /// planning, CPU operators, and blocking tablet waits as one admission
     /// domain until dedicated query workers are introduced.
     pub fn database_services(&self) -> SharedDatabaseServices {
+        self.build_database_services(None)
+    }
+
+    /// Build distributed SQL services with the metadata-owned transaction
+    /// lifecycle and MVCC history-protection boundary installed.
+    pub fn database_services_with_transaction_runtime(
+        &self,
+        runtime: Arc<TransactionRuntime>,
+    ) -> SharedDatabaseServices {
+        self.build_database_services(Some(runtime))
+    }
+
+    fn build_database_services(
+        &self,
+        transaction_runtime: Option<Arc<TransactionRuntime>>,
+    ) -> SharedDatabaseServices {
         let parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
@@ -959,6 +1103,7 @@ impl LocalDatabase {
             timestamp_reservations_reported: AtomicU64::new(0),
             timestamp_allocation_latency_reported: AtomicU64::new(0),
             timestamp_reservation_latency_reported: AtomicU64::new(0),
+            transaction_runtime,
         })
     }
 

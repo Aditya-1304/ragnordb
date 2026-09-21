@@ -111,6 +111,9 @@ message TabletScanRequest {
         // Conservative remaining caller budget for one forwarded attempt.
         // The receiver never reconstructs a deadline from its wall clock.
         optional uint64 deadline_remaining_ms = 11;
+        // Cleaner-only mode streams every intent in a bounded page. It does
+        // not return MVCC rows or enforce a snapshot timestamp.
+        bool intent_only = 12;
 }
 
 message TabletScanRow {

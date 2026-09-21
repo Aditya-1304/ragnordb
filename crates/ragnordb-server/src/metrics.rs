@@ -86,6 +86,18 @@ fn describe_metrics() {
         "ragnordb_txn_intents_resolved_by_cleaner_total",
         "Intents resolved by background cleaners"
     );
+    metrics::describe_gauge!(
+        "ragnordb_txn_gc_safe_point",
+        "Published metadata-managed MVCC history safe point"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_txn_gc_protections_active",
+        "Live durable MVCC history protections at the latest safe-point sweep"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_gc_protection_release_failures_total",
+        "Transaction history protections left to expire after release failures"
+    );
     metrics::describe_counter!(
         "ragnordb_txn_intent_cleaner_runs_total",
         "Background transaction intent-cleaner passes"

@@ -168,6 +168,7 @@ impl DurabilityGate {
             | Error::ConstraintViolation(_)
             | Error::Configuration(_)
             | Error::StatementTimeout { .. }
+            | Error::SnapshotTooOld { .. }
             | Error::WalAppendNotStaged {
                 recovery_required: false,
                 ..

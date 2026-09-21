@@ -111,6 +111,7 @@ fn prewrite_envelope(
             }],
             primary_key,
             ttl_ms: 30_000,
+            pending_status: None,
         }),
     )
     .unwrap()
@@ -132,6 +133,7 @@ fn commit_envelope(
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(200),
             keys: vec![key],
+            committed_status: None,
         }),
     )
     .unwrap()
@@ -437,6 +439,7 @@ fn participant_crash_before_and_after_apply_has_one_deterministic_outcome() {
         }],
         primary_key: key.clone(),
         ttl_ms: 30_000,
+        pending_status: None,
     });
 
     // Crash before apply: the replacement participant still applies the
@@ -484,6 +487,7 @@ fn participant_crash_before_and_after_apply_has_one_deterministic_outcome() {
             }],
             primary_key: key,
             ttl_ms: 30_000,
+            pending_status: None,
         }),
     )
     .unwrap();

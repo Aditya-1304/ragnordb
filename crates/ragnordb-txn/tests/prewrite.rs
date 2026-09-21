@@ -1,6 +1,7 @@
 use ragnordb_common::{
     Error,
     codec::{Row, Value},
+    command_codec::{PrewriteCommand, TabletCommand, TabletCommandEnvelope},
     encoding::encode_row,
     ids::{ClientRequestId, RaftGroupId, ReplicaId, TableId, TabletId, Timestamp, TxnId},
 };
@@ -8,6 +9,7 @@ use ragnordb_storage::key::{encode_row_key, make_row_key};
 use ragnordb_txn::{
     DistributedTransactionCoordinator, ParticipantDispatchError, ParticipantRoute,
     ParticipantRouteRefresher, PrewriteBatchDispatcher, PrewriteBatchPlan, Transaction,
+    TransactionFootprintPolicy,
 };
 
 fn key(value: i64) -> Vec<u8> {
@@ -40,7 +42,13 @@ fn root_request() -> ClientRequestId {
 }
 
 fn three_key_coordinator() -> DistributedTransactionCoordinator {
-    let mut transaction = Transaction::new(TxnId(42), Timestamp(100)).unwrap();
+    three_key_coordinator_with_policy(TransactionFootprintPolicy::default())
+}
+
+fn three_key_coordinator_with_policy(
+    policy: TransactionFootprintPolicy,
+) -> DistributedTransactionCoordinator {
+    let mut transaction = Transaction::new_with_policy(TxnId(42), Timestamp(100), policy).unwrap();
     transaction.buffer_put(key(1), row(1)).unwrap();
     transaction.buffer_put(key(2), row(2)).unwrap();
     transaction.buffer_delete(key(3)).unwrap();
@@ -60,6 +68,50 @@ fn three_key_coordinator() -> DistributedTransactionCoordinator {
         .unwrap();
     coordinator.set_status_route(route(20, 4, 200)).unwrap();
     coordinator
+}
+
+fn max_serialized_prewrite_command_bytes(coordinator: &DistributedTransactionCoordinator) -> usize {
+    coordinator
+        .plan_prewrite(30_000)
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .command
+                .writes
+                .iter()
+                .zip(&batch.participant_plans)
+                .map(|(write, participant)| {
+                    let is_primary = write.key == batch.command.primary_key;
+                    let mut prewrite = PrewriteCommand {
+                        txn_id: batch.command.txn_id,
+                        start_timestamp: batch.command.start_timestamp,
+                        writes: vec![write.clone()],
+                        primary_key: batch.command.primary_key.clone(),
+                        ttl_ms: batch.command.ttl_ms,
+                        pending_status: is_primary
+                            .then(|| batch.command.pending_status.clone())
+                            .flatten(),
+                    };
+                    if let Some(status) = prewrite.pending_status.as_mut() {
+                        prewrite.ttl_ms = u64::MAX;
+                        status.last_heartbeat_timestamp = Some(status.start_timestamp);
+                        status.lease_deadline_ms = Some(u64::MAX);
+                    }
+                    let envelope = TabletCommandEnvelope::new_with_logical_command_id_and_ack(
+                        participant.request_id.clone(),
+                        participant.logical_command_id,
+                        participant.route.tablet_id,
+                        participant.route.tablet_epoch,
+                        None,
+                        TabletCommand::Prewrite(prewrite),
+                    )
+                    .unwrap();
+                    envelope.encode().unwrap().len()
+                })
+        })
+        .max()
+        .unwrap()
 }
 
 #[test]
@@ -406,4 +458,98 @@ fn prewrite_execution_requires_a_nonzero_route_refresh_budget() {
     ));
     assert_eq!(dispatcher.calls, 0);
     assert_eq!(refresher.calls, 0);
+}
+
+struct CountingBatchDispatcher {
+    calls: usize,
+}
+
+impl PrewriteBatchDispatcher for CountingBatchDispatcher {
+    type Output = TabletId;
+
+    fn dispatch_prewrite(
+        &mut self,
+        plan: &PrewriteBatchPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        self.calls += 1;
+        Ok(plan.tablet_id())
+    }
+}
+
+#[test]
+fn participant_and_command_limits_accept_exact_values_and_reject_before_dispatch() {
+    // This catches footprint caps being checked after the coordinator has
+    // already admitted an earlier participant proposal.
+    let mut exact_participant_limit =
+        three_key_coordinator_with_policy(TransactionFootprintPolicy {
+            max_participant_tablets: 2,
+            ..TransactionFootprintPolicy::default()
+        });
+    let mut refresher = UnexpectedRefresh { calls: 0 };
+    let mut dispatcher = CountingBatchDispatcher { calls: 0 };
+    exact_participant_limit
+        .execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+    assert_eq!(dispatcher.calls, 2);
+
+    let mut over_participant_limit =
+        three_key_coordinator_with_policy(TransactionFootprintPolicy {
+            max_participant_tablets: 1,
+            ..TransactionFootprintPolicy::default()
+        });
+    let mut dispatcher = CountingBatchDispatcher { calls: 0 };
+    assert!(matches!(
+        over_participant_limit.execute_prewrite_with_retry(
+            30_000,
+            &mut refresher,
+            &mut dispatcher,
+            1,
+        ),
+        Err(Error::InvalidArgument(message)) if message.contains("participant tablets")
+    ));
+    assert_eq!(dispatcher.calls, 0);
+
+    let command_limit = max_serialized_prewrite_command_bytes(&three_key_coordinator());
+    let mut exact_command_limit = three_key_coordinator_with_policy(TransactionFootprintPolicy {
+        max_participant_command_bytes: command_limit,
+        ..TransactionFootprintPolicy::default()
+    });
+    let mut dispatcher = CountingBatchDispatcher { calls: 0 };
+    exact_command_limit
+        .execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+    assert_eq!(dispatcher.calls, 2);
+
+    let mut over_command_limit = three_key_coordinator_with_policy(TransactionFootprintPolicy {
+        max_participant_command_bytes: command_limit - 1,
+        ..TransactionFootprintPolicy::default()
+    });
+    let mut dispatcher = CountingBatchDispatcher { calls: 0 };
+    assert!(matches!(
+        over_command_limit.execute_prewrite_with_retry(
+            30_000,
+            &mut refresher,
+            &mut dispatcher,
+            1,
+        ),
+        Err(Error::InvalidArgument(message)) if message.contains("participant command bytes")
+    ));
+    assert_eq!(dispatcher.calls, 0);
+}
+
+#[test]
+fn expired_transaction_age_rejects_before_participant_dispatch() {
+    let mut coordinator = three_key_coordinator_with_policy(TransactionFootprintPolicy {
+        max_age_ms: 20,
+        ..TransactionFootprintPolicy::default()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(25));
+
+    let mut refresher = UnexpectedRefresh { calls: 0 };
+    let mut dispatcher = CountingBatchDispatcher { calls: 0 };
+    assert!(matches!(
+        coordinator.execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 1),
+        Err(Error::InvalidArgument(message)) if message.contains("age milliseconds")
+    ));
+    assert_eq!(dispatcher.calls, 0);
 }

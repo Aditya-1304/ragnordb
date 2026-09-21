@@ -2436,6 +2436,111 @@ impl MetadataProposalClient {
         )
     }
 
+    /// Durably pin MVCC history for one active transaction or supported
+    /// historical reader. The metadata apply result is the visibility boundary
+    /// callers must cross before issuing reads at `protected_timestamp`.
+    pub fn register_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Extend a live MVCC history pin without changing its protected
+    /// timestamp. The catalog rejects terminal, expired, or regressed leases.
+    pub fn renew_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::RenewGcProtection {
+                owner_id,
+                protection_id,
+                lease_deadline_ms,
+                now_ms,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Release one durable history pin after its reader or transaction has
+    /// finished. A process crash instead relies on the replicated lease expiry.
+    pub fn release_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::ReleaseGcProtection {
+                owner_id,
+                protection_id,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Ask metadata to monotonically advance the global MVCC history boundary.
+    /// Its state machine clamps the candidate against every protection live at
+    /// `now_ms`; this command is independent of A-WAL retention.
+    pub fn advance_gc_safe_point(
+        &self,
+        candidate: Timestamp,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::AdvanceGcSafePoint { candidate, now_ms },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    fn next_metadata_admin_request_id(&self) -> Result<RequestId> {
+        let sequence = self
+            .next_admin_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::InvalidArgument("administrative request sequence exhausted".into())
+            })?;
+        Ok(RequestId {
+            client_id: self.admin_client_id,
+            sequence,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+        })
+    }
+
     /// Propose removal of one physical metadata member through the metadata
     /// leader. A draining node is commonly a follower, so this path first
     /// attempts the local Ready owner and then uses the authenticated metadata
@@ -3729,12 +3834,12 @@ fn run_host(
     inbound.bind_current_thread();
     let mut timer_clock = SparseTickClock::new(TICK_INTERVAL);
 
-    host.schedule_all_groups_after(1)
-        .expect("active MultiRaft host must accept startup timer scheduling");
-    publish_host_status(&host_status, &host);
-
     let mut pending_metadata = BTreeMap::<u64, PendingMetadataProposal>::new();
     let mut pending_metadata_by_request = HashMap::<RequestId, u64>::new();
+
+    host.schedule_all_groups_after(1)
+        .expect("active MultiRaft host must accept startup timer scheduling");
+    publish_host_status(&host_status, &host, pending_metadata.len());
 
     let mut next_metadata_attempt = Instant::now();
 
@@ -3747,7 +3852,7 @@ fn run_host(
             &metadata,
             &metadata_replica_to_node,
         ) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             signal_metadata_failure(&mut startup_sender, error.to_string());
             fail_pending_metadata(
                 &mut pending_metadata,
@@ -3793,7 +3898,7 @@ fn run_host(
             &mut pending_metadata_by_request,
             METADATA_REQUEST_BUDGET,
         ) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             fail_pending_metadata(
                 &mut pending_metadata,
                 &mut pending_metadata_by_request,
@@ -3814,7 +3919,7 @@ fn run_host(
                 Ok(()) => admitted_messages += 1,
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
-                    publish_host_status(&host_status, &host);
+                    publish_host_status(&host_status, &host, pending_metadata.len());
                     signal_metadata_failure(
                         &mut startup_sender,
                         "shared Raft WAL requires node recovery".to_string(),
@@ -3854,7 +3959,7 @@ fn run_host(
             Ok(turn) => send_outbound(&transport, turn.outbound),
 
             Err(MultiRaftHostError::RecoveryRequired) => {
-                publish_host_status(&host_status, &host);
+                publish_host_status(&host_status, &host, pending_metadata.len());
                 signal_metadata_failure(
                     &mut startup_sender,
                     "shared Raft WAL requires node recovery".to_string(),
@@ -3889,7 +3994,7 @@ fn run_host(
             &mut pending_metadata_by_request,
         );
         if let Err(error) = tablet_lifecycle.reconcile(&mut host, &metadata, true) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             signal_metadata_failure(&mut startup_sender, error.to_string());
             fail_pending_metadata(
                 &mut pending_metadata,
@@ -3987,7 +4092,7 @@ fn run_host(
             next_metadata_attempt = now + METADATA_BOOTSTRAP_RETRY_INTERVAL;
         }
 
-        publish_host_status(&host_status, &host);
+        publish_host_status(&host_status, &host, pending_metadata.len());
 
         let wait = if host.has_runnable_work() {
             Duration::ZERO
@@ -4014,7 +4119,7 @@ fn run_host(
         &metadata_replica_to_node,
     );
 
-    publish_host_status(&host_status, &host);
+    publish_host_status(&host_status, &host, pending_metadata.len());
 }
 
 /// Select the smallest eligible replica ID so transfer decisions are stable
@@ -4339,10 +4444,19 @@ fn graceful_leadership_handoff(
 fn publish_host_status(
     status: &SharedMultiRaftHostStatus,
     host: &MultiRaftHost<impl RaftWal + Send + 'static>,
+    metadata_pending_proposals: usize,
 ) {
+    let mut snapshot = host.status();
+    if let Some(metadata_group) = snapshot
+        .groups
+        .iter_mut()
+        .find(|group| group.identity.raft_group_id == METADATA_RAFT_GROUP_ID)
+    {
+        metadata_group.pending_proposals = metadata_pending_proposals;
+    }
     *status
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = host.status();
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
 }
 
 fn service_metadata_requests<W>(

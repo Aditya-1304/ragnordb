@@ -50,7 +50,10 @@ pub use status::{
     TransactionStatusStore,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use ragnordb_common::{
     Error, Result,
@@ -64,10 +67,75 @@ use ragnordb_storage::{key::decode_row_key, mvcc::Mutation};
 pub struct Transaction {
     id: TxnId,
     start_ts: Timestamp,
+    created_at: Instant,
+    footprint_policy: TransactionFootprintPolicy,
     writes: BTreeMap<Vec<u8>, Mutation>,
     read_keys: BTreeSet<Vec<u8>>,
     read_spans: BTreeSet<TransactionReadSpan>,
 }
+
+/// Configurable limits for transaction-local memory and distributed prewrite
+/// admission. `Transaction::new` uses conservative defaults; server code may
+/// supply the node's configured policy with `Transaction::new_with_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionFootprintPolicy {
+    pub max_age_ms: u64,
+    pub max_write_bytes: usize,
+    pub max_write_keys: usize,
+    pub max_read_spans: usize,
+    pub max_participant_tablets: usize,
+    pub max_intent_accounting_bytes: usize,
+    pub max_participant_command_bytes: usize,
+}
+
+impl Default for TransactionFootprintPolicy {
+    fn default() -> Self {
+        Self {
+            max_age_ms: 60_000,
+            max_write_bytes: 64 * 1024 * 1024,
+            max_write_keys: 100_000,
+            max_read_spans: 4_096,
+            max_participant_tablets: 256,
+            max_intent_accounting_bytes: 64 * 1024 * 1024,
+            max_participant_command_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl TransactionFootprintPolicy {
+    /// Validate the policy before a transaction starts retaining caller data.
+    pub fn validate(self) -> Result<()> {
+        if self.max_age_ms == 0
+            || self.max_write_bytes == 0
+            || self.max_write_keys == 0
+            || self.max_read_spans == 0
+            || self.max_participant_tablets == 0
+            || self.max_intent_accounting_bytes == 0
+            || self.max_participant_command_bytes == 0
+        {
+            return Err(Error::InvalidArgument(
+                "transaction footprint limits must all be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded transaction diagnostics used by status surfaces and admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionFootprint {
+    pub age_ms: u64,
+    pub write_bytes: usize,
+    pub write_keys: usize,
+    pub read_spans: usize,
+    pub participant_tablets: usize,
+    pub intent_accounting_bytes: usize,
+    pub participant_command_bytes: usize,
+}
+
+/// Logical allocator charge for the lock, transaction ownership, and MVCC
+/// index/accounting entries retained for each unique buffered key.
+const INTENT_ACCOUNTING_OVERHEAD_BYTES: usize = 64;
 
 /// A table-scoped logical read interval retained for transaction accounting.
 ///
@@ -128,6 +196,15 @@ impl Transaction {
     /// Start an empty transaction at a timestamp allocated by the timestamp
     /// authority.
     pub fn new(id: TxnId, start_ts: Timestamp) -> Result<Self> {
+        Self::new_with_policy(id, start_ts, TransactionFootprintPolicy::default())
+    }
+
+    /// Start an empty transaction with caller-supplied resource limits.
+    pub fn new_with_policy(
+        id: TxnId,
+        start_ts: Timestamp,
+        footprint_policy: TransactionFootprintPolicy,
+    ) -> Result<Self> {
         if id.0 == 0 {
             return Err(Error::InvalidArgument(
                 "transaction ID 0 is reserved".to_string(),
@@ -140,13 +217,50 @@ impl Transaction {
             ));
         }
 
+        footprint_policy.validate()?;
+
         Ok(Self {
             id,
             start_ts,
+            created_at: Instant::now(),
+            footprint_policy,
             writes: BTreeMap::new(),
             read_keys: BTreeSet::new(),
             read_spans: BTreeSet::new(),
         })
+    }
+
+    /// Return the limits that govern this transaction.
+    pub fn footprint_policy(&self) -> TransactionFootprintPolicy {
+        self.footprint_policy
+    }
+
+    /// Install a server-configured policy before this transaction starts
+    /// collecting reads or writes. Late replacement is rejected so smaller
+    /// limits cannot be applied retroactively to already-admitted state.
+    pub fn set_footprint_policy(&mut self, policy: TransactionFootprintPolicy) -> Result<()> {
+        policy.validate()?;
+        if !self.writes.is_empty() || !self.read_keys.is_empty() || !self.read_spans.is_empty() {
+            return Err(Error::InvalidArgument(
+                "transaction footprint policy must be installed before reads or writes".to_string(),
+            ));
+        }
+        self.footprint_policy = policy;
+        Ok(())
+    }
+
+    /// Return the transaction's current bounded resource accounting.
+    pub fn footprint(&self) -> TransactionFootprint {
+        let (write_bytes, intent_accounting_bytes) = write_footprint(&self.writes);
+        TransactionFootprint {
+            age_ms: self.created_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            write_bytes,
+            write_keys: self.writes.len(),
+            read_spans: self.read_keys.len().saturating_add(self.read_spans.len()),
+            participant_tablets: 0,
+            intent_accounting_bytes,
+            participant_command_bytes: 0,
+        }
     }
 
     /// Return the globally unique transaction identifier.
@@ -182,18 +296,40 @@ impl Transaction {
 
     /// Record one logical point read exactly once.
     pub fn record_read(&mut self, key: Vec<u8>) -> Result<()> {
+        self.validate_age()?;
         decode_row_key(&key).map_err(|error| {
             Error::InvalidArgument(format!(
                 "transaction read key is not a canonical encoded row key: {error}"
             ))
         })?;
+        let is_new = !self.read_keys.contains(&key);
+        let current_reads = self.read_keys.len().saturating_add(self.read_spans.len());
+        if is_new && current_reads >= self.footprint_policy.max_read_spans {
+            return Err(footprint_limit_error(
+                "read spans",
+                self.footprint_policy.max_read_spans,
+                current_reads.saturating_add(1),
+            ));
+        }
         self.read_keys.insert(key);
         Ok(())
     }
 
-    /// Record one logical range read exactly once.
-    pub fn record_read_span(&mut self, span: TransactionReadSpan) {
+    /// Record one logical range read exactly once, subject to the configured
+    /// span and transaction-age limits.
+    pub fn record_read_span(&mut self, span: TransactionReadSpan) -> Result<()> {
+        self.validate_age()?;
+        let is_new = !self.read_spans.contains(&span);
+        let current_reads = self.read_keys.len().saturating_add(self.read_spans.len());
+        if is_new && current_reads >= self.footprint_policy.max_read_spans {
+            return Err(footprint_limit_error(
+                "read spans",
+                self.footprint_policy.max_read_spans,
+                current_reads.saturating_add(1),
+            ));
+        }
         self.read_spans.insert(span);
+        Ok(())
     }
 
     /// Return the number of distinct rows modified by the transaction.
@@ -213,6 +349,7 @@ impl Transaction {
     pub fn buffer_put(&mut self, key: Vec<u8>, row: Vec<u8>) -> Result<()> {
         let mutation = Mutation::Put(row);
         validate_buffered_mutation(&key, &mutation)?;
+        self.check_projected_writes(std::iter::once((&key, &mutation)))?;
         self.writes.insert(key, mutation);
         Ok(())
     }
@@ -221,6 +358,7 @@ impl Transaction {
     pub fn buffer_delete(&mut self, key: Vec<u8>) -> Result<()> {
         let mutation = Mutation::Delete;
         validate_buffered_mutation(&key, &mutation)?;
+        self.check_projected_writes(std::iter::once((&key, &mutation)))?;
         self.writes.insert(key, mutation);
         Ok(())
     }
@@ -237,8 +375,114 @@ impl Transaction {
             validate_buffered_mutation(key, mutation)?;
         }
 
+        self.check_projected_writes(writes.iter().map(|(key, mutation)| (key, mutation)))?;
+
         self.writes.extend(writes);
         Ok(())
+    }
+
+    pub fn validate_age(&self) -> Result<()> {
+        self.validate_age_at(std::time::Instant::now())
+    }
+
+    fn validate_age_at(&self, now: std::time::Instant) -> Result<()> {
+        let elapsed = now.saturating_duration_since(self.created_at);
+        if elapsed > std::time::Duration::from_millis(self.footprint_policy.max_age_ms) {
+            let age_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            return Err(footprint_limit_error(
+                "age milliseconds",
+                self.footprint_policy.max_age_ms as usize,
+                age_ms.min(usize::MAX as u64) as usize,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_distributed_footprint(
+        &self,
+        participant_tablets: usize,
+        participant_command_bytes: usize,
+        status_accounting_bytes: usize,
+        check_age: bool,
+    ) -> Result<TransactionFootprint> {
+        if check_age {
+            self.validate_age()?;
+        }
+        let mut footprint = self.footprint();
+        footprint.participant_tablets = participant_tablets;
+        footprint.participant_command_bytes = participant_command_bytes;
+        footprint.intent_accounting_bytes = footprint
+            .intent_accounting_bytes
+            .saturating_add(status_accounting_bytes);
+        check_limit(
+            "write bytes",
+            self.footprint_policy.max_write_bytes,
+            footprint.write_bytes,
+        )?;
+        check_limit(
+            "write keys",
+            self.footprint_policy.max_write_keys,
+            footprint.write_keys,
+        )?;
+        check_limit(
+            "read spans",
+            self.footprint_policy.max_read_spans,
+            footprint.read_spans,
+        )?;
+        check_limit(
+            "participant tablets",
+            self.footprint_policy.max_participant_tablets,
+            footprint.participant_tablets,
+        )?;
+        check_limit(
+            "intent/accounting bytes",
+            self.footprint_policy.max_intent_accounting_bytes,
+            footprint.intent_accounting_bytes,
+        )?;
+        check_limit(
+            "participant command bytes",
+            self.footprint_policy.max_participant_command_bytes,
+            footprint.participant_command_bytes,
+        )?;
+        Ok(footprint)
+    }
+
+    fn check_projected_writes<'a>(
+        &self,
+        additions: impl Iterator<Item = (&'a Vec<u8>, &'a Mutation)>,
+    ) -> Result<()> {
+        self.validate_age()?;
+        let mut projected_bytes = self.footprint().write_bytes;
+        let mut projected_keys = self.writes.len();
+        let mut projected_intent_bytes = self.footprint().intent_accounting_bytes;
+        for (key, mutation) in additions {
+            if let Some(previous) = self.writes.get(key.as_slice()) {
+                let (old_write_bytes, old_intent_bytes) = mutation_footprint(key, previous);
+                projected_bytes = projected_bytes.saturating_sub(old_write_bytes);
+                projected_intent_bytes = projected_intent_bytes.saturating_sub(old_intent_bytes);
+            } else {
+                projected_keys = projected_keys.saturating_add(1);
+            }
+            let (write_bytes, intent_bytes) = mutation_footprint(key, mutation);
+            projected_bytes = projected_bytes.saturating_add(write_bytes);
+            projected_intent_bytes = projected_intent_bytes.saturating_add(intent_bytes);
+        }
+
+        check_limit(
+            "write bytes",
+            self.footprint_policy.max_write_bytes,
+            projected_bytes,
+        )?;
+        check_limit(
+            "write keys",
+            self.footprint_policy.max_write_keys,
+            projected_keys,
+        )?;
+        check_limit(
+            "intent/accounting bytes",
+            self.footprint_policy.max_intent_accounting_bytes,
+            projected_intent_bytes,
+        )
     }
 
     /// Consume the transaction and return its complete write set.
@@ -268,6 +512,44 @@ fn validate_buffered_mutation(key: &[u8], mutation: &Mutation) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn write_footprint(writes: &BTreeMap<Vec<u8>, Mutation>) -> (usize, usize) {
+    writes.iter().fold(
+        (0usize, 0usize),
+        |(write_bytes, intent_bytes), (key, mutation)| {
+            let (payload_bytes, mutation_intent_bytes) = mutation_footprint(key, mutation);
+            (
+                write_bytes.saturating_add(payload_bytes),
+                intent_bytes.saturating_add(mutation_intent_bytes),
+            )
+        },
+    )
+}
+
+fn mutation_footprint(key: &[u8], mutation: &Mutation) -> (usize, usize) {
+    let row_bytes = match mutation {
+        Mutation::Put(row) => row.len(),
+        Mutation::Delete => 0,
+    };
+    let payload_bytes = key.len().saturating_add(row_bytes);
+    (
+        payload_bytes,
+        payload_bytes.saturating_add(INTENT_ACCOUNTING_OVERHEAD_BYTES),
+    )
+}
+
+fn check_limit(name: &str, limit: usize, actual: usize) -> Result<()> {
+    if actual > limit {
+        return Err(footprint_limit_error(name, limit, actual));
+    }
+    Ok(())
+}
+
+fn footprint_limit_error(name: &str, limit: usize, actual: usize) -> Error {
+    Error::InvalidArgument(format!(
+        "transaction {name} footprint {actual} exceeds configured limit {limit}"
+    ))
 }
 
 #[cfg(test)]
@@ -349,6 +631,170 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidArgument(_)));
         assert!(transaction.is_empty());
+    }
+
+    #[test]
+    fn write_footprint_rejection_preserves_the_existing_write_set() {
+        // This catches a real partial-buffering bug: a large later SQL batch
+        // must not retain its early keys after a later key exceeds the cap.
+        let existing_key = encoded_key(1);
+        let existing_row = encoded_row(1, "existing");
+        let valid_key = encoded_key(2);
+        let valid_row = encoded_row(2, "valid");
+        let oversized_key = encoded_key(3);
+        let oversized_row = encoded_row(3, "this row pushes the batch over its byte cap");
+        let existing_bytes = existing_key.len() + existing_row.len();
+        let exact_addition_bytes = valid_key.len() + valid_row.len();
+        let mut transaction = Transaction::new_with_policy(
+            TxnId(1),
+            Timestamp(1),
+            TransactionFootprintPolicy {
+                max_write_bytes: existing_bytes + exact_addition_bytes,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        transaction
+            .buffer_put(existing_key.clone(), existing_row.clone())
+            .unwrap();
+        transaction
+            .buffer_put(valid_key.clone(), valid_row.clone())
+            .unwrap();
+
+        let mut batch = BTreeMap::new();
+        batch.insert(valid_key.clone(), Mutation::Put(valid_row.clone()));
+        batch.insert(oversized_key.clone(), Mutation::Put(oversized_row));
+
+        let error = transaction.buffer_batch(batch).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(transaction.write_set().len(), 2);
+        assert_eq!(
+            transaction.pending_write(&existing_key),
+            Some(&Mutation::Put(existing_row))
+        );
+        assert_eq!(
+            transaction.pending_write(&valid_key),
+            Some(&Mutation::Put(valid_row))
+        );
+        assert_eq!(transaction.pending_write(&oversized_key), None);
+    }
+
+    #[test]
+    fn point_reads_share_the_bounded_read_span_budget() {
+        // Point keys are retained for serializable conflict validation. They
+        // must consume the configured read budget just like range spans or a
+        // transaction can grow its read set without a limit.
+        let mut transaction = Transaction::new_with_policy(
+            TxnId(1),
+            Timestamp(1),
+            TransactionFootprintPolicy {
+                max_read_spans: 1,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        transaction.record_read(encoded_key(1)).unwrap();
+
+        let error = transaction.record_read(encoded_key(2)).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(message) if message.contains("read spans")));
+        assert_eq!(transaction.footprint().read_spans, 1);
+    }
+
+    #[test]
+    fn write_key_and_intent_accounting_caps_accept_the_boundary_and_reject_one_over() {
+        // This catches transactions that fit a byte budget while exceeding
+        // the separate per-intent accounting budget or distinct-key budget.
+        let first_key = encoded_key(1);
+        let first_row = encoded_row(1, "first");
+        let second_key = encoded_key(2);
+        let second_row = encoded_row(2, "second");
+        let third_key = encoded_key(3);
+        let third_row = encoded_row(3, "third");
+
+        let mut key_limited = Transaction::new_with_policy(
+            TxnId(1),
+            Timestamp(1),
+            TransactionFootprintPolicy {
+                max_write_keys: 2,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        key_limited
+            .buffer_put(first_key.clone(), first_row.clone())
+            .unwrap();
+        key_limited
+            .buffer_put(second_key.clone(), second_row.clone())
+            .unwrap();
+        assert!(
+            key_limited
+                .buffer_put(third_key.clone(), third_row.clone())
+                .is_err()
+        );
+        assert_eq!(key_limited.write_set().len(), 2);
+
+        let exact_intent_bytes = first_key
+            .len()
+            .saturating_add(first_row.len())
+            .saturating_add(INTENT_ACCOUNTING_OVERHEAD_BYTES);
+        let mut exact = Transaction::new_with_policy(
+            TxnId(2),
+            Timestamp(2),
+            TransactionFootprintPolicy {
+                max_intent_accounting_bytes: exact_intent_bytes,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        exact
+            .buffer_put(first_key.clone(), first_row.clone())
+            .unwrap();
+        assert_eq!(
+            exact.footprint().intent_accounting_bytes,
+            exact_intent_bytes
+        );
+
+        let mut one_over = Transaction::new_with_policy(
+            TxnId(3),
+            Timestamp(3),
+            TransactionFootprintPolicy {
+                max_intent_accounting_bytes: exact_intent_bytes - 1,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        assert!(one_over.buffer_put(first_key, first_row).is_err());
+        assert!(one_over.is_empty());
+    }
+
+    #[test]
+    fn transaction_age_allows_the_exact_limit_and_rejects_one_millisecond_over() {
+        // Exact-time injection avoids a sleep race and protects the public
+        // boundary rule from an accidental `>=` change.
+        let mut transaction = Transaction::new_with_policy(
+            TxnId(1),
+            Timestamp(1),
+            TransactionFootprintPolicy {
+                max_age_ms: 10,
+                ..TransactionFootprintPolicy::default()
+            },
+        )
+        .unwrap();
+        let created_at = transaction.created_at;
+        transaction.created_at = created_at;
+
+        assert!(
+            transaction
+                .validate_age_at(created_at + std::time::Duration::from_millis(10))
+                .is_ok()
+        );
+        assert!(
+            transaction
+                .validate_age_at(created_at + std::time::Duration::from_millis(11))
+                .is_err()
+        );
     }
 
     #[test]

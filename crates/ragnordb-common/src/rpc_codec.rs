@@ -512,6 +512,9 @@ pub struct TabletScanRequest {
     /// Conservative remaining budget for one node-to-node forward. It is
     /// transport metadata, not part of logical scan identity.
     pub deadline_remaining_ms: Option<u64>,
+    /// Return all intents for cleaner enumeration instead of an MVCC read
+    /// page. This mode is bounded and never resolves locks locally.
+    pub intent_only: bool,
 }
 
 impl TabletScanRequest {
@@ -582,6 +585,7 @@ impl TabletScanRequest {
             max_bytes: self.max_bytes,
             rpc_attempt_id: self.rpc_attempt_id,
             deadline_remaining_ms: self.deadline_remaining_ms,
+            intent_only: self.intent_only,
         }
     }
 
@@ -600,6 +604,7 @@ impl TabletScanRequest {
             max_bytes: proto.max_bytes,
             rpc_attempt_id: proto.rpc_attempt_id,
             deadline_remaining_ms: proto.deadline_remaining_ms,
+            intent_only: proto.intent_only,
         };
         request.validate()?;
         Ok(request)
@@ -735,10 +740,19 @@ impl TabletScanBatch {
             intent.lock.validate()?;
         }
         if !self.intents.is_empty() {
-            return if self.rows.is_empty() && self.next_resume_after.is_none() && !self.exhausted {
-                Ok(())
-            } else {
-                Err("intent scan response must contain only intents and retry the same cursor")
+            if !self.rows.is_empty() {
+                return Err("intent scan response must not contain MVCC rows");
+            }
+            return match (
+                &self.intents.last(),
+                &self.next_resume_after,
+                self.exhausted,
+            ) {
+                (Some(_), None, false) | (Some(_), None, true) => Ok(()),
+                (Some(last), Some(cursor), false) if last.key.as_slice() == cursor.as_slice() => {
+                    Ok(())
+                }
+                _ => Err("intent scan continuation must match its last key"),
             };
         }
         match (&self.rows.last(), &self.next_resume_after) {
@@ -764,6 +778,26 @@ impl TabletScanBatch {
         }
         if self.byte_len() > request.max_bytes as usize {
             return Err("tablet scan batch exceeds max_bytes");
+        }
+        if request.intent_only {
+            if !self.rows.is_empty() {
+                return Err("intent-only scan must not return MVCC rows");
+            }
+            if self.intents.is_empty() {
+                if !self.exhausted || self.next_resume_after.is_some() {
+                    return Err("empty intent-only scan response must be exhausted");
+                }
+            } else if self.exhausted {
+                if self.next_resume_after.is_some() {
+                    return Err("exhausted intent scan must not publish a continuation");
+                }
+            } else if self.next_resume_after.as_ref()
+                != self.intents.last().map(|intent| &intent.key)
+            {
+                return Err("non-exhausted intent scan must resume after its last key");
+            }
+        } else if !self.intents.is_empty() && (self.next_resume_after.is_some() || self.exhausted) {
+            return Err("foreground intent response must retry the same cursor");
         }
         for row in &self.rows {
             if request
@@ -2318,6 +2352,7 @@ mod tests {
             max_bytes: 64,
             rpc_attempt_id: Some(41),
             deadline_remaining_ms: Some(456),
+            intent_only: false,
         };
         let batch = TabletScanBatch {
             rows: vec![
@@ -2361,6 +2396,7 @@ mod tests {
             max_bytes: 64,
             rpc_attempt_id: Some(41),
             deadline_remaining_ms: Some(456),
+            intent_only: false,
         };
         let batch = TabletScanBatch {
             rows: Vec::new(),
@@ -2412,6 +2448,7 @@ mod tests {
             max_bytes: 32,
             rpc_attempt_id: Some(1),
             deadline_remaining_ms: None,
+            intent_only: false,
         };
 
         assert_eq!(

@@ -188,6 +188,8 @@ pub struct ReplicatedTabletStatus {
     pub snapshot_term: u64,
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
+    /// Locally admitted client proposals that still await a terminal outcome.
+    pub pending_proposals: usize,
     pub apply_backlog_entries: usize,
     pub apply_backlog_bytes: usize,
     pub apply_backlog_age_ms: u64,
@@ -1358,6 +1360,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
             snapshot_index: status.snapshot_index,
             uncommitted_bytes: status.uncommitted_bytes,
             replication_inflight_bytes: status.replication_inflight_bytes,
+            pending_proposals: status.pending_proposals,
             apply_backlog_entries: status.apply_backlog_entries,
             apply_backlog_bytes: status.apply_backlog_bytes,
             apply_backlog_age_ms: status.apply_backlog_age_ms,
@@ -4206,6 +4209,7 @@ where
                 })
                 .unwrap_or((0, 0)),
             pending_snapshot_install.is_some() || pending_local_snapshot.is_some(),
+            registry.pending_count(),
             *ownership,
             &status,
         );
@@ -5584,6 +5588,79 @@ fn evaluate_point_inspection_request<S: MvccStorage>(
 
 const MAX_TABLET_SCAN_INTENTS: usize = 64;
 
+/// Enumerate every intent in a small, byte-bounded page. Unlike the
+/// foreground conflict path this scans locks regardless of their snapshot
+/// timestamp; only the status authority may authorize later resolution.
+fn scan_intent_only_batch<S: MvccStorage>(
+    storage: &S,
+    request: &TabletScanRequest,
+    table_id: TableId,
+) -> Result<TabletScanBatch> {
+    let encode_bound = |primary_key: &Option<Vec<u8>>| {
+        primary_key
+            .as_ref()
+            .map(|primary_key_bytes| {
+                encode_row_key(&ragnordb_common::ids::RowKey {
+                    table_id,
+                    primary_key_bytes: primary_key_bytes.clone(),
+                })
+            })
+            .transpose()
+    };
+    let start = encode_bound(&request.start_key)?;
+    let end = encode_bound(&request.end_key)?;
+    let resume_after = encode_bound(&request.resume_after)?;
+    let page_limit = (request.max_rows as usize).min(MAX_TABLET_SCAN_INTENTS);
+    let page = storage.scan_intent_page(
+        start.as_deref(),
+        end.as_deref(),
+        resume_after.as_deref(),
+        page_limit,
+    )?;
+
+    let mut intents = Vec::with_capacity(page.locks.len());
+    let mut used_bytes = 0_usize;
+    let mut has_more = page.has_more;
+    for (encoded_key, lock) in page.locks {
+        let row_key = decode_row_key(&encoded_key)?;
+        if row_key.table_id != table_id {
+            return Err(Error::CorruptData(
+                "intent scan returned a key for a different table".to_string(),
+            ));
+        }
+        let intent = TabletScanIntent {
+            key: row_key.primary_key_bytes,
+            lock,
+        };
+        let item_bytes = intent.byte_len();
+        if used_bytes.saturating_add(item_bytes) > request.max_bytes as usize {
+            if intents.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "tablet intent exceeds the requested scan byte budget".to_string(),
+                ));
+            }
+            has_more = true;
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(item_bytes);
+        intents.push(intent);
+    }
+
+    let next_resume_after = has_more
+        .then(|| intents.last().map(|intent| intent.key.clone()))
+        .flatten();
+    let batch = TabletScanBatch {
+        rows: Vec::new(),
+        intents,
+        next_resume_after,
+        exhausted: !has_more,
+    };
+    batch
+        .validate_for(request)
+        .map_err(|error| Error::CorruptData(error.to_string()))?;
+    Ok(batch)
+}
+
 /// Return a retry-same-cursor response when the requested range contains a
 /// conflicting intent. This runs on the serialized tablet owner so lock
 /// inspection and the later MVCC page read cannot cross an apply transition.
@@ -5679,6 +5756,14 @@ fn evaluate_scan_request(
             current_epoch: identity.target.tablet_epoch,
             expected_epoch: request.tablet_epoch,
         });
+    }
+
+    if request.intent_only {
+        return scan_intent_only_batch(
+            tablet.state_machine().tablet().storage(),
+            &request,
+            identity.target.table_id,
+        );
     }
 
     let transaction_id = TxnId((request.request_id.client_id as u64).max(1));
@@ -7028,6 +7113,7 @@ fn publish_status<W, LS, SS>(
     serving_leader: bool,
     snapshot: (u64, u64),
     snapshot_install_pending: bool,
+    pending_proposals: usize,
     ownership: ReactorOwnership,
     status: &RwLock<ReplicatedTabletStatus>,
 ) where
@@ -7066,6 +7152,7 @@ fn publish_status<W, LS, SS>(
         .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
         .map(|progress| progress.inflight_bytes)
         .sum();
+    published.pending_proposals = pending_proposals;
     let apply_backlog = ready_loop.apply_backlog_status();
     published.apply_backlog_entries = apply_backlog.entries;
     published.apply_backlog_bytes = apply_backlog.bytes;
@@ -7512,6 +7599,104 @@ mod tests {
     }
 
     #[test]
+    /// Realistic bug caught: the production background cleaner cannot inspect
+    /// pending intents through a bounded node-to-node tablet scan, so stale
+    /// intents would otherwise remain invisible after the server starts it.
+    fn intent_only_scan_returns_a_bounded_continuable_page() {
+        let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+            cluster_id: "cluster".to_string(),
+            raft_group_id: RaftGroupId(9),
+            tablet_id: TabletId(3),
+            table_id: TableId(3),
+            tablet_epoch: 7,
+        });
+        let key = ragnordb_storage::key::make_row_key(TableId(3), &[Value::Int(1)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+        let status = TxnStatusRecord {
+            txn_id: TxnId(41),
+            start_timestamp: Timestamp(10),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: encoded_key.clone(),
+            participant_tablet_ids: vec![3],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: Some(1_000),
+        };
+        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new(
+            ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap(),
+            7,
+            RaftGroupId(9),
+        )
+        .unwrap();
+        state_machine
+            .apply(
+                TabletCommandEnvelope::new(
+                    RequestId {
+                        client_id: 100,
+                        sequence: 1,
+                        raft_group_id: RaftGroupId(9),
+                    },
+                    TabletId(3),
+                    7,
+                    TabletCommand::Prewrite(PrewriteCommand {
+                        txn_id: status.txn_id,
+                        start_timestamp: status.start_timestamp,
+                        writes: vec![WriteEntry {
+                            key: encoded_key,
+                            row: Some(Row {
+                                values: vec![Value::Text("pending".to_string())],
+                            }),
+                            op: WriteKind::Put,
+                        }],
+                        primary_key: status.primary_key.clone(),
+                        ttl_ms: 30_000,
+                        pending_status: Some(status),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let request = TabletScanRequest {
+            request_id: RequestId {
+                client_id: 101,
+                sequence: 1,
+                raft_group_id: RaftGroupId(9),
+            },
+            tablet_id: TabletId(3),
+            tablet_epoch: 7,
+            start_key: None,
+            end_key: None,
+            resume_after: None,
+            read_timestamp: Timestamp(1),
+            max_rows: 8,
+            max_bytes: 1_024,
+            rpc_attempt_id: None,
+            deadline_remaining_ms: None,
+            intent_only: true,
+        };
+        let applier = TabletCommandApplier::new(state_machine);
+
+        let batch = evaluate_scan_request(
+            request.clone(),
+            &applier,
+            true,
+            Some(1),
+            &identity,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("the cleaner intent page must be readable through the owner");
+
+        assert!(batch.rows.is_empty());
+        assert_eq!(batch.intents.len(), 1);
+        assert_eq!(batch.intents[0].key, key.primary_key_bytes);
+        assert_eq!(batch.intents[0].lock.txn_id, TxnId(41));
+        assert!(batch.exhausted);
+        assert!(batch.next_resume_after.is_none());
+        assert!(batch.validate_for(&request).is_ok());
+    }
+
+    #[test]
     /// Realistic bug caught: a saturated Ready-owner request queue could make
     /// a latest-read caller wait in `SyncSender::send` after its deadline had
     /// already elapsed.
@@ -7629,6 +7814,7 @@ mod tests {
                 max_bytes: 64,
                 rpc_attempt_id: Some(1),
                 deadline_remaining_ms: None,
+                intent_only: false,
             },
             deadline,
         );

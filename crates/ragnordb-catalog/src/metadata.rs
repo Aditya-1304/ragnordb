@@ -24,8 +24,8 @@ use ragnordb_common::{
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
         MetadataAllocatorState, MetadataCachedOutcome, MetadataClientSession, MetadataCommand,
-        MetadataRequestDeduplication, MetadataSnapshot, NodeDescriptor, NodeLifecycle,
-        PartitionSpec, PlacementPolicy, RetiredReplicaLifetime, TabletDescriptor,
+        MetadataGcProtection, MetadataRequestDeduplication, MetadataSnapshot, NodeDescriptor,
+        NodeLifecycle, PartitionSpec, PlacementPolicy, RetiredReplicaLifetime, TabletDescriptor,
     },
 };
 
@@ -180,6 +180,56 @@ pub enum MetadataRejection {
 
     #[error("timestamp reservation regressed from {current:?} to {received:?}")]
     TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
+    },
+
+    #[error("GC protection ({owner_id}, {protection_id}) is not registered")]
+    UnknownGcProtection { owner_id: u128, protection_id: u128 },
+
+    #[error(
+        "GC protection ({owner_id}, {protection_id}) changed its protected timestamp from {existing:?} to {received:?}"
+    )]
+    GcProtectionIdentityConflict {
+        owner_id: u128,
+        protection_id: u128,
+        existing: Timestamp,
+        received: Timestamp,
+    },
+
+    #[error(
+        "GC protection ({owner_id}, {protection_id}) is already registered; renew its lease instead of registering it again"
+    )]
+    GcProtectionRegistrationConflict { owner_id: u128, protection_id: u128 },
+
+    #[error(
+        "GC protection ({owner_id}, {protection_id}) expired at {deadline_ms} ms and cannot be renewed at {now_ms} ms"
+    )]
+    ExpiredGcProtection {
+        owner_id: u128,
+        protection_id: u128,
+        deadline_ms: u64,
+        now_ms: u64,
+    },
+
+    #[error(
+        "GC protection ({owner_id}, {protection_id}) deadline regressed from {current_ms} to {received_ms} ms"
+    )]
+    GcProtectionDeadlineRegressed {
+        owner_id: u128,
+        protection_id: u128,
+        current_ms: u64,
+        received_ms: u64,
+    },
+
+    #[error("GC protection timestamp {protected:?} is below safe point {safe_point:?}")]
+    GcProtectionBelowSafePoint {
+        protected: Timestamp,
+        safe_point: Timestamp,
+    },
+
+    #[error("GC safe point regressed from {current:?} to {received:?}")]
+    GcSafePointRegressed {
         current: Timestamp,
         received: Timestamp,
     },
@@ -409,6 +459,12 @@ pub struct MetadataState {
     /// in catalog state.
     timestamp_reserved_until: Timestamp,
 
+    /// Monotonic MVCC history floor; unrelated to Raft/A-WAL retention.
+    gc_safe_point: Timestamp,
+
+    /// Active leased protections ordered by stable owner/protection identity.
+    gc_protections: BTreeMap<(u128, u128), MetadataGcProtection>,
+
     nodes: BTreeMap<NodeId, NodeDescriptor>,
 
     tables: BTreeMap<TableId, Arc<TableSchema>>,
@@ -451,6 +507,8 @@ impl Default for MetadataState {
             cluster_id: None,
             allocator: MetadataAllocatorState::initial(),
             timestamp_reserved_until: Timestamp(0),
+            gc_safe_point: Timestamp(0),
+            gc_protections: BTreeMap::new(),
             nodes: BTreeMap::new(),
             tables: BTreeMap::new(),
             table_ids_by_name: BTreeMap::new(),
@@ -480,6 +538,27 @@ impl MetadataState {
 
     pub const fn timestamp_reserved_until(&self) -> Timestamp {
         self.timestamp_reserved_until
+    }
+
+    /// Return the minimum MVCC timestamp still accepted by tablet reads.
+    ///
+    /// This is an MVCC history boundary only; it does not imply any Raft log
+    /// or A-WAL retention decision.
+    pub const fn gc_safe_point(&self) -> Timestamp {
+        self.gc_safe_point
+    }
+
+    /// Read the currently registered GC protections in stable identity order.
+    pub fn gc_protections(&self) -> impl Iterator<Item = &MetadataGcProtection> {
+        self.gc_protections.values()
+    }
+
+    pub fn gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+    ) -> Option<&MetadataGcProtection> {
+        self.gc_protections.get(&(owner_id, protection_id))
     }
 
     /// Return the next never-published replica identity.
@@ -636,6 +715,36 @@ impl MetadataState {
                 self.apply_reserve_timestamps(reserved_until)
             }
 
+            MetadataCommand::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => self.apply_register_gc_protection(
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            ),
+
+            MetadataCommand::RenewGcProtection {
+                owner_id,
+                protection_id,
+                lease_deadline_ms,
+                now_ms,
+            } => self.apply_renew_gc_protection(owner_id, protection_id, lease_deadline_ms, now_ms),
+
+            MetadataCommand::ReleaseGcProtection {
+                owner_id,
+                protection_id,
+            } => self.apply_release_gc_protection(owner_id, protection_id),
+
+            MetadataCommand::AdvanceGcSafePoint { candidate, now_ms } => {
+                self.apply_advance_gc_safe_point(candidate, now_ms)
+            }
+
             MetadataCommand::RegisterNode(node) => self.apply_register_node(node),
 
             MetadataCommand::SetNodeLifecycle { node_id, lifecycle } => {
@@ -700,6 +809,10 @@ impl MetadataState {
 
             timestamp_reserved_until: self.timestamp_reserved_until,
 
+            gc_safe_point: self.gc_safe_point,
+
+            gc_protections: self.gc_protections.values().copied().collect(),
+
             request_deduplication: self
                 .request_deduplication
                 .iter()
@@ -735,6 +848,8 @@ impl MetadataState {
             retired_replicas,
             allocator,
             timestamp_reserved_until,
+            gc_safe_point,
+            gc_protections,
             request_deduplication,
             client_sessions,
         } = snapshot;
@@ -743,6 +858,11 @@ impl MetadataState {
             let mut state = Self::new();
             state.allocator = allocator;
             state.timestamp_reserved_until = timestamp_reserved_until;
+            state.gc_safe_point = gc_safe_point;
+            state.gc_protections = gc_protections
+                .into_iter()
+                .map(|protection| ((protection.owner_id, protection.protection_id), protection))
+                .collect();
             return Ok(state);
         }
 
@@ -855,6 +975,11 @@ impl MetadataState {
         // has been reconstructed successfully.
         state.allocator = allocator;
         state.timestamp_reserved_until = timestamp_reserved_until;
+        state.gc_safe_point = gc_safe_point;
+        state.gc_protections = gc_protections
+            .into_iter()
+            .map(|protection| ((protection.owner_id, protection.protection_id), protection))
+            .collect();
 
         for request in request_deduplication {
             if let MetadataCachedOutcome::TableCreated {
@@ -950,6 +1075,157 @@ impl MetadataState {
         MetadataApplyOutcome::TimestampsReserved {
             reserved_from,
             reserved_until,
+        }
+    }
+
+    fn apply_register_gc_protection(
+        &mut self,
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        _now_ms: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+        if protected_timestamp < self.gc_safe_point {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::GcProtectionBelowSafePoint {
+                protected: protected_timestamp,
+                safe_point: self.gc_safe_point,
+            });
+        }
+
+        let key = (owner_id, protection_id);
+        if let Some(existing) = self.gc_protections.get(&key) {
+            if existing.protected_timestamp != protected_timestamp {
+                return MetadataApplyOutcome::Rejected(
+                    MetadataRejection::GcProtectionIdentityConflict {
+                        owner_id,
+                        protection_id,
+                        existing: existing.protected_timestamp,
+                        received: protected_timestamp,
+                    },
+                );
+            }
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::GcProtectionRegistrationConflict {
+                    owner_id,
+                    protection_id,
+                },
+            );
+        }
+
+        self.gc_protections.insert(
+            key,
+            MetadataGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+            },
+        );
+        MetadataApplyOutcome::Applied
+    }
+
+    fn apply_renew_gc_protection(
+        &mut self,
+        owner_id: u128,
+        protection_id: u128,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+        let key = (owner_id, protection_id);
+        let Some(existing) = self.gc_protections.get(&key).copied() else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownGcProtection {
+                owner_id,
+                protection_id,
+            });
+        };
+        if existing.lease_deadline_ms <= now_ms {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::ExpiredGcProtection {
+                owner_id,
+                protection_id,
+                deadline_ms: existing.lease_deadline_ms,
+                now_ms,
+            });
+        }
+        if lease_deadline_ms == existing.lease_deadline_ms {
+            return MetadataApplyOutcome::AlreadyApplied;
+        }
+        if lease_deadline_ms < existing.lease_deadline_ms {
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::GcProtectionDeadlineRegressed {
+                    owner_id,
+                    protection_id,
+                    current_ms: existing.lease_deadline_ms,
+                    received_ms: lease_deadline_ms,
+                },
+            );
+        }
+
+        self.gc_protections
+            .get_mut(&key)
+            .expect("protection was checked above")
+            .lease_deadline_ms = lease_deadline_ms;
+        MetadataApplyOutcome::Applied
+    }
+
+    fn apply_release_gc_protection(
+        &mut self,
+        owner_id: u128,
+        protection_id: u128,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+        if self
+            .gc_protections
+            .remove(&(owner_id, protection_id))
+            .is_some()
+        {
+            MetadataApplyOutcome::Applied
+        } else {
+            MetadataApplyOutcome::AlreadyApplied
+        }
+    }
+
+    fn apply_advance_gc_safe_point(
+        &mut self,
+        candidate: Timestamp,
+        now_ms: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+        if candidate < self.gc_safe_point {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::GcSafePointRegressed {
+                current: self.gc_safe_point,
+                received: candidate,
+            });
+        }
+
+        // Expiration is evaluated from the committed command's timestamp so
+        // log replay applies exactly the same protection set on every replica.
+        let previous = self.gc_safe_point;
+        let count_before = self.gc_protections.len();
+        self.gc_protections
+            .retain(|_, protection| protection.lease_deadline_ms > now_ms);
+        let protections_expired = count_before != self.gc_protections.len();
+        let protected_floor = self
+            .gc_protections
+            .values()
+            .map(|protection| protection.protected_timestamp)
+            .min();
+        self.gc_safe_point = protected_floor.map_or(candidate, |floor| candidate.min(floor));
+
+        if previous == self.gc_safe_point && !protections_expired {
+            MetadataApplyOutcome::AlreadyApplied
+        } else {
+            MetadataApplyOutcome::Applied
         }
     }
 

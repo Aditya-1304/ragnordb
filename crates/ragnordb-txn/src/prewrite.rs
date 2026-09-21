@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use ragnordb_common::{
     Error, Result,
     codec::{TxnStatus, TxnStatusRecord, WriteKind},
-    command_codec::{PrewriteCommand, WriteEntry},
+    command_codec::{PrewriteCommand, TabletCommand, TabletCommandEnvelope, WriteEntry},
     encoding::decode_row,
     ids::{ParticipantCommandPhase, TabletId},
 };
@@ -162,6 +162,78 @@ pub(crate) fn plan_prewrite(
             })
         })
         .collect()
+}
+
+/// Validate aggregate transaction limits and measure the conservative
+/// serialized size of each single-key command emitted by
+/// `GatewayTransactionDispatcher` before any participant is admitted to Raft.
+pub(crate) fn preflight_prewrite_commands(
+    coordinator: &DistributedTransactionCoordinator,
+    batches: &[PrewriteBatchPlan],
+    acknowledged_through: Option<u64>,
+    check_age: bool,
+) -> Result<crate::TransactionFootprint> {
+    let mut max_command_bytes = 0usize;
+    for batch in batches {
+        if batch.command.writes.len() != batch.participant_plans.len() {
+            return Err(Error::CorruptData(
+                "prewrite command lost its per-key logical identities".to_string(),
+            ));
+        }
+        for (write, participant_plan) in batch.command.writes.iter().zip(&batch.participant_plans) {
+            let is_primary = write.key == batch.command.primary_key;
+            let mut prewrite = PrewriteCommand {
+                txn_id: batch.command.txn_id,
+                start_timestamp: batch.command.start_timestamp,
+                writes: vec![write.clone()],
+                primary_key: batch.command.primary_key.clone(),
+                ttl_ms: batch.command.ttl_ms,
+                pending_status: if is_primary {
+                    batch.command.pending_status.clone()
+                } else {
+                    None
+                },
+            };
+            if let Some(status) = prewrite.pending_status.as_mut() {
+                // The production lifecycle gateway fills these fields just
+                // before the first Raft proposal. Measure their maximum wire
+                // representation here so every participant passes admission
+                // before any command can become durable, even with a large
+                // configured lease duration.
+                prewrite.ttl_ms = u64::MAX;
+                status.last_heartbeat_timestamp = Some(status.start_timestamp);
+                status.lease_deadline_ms = Some(u64::MAX);
+            }
+            let command = TabletCommand::Prewrite(prewrite);
+            let envelope = TabletCommandEnvelope::new_with_logical_command_id_and_ack(
+                participant_plan.request_id.clone(),
+                participant_plan.logical_command_id,
+                participant_plan.route.tablet_id,
+                participant_plan.route.tablet_epoch,
+                acknowledged_through,
+                command,
+            )
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+            max_command_bytes = max_command_bytes.max(
+                envelope
+                    .encode()
+                    .map_err(|error| Error::InvalidArgument(error.to_string()))?
+                    .len(),
+            );
+        }
+    }
+
+    // The primary status record retains the primary key and one tablet ID per
+    // participant in addition to the independently charged per-intent state.
+    let status_accounting_bytes = 64usize
+        .saturating_add(coordinator.primary_key().len())
+        .saturating_add(batches.len().saturating_mul(std::mem::size_of::<u64>()));
+    coordinator.transaction().validate_distributed_footprint(
+        batches.len(),
+        max_command_bytes,
+        status_accounting_bytes,
+        check_age,
+    )
 }
 
 fn write_entry(key: &[u8], mutation: &Mutation) -> Result<WriteEntry> {

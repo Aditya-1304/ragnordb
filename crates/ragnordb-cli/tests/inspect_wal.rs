@@ -1,7 +1,21 @@
 use std::{path::Path, process::Command};
 
-use ragnordb_common::ids::{NodeId, Timestamp};
+use ragnordb_common::{
+    codec::{Row, Value, WriteKind},
+    command_codec::{
+        PrewriteCommand, TabletCommand, TabletCommandBatchEnvelope, TabletCommandEnvelope,
+        WriteEntry,
+    },
+    ids::{NodeId, RaftGroupId, ReplicaId, RequestId, TabletId, Timestamp, TxnId},
+};
 use ragnordb_exec::SqlSession;
+use ragnordb_multiraft::storage::{
+    codec::{
+        DurableRaftEntryPayload, RAFT_LOG_ENTRY_RECORD_VERSION, RaftLogEntryRecord,
+        RaftReplicaIdentity,
+    },
+    persistence::RaftWalRecordType,
+};
 use ragnordb_server::database::LocalDatabase;
 use ragnordb_storage::wal::{CheckpointMarker, RagnorDbWalRecordType};
 use wal::{
@@ -23,6 +37,51 @@ fn open_wal_for_write(data_dir: &Path, node_id: NodeId) -> WalHandle<FsSegmentDi
     WalHandle::open(FsSegmentDirectory::new(wal_dir), config, ())
         .expect("test WAL must open")
         .0
+}
+
+fn prewrite_envelope(
+    txn_id: u64,
+    request_sequence: u64,
+    key: &[u8],
+    row_value: &str,
+) -> TabletCommandEnvelope {
+    TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 42,
+            sequence: request_sequence,
+            raft_group_id: RaftGroupId(70),
+        },
+        TabletId(12),
+        1,
+        TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: TxnId(txn_id),
+            start_timestamp: Timestamp(10),
+            writes: vec![WriteEntry {
+                key: key.to_vec(),
+                row: Some(Row {
+                    values: vec![Value::Text(row_value.to_string())],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: key.to_vec(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        }),
+    )
+    .expect("test tablet command envelope must validate")
+}
+
+fn encode_raft_log_entry(index: u64, command: Vec<u8>) -> Vec<u8> {
+    RaftLogEntryRecord {
+        format_version: RAFT_LOG_ENTRY_RECORD_VERSION,
+        identity: RaftReplicaIdentity::new(RaftGroupId(70), ReplicaId(3))
+            .expect("test Raft identity must validate"),
+        index,
+        term: 2,
+        payload: DurableRaftEntryPayload::Normal(command),
+    }
+    .encode()
+    .expect("test Raft log entry must encode")
 }
 
 /// Realistic bug caught:
@@ -299,4 +358,107 @@ fn inspect_wal_prints_physical_diagnostics_and_decoded_database_records() {
         stdout.contains("writes=1 puts=1 deletes=0"),
         "inspection must summarize the decoded transaction mutation batch:\n{stdout}"
     );
+}
+
+/// Realistic bug caught:
+///
+/// The existing inspector skipped replicated Raft log records, leaving an
+/// operator unable to identify the transactions represented by durable
+/// prewrite commands. This verifies both envelope encodings and ensures the
+/// diagnostic view stays bounded and does not print row keys or values.
+#[test]
+fn inspect_wal_decodes_bounded_transaction_identity_from_raft_entries() {
+    let data_dir = tempfile::tempdir().expect("temporary database directory must be created");
+    let node_id = NodeId(27);
+    let (database, _) =
+        LocalDatabase::recover(data_dir.path(), node_id).expect("empty database must recover");
+    drop(database);
+    let wal = open_wal_for_write(data_dir.path(), node_id);
+
+    let batch = TabletCommandBatchEnvelope::new(vec![
+        prewrite_envelope(9001, 1, b"private-key-one", "PRIVATE_ROW_VALUE_ONE"),
+        prewrite_envelope(9002, 2, b"private-key-two", "PRIVATE_ROW_VALUE_TWO"),
+    ])
+    .expect("test command batch must validate")
+    .encode()
+    .expect("test command batch must encode");
+    let _batch_extent = wal
+        .append_and_sync(
+            RaftWalRecordType::LogEntry.as_wal_record_type(),
+            &encode_raft_log_entry(41, batch),
+        )
+        .expect("batched transaction proposal must become durable");
+
+    let single = prewrite_envelope(9003, 3, b"private-key-three", "PRIVATE_ROW_VALUE_THREE")
+        .encode()
+        .expect("test command envelope must encode");
+    let _single_extent = wal
+        .append_and_sync(
+            RaftWalRecordType::LogEntry.as_wal_record_type(),
+            &encode_raft_log_entry(42, single),
+        )
+        .expect("single transaction proposal must become durable");
+
+    // The diagnostic entry cap is below the total entry count so the CLI
+    // reports the omitted tail instead of growing output with the WAL length.
+    let bounded_command = prewrite_envelope(9010, 10, b"private-key-cap", "PRIVATE_ROW_VALUE_CAP")
+        .encode()
+        .expect("test command envelope must encode");
+    for index in 43..(43 + 130) {
+        let _extent = wal
+            .append_and_sync(
+                RaftWalRecordType::LogEntry.as_wal_record_type(),
+                &encode_raft_log_entry(index, bounded_command.clone()),
+            )
+            .expect("bounded diagnostic fixture entry must become durable");
+    }
+    drop(wal);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ragnordb"))
+        .arg("inspect")
+        .arg("wal")
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--node-id")
+        .arg(node_id.0.to_string())
+        .output()
+        .expect("inspect command must start");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "inspect wal must succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("encoding=batch commands=2"));
+    assert!(stdout.contains("encoding=single commands=1"));
+    for txn_id in [9001, 9002, 9003] {
+        assert!(
+            stdout.contains(&format!("txn_id={txn_id}")),
+            "decoded diagnostics must identify transaction {txn_id}:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("raft_entry_diagnostics_omitted: 4"),
+        "the decoded diagnostic view must stop at its configured entry cap:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("  raft_log_entry:").count(),
+        128,
+        "the CLI must emit no more than the configured number of entry diagnostics"
+    );
+    for private_value in [
+        "private-key-one",
+        "private-key-two",
+        "private-key-three",
+        "PRIVATE_ROW_VALUE_ONE",
+        "PRIVATE_ROW_VALUE_TWO",
+        "PRIVATE_ROW_VALUE_THREE",
+    ] {
+        assert!(
+            !stdout.contains(private_value),
+            "WAL diagnostics must not expose mutation keys or row values"
+        );
+    }
 }
