@@ -1525,6 +1525,7 @@ dependencies = [
  "clap",
  "ragnordb-common",
  "ragnordb-exec",
+ "ragnordb-multiraft",
  "ragnordb-server",
  "ragnordb-storage",
  "reqwest",

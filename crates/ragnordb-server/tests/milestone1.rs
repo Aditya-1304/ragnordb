@@ -112,6 +112,7 @@ async fn admin_status_returns_json() {
                 uncommitted_bytes: 0,
                 replication_inflight_bytes: 0,
                 pending_work: false,
+                pending_proposals: 2,
                 apply_backlog_entries: 0,
                 apply_backlog_bytes: 0,
                 apply_backlog_age_ms: 0,
@@ -145,6 +146,7 @@ async fn admin_status_returns_json() {
                 uncommitted_bytes: 0,
                 replication_inflight_bytes: 0,
                 pending_work: false,
+                pending_proposals: 0,
                 apply_backlog_entries: 0,
                 apply_backlog_bytes: 0,
                 apply_backlog_age_ms: 0,
@@ -174,6 +176,7 @@ async fn admin_status_returns_json() {
         replicated_tablet: None,
         multiraft_status: Some(multiraft_status),
         node_lifecycle: None,
+        transaction_runtime: None,
     });
 
     let server_task = {
@@ -197,10 +200,17 @@ async fn admin_status_returns_json() {
     assert_eq!(json["durability"]["recovery_required"], false);
     assert_eq!(json["multiraft"]["node_id"], 7);
     assert_eq!(json["multiraft"]["group_count"], 2);
-    assert_eq!(json["multiraft"]["top_groups"].as_array().unwrap().len(), 0);
+    assert_eq!(json["multiraft"]["pending_proposal_count"], 2);
+    assert_eq!(json["multiraft"]["top_groups"].as_array().unwrap().len(), 1);
+    assert_eq!(json["multiraft"]["top_groups"][0]["pending_proposals"], 2);
 
     let groups_body = read_http_body(addr, "/status/groups").await.unwrap();
     let groups_json: serde_json::Value = serde_json::from_str(&groups_body).unwrap();
+    assert_eq!(groups_json["multiraft"]["groups"][0]["applied_index"], 0);
+    assert_eq!(
+        groups_json["multiraft"]["groups"][0]["pending_proposals"],
+        2
+    );
     assert_eq!(
         groups_json["multiraft"]["groups"][0]["apply_backlog_entries"],
         0
@@ -240,6 +250,7 @@ async fn admin_metrics_returns_prometheus_text() {
         replicated_tablet: None,
         multiraft_status: None,
         node_lifecycle: None,
+        transaction_runtime: None,
     });
 
     let server_task = {
@@ -329,6 +340,7 @@ async fn admin_status_uses_json_content_type() {
         replicated_tablet: None,
         multiraft_status: None,
         node_lifecycle: None,
+        transaction_runtime: None,
     });
 
     let server_task = {

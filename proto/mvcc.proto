@@ -32,6 +32,7 @@ message TxnStatusRecord {
   bytes primary_key = 5;
   repeated uint64 participant_tablet_ids = 6;
   ragnordb.ids.Timestamp last_heartbeat_timestamp = 7;
+  uint64 lease_deadline_ms = 8;
 }
 
 enum TxnStatus {

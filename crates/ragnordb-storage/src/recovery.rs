@@ -1095,12 +1095,14 @@ fn recovery_corruption(lsn: Lsn, operation: &str, source: Error) -> Error {
     Error::CorruptData(format!("{operation} at WAL LSN {}: {source}", lsn.as_u64()))
 }
 
-/// convert an WAL iterator failure into a canonical startup recovery error
+/// convert a WAL iterator failure into a canonical startup recovery error
 ///
 /// physical WAL errors are kept separate from invalid RagnorDB payloads so
-/// startup diagnostics accurately identify which recovery boundary failed
+/// startup diagnostics accurately identify which recovery boundary failed. The
+/// concrete WAL error remains in the source chain for typed diagnosis.
 fn wal_recovery_failure(operation: &str, lsn: Lsn, source: WalError) -> Error {
-    Error::RecoveryFailed {
-        reason: format!("{operation} at WAL LSN {}: {source}", lsn.as_u64()),
+    Error::RecoveryFailedWithSource {
+        context: format!("{operation} at WAL LSN {}", lsn.as_u64()),
+        source: Box::new(source),
     }
 }

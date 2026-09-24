@@ -10,6 +10,7 @@ use ragnordb_common::{
     Error, Result,
     ids::{Timestamp, TxnId},
 };
+use std::time::Instant;
 
 /// Allocates transaction identities and MVCC timestamps.
 ///
@@ -24,6 +25,426 @@ pub trait TransactionManager {
 
     /// Allocate a commit timestamp strictly greater than `start_ts`.
     fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp>;
+
+    /// Observe a committed replicated high-water mark before serving new work.
+    /// Local implementations use this during recovery and follower catch-up;
+    /// the timestamp-oracle implementation advances its local cursor without
+    /// pretending that an unreserved range is locally available.
+    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp);
+
+    fn last_allocated_transaction_id(&self) -> TxnId;
+
+    fn last_allocated_timestamp(&self) -> Timestamp;
+
+    fn timestamp_oracle_stats(&self) -> TimestampOracleStats {
+        TimestampOracleStats::default()
+    }
+}
+
+impl<M> TransactionManager for Box<M>
+where
+    M: TransactionManager + ?Sized,
+{
+    fn begin_transaction(&mut self) -> Result<Transaction> {
+        (**self).begin_transaction()
+    }
+
+    fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        (**self).allocate_commit_timestamp(start_ts)
+    }
+
+    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
+        (**self).observe_replicated_high_water(transaction_id, timestamp);
+    }
+
+    fn last_allocated_transaction_id(&self) -> TxnId {
+        (**self).last_allocated_transaction_id()
+    }
+
+    fn last_allocated_timestamp(&self) -> Timestamp {
+        (**self).last_allocated_timestamp()
+    }
+
+    fn timestamp_oracle_stats(&self) -> TimestampOracleStats {
+        (**self).timestamp_oracle_stats()
+    }
+}
+
+/// Cumulative timestamp-oracle counters exposed to the server metrics layer.
+/// Latencies are nanoseconds so callers can report deltas without coupling the
+/// transaction crate to a particular metrics backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampOracleStats {
+    pub allocations: u64,
+    pub reservations: u64,
+    pub allocation_latency_nanos: u64,
+    pub reservation_latency_nanos: u64,
+    pub last_allocated: Timestamp,
+    pub reserved_until: Timestamp,
+}
+
+impl Default for TimestampOracleStats {
+    fn default() -> Self {
+        Self {
+            allocations: 0,
+            reservations: 0,
+            allocation_latency_nanos: 0,
+            reservation_latency_nanos: 0,
+            last_allocated: Timestamp(0),
+            reserved_until: Timestamp(0),
+        }
+    }
+}
+
+/// Durable reservation boundary used by the live timestamp oracle.
+///
+/// The provider must return only after the requested frontier has committed in
+/// the metadata Raft group. Returning a merely proposed or locally appended
+/// frontier would allow a crash to reuse timestamps that were handed to SQL
+/// sessions but never became part of the recovery authority.
+pub trait TimestampReservationProvider {
+    fn reserve_timestamps(&mut self, requested_until: Timestamp) -> Result<TimestampReservation>;
+}
+
+/// One disjoint interval returned by the durable reservation authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampReservation {
+    pub reserved_from: Timestamp,
+    pub reserved_until: Timestamp,
+}
+
+/// In-memory allocator over a metadata-owned durable timestamp frontier.
+///
+/// The oracle consumes a committed interval locally and extends it before the
+/// interval is exhausted. Unused values are intentionally abandoned on
+/// restart or leadership loss: the next owner starts strictly above the
+/// durable frontier, which is the safety property that prevents reuse.
+#[derive(Debug)]
+pub struct TimestampOracle<P> {
+    provider: P,
+    next_timestamp: u64,
+    last_allocated: Timestamp,
+    reserved_until: Timestamp,
+    reservation_size: u64,
+    prefetch_threshold: u64,
+    allocations: u64,
+    reservations: u64,
+    allocation_latency_nanos: u64,
+    reservation_latency_nanos: u64,
+}
+
+impl<P> TimestampOracle<P>
+where
+    P: TimestampReservationProvider,
+{
+    /// Create an oracle and durably reserve its first interval.
+    pub fn new(provider: P, reservation_size: u64, prefetch_threshold: u64) -> Result<Self> {
+        validate_reservation_policy(reservation_size, prefetch_threshold)?;
+
+        let mut oracle = Self {
+            provider,
+            next_timestamp: 1,
+            last_allocated: Timestamp(0),
+            reserved_until: Timestamp(0),
+            reservation_size,
+            prefetch_threshold,
+            allocations: 0,
+            reservations: 0,
+            allocation_latency_nanos: 0,
+            reservation_latency_nanos: 0,
+        };
+        oracle.ensure_reserved_through(Timestamp(1))?;
+        Ok(oracle)
+    }
+
+    /// Recreate an oracle from a metadata snapshot or a committed failover
+    /// read. No local range is considered reusable until a new reservation
+    /// command commits for this owner.
+    pub fn from_durable_frontier(
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<Self> {
+        validate_reservation_policy(reservation_size, prefetch_threshold)?;
+        let next_timestamp = durable_frontier.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration(
+                "timestamp oracle has exhausted the u64 timestamp space".to_string(),
+            )
+        })?;
+
+        Ok(Self {
+            provider,
+            next_timestamp,
+            last_allocated: durable_frontier,
+            reserved_until: durable_frontier,
+            reservation_size,
+            prefetch_threshold,
+            allocations: 0,
+            reservations: 0,
+            allocation_latency_nanos: 0,
+            reservation_latency_nanos: 0,
+        })
+    }
+
+    /// Allocate one timestamp from the committed local interval.
+    pub fn allocate_timestamp(&mut self) -> Result<Timestamp> {
+        let started = Instant::now();
+        let result = (|| {
+            let next = Timestamp(self.next_timestamp);
+            if next.0 == 0 {
+                return Err(Error::Configuration(
+                    "timestamp oracle generated the reserved zero timestamp".to_string(),
+                ));
+            }
+
+            if next > self.reserved_until {
+                self.ensure_reserved_through(next)?;
+            } else if self.remaining() <= self.prefetch_threshold {
+                // Prefetch happens before consuming the threshold-crossing value.
+                // A failed reservation therefore fails the request rather than
+                // handing out a timestamp while silently losing the refill error.
+                let next_frontier = self.reserved_until.0.checked_add(1).ok_or_else(|| {
+                    Error::Configuration(
+                        "timestamp oracle has exhausted the u64 timestamp space".to_string(),
+                    )
+                })?;
+                self.ensure_reserved_through(Timestamp(next_frontier))?;
+            }
+
+            let allocated = Timestamp(self.next_timestamp);
+            self.next_timestamp = self.next_timestamp.checked_add(1).ok_or_else(|| {
+                Error::Configuration(
+                    "timestamp oracle has exhausted the u64 timestamp space".to_string(),
+                )
+            })?;
+            self.last_allocated = allocated;
+            Ok(allocated)
+        })();
+        if result.is_ok() {
+            self.allocations = self.allocations.saturating_add(1);
+            self.allocation_latency_nanos = self
+                .allocation_latency_nanos
+                .saturating_add(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX));
+        }
+        result
+    }
+
+    /// Allocate a commit timestamp strictly newer than the transaction start.
+    ///
+    /// Any unused local values below `start_ts` are skipped. This is required
+    /// when a transaction begins on one owner and commits after a leadership
+    /// transition or after another transaction advanced the shared frontier.
+    pub fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        if start_ts.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction start timestamp 0 is reserved".to_string(),
+            ));
+        }
+
+        let minimum = start_ts.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration("commit timestamp cannot be newer than u64::MAX".to_string())
+        })?;
+        if self.next_timestamp < minimum {
+            self.next_timestamp = minimum;
+        }
+        self.allocate_timestamp()
+    }
+
+    /// Discard the current in-memory interval after leadership loss and begin
+    /// above the newly observed durable metadata frontier.
+    pub fn reset_after_failover(&mut self, durable_frontier: Timestamp) -> Result<()> {
+        if durable_frontier < self.reserved_until {
+            return Err(Error::Configuration(format!(
+                "failover frontier {} is below the local durable reservation {}",
+                durable_frontier.0, self.reserved_until.0
+            )));
+        }
+
+        self.next_timestamp = durable_frontier.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration(
+                "timestamp oracle has exhausted the u64 timestamp space".to_string(),
+            )
+        })?;
+        self.last_allocated = durable_frontier;
+        self.reserved_until = durable_frontier;
+        Ok(())
+    }
+
+    /// Advance the local cursor after applying a replicated commit observed
+    /// outside the local allocator's own request path.
+    pub fn observe_replicated_high_water(&mut self, timestamp: Timestamp) {
+        self.last_allocated = self.last_allocated.max(timestamp);
+        if timestamp.0 >= self.next_timestamp {
+            self.next_timestamp = timestamp.0.checked_add(1).unwrap_or(0);
+        }
+        self.reserved_until = self.reserved_until.max(timestamp);
+    }
+
+    pub fn last_allocated(&self) -> Timestamp {
+        self.last_allocated
+    }
+
+    pub fn reserved_until(&self) -> Timestamp {
+        self.reserved_until
+    }
+
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
+    }
+
+    pub fn stats(&self) -> TimestampOracleStats {
+        TimestampOracleStats {
+            allocations: self.allocations,
+            reservations: self.reservations,
+            allocation_latency_nanos: self.allocation_latency_nanos,
+            reservation_latency_nanos: self.reservation_latency_nanos,
+            last_allocated: self.last_allocated,
+            reserved_until: self.reserved_until,
+        }
+    }
+
+    fn remaining(&self) -> u64 {
+        self.reserved_until
+            .0
+            .saturating_sub(self.next_timestamp)
+            .saturating_add(1)
+    }
+
+    fn ensure_reserved_through(&mut self, target: Timestamp) -> Result<()> {
+        if target <= self.reserved_until {
+            return Ok(());
+        }
+
+        let required_extension = target.0 - self.reserved_until.0;
+        let extension = self.reservation_size.max(required_extension);
+        let requested_until = self
+            .reserved_until
+            .0
+            .checked_add(extension)
+            .ok_or_else(|| {
+                Error::Configuration(
+                    "timestamp oracle has exhausted the u64 timestamp space".to_string(),
+                )
+            })?;
+        let started = Instant::now();
+        let previous_frontier = self.reserved_until;
+        let reservation = self
+            .provider
+            .reserve_timestamps(Timestamp(requested_until))?;
+        if reservation.reserved_from <= previous_frontier
+            || reservation.reserved_until < Timestamp(requested_until)
+            || reservation.reserved_from > reservation.reserved_until
+        {
+            return Err(Error::Configuration(format!(
+                "timestamp reservation provider returned invalid interval {}..={} for requested {}",
+                reservation.reserved_from.0, reservation.reserved_until.0, requested_until,
+            )));
+        }
+        if self.next_timestamp > previous_frontier.0 {
+            self.next_timestamp = self.next_timestamp.max(reservation.reserved_from.0);
+        }
+        self.reserved_until = reservation.reserved_until;
+        self.reservations = self.reservations.saturating_add(1);
+        self.reservation_latency_nanos = self
+            .reservation_latency_nanos
+            .saturating_add(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX));
+        Ok(())
+    }
+}
+
+fn validate_reservation_policy(reservation_size: u64, prefetch_threshold: u64) -> Result<()> {
+    if reservation_size == 0 {
+        return Err(Error::InvalidArgument(
+            "timestamp reservation size must be nonzero".to_string(),
+        ));
+    }
+    if prefetch_threshold >= reservation_size {
+        return Err(Error::InvalidArgument(
+            "timestamp prefetch threshold must be below reservation size".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Transaction manager backed by the metadata timestamp oracle.
+///
+/// Transaction IDs intentionally reuse the globally unique start timestamp.
+/// This keeps the Phase 6.1 authority single-sourced: a transaction identity
+/// cannot be minted independently on two nodes while the later transaction
+/// status protocol is still under construction.
+#[derive(Debug)]
+pub struct ReservedTimestampTransactionManager<P> {
+    oracle: TimestampOracle<P>,
+}
+
+impl<P> ReservedTimestampTransactionManager<P>
+where
+    P: TimestampReservationProvider,
+{
+    pub fn new(provider: P, reservation_size: u64, prefetch_threshold: u64) -> Result<Self> {
+        Ok(Self {
+            oracle: TimestampOracle::new(provider, reservation_size, prefetch_threshold)?,
+        })
+    }
+
+    pub fn from_durable_frontier(
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            oracle: TimestampOracle::from_durable_frontier(
+                provider,
+                durable_frontier,
+                reservation_size,
+                prefetch_threshold,
+            )?,
+        })
+    }
+
+    pub fn oracle(&self) -> &TimestampOracle<P> {
+        &self.oracle
+    }
+
+    pub fn oracle_mut(&mut self) -> &mut TimestampOracle<P> {
+        &mut self.oracle
+    }
+}
+
+impl<P> TransactionManager for ReservedTimestampTransactionManager<P>
+where
+    P: TimestampReservationProvider,
+{
+    fn begin_transaction(&mut self) -> Result<Transaction> {
+        let start_ts = self.oracle.allocate_timestamp()?;
+        Transaction::new(TxnId(start_ts.0), start_ts)
+    }
+
+    fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.oracle.allocate_commit_timestamp(start_ts)
+    }
+
+    fn observe_replicated_high_water(&mut self, _transaction_id: TxnId, timestamp: Timestamp) {
+        self.oracle.observe_replicated_high_water(timestamp);
+    }
+
+    fn last_allocated_transaction_id(&self) -> TxnId {
+        TxnId(self.oracle.last_allocated().0)
+    }
+
+    fn last_allocated_timestamp(&self) -> Timestamp {
+        self.oracle.last_allocated()
+    }
+
+    fn timestamp_oracle_stats(&self) -> TimestampOracleStats {
+        self.oracle.stats()
+    }
 }
 
 /// In-memory transaction manager for local Milestone 2 execution.
@@ -161,11 +582,115 @@ impl TransactionManager for LocalTransactionManager {
     fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
         self.allocate_timestamp_after(start_ts)
     }
+
+    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
+        LocalTransactionManager::observe_replicated_high_water(self, transaction_id, timestamp);
+    }
+
+    fn last_allocated_transaction_id(&self) -> TxnId {
+        LocalTransactionManager::last_allocated_transaction_id(self)
+    }
+
+    fn last_allocated_timestamp(&self) -> Timestamp {
+        LocalTransactionManager::last_allocated_timestamp(self)
+    }
+
+    fn timestamp_oracle_stats(&self) -> TimestampOracleStats {
+        TimestampOracleStats::default()
+    }
+}
+
+impl CommitTimestampAllocator for LocalTransactionManager {
+    fn finalize_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.allocate_commit_timestamp(start_ts)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FakeReservationProvider {
+        durable_frontier: Timestamp,
+        requests: Vec<Timestamp>,
+    }
+
+    impl Default for FakeReservationProvider {
+        fn default() -> Self {
+            Self {
+                durable_frontier: Timestamp(0),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl TimestampReservationProvider for FakeReservationProvider {
+        fn reserve_timestamps(
+            &mut self,
+            requested_until: Timestamp,
+        ) -> Result<TimestampReservation> {
+            let reserved_from = self
+                .durable_frontier
+                .0
+                .checked_add(1)
+                .ok_or_else(|| Error::Configuration("fake frontier exhausted".to_string()))?;
+            self.requests.push(requested_until);
+            if requested_until <= self.durable_frontier {
+                return Err(Error::Configuration(
+                    "fake reservation provider regressed the durable frontier".to_string(),
+                ));
+            }
+            self.durable_frontier = requested_until;
+            Ok(TimestampReservation {
+                reserved_from: Timestamp(reserved_from),
+                reserved_until: self.durable_frontier,
+            })
+        }
+    }
+
+    #[test]
+    fn reserved_manager_prefetches_before_exhaustion_and_preserves_commit_ordering() {
+        let provider = FakeReservationProvider::default();
+        let mut manager = ReservedTimestampTransactionManager::new(provider, 10, 3).unwrap();
+
+        let first = manager.begin_transaction().unwrap();
+
+        assert_eq!(first.start_ts(), Timestamp(1));
+        assert_eq!(manager.oracle().reserved_until(), Timestamp(10));
+        assert_eq!(manager.oracle().last_allocated(), Timestamp(1));
+
+        let commit = manager.allocate_commit_timestamp(Timestamp(50)).unwrap();
+
+        assert_eq!(commit, Timestamp(51));
+        assert!(commit > first.start_ts());
+        assert!(manager.oracle().reserved_until() >= Timestamp(51));
+        assert!(
+            manager
+                .oracle()
+                .provider()
+                .requests
+                .iter()
+                .any(|requested| *requested >= Timestamp(51))
+        );
+    }
+
+    #[test]
+    fn oracle_restart_starts_strictly_after_durable_frontier_and_skips_unused_values() {
+        let provider = FakeReservationProvider {
+            durable_frontier: Timestamp(100),
+            requests: Vec::new(),
+        };
+        let mut oracle =
+            TimestampOracle::from_durable_frontier(provider, Timestamp(100), 10, 2).unwrap();
+
+        assert_eq!(oracle.allocate_timestamp().unwrap(), Timestamp(101));
+        oracle.reset_after_failover(Timestamp(200)).unwrap();
+        oracle.provider_mut().durable_frontier = Timestamp(200);
+
+        assert_eq!(oracle.allocate_timestamp().unwrap(), Timestamp(201));
+        assert!(oracle.last_allocated() > Timestamp(200));
+    }
 
     #[test]
     fn local_manager_allocates_monotonic_transaction_metadata() {

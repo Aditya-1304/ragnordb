@@ -1,5 +1,5 @@
 use super::catalog_codec::TableDefinition as TableDef;
-use super::codec::{Row, WriteKind};
+use super::codec::{Row, TxnStatus, TxnStatusRecord, WriteKind};
 use crate::ids::{LogicalCommandId, RaftGroupId, RequestId, TabletId, Timestamp, TxnId};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -479,6 +479,8 @@ pub enum CachedTabletCommandResult {
     Commit,
     Rollback,
     ResolveIntent,
+    PublishAbortedTransactionStatus,
+    HeartbeatTransactionStatus,
 }
 
 impl CachedTabletCommandResult {
@@ -490,6 +492,12 @@ impl CachedTabletCommandResult {
             Self::Commit => command::CachedTabletCommandResult::Commit,
             Self::Rollback => command::CachedTabletCommandResult::Rollback,
             Self::ResolveIntent => command::CachedTabletCommandResult::ResolveIntent,
+            Self::PublishAbortedTransactionStatus => {
+                command::CachedTabletCommandResult::PublishAbortedTransactionStatus
+            }
+            Self::HeartbeatTransactionStatus => {
+                command::CachedTabletCommandResult::HeartbeatTransactionStatus
+            }
         }
     }
 
@@ -503,6 +511,12 @@ impl CachedTabletCommandResult {
             command::CachedTabletCommandResult::Commit => Ok(Self::Commit),
             command::CachedTabletCommandResult::Rollback => Ok(Self::Rollback),
             command::CachedTabletCommandResult::ResolveIntent => Ok(Self::ResolveIntent),
+            command::CachedTabletCommandResult::PublishAbortedTransactionStatus => {
+                Ok(Self::PublishAbortedTransactionStatus)
+            }
+            command::CachedTabletCommandResult::HeartbeatTransactionStatus => {
+                Ok(Self::HeartbeatTransactionStatus)
+            }
             command::CachedTabletCommandResult::Unspecified => {
                 Err(TabletStateMachineSnapshotError::UnspecifiedCachedResult)
             }
@@ -634,9 +648,9 @@ pub enum CachedTabletCommandRejectionKind {
 /// versioned snapshot of replicated tablet command metadata
 ///
 /// the surrounding tablet snapshot owns MVCC bytes and Raft metadata. This
-/// value preserves the tablet generation and retry state that must be restored
-/// before post-snapshot commands are applied
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// value preserves the tablet generation, retry state, and durable transaction
+/// decisions that must be restored before post-snapshot commands are applied
+#[derive(Debug, Clone, PartialEq)]
 pub struct TabletStateMachineSnapshot {
     pub format_version: u32,
     pub tablet_id: TabletId,
@@ -648,7 +662,12 @@ pub struct TabletStateMachineSnapshot {
     /// Retaining the watermark after deleting outcomes makes old retries fail
     /// closed after snapshot restore.
     pub logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
+    /// Durable transaction decisions owned by this tablet's Raft state machine.
+    /// Older snapshots omit these records and decode as an empty map.
+    pub transaction_statuses: BTreeMap<TxnId, TxnStatusRecord>,
 }
+
+impl Eq for TabletStateMachineSnapshot {}
 
 impl TabletStateMachineSnapshot {
     pub fn new(
@@ -691,6 +710,26 @@ impl TabletStateMachineSnapshot {
         logical_commands: BTreeMap<LogicalCommandId, ClientDeduplicationSnapshot>,
         logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
     ) -> Result<Self, TabletStateMachineSnapshotError> {
+        Self::new_with_logical_commands_and_horizons_and_transaction_statuses(
+            tablet_id,
+            tablet_epoch,
+            raft_group_id,
+            clients,
+            logical_commands,
+            logical_client_retry_horizons,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn new_with_logical_commands_and_horizons_and_transaction_statuses(
+        tablet_id: TabletId,
+        tablet_epoch: u64,
+        raft_group_id: RaftGroupId,
+        clients: BTreeMap<u128, ClientDeduplicationSnapshot>,
+        logical_commands: BTreeMap<LogicalCommandId, ClientDeduplicationSnapshot>,
+        logical_client_retry_horizons: BTreeMap<(u128, u64), u64>,
+        transaction_statuses: BTreeMap<TxnId, TxnStatusRecord>,
+    ) -> Result<Self, TabletStateMachineSnapshotError> {
         let snapshot = Self {
             format_version: TABLET_STATE_MACHINE_SNAPSHOT_VERSION,
             tablet_id,
@@ -699,6 +738,7 @@ impl TabletStateMachineSnapshot {
             clients,
             logical_commands,
             logical_client_retry_horizons,
+            transaction_statuses,
         };
 
         snapshot.validate()?;
@@ -747,6 +787,28 @@ impl TabletStateMachineSnapshot {
             }
         }
 
+        for (txn_id, status) in &self.transaction_statuses {
+            status
+                .validate()
+                .map_err(TabletStateMachineSnapshotError::InvalidTxnStatus)?;
+            if *txn_id != status.txn_id {
+                return Err(TabletStateMachineSnapshotError::TxnStatusKeyMismatch {
+                    key: *txn_id,
+                    status: status.txn_id,
+                });
+            }
+            let primary_tablet_id = status
+                .primary_tablet_id()
+                .map_err(TabletStateMachineSnapshotError::InvalidTxnStatus)?;
+            if primary_tablet_id != self.tablet_id {
+                return Err(TabletStateMachineSnapshotError::TxnStatusTabletMismatch {
+                    txn_id: *txn_id,
+                    snapshot_tablet_id: self.tablet_id,
+                    status_tablet_id: primary_tablet_id,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -754,7 +816,7 @@ impl TabletStateMachineSnapshot {
     /// snapshot. `BTreeMap` ordering fixes the repeated-client entry order
     pub fn encode(&self) -> Result<Vec<u8>, TabletStateMachineSnapshotError> {
         self.validate()?;
-        Ok(self.to_proto().encode_to_vec())
+        Ok(self.to_proto()?.encode_to_vec())
     }
 
     /// decode and validate command metadata recovered from a tablet snapshot
@@ -765,8 +827,10 @@ impl TabletStateMachineSnapshot {
         Self::from_proto(proto)
     }
 
-    fn to_proto(&self) -> command::TabletStateMachineSnapshot {
-        command::TabletStateMachineSnapshot {
+    fn to_proto(
+        &self,
+    ) -> Result<command::TabletStateMachineSnapshot, TabletStateMachineSnapshotError> {
+        Ok(command::TabletStateMachineSnapshot {
             format_version: self.format_version,
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
@@ -843,7 +907,16 @@ impl TabletStateMachineSnapshot {
                     }
                 })
                 .collect(),
-        }
+            transaction_statuses: self
+                .transaction_statuses
+                .values()
+                .map(|status| {
+                    status
+                        .to_proto()
+                        .map_err(TabletStateMachineSnapshotError::InvalidTxnStatus)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     fn from_proto(
@@ -1026,6 +1099,16 @@ impl TabletStateMachineSnapshot {
             }
         }
 
+        let mut transaction_statuses = BTreeMap::new();
+        for status in proto.transaction_statuses {
+            let status = TxnStatusRecord::from_proto(status)
+                .map_err(TabletStateMachineSnapshotError::InvalidTxnStatus)?;
+            let txn_id = status.txn_id;
+            if transaction_statuses.insert(txn_id, status).is_some() {
+                return Err(TabletStateMachineSnapshotError::DuplicateTxnStatus(txn_id));
+            }
+        }
+
         let snapshot = Self {
             format_version: proto.format_version,
             tablet_id,
@@ -1034,6 +1117,7 @@ impl TabletStateMachineSnapshot {
             clients,
             logical_commands,
             logical_client_retry_horizons,
+            transaction_statuses,
         };
 
         snapshot.validate()?;
@@ -1105,6 +1189,24 @@ pub enum TabletStateMachineSnapshotError {
     #[error("tablet state-machine snapshot contains an unspecified cached result")]
     UnspecifiedCachedResult,
 
+    #[error("tablet state-machine snapshot contains duplicate status for transaction {0:?}")]
+    DuplicateTxnStatus(TxnId),
+
+    #[error("tablet snapshot status map key {key:?} does not match record transaction {status:?}")]
+    TxnStatusKeyMismatch { key: TxnId, status: TxnId },
+
+    #[error(
+        "transaction status {txn_id:?} is owned by tablet {status_tablet_id:?}, not snapshot tablet {snapshot_tablet_id:?}"
+    )]
+    TxnStatusTabletMismatch {
+        txn_id: TxnId,
+        snapshot_tablet_id: TabletId,
+        status_tablet_id: TabletId,
+    },
+
+    #[error("invalid transaction status in tablet state-machine snapshot: {0}")]
+    InvalidTxnStatus(&'static str),
+
     #[error("cannot decode tablet state-machine snapshot: {0}")]
     Decode(String),
 }
@@ -1120,10 +1222,15 @@ pub struct PrewriteCommand {
     pub writes: Vec<WriteEntry>,
     pub primary_key: Vec<u8>,
     pub ttl_ms: u64,
+    /// Present only on the primary participant so the pending decision and
+    /// first primary intent enter the same Raft apply transition.
+    pub pending_status: Option<TxnStatusRecord>,
 }
 
 impl PrewriteCommand {
-    pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
+    /// Validate the semantic metadata and complete mutation batch carried by
+    /// a prewrite command before it crosses a Raft or recovery boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
         validate_write_entries(&self.writes)?;
         if self.primary_key.is_empty() {
@@ -1132,6 +1239,30 @@ impl PrewriteCommand {
         if self.ttl_ms == 0 {
             return Err("prewrite lock TTL must be non-zero");
         }
+        if let Some(status) = &self.pending_status {
+            status.validate()?;
+            if status.txn_id != self.txn_id
+                || status.start_timestamp != self.start_timestamp
+                || status.status != TxnStatus::Pending
+                || status.commit_timestamp.is_some()
+                || status.primary_key != self.primary_key
+            {
+                return Err("pending status does not match the primary prewrite");
+            }
+            if !self
+                .writes
+                .iter()
+                .any(|write| write.key == status.primary_key)
+            {
+                return Err("primary prewrite must include the status record primary key");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::PrewriteCommand, &'static str> {
+        self.validate()?;
 
         Ok(command::PrewriteCommand {
             txn_id: Some(self.txn_id.to_proto()),
@@ -1143,26 +1274,37 @@ impl PrewriteCommand {
                 .iter()
                 .map(WriteEntry::to_proto)
                 .collect::<Result<Vec<_>, _>>()?,
+            pending_status: self
+                .pending_status
+                .as_ref()
+                .map(TxnStatusRecord::to_proto)
+                .transpose()?,
         })
     }
 
     pub fn from_proto(proto: command::PrewriteCommand) -> Result<Self, &'static str> {
+        let txn_id = TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?);
+        let start_timestamp =
+            Timestamp::from_proto(proto.start_timestamp.ok_or("missing start_timestamp")?);
         let writes = proto
             .writes
             .into_iter()
             .map(WriteEntry::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
-        validate_write_entries(&writes)?;
 
-        Ok(Self {
-            txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
-            start_timestamp: Timestamp::from_proto(
-                proto.start_timestamp.ok_or("missing start_timestamp")?,
-            ),
+        let command = Self {
+            txn_id,
+            start_timestamp,
             writes,
             primary_key: proto.primary_key,
             ttl_ms: proto.ttl_ms,
-        })
+            pending_status: proto
+                .pending_status
+                .map(TxnStatusRecord::from_proto)
+                .transpose()?,
+        };
+        command.validate()?;
+        Ok(command)
     }
 }
 
@@ -1175,25 +1317,54 @@ pub struct CommitCommand {
     pub start_timestamp: Timestamp,
     pub commit_timestamp: Timestamp,
     pub keys: Vec<Vec<u8>>,
+    /// Present only on the primary participant; state-machine apply publishes
+    /// this decision in the same transition that commits the primary intent.
+    pub committed_status: Option<TxnStatusRecord>,
 }
 
 impl CommitCommand {
-    pub fn to_proto(&self) -> Result<command::CommitCommand, &'static str> {
+    /// Validate the transaction identity, timestamp relationship, and complete
+    /// participant key batch before the command crosses a Raft or recovery
+    /// boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
         if self.commit_timestamp.0 <= self.start_timestamp.0 {
             return Err("commit timestamp must be greater than start timestamp");
         }
         validate_keys(&self.keys)?;
+        if let Some(status) = &self.committed_status {
+            status.validate()?;
+            if status.txn_id != self.txn_id
+                || status.start_timestamp != self.start_timestamp
+                || status.commit_timestamp != Some(self.commit_timestamp)
+                || status.status != TxnStatus::Committed
+            {
+                return Err("committed status does not match the primary commit");
+            }
+            if !self.keys.iter().any(|key| key == &status.primary_key) {
+                return Err("primary commit must include the status record primary key");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::CommitCommand, &'static str> {
+        self.validate()?;
         Ok(command::CommitCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             commit_timestamp: Some(self.commit_timestamp.to_proto()),
             keys: self.keys.clone(),
+            committed_status: self
+                .committed_status
+                .as_ref()
+                .map(TxnStatusRecord::to_proto)
+                .transpose()?,
         })
     }
 
     pub fn from_proto(proto: command::CommitCommand) -> Result<Self, &'static str> {
-        Ok(CommitCommand {
+        let command = CommitCommand {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
@@ -1202,8 +1373,191 @@ impl CommitCommand {
                 proto.commit_timestamp.ok_or("missing commit_timestamp")?,
             ),
             keys: proto.keys,
+            committed_status: proto
+                .committed_status
+                .map(TxnStatusRecord::from_proto)
+                .transpose()?,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+}
+
+/// Publish the aborted decision after the coordinator has applied participant
+/// rollback. The status authority performs no MVCC change for this command.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishAbortedTransactionStatus {
+    pub status_record: TxnStatusRecord,
+}
+
+impl PublishAbortedTransactionStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.status_record.validate()?;
+        if self.status_record.status != TxnStatus::Aborted
+            || self.status_record.commit_timestamp.is_some()
+        {
+            return Err("abort publication requires an aborted status without commit timestamp");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::PublishAbortedTransactionStatus, &'static str> {
+        self.validate()?;
+        Ok(command::PublishAbortedTransactionStatus {
+            status_record: Some(self.status_record.to_proto()?),
         })
     }
+
+    pub fn from_proto(
+        proto: command::PublishAbortedTransactionStatus,
+    ) -> Result<Self, &'static str> {
+        let command = Self {
+            status_record: TxnStatusRecord::from_proto(
+                proto.status_record.ok_or("missing status_record")?,
+            )?,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+}
+
+/// Fenced renewal of a pending transaction lease at its status authority.
+///
+/// The command carries both the observed and proposed status plus one fixed
+/// wall-clock sample. Replicated apply therefore rejects stale heartbeats,
+/// terminal decisions, and renewals submitted after the old lease expired.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartbeatTransactionStatus {
+    pub expected_status: TxnStatusRecord,
+    pub next_status: TxnStatusRecord,
+    pub now_ms: u64,
+}
+
+impl HeartbeatTransactionStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected_status.validate()?;
+        self.next_status.validate()?;
+        if self.now_ms == 0 {
+            return Err("heartbeat apply time must be non-zero");
+        }
+        if self.expected_status.status != TxnStatus::Pending
+            || self.next_status.status != TxnStatus::Pending
+            || self.expected_status.commit_timestamp.is_some()
+            || self.next_status.commit_timestamp.is_some()
+        {
+            return Err("heartbeat requires pending status records");
+        }
+        if !same_transaction_status_identity(&self.expected_status, &self.next_status) {
+            return Err("heartbeat changed transaction status identity");
+        }
+        let current_deadline = self
+            .expected_status
+            .lease_deadline_ms
+            .ok_or("heartbeat requires an existing lease deadline")?;
+        if self.now_ms >= current_deadline {
+            return Err("heartbeat apply time is at or after the current lease deadline");
+        }
+        let next_deadline = self
+            .next_status
+            .lease_deadline_ms
+            .ok_or("heartbeat requires a next lease deadline")?;
+        if next_deadline < current_deadline {
+            return Err("heartbeat lease deadline must not regress");
+        }
+        let previous_timestamp = self
+            .expected_status
+            .last_heartbeat_timestamp
+            .unwrap_or(self.expected_status.start_timestamp);
+        let next_timestamp = self
+            .next_status
+            .last_heartbeat_timestamp
+            .ok_or("heartbeat requires a next heartbeat timestamp")?;
+        if next_timestamp <= previous_timestamp {
+            return Err("heartbeat timestamp must advance monotonically");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::HeartbeatTransactionStatus, &'static str> {
+        self.validate()?;
+        Ok(command::HeartbeatTransactionStatus {
+            expected_status: Some(self.expected_status.to_proto()?),
+            next_status: Some(self.next_status.to_proto()?),
+            now_ms: self.now_ms,
+        })
+    }
+
+    pub fn from_proto(proto: command::HeartbeatTransactionStatus) -> Result<Self, &'static str> {
+        let heartbeat = Self {
+            expected_status: TxnStatusRecord::from_proto(
+                proto.expected_status.ok_or("missing expected_status")?,
+            )?,
+            next_status: TxnStatusRecord::from_proto(
+                proto.next_status.ok_or("missing next_status")?,
+            )?,
+            now_ms: proto.now_ms,
+        };
+        heartbeat.validate()?;
+        Ok(heartbeat)
+    }
+}
+
+/// Publish a replicated abort decision only if the observed pending lease is
+/// still the current, expired status record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpirePendingTransactionStatus {
+    pub expected_status: TxnStatusRecord,
+    pub now_ms: u64,
+}
+
+impl ExpirePendingTransactionStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.expected_status.validate()?;
+        if self.now_ms == 0 {
+            return Err("expiry apply time must be non-zero");
+        }
+        if self.expected_status.status != TxnStatus::Pending
+            || self.expected_status.commit_timestamp.is_some()
+        {
+            return Err("expiry requires a pending status record");
+        }
+        let deadline = self
+            .expected_status
+            .lease_deadline_ms
+            .ok_or("expiry requires an existing lease deadline")?;
+        if self.now_ms < deadline {
+            return Err("expiry apply time precedes the pending lease deadline");
+        }
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<command::ExpirePendingTransactionStatus, &'static str> {
+        self.validate()?;
+        Ok(command::ExpirePendingTransactionStatus {
+            expected_status: Some(self.expected_status.to_proto()?),
+            now_ms: self.now_ms,
+        })
+    }
+
+    pub fn from_proto(
+        proto: command::ExpirePendingTransactionStatus,
+    ) -> Result<Self, &'static str> {
+        let expiry = Self {
+            expected_status: TxnStatusRecord::from_proto(
+                proto.expected_status.ok_or("missing expected_status")?,
+            )?,
+            now_ms: proto.now_ms,
+        };
+        expiry.validate()?;
+        Ok(expiry)
+    }
+}
+
+fn same_transaction_status_identity(left: &TxnStatusRecord, right: &TxnStatusRecord) -> bool {
+    left.txn_id == right.txn_id
+        && left.start_timestamp == right.start_timestamp
+        && left.primary_key == right.primary_key
+        && left.participant_tablet_ids == right.participant_tablet_ids
 }
 
 /// roll back every key owned by one tablet participant
@@ -1218,9 +1572,15 @@ pub struct RollbackCommand {
 }
 
 impl RollbackCommand {
-    pub fn to_proto(&self) -> Result<command::RollbackCommand, &'static str> {
+    /// Validate the transaction identity and complete rollback key batch
+    /// before the command crosses a Raft or recovery boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
         validate_txn_start(self.txn_id, self.start_timestamp)?;
-        validate_keys(&self.keys)?;
+        validate_keys(&self.keys)
+    }
+
+    pub fn to_proto(&self) -> Result<command::RollbackCommand, &'static str> {
+        self.validate()?;
         Ok(command::RollbackCommand {
             txn_id: Some(self.txn_id.to_proto()),
             start_timestamp: Some(self.start_timestamp.to_proto()),
@@ -1229,13 +1589,15 @@ impl RollbackCommand {
     }
 
     pub fn from_proto(proto: command::RollbackCommand) -> Result<Self, &'static str> {
-        Ok(RollbackCommand {
+        let command = RollbackCommand {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_timestamp")?,
             ),
             keys: proto.keys,
-        })
+        };
+        command.validate()?;
+        Ok(command)
     }
 }
 
@@ -1558,6 +1920,9 @@ pub enum TabletCommand {
     ResolveIntent(ResolveIntentCommand),
     Catalog(CatalogCommand),
     Noop(NoopCommand),
+    PublishAbortedTransactionStatus(PublishAbortedTransactionStatus),
+    HeartbeatTransactionStatus(HeartbeatTransactionStatus),
+    ExpirePendingTransactionStatus(ExpirePendingTransactionStatus),
 }
 
 impl TabletCommand {
@@ -1584,6 +1949,11 @@ impl TabletCommand {
             TabletCommand::ResolveIntent(_) => "resolve-intent",
             TabletCommand::Catalog(_) => "catalog",
             TabletCommand::Noop(_) => "noop",
+            TabletCommand::PublishAbortedTransactionStatus(_) => {
+                "publish-aborted-transaction-status"
+            }
+            TabletCommand::HeartbeatTransactionStatus(_) => "heartbeat-transaction-status",
+            TabletCommand::ExpirePendingTransactionStatus(_) => "expire-pending-transaction-status",
         }
     }
 
@@ -1611,6 +1981,19 @@ impl TabletCommand {
             TabletCommand::Noop(command) => {
                 Some(command::tablet_command::Command::Noop(command.to_proto()))
             }
+            TabletCommand::PublishAbortedTransactionStatus(command) => Some(
+                command::tablet_command::Command::PublishAbortedTransactionStatus(
+                    command.to_proto()?,
+                ),
+            ),
+            TabletCommand::HeartbeatTransactionStatus(command) => Some(
+                command::tablet_command::Command::HeartbeatTransactionStatus(command.to_proto()?),
+            ),
+            TabletCommand::ExpirePendingTransactionStatus(command) => Some(
+                command::tablet_command::Command::ExpirePendingTransactionStatus(
+                    command.to_proto()?,
+                ),
+            ),
         };
 
         Ok(command::TabletCommand { command })
@@ -1639,6 +2022,21 @@ impl TabletCommand {
             Some(command::tablet_command::Command::Noop(c)) => {
                 Ok(TabletCommand::Noop(NoopCommand::from_proto(c)?))
             }
+            Some(command::tablet_command::Command::PublishAbortedTransactionStatus(c)) => {
+                Ok(TabletCommand::PublishAbortedTransactionStatus(
+                    PublishAbortedTransactionStatus::from_proto(c)?,
+                ))
+            }
+            Some(command::tablet_command::Command::HeartbeatTransactionStatus(c)) => {
+                Ok(TabletCommand::HeartbeatTransactionStatus(
+                    HeartbeatTransactionStatus::from_proto(c)?,
+                ))
+            }
+            Some(command::tablet_command::Command::ExpirePendingTransactionStatus(c)) => {
+                Ok(TabletCommand::ExpirePendingTransactionStatus(
+                    ExpirePendingTransactionStatus::from_proto(c)?,
+                ))
+            }
             None => Err("missing tablet command"),
         }
     }
@@ -1665,6 +2063,7 @@ mod tests {
             }],
             primary_key: b"/table/1/pk/1".to_vec(),
             ttl_ms: 30_000,
+            pending_status: None,
         };
 
         let proto = command.to_proto().unwrap();
@@ -1677,16 +2076,148 @@ mod tests {
     }
 
     #[test]
+    fn transaction_status_command_metadata_roundtrips() {
+        let primary_key = b"/table/1/pk/1".to_vec();
+        let pending = TxnStatusRecord {
+            txn_id: TxnId(15),
+            start_timestamp: Timestamp(100),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: primary_key.clone(),
+            participant_tablet_ids: vec![7, 8],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let prewrite = TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: pending.txn_id,
+            start_timestamp: pending.start_timestamp,
+            writes: vec![WriteEntry {
+                key: primary_key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(1)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: primary_key.clone(),
+            ttl_ms: 30_000,
+            pending_status: Some(pending.clone()),
+        });
+
+        let decoded_prewrite = TabletCommand::from_proto(prewrite.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded_prewrite, prewrite);
+
+        let committed = TxnStatusRecord {
+            commit_timestamp: Some(Timestamp(110)),
+            status: TxnStatus::Committed,
+            ..pending.clone()
+        };
+        let commit = TabletCommand::Commit(CommitCommand {
+            txn_id: committed.txn_id,
+            start_timestamp: committed.start_timestamp,
+            commit_timestamp: Timestamp(110),
+            keys: vec![primary_key.clone()],
+            committed_status: Some(committed.clone()),
+        });
+        let decoded_commit = TabletCommand::from_proto(commit.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded_commit, commit);
+
+        let aborted = TxnStatusRecord {
+            status: TxnStatus::Aborted,
+            ..pending
+        };
+        let abort =
+            TabletCommand::PublishAbortedTransactionStatus(PublishAbortedTransactionStatus {
+                status_record: aborted,
+            });
+        assert_eq!(
+            TabletCommand::from_proto(abort.to_proto().unwrap()).unwrap(),
+            abort
+        );
+    }
+
+    #[test]
+    fn prewrite_from_proto_rejects_invalid_transaction_metadata() {
+        let command = PrewriteCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            writes: vec![WriteEntry {
+                key: b"/table/1/pk/1".to_vec(),
+                row: Some(Row {
+                    values: vec![Value::Int(1)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: b"/table/1/pk/1".to_vec(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_primary = command.to_proto().unwrap();
+        invalid_primary.primary_key.clear();
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_primary),
+            Err("prewrite primary key must not be empty")
+        );
+
+        let mut invalid_ttl = command.to_proto().unwrap();
+        invalid_ttl.ttl_ms = 0;
+        assert_eq!(
+            PrewriteCommand::from_proto(invalid_ttl),
+            Err("prewrite lock TTL must be non-zero")
+        );
+    }
+
+    #[test]
     fn commit_command_roundtrip() {
         let cmd = CommitCommand {
             txn_id: TxnId(1),
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(105),
             keys: vec![b"/table/1/pk/1".to_vec()],
+            committed_status: None,
         };
         let proto = cmd.to_proto().unwrap();
         let decoded = CommitCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.commit_timestamp.0, 105);
+    }
+
+    #[test]
+    fn commit_from_proto_rejects_invalid_metadata() {
+        let command = CommitCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            commit_timestamp: Timestamp(105),
+            keys: vec![b"/table/1/pk/1".to_vec()],
+            committed_status: None,
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            CommitCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_timestamp = command.to_proto().unwrap();
+        invalid_timestamp.commit_timestamp = Some(Timestamp(100).to_proto());
+        assert_eq!(
+            CommitCommand::from_proto(invalid_timestamp),
+            Err("commit timestamp must be greater than start timestamp")
+        );
+
+        let mut empty_keys = command.to_proto().unwrap();
+        empty_keys.keys.clear();
+        assert_eq!(
+            CommitCommand::from_proto(empty_keys),
+            Err("participant command requires at least one row key")
+        );
     }
 
     #[test]
@@ -1699,6 +2230,36 @@ mod tests {
         let proto = cmd.to_proto().unwrap();
         let decoded = RollbackCommand::from_proto(proto).unwrap();
         assert_eq!(decoded.txn_id.0, 1);
+    }
+
+    #[test]
+    fn rollback_from_proto_rejects_invalid_metadata() {
+        let command = RollbackCommand {
+            txn_id: TxnId(1),
+            start_timestamp: Timestamp(100),
+            keys: vec![b"/table/1/pk/1".to_vec()],
+        };
+
+        let mut invalid_transaction = command.to_proto().unwrap();
+        invalid_transaction.txn_id = Some(TxnId(0).to_proto());
+        assert_eq!(
+            RollbackCommand::from_proto(invalid_transaction),
+            Err("transaction ID must be non-zero")
+        );
+
+        let mut invalid_start_timestamp = command.to_proto().unwrap();
+        invalid_start_timestamp.start_timestamp = Some(Timestamp(0).to_proto());
+        assert_eq!(
+            RollbackCommand::from_proto(invalid_start_timestamp),
+            Err("transaction start timestamp must be non-zero")
+        );
+
+        let mut empty_keys = command.to_proto().unwrap();
+        empty_keys.keys.clear();
+        assert_eq!(
+            RollbackCommand::from_proto(empty_keys),
+            Err("participant command requires at least one row key")
+        );
     }
 
     #[test]
@@ -1831,6 +2392,7 @@ mod tests {
             }],
             primary_key: b"/table/1/pk/1".to_vec(),
             ttl_ms: 30_000,
+            pending_status: None,
         });
         let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
@@ -1844,6 +2406,7 @@ mod tests {
             start_timestamp: Timestamp(100),
             commit_timestamp: Timestamp(105),
             keys: vec![b"/table/1/pk/1".to_vec()],
+            committed_status: None,
         });
         let proto = cmd.to_proto().unwrap();
         let decoded = TabletCommand::from_proto(proto).unwrap();
@@ -2075,5 +2638,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded, outcome);
+    }
+
+    /// Realistic bug caught: a tablet snapshot can be installed after Raft has
+    /// compacted the entries that published a transaction decision. If the
+    /// snapshot codec drops that decision, a restarted reader can no longer
+    /// distinguish a committed intent from an unresolved one.
+    #[test]
+    fn snapshot_roundtrip_preserves_transaction_status_records() {
+        use crate::{codec::TxnStatusRecord, ids::TxnId};
+
+        let mut bytes = TabletStateMachineSnapshot::new_with_logical_commands_and_horizons(
+            TabletId(9),
+            1,
+            RaftGroupId(11),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert!(
+            TabletStateMachineSnapshot::decode(&bytes)
+                .unwrap()
+                .transaction_statuses
+                .is_empty(),
+            "legacy snapshot without status records must restore an empty status map"
+        );
+        let status = TxnStatusRecord {
+            txn_id: TxnId(12),
+            start_timestamp: Timestamp(40),
+            commit_timestamp: Some(Timestamp(50)),
+            status: TxnStatus::Committed,
+            primary_key: b"primary-key".to_vec(),
+            participant_tablet_ids: vec![9, 22],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let status_bytes = status.to_proto().unwrap().encode_to_vec();
+
+        // Field 8 is reserved for transaction status records in the replicated
+        // state-machine snapshot. Constructing the wire field directly keeps
+        // this regression test executable before the domain schema understands
+        // it, so RED proves that the existing codec actually discards it.
+        append_varint((8 << 3) | 2, &mut bytes);
+        append_varint(status_bytes.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&status_bytes);
+
+        let recovered = TabletStateMachineSnapshot::decode(&bytes).unwrap();
+        let reencoded = recovered.encode().unwrap();
+
+        assert!(
+            reencoded
+                .windows(status_bytes.len())
+                .any(|window| window == status_bytes),
+            "snapshot roundtrip dropped the transaction status record"
+        );
+    }
+
+    fn append_varint(mut value: u64, output: &mut Vec<u8>) {
+        while value >= 0x80 {
+            output.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
     }
 }

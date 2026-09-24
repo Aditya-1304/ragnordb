@@ -74,7 +74,7 @@ fn test_snapshot() -> (snapshot_proto::DatabaseSnapshot, Vec<u8>, Vec<u8>) {
             writes: vec![snapshot_proto::WriteEntry {
                 key: key.clone(),
                 write_timestamp: Some(Timestamp(90).to_proto()),
-                record: Some(write.to_proto()),
+                record: Some(write.to_proto().unwrap()),
             }],
         }],
     };

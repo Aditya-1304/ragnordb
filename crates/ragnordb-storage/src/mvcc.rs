@@ -24,9 +24,11 @@
 //!
 //! this commits buffered single tablet transaction directly after
 //! validating the entire batch.
-//! Distributed prewrite, lock resolution, transction status records
-//! Raft application, WAL durability, and garbage collection are
-//! intentionally deferred to their later milestones
+//! Distributed prewrite, terminal intent resolution, transaction status
+//! records, Raft application, WAL durability, and garbage collection are
+//! implemented at separate layer boundaries. Read-time resolution returns a
+//! durable command plan to the tablet/Raft owner; it never mutates MVCC state
+//! as a side effect of an ordinary read.
 //!
 //! the existing raft `WriteEntry` currently stores one `Value`,
 //! while `Mutation::Put` stores a complete canonical encoded row
@@ -39,6 +41,7 @@ use std::{
 };
 
 use crate::key::decode_row_key;
+use prost::Message;
 
 use ragnordb_common::{
     Error, Result,
@@ -104,6 +107,16 @@ pub struct MvccScanPage {
     pub has_more: bool,
 }
 
+/// One bounded, ordered scan response over unresolved transaction intents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntentScanPage {
+    /// Canonical row keys paired with the validated lock records they own.
+    pub locks: Vec<(Vec<u8>, LockRecord)>,
+
+    /// Whether another intent remains after the final returned key.
+    pub has_more: bool,
+}
+
 /// Storage contract required by the transaction-aware tablet layer.
 ///
 /// All keys passed to this trait must be complete canonical row-key encodings
@@ -111,6 +124,55 @@ pub struct MvccScanPage {
 pub trait MvccStorage {
     /// Read the row version visible at `read_ts`.
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>>;
+
+    /// Return the lock that conflicts with a snapshot read, if any.
+    ///
+    /// This is a read-only inspection boundary for intent resolution. The
+    /// caller must consult the authoritative transaction status and submit a
+    /// replicated resolve command; it must not mutate the backend directly
+    /// from this inspection method.
+    fn intent_for_read(&self, _key: &[u8], _read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        Err(Error::NotImplemented(
+            "intent inspection is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Scan unresolved intents in canonical key order using an exclusive
+    /// continuation key.
+    ///
+    /// The cleaner uses this read-only boundary to bound work per background
+    /// pass. It must never infer expiry from the local lock age; the caller
+    /// still has to consult the authoritative transaction-status record before
+    /// dispatching a replicated resolution command.
+    fn scan_intent_page(
+        &self,
+        _start: Option<&[u8]>,
+        _end: Option<&[u8]>,
+        _resume_after: Option<&[u8]>,
+        _max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        Err(Error::NotImplemented(
+            "intent scanning is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Inspect a bounded page of intents that conflict with a foreground
+    /// snapshot read. The tablet owner invokes this before returning visible
+    /// scan rows so lock-only inserts and old committed values cannot hide a
+    /// read-conflicting intent.
+    fn scan_conflicting_intents(
+        &self,
+        _start: Option<&[u8]>,
+        _end: Option<&[u8]>,
+        _resume_after: Option<&[u8]>,
+        _read_ts: Timestamp,
+        _max_locks: usize,
+        _max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        Err(Error::NotImplemented(
+            "foreground scan intent inspection is not supported by this MVCC backend",
+        ))
+    }
 
     /// Scan the half-open encoded-key range `[start, end)` at `read_ts`.
     ///
@@ -330,7 +392,7 @@ impl InMemoryMvcc {
     /// commit/catalog barrier. Flattening the ordered maps here fixes both the
     /// state image and its deterministic protobuf ordering before that barrier
     /// is released
-    pub fn capture_snapshot_state(&self) -> CapturedMvccState {
+    pub fn capture_snapshot_state(&self) -> Result<CapturedMvccState> {
         let default_values = self
             .default
             .iter()
@@ -348,27 +410,37 @@ impl InMemoryMvcc {
         let locks = self
             .locks
             .iter()
-            .map(|(key, record)| snapshot_proto::LockEntry {
-                key: key.clone(),
-                record: Some(record.to_proto()),
+            .map(|(key, record)| {
+                Ok(snapshot_proto::LockEntry {
+                    key: key.clone(),
+                    record: Some(record.to_proto().map_err(|error| {
+                        Error::CorruptData(format!(
+                            "in-memory lock record cannot be snapshotted: {error}"
+                        ))
+                    })?),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let writes = self
             .writes
             .iter()
             .flat_map(|(key, versions)| {
-                versions.iter().map(
-                    move |(write_timestamp, record)| snapshot_proto::WriteEntry {
+                versions.iter().map(move |(write_timestamp, record)| {
+                    Ok(snapshot_proto::WriteEntry {
                         key: key.clone(),
                         write_timestamp: Some(write_timestamp.to_proto()),
-                        record: Some(record.to_proto()),
-                    },
-                )
+                        record: Some(record.to_proto().map_err(|error| {
+                            Error::CorruptData(format!(
+                                "in-memory write record cannot be snapshotted: {error}"
+                            ))
+                        })?),
+                    })
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        CapturedMvccState::new(default_values, locks, writes)
+        Ok(CapturedMvccState::new(default_values, locks, writes))
     }
 
     /// Reconstruct one table's complete MVCC maps from snapshot entries.
@@ -817,6 +889,154 @@ impl MvccStorage for InMemoryMvcc {
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
         validate_encoded_key_argument(key, "read key")?;
         self.read_visible_version(key, read_ts)
+    }
+
+    fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        validate_encoded_key_argument(key, "intent read key")?;
+
+        let Some(lock) = self.locks.get(key) else {
+            return Ok(None);
+        };
+
+        if lock.start_timestamp > read_ts {
+            return Ok(None);
+        }
+
+        lock.validate().map_err(|error| {
+            Error::CorruptData(format!("intent lock cannot be used for a read: {error}"))
+        })?;
+
+        Ok(Some(lock.clone()))
+    }
+
+    fn scan_intent_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        if max_locks == 0 {
+            return Err(Error::InvalidArgument(
+                "intent scan page max_locks must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "intent scan resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(IntentScanPage {
+                    locks: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut locks = Vec::new();
+        for (key, lock) in self.locks.range((lower, upper)) {
+            if locks.len() >= max_locks {
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            validate_encoded_key_argument(key, "intent scan key")?;
+            lock.validate().map_err(|error| {
+                Error::CorruptData(format!("intent scan found an invalid lock: {error}"))
+            })?;
+            locks.push((key.clone(), lock.clone()));
+        }
+
+        Ok(IntentScanPage {
+            locks,
+            has_more: false,
+        })
+    }
+
+    fn scan_conflicting_intents(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        if max_locks == 0 {
+            return Err(Error::InvalidArgument(
+                "foreground scan intent max_locks must be greater than zero".to_string(),
+            ));
+        }
+        if max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "foreground scan intent max_bytes must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "foreground scan intent resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(IntentScanPage {
+                    locks: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut locks = Vec::new();
+        let mut encoded_bytes = 0usize;
+        for (key, lock) in self.locks.range((lower, upper)) {
+            validate_encoded_key_argument(key, "foreground scan intent key")?;
+            lock.validate().map_err(|error| {
+                Error::CorruptData(format!("foreground scan found an invalid lock: {error}"))
+            })?;
+            if lock.start_timestamp > read_ts {
+                continue;
+            }
+
+            if locks.len() >= max_locks {
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            let encoded_lock = lock
+                .to_proto()
+                .map_err(|error| Error::CorruptData(error.to_string()))?
+                .encoded_len();
+            let entry_bytes = key.len().checked_add(encoded_lock).ok_or_else(|| {
+                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+            })?;
+            let next_bytes = encoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+            })?;
+            if next_bytes > max_bytes {
+                if locks.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "foreground scan intent byte budget is smaller than the first encoded lock"
+                            .to_string(),
+                    ));
+                }
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            encoded_bytes = next_bytes;
+            locks.push((key.clone(), lock.clone()));
+        }
+
+        Ok(IntentScanPage {
+            locks,
+            has_more: false,
+        })
     }
 
     fn scan(
@@ -2036,6 +2256,50 @@ mod tests {
             byte_budget
         );
         assert!(byte_page.has_more);
+    }
+
+    #[test]
+    fn foreground_intent_scan_finds_lock_only_keys_and_filters_future_locks() {
+        // A visible-row scan omits a newly inserted key until its transaction
+        // commits. Foreground range reads need this bounded lock view to avoid
+        // returning a silently incomplete result.
+        let keys = [encoded_key(1), encoded_key(2), encoded_key(3)];
+        let mut engine = InMemoryMvcc::new();
+        for (index, (key, start_timestamp)) in keys.iter().zip([3, 4, 9]).enumerate() {
+            engine.locks.insert(
+                key.clone(),
+                LockRecord {
+                    txn_id: TxnId(index as u64 + 1),
+                    primary_key: key.clone(),
+                    start_timestamp: Timestamp(start_timestamp),
+                    ttl_ms: 1_000,
+                    op: WriteKind::Put,
+                },
+            );
+        }
+
+        let first = engine
+            .scan_conflicting_intents(None, None, None, Timestamp(5), 1, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            first.locks,
+            vec![(keys[0].clone(), engine.locks[&keys[0]].clone())]
+        );
+        assert!(first.has_more);
+
+        let second = engine
+            .scan_conflicting_intents(None, None, Some(&keys[0]), Timestamp(5), 1, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            second.locks,
+            vec![(keys[1].clone(), engine.locks[&keys[1]].clone())]
+        );
+        assert!(!second.has_more);
+
+        let error = engine
+            .scan_conflicting_intents(None, None, None, Timestamp(5), 1, 1)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
     }
 
     #[test]

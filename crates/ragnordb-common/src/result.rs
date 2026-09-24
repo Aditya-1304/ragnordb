@@ -57,6 +57,11 @@ pub enum Error {
     #[error("write conflict: {0}")]
     WriteConflict(String),
 
+    /// The requested MVCC snapshot predates the cluster's published history
+    /// boundary and cannot be served without silently omitting versions.
+    #[error("snapshot too old: {reason}")]
+    SnapshotTooOld { reason: String },
+
     /// The SQL parser could not construct an AST from the client input
     #[error("SQL parse error: {0}")]
     SqlParse(String),
@@ -199,6 +204,18 @@ pub enum Error {
         reason: String,
     },
 
+    /// physical A-WAL recovery failed and the original WAL error remains
+    /// available as a typed source for diagnosis and recovery tooling
+    #[error("WAL recovery failed: {context}: {source}")]
+    RecoveryFailedWithSource {
+        /// recovery operation that could not proceed
+        context: String,
+
+        /// concrete failure returned by A-WAL or another recovery dependency
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// a database snapshot could not be durably published to its final path
     ///
     /// The snapshot has not been referenced by WAL yet. Callers must not append
@@ -273,12 +290,14 @@ impl Error {
             | Self::UnsupportedSql(_)
             | Self::SchemaMismatch(_)
             | Self::Configuration(_)
+            | Self::SnapshotTooOld { .. }
             | Self::DistributedScanFailed {
                 retryable: false, ..
             }
             | Self::WalAppendNotStaged { .. }
             | Self::RecoveryRequired { .. }
             | Self::RecoveryFailed { .. }
+            | Self::RecoveryFailedWithSource { .. }
             | Self::SnapshotPublicationFailed { .. } => RetryAction::None,
         }
     }

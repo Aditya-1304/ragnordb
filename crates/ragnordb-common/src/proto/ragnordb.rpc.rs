@@ -62,6 +62,52 @@ pub struct TabletReadRequest {
     #[prost(uint64, optional, tag = "8")]
     pub deadline_remaining_ms: ::core::option::Option<u64>,
 }
+/// Authoritative status lookup executed through the primary tablet's
+/// linearizable read barrier. An absent record is returned as not-found and
+/// must never be interpreted as an abort decision.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletTransactionStatusRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "4")]
+    pub txn_id: ::core::option::Option<super::ids::TxnId>,
+    #[prost(uint64, optional, tag = "5")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
+}
+/// Participant-side, read-only inspection of one MVCC key. The tablet owner
+/// returns the visible row and any read-conflicting intent from one serialized
+/// state-machine observation; intent resolution remains a separate replicated
+/// command.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletPointInspectionRequest {
+    #[prost(message, optional, tag = "1")]
+    pub request_id: ::core::option::Option<super::ids::RequestId>,
+    #[prost(message, optional, tag = "2")]
+    pub tablet_id: ::core::option::Option<super::ids::TabletId>,
+    #[prost(uint64, tag = "3")]
+    pub tablet_epoch: u64,
+    #[prost(message, optional, tag = "4")]
+    pub row_key: ::core::option::Option<super::row::RowKey>,
+    #[prost(message, optional, tag = "5")]
+    pub read_timestamp: ::core::option::Option<super::ids::Timestamp>,
+    #[prost(uint64, optional, tag = "6")]
+    pub rpc_attempt_id: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletPointInspection {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    pub visible_row: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, optional, tag = "2")]
+    pub intent: ::core::option::Option<super::mvcc::LockRecord>,
+}
 /// A bounded, resumable read over one logical half-open tablet span. The
 /// existing TabletCommandResponse envelope carries the encoded TabletScanBatch
 /// response so scan failures retain the established retry and attempt-correlation
@@ -92,6 +138,10 @@ pub struct TabletScanRequest {
     /// The receiver never reconstructs a deadline from its wall clock.
     #[prost(uint64, optional, tag = "11")]
     pub deadline_remaining_ms: ::core::option::Option<u64>,
+    /// Cleaner-only mode streams every intent in a bounded page. It does
+    /// not return MVCC rows or enforce a snapshot timestamp.
+    #[prost(bool, tag = "12")]
+    pub intent_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletScanRow {
@@ -101,6 +151,13 @@ pub struct TabletScanRow {
     pub row: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletScanIntent {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub intent: ::core::option::Option<super::mvcc::LockRecord>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletScanBatch {
     #[prost(message, repeated, tag = "1")]
     pub rows: ::prost::alloc::vec::Vec<TabletScanRow>,
@@ -108,6 +165,8 @@ pub struct TabletScanBatch {
     pub next_resume_after: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(bool, tag = "3")]
     pub exhausted: bool,
+    #[prost(message, repeated, tag = "4")]
+    pub intents: ::prost::alloc::vec::Vec<TabletScanIntent>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletCommandResponse {
@@ -307,6 +366,14 @@ pub struct MetadataProposalOutcome {
     pub raft_group_id: u64,
     #[prost(string, tag = "7")]
     pub rejection: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "8")]
+    pub timestamp_reserved_until: u64,
+    #[prost(uint64, tag = "9")]
+    pub timestamp_current: u64,
+    #[prost(uint64, tag = "10")]
+    pub timestamp_received: u64,
+    #[prost(uint64, tag = "11")]
+    pub timestamp_reserved_from: u64,
 }
 /// Nested message and enum types in `MetadataProposalOutcome`.
 pub mod metadata_proposal_outcome {
@@ -330,6 +397,8 @@ pub mod metadata_proposal_outcome {
         ClientRenewed = 4,
         TableCreated = 5,
         Rejected = 6,
+        TimestampsReserved = 7,
+        TimestampReservationRegressed = 8,
     }
     impl Kind {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -345,6 +414,8 @@ pub mod metadata_proposal_outcome {
                 Self::ClientRenewed => "CLIENT_RENEWED",
                 Self::TableCreated => "TABLE_CREATED",
                 Self::Rejected => "REJECTED",
+                Self::TimestampsReserved => "TIMESTAMPS_RESERVED",
+                Self::TimestampReservationRegressed => "TIMESTAMP_RESERVATION_REGRESSED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -357,6 +428,10 @@ pub mod metadata_proposal_outcome {
                 "CLIENT_RENEWED" => Some(Self::ClientRenewed),
                 "TABLE_CREATED" => Some(Self::TableCreated),
                 "REJECTED" => Some(Self::Rejected),
+                "TIMESTAMPS_RESERVED" => Some(Self::TimestampsReserved),
+                "TIMESTAMP_RESERVATION_REGRESSED" => {
+                    Some(Self::TimestampReservationRegressed)
+                }
                 _ => None,
             }
         }
@@ -408,6 +483,8 @@ pub enum MessageType {
     TabletScanRequest = 8,
     ReplicaJoinRequest = 9,
     ReplicaJoinResponse = 10,
+    TabletTransactionStatusRequest = 11,
+    TabletPointInspectionRequest = 12,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -429,6 +506,12 @@ impl MessageType {
             Self::TabletScanRequest => "MESSAGE_TYPE_TABLET_SCAN_REQUEST",
             Self::ReplicaJoinRequest => "MESSAGE_TYPE_REPLICA_JOIN_REQUEST",
             Self::ReplicaJoinResponse => "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE",
+            Self::TabletTransactionStatusRequest => {
+                "MESSAGE_TYPE_TABLET_TRANSACTION_STATUS_REQUEST"
+            }
+            Self::TabletPointInspectionRequest => {
+                "MESSAGE_TYPE_TABLET_POINT_INSPECTION_REQUEST"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -447,6 +530,12 @@ impl MessageType {
             "MESSAGE_TYPE_TABLET_SCAN_REQUEST" => Some(Self::TabletScanRequest),
             "MESSAGE_TYPE_REPLICA_JOIN_REQUEST" => Some(Self::ReplicaJoinRequest),
             "MESSAGE_TYPE_REPLICA_JOIN_RESPONSE" => Some(Self::ReplicaJoinResponse),
+            "MESSAGE_TYPE_TABLET_TRANSACTION_STATUS_REQUEST" => {
+                Some(Self::TabletTransactionStatusRequest)
+            }
+            "MESSAGE_TYPE_TABLET_POINT_INSPECTION_REQUEST" => {
+                Some(Self::TabletPointInspectionRequest)
+            }
             _ => None,
         }
     }

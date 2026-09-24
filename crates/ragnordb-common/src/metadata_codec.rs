@@ -13,7 +13,7 @@ use crate::{
     catalog_codec::{ColumnDefinition, TableDefinition},
     ids::{
         ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
-        RequestId, TableId, TabletId,
+        RequestId, TableId, TabletId, Timestamp,
     },
     proto::metadata,
 };
@@ -34,7 +34,11 @@ pub const LEGACY_METADATA_SNAPSHOT_VERSION: u32 = 1;
 ///
 /// Version 2 prevents an older reader from silently ignoring allocator history
 /// that may no longer be derivable from visible objects after metadata deletion.
-pub const METADATA_SNAPSHOT_VERSION: u32 = 2;
+pub const PREVIOUS_METADATA_SNAPSHOT_VERSION: u32 = 2;
+
+/// Snapshot format carrying durable MVCC history protections and the global
+/// safe point.
+pub const METADATA_SNAPSHOT_VERSION: u32 = 3;
 
 /// Compatibility high-water marks reserved by the M4 runtime and metadata
 /// Raft group. New metadata allocations begin strictly above these values.
@@ -70,6 +74,43 @@ pub enum MetadataCommand {
         client_id: u128,
         session_epoch: u64,
         acknowledged_through: u64,
+    },
+
+    /// Advance the durable timestamp reservation frontier owned by metadata
+    /// Raft. Timestamp values below this frontier are safe to allocate after
+    /// recovery because the frontier itself is replicated state.
+    ReserveTimestamps {
+        reserved_until: Timestamp,
+    },
+
+    /// Add one leased reader/transaction protection to metadata state.
+    RegisterGcProtection {
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    },
+
+    /// Extend an existing protection without changing its protected history.
+    RenewGcProtection {
+        owner_id: u128,
+        protection_id: u128,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    },
+
+    /// Release a protection after its reader/transaction has finished.
+    ReleaseGcProtection {
+        owner_id: u128,
+        protection_id: u128,
+    },
+
+    /// Monotonically advance the global MVCC history boundary, constrained by
+    /// every protection whose lease remains live at `now_ms`.
+    AdvanceGcSafePoint {
+        candidate: Timestamp,
+        now_ms: u64,
     },
 
     RegisterNode(NodeDescriptor),
@@ -259,6 +300,14 @@ pub enum MetadataCachedOutcome {
         table_id: TableId,
         tablet_id: TabletId,
         raft_group_id: RaftGroupId,
+    },
+    TimestampsReserved {
+        reserved_from: Timestamp,
+        reserved_until: Timestamp,
+    },
+    TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
     },
     Rejected(String),
 }
@@ -503,9 +552,31 @@ pub struct MetadataSnapshot {
     pub desired_placements: Vec<DesiredReplicaPlacement>,
     pub retired_replicas: Vec<RetiredReplicaLifetime>,
     pub allocator: MetadataAllocatorState,
+    /// Highest timestamp range endpoint durably reserved by metadata Raft.
+    /// Zero is valid for an uninitialized cluster and for legacy snapshots.
+    pub timestamp_reserved_until: Timestamp,
+
+    /// Lowest MVCC timestamp which tablets may still read. This is distinct
+    /// from Raft log and A-WAL retention.
+    pub gc_safe_point: Timestamp,
+
+    /// Durable leases which were live at the last metadata safe-point sweep.
+    pub gc_protections: Vec<MetadataGcProtection>,
 
     pub request_deduplication: Vec<MetadataRequestDeduplication>,
     pub client_sessions: Vec<MetadataClientSession>,
+}
+
+/// One durable lease protecting a timestamp from MVCC history collection.
+///
+/// `owner_id` identifies the transaction or reader; `protection_id` allows
+/// that owner to hold independent read timestamps concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataGcProtection {
+    pub owner_id: u128,
+    pub protection_id: u128,
+    pub protected_timestamp: Timestamp,
+    pub lease_deadline_ms: u64,
 }
 
 impl MetadataCommand {
@@ -613,6 +684,49 @@ impl MetadataCommand {
                 Ok(())
             }
 
+            Self::ReserveTimestamps { reserved_until } => {
+                if reserved_until.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+                Ok(())
+            }
+
+            Self::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => {
+                validate_gc_protection_identity(*owner_id, *protection_id)?;
+                if protected_timestamp.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+                validate_live_gc_lease(*lease_deadline_ms, *now_ms)
+            }
+
+            Self::RenewGcProtection {
+                owner_id,
+                protection_id,
+                lease_deadline_ms,
+                now_ms,
+            } => {
+                validate_gc_protection_identity(*owner_id, *protection_id)?;
+                validate_live_gc_lease(*lease_deadline_ms, *now_ms)
+            }
+
+            Self::ReleaseGcProtection {
+                owner_id,
+                protection_id,
+            } => validate_gc_protection_identity(*owner_id, *protection_id),
+
+            Self::AdvanceGcSafePoint { candidate, .. } => {
+                if candidate.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+                Ok(())
+            }
+
             Self::RegisterNode(node) => node.validate(),
 
             Self::SetNodeLifecycle { node_id, .. } => {
@@ -686,6 +800,53 @@ impl MetadataCommand {
                 session_epoch: *session_epoch,
                 acknowledged_through: *acknowledged_through,
             }),
+
+            Self::ReserveTimestamps { reserved_until } => {
+                Command::ReserveTimestamps(metadata::ReserveTimestamps {
+                    reserved_until: reserved_until.0,
+                })
+            }
+
+            Self::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => Command::RegisterGcProtection(metadata::RegisterGcProtection {
+                owner_id: owner_id.to_le_bytes().to_vec(),
+                protection_id: protection_id.to_le_bytes().to_vec(),
+                protected_timestamp: protected_timestamp.0,
+                lease_deadline_ms: *lease_deadline_ms,
+                now_ms: *now_ms,
+            }),
+
+            Self::RenewGcProtection {
+                owner_id,
+                protection_id,
+                lease_deadline_ms,
+                now_ms,
+            } => Command::RenewGcProtection(metadata::RenewGcProtection {
+                owner_id: owner_id.to_le_bytes().to_vec(),
+                protection_id: protection_id.to_le_bytes().to_vec(),
+                lease_deadline_ms: *lease_deadline_ms,
+                now_ms: *now_ms,
+            }),
+
+            Self::ReleaseGcProtection {
+                owner_id,
+                protection_id,
+            } => Command::ReleaseGcProtection(metadata::ReleaseGcProtection {
+                owner_id: owner_id.to_le_bytes().to_vec(),
+                protection_id: protection_id.to_le_bytes().to_vec(),
+            }),
+
+            Self::AdvanceGcSafePoint { candidate, now_ms } => {
+                Command::AdvanceGcSafePoint(metadata::AdvanceGcSafePoint {
+                    candidate_timestamp: candidate.0,
+                    now_ms: *now_ms,
+                })
+            }
 
             Self::RegisterNode(node) => Command::RegisterNode(metadata::RegisterNode {
                 node: Some(node.to_proto()),
@@ -775,6 +936,44 @@ impl MetadataCommand {
                 client_id: decode_client_id(&command.client_id)?,
                 session_epoch: command.session_epoch,
                 acknowledged_through: command.acknowledged_through,
+            },
+
+            Some(Command::ReserveTimestamps(command)) => Self::ReserveTimestamps {
+                reserved_until: Timestamp(command.reserved_until),
+            },
+
+            Some(Command::RegisterGcProtection(command)) => Self::RegisterGcProtection {
+                owner_id: decode_gc_identity(&command.owner_id, "register_gc_protection.owner_id")?,
+                protection_id: decode_gc_identity(
+                    &command.protection_id,
+                    "register_gc_protection.protection_id",
+                )?,
+                protected_timestamp: Timestamp(command.protected_timestamp),
+                lease_deadline_ms: command.lease_deadline_ms,
+                now_ms: command.now_ms,
+            },
+
+            Some(Command::RenewGcProtection(command)) => Self::RenewGcProtection {
+                owner_id: decode_gc_identity(&command.owner_id, "renew_gc_protection.owner_id")?,
+                protection_id: decode_gc_identity(
+                    &command.protection_id,
+                    "renew_gc_protection.protection_id",
+                )?,
+                lease_deadline_ms: command.lease_deadline_ms,
+                now_ms: command.now_ms,
+            },
+
+            Some(Command::ReleaseGcProtection(command)) => Self::ReleaseGcProtection {
+                owner_id: decode_gc_identity(&command.owner_id, "release_gc_protection.owner_id")?,
+                protection_id: decode_gc_identity(
+                    &command.protection_id,
+                    "release_gc_protection.protection_id",
+                )?,
+            },
+
+            Some(Command::AdvanceGcSafePoint(command)) => Self::AdvanceGcSafePoint {
+                candidate: Timestamp(command.candidate_timestamp),
+                now_ms: command.now_ms,
             },
 
             Some(Command::RegisterNode(command)) => {
@@ -1563,6 +1762,9 @@ impl MetadataSnapshot {
                     || !self.retired_replicas.is_empty()
                     || !self.client_sessions.is_empty()
                     || !self.request_deduplication.is_empty()
+                    || self.timestamp_reserved_until.0 != 0
+                    || self.gc_safe_point.0 != 0
+                    || !self.gc_protections.is_empty()
                 {
                     return Err(MetadataCommandCodecError::UninitializedSnapshotHasState);
                 }
@@ -1595,6 +1797,10 @@ impl MetadataSnapshot {
 
         for client_session in &self.client_sessions {
             client_session.validate()?;
+        }
+
+        for protection in &self.gc_protections {
+            protection.validate(self.gc_safe_point)?;
         }
 
         self.allocator.validate()?;
@@ -1714,6 +1920,14 @@ impl MetadataSnapshot {
             ));
         }
 
+        if !strictly_ascending(&self.gc_protections, |protection| {
+            (protection.owner_id, protection.protection_id)
+        }) {
+            return Err(MetadataCommandCodecError::NonCanonicalSnapshot(
+                "gc_protections",
+            ));
+        }
+
         Ok(())
     }
 
@@ -1750,6 +1964,16 @@ impl MetadataSnapshot {
 
             allocator_state: Some(self.allocator.to_proto()),
 
+            timestamp_reserved_until: self.timestamp_reserved_until.0,
+
+            gc_safe_point: self.gc_safe_point.0,
+
+            gc_protections: self
+                .gc_protections
+                .iter()
+                .map(MetadataGcProtection::to_proto)
+                .collect(),
+
             request_deduplication: self
                 .request_deduplication
                 .iter()
@@ -1768,6 +1992,7 @@ impl MetadataSnapshot {
         let snapshot_version = proto.format_version;
 
         if snapshot_version != LEGACY_METADATA_SNAPSHOT_VERSION
+            && snapshot_version != PREVIOUS_METADATA_SNAPSHOT_VERSION
             && snapshot_version != METADATA_SNAPSHOT_VERSION
         {
             return Err(MetadataCommandCodecError::UnsupportedSnapshotVersion(
@@ -1784,10 +2009,19 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator_state,
+            timestamp_reserved_until,
+            gc_safe_point,
+            gc_protections,
             request_deduplication,
             client_sessions,
             ..
         } = proto;
+
+        if snapshot_version < METADATA_SNAPSHOT_VERSION
+            && (gc_safe_point != 0 || !gc_protections.is_empty())
+        {
+            return Err(MetadataCommandCodecError::UnexpectedGcStateInLegacySnapshot);
+        }
 
         let cluster_id = if initialized {
             Some(cluster_id)
@@ -1836,59 +2070,61 @@ impl MetadataSnapshot {
             .map(MetadataClientSession::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut allocator = match (snapshot_version, allocator_state) {
-            (METADATA_SNAPSHOT_VERSION, Some(allocator))
-            | (LEGACY_METADATA_SNAPSHOT_VERSION, Some(allocator)) => {
-                MetadataAllocatorState::from_proto(allocator)?
+        let gc_protections = gc_protections
+            .into_iter()
+            .map(MetadataGcProtection::from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut allocator = match allocator_state {
+            Some(allocator) => MetadataAllocatorState::from_proto(allocator)?,
+
+            None if snapshot_version == LEGACY_METADATA_SNAPSHOT_VERSION => {
+                MetadataAllocatorState {
+                    max_table_id: tables
+                        .iter()
+                        .map(|table| table.table_id)
+                        .max()
+                        .unwrap_or(INITIAL_METADATA_TABLE_HIGH_WATER)
+                        .max(INITIAL_METADATA_TABLE_HIGH_WATER),
+
+                    max_tablet_id: tablets
+                        .iter()
+                        .map(|tablet| tablet.tablet_id.0)
+                        .max()
+                        .unwrap_or(INITIAL_METADATA_TABLET_HIGH_WATER)
+                        .max(INITIAL_METADATA_TABLET_HIGH_WATER),
+
+                    max_raft_group_id: tablets
+                        .iter()
+                        .map(|tablet| tablet.raft_group_id.0)
+                        .chain(
+                            retired_replicas
+                                .iter()
+                                .map(|retired| retired.raft_group_id.0),
+                        )
+                        .max()
+                        .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER)
+                        .max(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER),
+
+                    max_replica_id: desired_placements
+                        .iter()
+                        .flat_map(|placement| {
+                            placement
+                                .replicas
+                                .iter()
+                                .map(|replica| replica.replica_id.0)
+                        })
+                        .chain(retired_replicas.iter().map(|retired| retired.replica_id.0))
+                        .max()
+                        .unwrap_or(0),
+                }
             }
 
-            (METADATA_SNAPSHOT_VERSION, None) => {
+            None => {
                 return Err(MetadataCommandCodecError::MissingField(
                     "snapshot.allocator_state",
                 ));
             }
-
-            (LEGACY_METADATA_SNAPSHOT_VERSION, None) => MetadataAllocatorState {
-                max_table_id: tables
-                    .iter()
-                    .map(|table| table.table_id)
-                    .max()
-                    .unwrap_or(INITIAL_METADATA_TABLE_HIGH_WATER)
-                    .max(INITIAL_METADATA_TABLE_HIGH_WATER),
-
-                max_tablet_id: tablets
-                    .iter()
-                    .map(|tablet| tablet.tablet_id.0)
-                    .max()
-                    .unwrap_or(INITIAL_METADATA_TABLET_HIGH_WATER)
-                    .max(INITIAL_METADATA_TABLET_HIGH_WATER),
-
-                max_raft_group_id: tablets
-                    .iter()
-                    .map(|tablet| tablet.raft_group_id.0)
-                    .chain(
-                        retired_replicas
-                            .iter()
-                            .map(|retired| retired.raft_group_id.0),
-                    )
-                    .max()
-                    .unwrap_or(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER)
-                    .max(INITIAL_METADATA_RAFT_GROUP_HIGH_WATER),
-
-                max_replica_id: desired_placements
-                    .iter()
-                    .flat_map(|placement| {
-                        placement
-                            .replicas
-                            .iter()
-                            .map(|replica| replica.replica_id.0)
-                    })
-                    .chain(retired_replicas.iter().map(|retired| retired.replica_id.0))
-                    .max()
-                    .unwrap_or(0),
-            },
-
-            _ => unreachable!("snapshot version checked above"),
         };
 
         // Version-2 snapshots written before the replica high-water field was
@@ -1917,6 +2153,9 @@ impl MetadataSnapshot {
             desired_placements,
             retired_replicas,
             allocator,
+            timestamp_reserved_until: Timestamp(timestamp_reserved_until),
+            gc_safe_point: Timestamp(gc_safe_point),
+            gc_protections,
             request_deduplication,
             client_sessions,
         };
@@ -1924,6 +2163,46 @@ impl MetadataSnapshot {
         snapshot.validate()?;
 
         Ok(snapshot)
+    }
+}
+
+impl MetadataGcProtection {
+    fn validate(&self, gc_safe_point: Timestamp) -> Result<(), MetadataCommandCodecError> {
+        validate_gc_protection_identity(self.owner_id, self.protection_id)?;
+        if self.protected_timestamp.0 == 0 {
+            return Err(MetadataCommandCodecError::ZeroTimestamp);
+        }
+        if self.lease_deadline_ms == 0 {
+            return Err(MetadataCommandCodecError::ZeroGcProtectionLease);
+        }
+        if self.protected_timestamp < gc_safe_point {
+            return Err(MetadataCommandCodecError::GcProtectionBelowSafePoint {
+                protected: self.protected_timestamp,
+                safe_point: gc_safe_point,
+            });
+        }
+        Ok(())
+    }
+
+    fn to_proto(&self) -> metadata::GcProtection {
+        metadata::GcProtection {
+            owner_id: self.owner_id.to_le_bytes().to_vec(),
+            protection_id: self.protection_id.to_le_bytes().to_vec(),
+            protected_timestamp: self.protected_timestamp.0,
+            lease_deadline_ms: self.lease_deadline_ms,
+        }
+    }
+
+    fn from_proto(proto: metadata::GcProtection) -> Result<Self, MetadataCommandCodecError> {
+        Ok(Self {
+            owner_id: decode_gc_identity(&proto.owner_id, "snapshot.gc_protections.owner_id")?,
+            protection_id: decode_gc_identity(
+                &proto.protection_id,
+                "snapshot.gc_protections.protection_id",
+            )?,
+            protected_timestamp: Timestamp(proto.protected_timestamp),
+            lease_deadline_ms: proto.lease_deadline_ms,
+        })
     }
 }
 
@@ -2031,6 +2310,21 @@ impl MetadataRequestDeduplication {
                 }
             }
 
+            MetadataCachedOutcome::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => {
+                if reserved_from.0 == 0 || reserved_from > reserved_until {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+            }
+
+            MetadataCachedOutcome::TimestampReservationRegressed { current, received } => {
+                if current.0 == 0 || received.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+            }
+
             MetadataCachedOutcome::Rejected(reason) if reason.trim().is_empty() => {
                 return Err(MetadataCommandCodecError::InvalidCachedOutcome(
                     "rejection reason cannot be empty",
@@ -2044,70 +2338,134 @@ impl MetadataRequestDeduplication {
     }
 
     fn to_proto(&self) -> metadata::MetadataRequestDeduplication {
-        let (outcome_kind, table_id, tablet_id, raft_group_id, rejection, client_id, session_epoch) =
-            match &self.outcome {
-                MetadataCachedOutcome::Applied => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::AlreadyApplied => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::ClientRegistered {
-                    client_id,
-                    session_epoch,
-                } => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    client_id.to_le_bytes().to_vec(),
-                    *session_epoch,
-                ),
-                MetadataCachedOutcome::ClientRenewed => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::TableCreated {
-                    table_id,
-                    tablet_id,
-                    raft_group_id,
-                } => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
-                    table_id.0,
-                    tablet_id.0,
-                    raft_group_id.0,
-                    String::new(),
-                    Vec::new(),
-                    0,
-                ),
-                MetadataCachedOutcome::Rejected(reason) => (
-                    metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
-                    0,
-                    0,
-                    0,
-                    reason.clone(),
-                    Vec::new(),
-                    0,
-                ),
-            };
+        let (
+            outcome_kind,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+            client_id,
+            session_epoch,
+            timestamp_reserved_from,
+            timestamp_reserved_until,
+            timestamp_reservation_current,
+            timestamp_reservation_received,
+        ) = match &self.outcome {
+            MetadataCachedOutcome::Applied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeApplied,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::AlreadyApplied => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeAlreadyApplied,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::ClientRegistered {
+                client_id,
+                session_epoch,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRegistered,
+                0,
+                0,
+                0,
+                String::new(),
+                client_id.to_le_bytes().to_vec(),
+                *session_epoch,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::ClientRenewed => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeClientRenewed,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTableCreated,
+                table_id.0,
+                tablet_id.0,
+                raft_group_id.0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampsReserved,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                reserved_until.0,
+                reserved_from.0,
+                0,
+                0,
+            ),
+            MetadataCachedOutcome::TimestampReservationRegressed { current, received } => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampReservationRegressed,
+                0,
+                0,
+                0,
+                String::new(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                current.0,
+                received.0,
+            ),
+            MetadataCachedOutcome::Rejected(reason) => (
+                metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected,
+                0,
+                0,
+                0,
+                reason.clone(),
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+        };
 
         metadata::MetadataRequestDeduplication {
             request_id: Some(self.request_id.to_proto()),
@@ -2118,6 +2476,10 @@ impl MetadataRequestDeduplication {
             rejection,
             client_id,
             session_epoch,
+            timestamp_reserved_from,
+            timestamp_reserved_until,
+            timestamp_reservation_current,
+            timestamp_reservation_received,
             logical_command_id: Some(self.logical_command_id.to_proto()),
         }
     }
@@ -2162,6 +2524,18 @@ impl MetadataRequestDeduplication {
                     table_id: TableId(proto.table_id),
                     tablet_id: TabletId(proto.tablet_id),
                     raft_group_id: RaftGroupId(proto.raft_group_id),
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampsReserved => {
+                MetadataCachedOutcome::TimestampsReserved {
+                    reserved_from: Timestamp(proto.timestamp_reserved_from),
+                    reserved_until: Timestamp(proto.timestamp_reserved_until),
+                }
+            }
+            metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeTimestampReservationRegressed => {
+                MetadataCachedOutcome::TimestampReservationRegressed {
+                    current: Timestamp(proto.timestamp_reservation_current),
+                    received: Timestamp(proto.timestamp_reservation_received),
                 }
             }
             metadata::MetadataCachedOutcomeKind::MetadataCachedOutcomeRejected => {
@@ -2220,6 +2594,50 @@ fn compatibility_metadata_logical_id(request_id: &RequestId) -> LogicalCommandId
         command_ordinal: 1,
         kind: CommandKind::Catalog,
     }
+}
+
+fn validate_gc_protection_identity(
+    owner_id: u128,
+    protection_id: u128,
+) -> Result<(), MetadataCommandCodecError> {
+    if owner_id == 0 {
+        return Err(MetadataCommandCodecError::ZeroGcOwnerId);
+    }
+    if protection_id == 0 {
+        return Err(MetadataCommandCodecError::ZeroGcProtectionId);
+    }
+    Ok(())
+}
+
+fn validate_live_gc_lease(
+    lease_deadline_ms: u64,
+    now_ms: u64,
+) -> Result<(), MetadataCommandCodecError> {
+    if lease_deadline_ms == 0 {
+        return Err(MetadataCommandCodecError::ZeroGcProtectionLease);
+    }
+    if lease_deadline_ms <= now_ms {
+        return Err(MetadataCommandCodecError::ExpiredGcProtectionLease {
+            deadline_ms: lease_deadline_ms,
+            now_ms,
+        });
+    }
+    Ok(())
+}
+
+fn decode_gc_identity(
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<u128, MetadataCommandCodecError> {
+    let value = u128::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| MetadataCommandCodecError::InvalidGcIdentity(field))?,
+    );
+    if value == 0 {
+        return Err(MetadataCommandCodecError::InvalidGcIdentity(field));
+    }
+    Ok(value)
 }
 
 fn decode_client_id(bytes: &[u8]) -> Result<u128, MetadataCommandCodecError> {
@@ -2368,6 +2786,33 @@ pub enum MetadataCommandCodecError {
 
     #[error("metadata expected schema version must be non-zero")]
     ZeroExpectedSchemaVersion,
+
+    #[error("metadata timestamp reservation endpoint must be non-zero")]
+    ZeroTimestamp,
+
+    #[error("metadata GC protection owner ID must be non-zero")]
+    ZeroGcOwnerId,
+
+    #[error("metadata GC protection ID must be non-zero")]
+    ZeroGcProtectionId,
+
+    #[error("metadata GC protection lease deadline must be non-zero")]
+    ZeroGcProtectionLease,
+
+    #[error("metadata GC protection lease expired at {deadline_ms} ms (command time {now_ms} ms)")]
+    ExpiredGcProtectionLease { deadline_ms: u64, now_ms: u64 },
+
+    #[error("metadata GC identity field {0} must contain a non-zero 16-byte ID")]
+    InvalidGcIdentity(&'static str),
+
+    #[error("metadata GC protection timestamp {protected:?} is below safe point {safe_point:?}")]
+    GcProtectionBelowSafePoint {
+        protected: Timestamp,
+        safe_point: Timestamp,
+    },
+
+    #[error("legacy metadata snapshot contains GC state without format version 3")]
+    UnexpectedGcStateInLegacySnapshot,
 
     #[error("metadata table must have at least one tablet")]
     ZeroTabletCount,

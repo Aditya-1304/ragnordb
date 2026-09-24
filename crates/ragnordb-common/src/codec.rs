@@ -1,4 +1,4 @@
-use crate::ids::{Timestamp, TxnId};
+use crate::ids::{TabletId, Timestamp, TxnId};
 use crate::proto::{mvcc, row};
 
 /// A typed SQL cell value
@@ -131,18 +131,45 @@ impl WriteKind {
 }
 
 impl LockRecord {
-    pub fn to_proto(&self) -> mvcc::LockRecord {
-        mvcc::LockRecord {
+    /// Validate the lock contract before it crosses a durable or RPC boundary.
+    ///
+    /// Rollback is represented by a write record, never by a live lock. Keeping
+    /// that distinction explicit prevents a malformed lock from being mistaken
+    /// for an active intent during recovery or read-time resolution.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.txn_id.0 == 0 {
+            return Err("lock record requires a non-zero transaction ID");
+        }
+        if self.primary_key.is_empty() {
+            return Err("lock record requires a non-empty primary key");
+        }
+        if self.start_timestamp.0 == 0 {
+            return Err("lock record requires a non-zero start timestamp");
+        }
+        if self.ttl_ms == 0 {
+            return Err("lock record requires a non-zero TTL");
+        }
+        if self.op == WriteKind::Rollback {
+            return Err("lock record cannot contain a rollback operation");
+        }
+
+        Ok(())
+    }
+
+    pub fn to_proto(&self) -> Result<mvcc::LockRecord, &'static str> {
+        self.validate()?;
+
+        Ok(mvcc::LockRecord {
             txn_id: Some(self.txn_id.to_proto()),
             primary_key: self.primary_key.clone(),
             start_timestamp: Some(self.start_timestamp.to_proto()),
             ttl_ms: self.ttl_ms,
             op: self.op.to_proto() as i32,
-        }
+        })
     }
 
     pub fn from_proto(proto: mvcc::LockRecord) -> Result<Self, &'static str> {
-        Ok(LockRecord {
+        let record = LockRecord {
             txn_id: TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?),
             primary_key: proto.primary_key,
             start_timestamp: Timestamp::from_proto(
@@ -150,21 +177,47 @@ impl LockRecord {
             ),
             ttl_ms: proto.ttl_ms,
             op: WriteKind::from_proto(mvcc::WriteKind::try_from(proto.op).map_err(|_| "inv")?)?,
-        })
+        };
+        record.validate()?;
+        Ok(record)
     }
 }
 
 impl WriteRecord {
-    pub fn to_proto(&self) -> mvcc::WriteRecord {
-        mvcc::WriteRecord {
-            start_timestamp: Some(self.start_timestamp.to_proto()),
-            commit_timestamp: Some(self.commit_timestamp.to_proto()),
-            op: self.op.to_proto() as i32,
+    /// Validate the timestamp relationship that gives each write record its
+    /// unambiguous MVCC meaning. Rollback records use the transaction start
+    /// timestamp as their durable marker because they have no commit timestamp.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.start_timestamp.0 == 0 {
+            return Err("write record requires a non-zero start timestamp");
+        }
+        if self.commit_timestamp.0 == 0 {
+            return Err("write record requires a non-zero commit timestamp");
+        }
+
+        match self.op {
+            WriteKind::Put | WriteKind::Delete if self.commit_timestamp <= self.start_timestamp => {
+                Err("committed write timestamp must be greater than start timestamp")
+            }
+            WriteKind::Rollback if self.commit_timestamp != self.start_timestamp => {
+                Err("rollback write timestamp must equal start timestamp")
+            }
+            _ => Ok(()),
         }
     }
 
+    pub fn to_proto(&self) -> Result<mvcc::WriteRecord, &'static str> {
+        self.validate()?;
+
+        Ok(mvcc::WriteRecord {
+            start_timestamp: Some(self.start_timestamp.to_proto()),
+            commit_timestamp: Some(self.commit_timestamp.to_proto()),
+            op: self.op.to_proto() as i32,
+        })
+    }
+
     pub fn from_proto(proto: mvcc::WriteRecord) -> Result<Self, &'static str> {
-        Ok(WriteRecord {
+        let record = WriteRecord {
             start_timestamp: Timestamp::from_proto(
                 proto.start_timestamp.ok_or("missing start_ts")?,
             ),
@@ -172,7 +225,9 @@ impl WriteRecord {
                 proto.commit_timestamp.ok_or("missing commit_ts")?,
             ),
             op: WriteKind::from_proto(mvcc::WriteKind::try_from(proto.op).map_err(|_| "inv")?)?,
-        })
+        };
+        record.validate()?;
+        Ok(record)
     }
 }
 
@@ -186,7 +241,9 @@ impl WriteRecord {
 /// participant_tablet_ids: the set of tablets involved, so
 ///   intent cleaners can find all keys that need resolution.
 /// last_heartbeat_timestamp: updated by the coordinator to
-///   prevent lock expiry on active transactions.
+///   identify the latest logical heartbeat update.
+/// lease_deadline_ms: fenced wall-clock deadline owned by the status
+///   authority; it must never be reconstructed from an MVCC timestamp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxnStatusRecord {
     pub txn_id: TxnId,
@@ -196,6 +253,7 @@ pub struct TxnStatusRecord {
     pub primary_key: Vec<u8>,
     pub participant_tablet_ids: Vec<u64>,
     pub last_heartbeat_timestamp: Option<Timestamp>,
+    pub lease_deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +283,73 @@ impl TxnStatus {
 }
 
 impl TxnStatusRecord {
+    /// Validate the durable status state and its deterministic participant list.
+    ///
+    /// The first participant is the primary/status tablet. The remaining tablet
+    /// IDs are sorted and unique so the record has one canonical representation;
+    /// the primary key remains the durable locator when that tablet later moves.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.txn_id.0 == 0 {
+            return Err("transaction status requires a non-zero transaction ID");
+        }
+        if self.start_timestamp.0 == 0 {
+            return Err("transaction status requires a non-zero start timestamp");
+        }
+        if self.primary_key.is_empty() {
+            return Err("transaction status requires a non-empty primary key");
+        }
+        if self.participant_tablet_ids.is_empty() {
+            return Err("transaction status requires a primary participant tablet");
+        }
+        if self.participant_tablet_ids[0] == 0 {
+            return Err("transaction status requires a non-zero primary tablet ID");
+        }
+        if self.participant_tablet_ids[1..]
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("participant tablet IDs after the primary must be strictly increasing");
+        }
+        if self.participant_tablet_ids[1..].contains(&self.participant_tablet_ids[0]) {
+            return Err("primary tablet ID must not be repeated in participants");
+        }
+        if self
+            .last_heartbeat_timestamp
+            .is_some_and(|timestamp| timestamp < self.start_timestamp)
+        {
+            return Err("last heartbeat timestamp must not precede start timestamp");
+        }
+        if self.lease_deadline_ms.is_some_and(|deadline| deadline == 0) {
+            return Err("lease deadline must be non-zero when present");
+        }
+
+        match (self.status, self.commit_timestamp) {
+            (TxnStatus::Committed, Some(commit_timestamp))
+                if commit_timestamp > self.start_timestamp => {}
+            (TxnStatus::Committed, Some(_)) => {
+                return Err("commit_timestamp must be greater than start_timestamp");
+            }
+            (TxnStatus::Committed, None) => {
+                return Err("committed transaction requires commit_timestamp");
+            }
+            (TxnStatus::Pending | TxnStatus::Aborted, None) => {}
+            (TxnStatus::Pending, Some(_)) => {
+                return Err("pending transaction must not contain commit_timestamp");
+            }
+            (TxnStatus::Aborted, Some(_)) => {
+                return Err("aborted transaction must not contain commit_timestamp");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return the status tablet encoded by the first participant entry.
+    pub fn primary_tablet_id(&self) -> Result<TabletId, &'static str> {
+        self.validate()?;
+        Ok(TabletId(self.participant_tablet_ids[0]))
+    }
+
     pub fn to_proto(&self) -> Result<mvcc::TxnStatusRecord, &'static str> {
         self.validate()?;
 
@@ -238,6 +363,7 @@ impl TxnStatusRecord {
             last_heartbeat_timestamp: self
                 .last_heartbeat_timestamp
                 .map(|timestamp| timestamp.to_proto()),
+            lease_deadline_ms: self.lease_deadline_ms.unwrap_or_default(),
         })
     }
 
@@ -259,35 +385,12 @@ impl TxnStatusRecord {
             primary_key: proto.primary_key,
             participant_tablet_ids: proto.participant_tablet_ids,
             last_heartbeat_timestamp: proto.last_heartbeat_timestamp.map(Timestamp::from_proto),
+            lease_deadline_ms: (proto.lease_deadline_ms != 0).then_some(proto.lease_deadline_ms),
         };
 
         record.validate()?;
 
         Ok(record)
-    }
-
-    /// Validate invariants that must hold before a transaction status is persisted,
-    /// replicated or accepted during recovery
-    pub fn validate(&self) -> Result<(), &'static str> {
-        match (self.status, self.commit_timestamp) {
-            (TxnStatus::Committed, Some(commit_timestamp))
-                if commit_timestamp > self.start_timestamp =>
-            {
-                Ok(())
-            }
-            (TxnStatus::Committed, Some(_)) => {
-                Err("commit_timestamp must be greater than start_timestamp")
-            }
-            (TxnStatus::Committed, None) => Err("committed transaction requires commit_timestamp"),
-
-            (TxnStatus::Pending, None) | (TxnStatus::Aborted, None) => Ok(()),
-            (TxnStatus::Pending, Some(_)) => {
-                Err("pending transaction must not contain commit_timestamp")
-            }
-            (TxnStatus::Aborted, Some(_)) => {
-                Err("aborted transaction must not contain commit_timestamp")
-            }
-        }
     }
 }
 
@@ -361,7 +464,7 @@ mod tests {
             op: WriteKind::Put,
         };
 
-        let proto = record.to_proto();
+        let proto = record.to_proto().unwrap();
         let decoded = LockRecord::from_proto(proto).unwrap();
 
         assert_eq!(decoded.txn_id.0, 99);
@@ -378,7 +481,7 @@ mod tests {
             op: WriteKind::Delete,
         };
 
-        let proto = record.to_proto();
+        let proto = record.to_proto().unwrap();
         let decoded = WriteRecord::from_proto(proto).unwrap();
 
         assert_eq!(decoded.start_timestamp.0, 100);
@@ -396,6 +499,7 @@ mod tests {
             primary_key: b"/table/1/pk/1".to_vec(),
             participant_tablet_ids: vec![1, 2, 3],
             last_heartbeat_timestamp: Some(Timestamp(205)),
+            lease_deadline_ms: Some(30_000),
         };
 
         let proto = record.to_proto().unwrap();
@@ -404,6 +508,88 @@ mod tests {
         assert_eq!(decoded.txn_id.0, 42);
         assert!(matches!(decoded.status, TxnStatus::Committed));
         assert_eq!(decoded.participant_tablet_ids, vec![1, 2, 3]);
+        assert_eq!(decoded.lease_deadline_ms, Some(30_000));
+    }
+
+    #[test]
+    fn lock_record_rejects_invalid_durable_fields() {
+        let record = LockRecord {
+            txn_id: TxnId(0),
+            primary_key: Vec::new(),
+            start_timestamp: Timestamp(0),
+            ttl_ms: 0,
+            op: WriteKind::Rollback,
+        };
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "lock record requires a non-zero transaction ID"
+        );
+
+        let mut proto = mvcc::LockRecord {
+            txn_id: Some(TxnId(7).to_proto()),
+            primary_key: b"primary".to_vec(),
+            start_timestamp: Some(Timestamp(8).to_proto()),
+            ttl_ms: 1_000,
+            op: mvcc::WriteKind::Rollback as i32,
+        };
+        assert_eq!(
+            LockRecord::from_proto(proto.clone()).unwrap_err(),
+            "lock record cannot contain a rollback operation"
+        );
+
+        proto.op = mvcc::WriteKind::Put as i32;
+        proto.ttl_ms = 0;
+        assert_eq!(
+            LockRecord::from_proto(proto).unwrap_err(),
+            "lock record requires a non-zero TTL"
+        );
+    }
+
+    #[test]
+    fn write_record_rejects_invalid_timestamp_relationships() {
+        let record = WriteRecord {
+            start_timestamp: Timestamp(10),
+            commit_timestamp: Timestamp(10),
+            op: WriteKind::Put,
+        };
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "committed write timestamp must be greater than start timestamp"
+        );
+
+        let rollback = WriteRecord {
+            start_timestamp: Timestamp(10),
+            commit_timestamp: Timestamp(11),
+            op: WriteKind::Rollback,
+        };
+
+        assert_eq!(
+            rollback.to_proto().unwrap_err(),
+            "rollback write timestamp must equal start timestamp"
+        );
+    }
+
+    #[test]
+    fn txn_status_record_requires_canonical_participant_metadata() {
+        let mut record = transaction_status_record(TxnStatus::Pending, None);
+        record.participant_tablet_ids = vec![7, 3, 3];
+
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "participant tablet IDs after the primary must be strictly increasing"
+        );
+
+        record.participant_tablet_ids = vec![7, 3, 5];
+        record.last_heartbeat_timestamp = Some(Timestamp(99));
+        assert_eq!(
+            record.to_proto().unwrap_err(),
+            "last heartbeat timestamp must not precede start timestamp"
+        );
+
+        record.last_heartbeat_timestamp = Some(Timestamp(100));
+        assert_eq!(record.primary_tablet_id().unwrap().0, 7);
     }
 
     #[test]
@@ -435,6 +621,7 @@ mod tests {
             primary_key: b"/table/1/pk/1".to_vec(),
             participant_tablet_ids: vec![1, 2],
             last_heartbeat_timestamp: Some(Timestamp(100)),
+            lease_deadline_ms: Some(30_000),
         }
     }
 

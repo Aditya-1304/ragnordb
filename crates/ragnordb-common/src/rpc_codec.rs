@@ -4,8 +4,10 @@ use std::{
 };
 
 use super::command_codec::TabletCommand;
+use crate::codec::LockRecord;
 use crate::ids::{
     LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId, TableId, TabletId, Timestamp,
+    TxnId,
 };
 use crate::proto::rpc;
 use prost::Message;
@@ -26,6 +28,8 @@ use prost::Message;
 ///   0x06 — TabletReadRequest
 ///   0x07 — TabletOutcomeQueryRequest
 ///   0x08 — TabletScanRequest
+///   0x0C — TabletPointInspectionRequest
+///   0x0D — TabletTransactionStatusRequest
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcFrame {
     pub msg_type: MessageType,
@@ -45,6 +49,8 @@ pub enum MessageType {
     TabletScanRequest,
     ReplicaJoinRequest,
     ReplicaJoinResponse,
+    TabletTransactionStatusRequest,
+    TabletPointInspectionRequest,
 }
 
 impl MessageType {
@@ -64,6 +70,9 @@ impl MessageType {
             Self::TabletScanRequest => 0x08,
             Self::ReplicaJoinRequest => 0x09,
             Self::ReplicaJoinResponse => 0x0A,
+            // 0x0B is reserved by the physical transport for heartbeat batches.
+            Self::TabletTransactionStatusRequest => 0x0D,
+            Self::TabletPointInspectionRequest => 0x0C,
         }
     }
 
@@ -79,6 +88,8 @@ impl MessageType {
             0x08 => Ok(Self::TabletScanRequest),
             0x09 => Ok(Self::ReplicaJoinRequest),
             0x0A => Ok(Self::ReplicaJoinResponse),
+            0x0C => Ok(Self::TabletPointInspectionRequest),
+            0x0D => Ok(Self::TabletTransactionStatusRequest),
             _ => Err("unknown RPC message type"),
         }
     }
@@ -95,6 +106,12 @@ impl MessageType {
             MessageType::TabletScanRequest => rpc::MessageType::TabletScanRequest,
             MessageType::ReplicaJoinRequest => rpc::MessageType::ReplicaJoinRequest,
             MessageType::ReplicaJoinResponse => rpc::MessageType::ReplicaJoinResponse,
+            MessageType::TabletTransactionStatusRequest => {
+                rpc::MessageType::TabletTransactionStatusRequest
+            }
+            MessageType::TabletPointInspectionRequest => {
+                rpc::MessageType::TabletPointInspectionRequest
+            }
         }
     }
 
@@ -112,6 +129,12 @@ impl MessageType {
             rpc::MessageType::TabletScanRequest => Ok(MessageType::TabletScanRequest),
             rpc::MessageType::ReplicaJoinRequest => Ok(MessageType::ReplicaJoinRequest),
             rpc::MessageType::ReplicaJoinResponse => Ok(MessageType::ReplicaJoinResponse),
+            rpc::MessageType::TabletTransactionStatusRequest => {
+                Ok(MessageType::TabletTransactionStatusRequest)
+            }
+            rpc::MessageType::TabletPointInspectionRequest => {
+                Ok(MessageType::TabletPointInspectionRequest)
+            }
             rpc::MessageType::Unspecified => Err("unspecified message type"),
         }
     }
@@ -321,6 +344,142 @@ impl TabletReadRequest {
     }
 }
 
+/// Read-only query for the authoritative transaction status stored by a
+/// transaction's primary tablet. The request never carries participant-local
+/// expiry information, so absence cannot be mistaken for an abort decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletTransactionStatusRequest {
+    pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub txn_id: TxnId,
+    /// Conservative remaining budget for one node-to-node forward.
+    pub deadline_remaining_ms: Option<u64>,
+}
+
+impl TabletTransactionStatusRequest {
+    pub fn to_proto(&self) -> rpc::TabletTransactionStatusRequest {
+        rpc::TabletTransactionStatusRequest {
+            request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+            txn_id: Some(self.txn_id.to_proto()),
+            rpc_attempt_id: None,
+            deadline_remaining_ms: self.deadline_remaining_ms,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletTransactionStatusRequest) -> Result<Self, &'static str> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+        let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+        let txn_id = TxnId::from_proto(proto.txn_id.ok_or("missing txn_id")?);
+        if request_id.client_id == 0
+            || request_id.sequence == 0
+            || request_id.raft_group_id.0 == 0
+            || tablet_id.0 == 0
+            || proto.tablet_epoch == 0
+            || txn_id.0 == 0
+        {
+            return Err("transaction status request contains a reserved zero identity");
+        }
+        if proto.deadline_remaining_ms == Some(0) {
+            return Err("transaction status request deadline must be non-zero");
+        }
+
+        Ok(Self {
+            request_id,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
+            txn_id,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
+        })
+    }
+}
+
+/// Read-only participant inspection request issued after metadata selected a
+/// tablet route. The tablet owner evaluates the visible MVCC value and any
+/// conflicting intent in one serialized observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletPointInspectionRequest {
+    pub request_id: RequestId,
+    pub tablet_id: TabletId,
+    pub tablet_epoch: u64,
+    pub row_key: crate::ids::RowKey,
+    pub read_timestamp: Timestamp,
+    /// Conservative remaining budget for one node-to-node forward.
+    pub deadline_remaining_ms: Option<u64>,
+}
+
+impl TabletPointInspectionRequest {
+    pub fn to_proto(&self) -> rpc::TabletPointInspectionRequest {
+        rpc::TabletPointInspectionRequest {
+            request_id: Some(self.request_id.to_proto()),
+            tablet_id: Some(self.tablet_id.to_proto()),
+            tablet_epoch: self.tablet_epoch,
+            row_key: Some(self.row_key.to_proto()),
+            read_timestamp: Some(self.read_timestamp.to_proto()),
+            rpc_attempt_id: None,
+            deadline_remaining_ms: self.deadline_remaining_ms,
+        }
+    }
+
+    pub fn from_proto(proto: rpc::TabletPointInspectionRequest) -> Result<Self, &'static str> {
+        let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+        let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+        let row_key = crate::ids::RowKey::from_proto(proto.row_key.ok_or("missing row_key")?)?;
+        let read_timestamp =
+            Timestamp::from_proto(proto.read_timestamp.ok_or("missing read_timestamp")?);
+        if request_id.client_id == 0
+            || request_id.sequence == 0
+            || request_id.raft_group_id.0 == 0
+            || tablet_id.0 == 0
+            || proto.tablet_epoch == 0
+            || row_key.table_id.0 == 0
+            || read_timestamp.0 == 0
+        {
+            return Err("point inspection request contains a reserved zero identity");
+        }
+        if proto.deadline_remaining_ms == Some(0) {
+            return Err("point inspection request deadline must be non-zero");
+        }
+
+        Ok(Self {
+            request_id,
+            tablet_id,
+            tablet_epoch: proto.tablet_epoch,
+            row_key,
+            read_timestamp,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
+        })
+    }
+}
+
+/// Participant-side result containing the row visible at the supplied MVCC
+/// timestamp and any read-conflicting intent observed alongside it. The
+/// intent is data for the coordinator to inspect; this result does not resolve
+/// or otherwise mutate it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletPointReadInspection {
+    pub visible_row: Option<Vec<u8>>,
+    pub intent: Option<LockRecord>,
+}
+
+impl TabletPointReadInspection {
+    pub fn to_proto(&self) -> Result<rpc::TabletPointInspection, &'static str> {
+        Ok(rpc::TabletPointInspection {
+            visible_row: self.visible_row.clone(),
+            intent: self.intent.as_ref().map(LockRecord::to_proto).transpose()?,
+        })
+    }
+
+    pub fn from_proto(proto: rpc::TabletPointInspection) -> Result<Self, &'static str> {
+        Ok(Self {
+            visible_row: proto.visible_row,
+            intent: proto.intent.map(LockRecord::from_proto).transpose()?,
+        })
+    }
+}
+
 /// Maximum number of rows admitted into one tablet scan batch. The request
 /// carries a caller-selected lower cap, but never a value above this protocol
 /// bound; this keeps one malformed or malicious request from forcing an
@@ -353,6 +512,9 @@ pub struct TabletScanRequest {
     /// Conservative remaining budget for one node-to-node forward. It is
     /// transport metadata, not part of logical scan identity.
     pub deadline_remaining_ms: Option<u64>,
+    /// Return all intents for cleaner enumeration instead of an MVCC read
+    /// page. This mode is bounded and never resolves locks locally.
+    pub intent_only: bool,
 }
 
 impl TabletScanRequest {
@@ -423,6 +585,7 @@ impl TabletScanRequest {
             max_bytes: self.max_bytes,
             rpc_attempt_id: self.rpc_attempt_id,
             deadline_remaining_ms: self.deadline_remaining_ms,
+            intent_only: self.intent_only,
         }
     }
 
@@ -441,6 +604,7 @@ impl TabletScanRequest {
             max_bytes: proto.max_bytes,
             rpc_attempt_id: proto.rpc_attempt_id,
             deadline_remaining_ms: proto.deadline_remaining_ms,
+            intent_only: proto.intent_only,
         };
         request.validate()?;
         Ok(request)
@@ -476,23 +640,67 @@ impl TabletScanRow {
     }
 }
 
+/// One read-conflicting intent discovered while scanning a tablet range.
+///
+/// `key` uses the same primary-key bytes as `TabletScanRow`; the lock retains
+/// its canonical fully encoded primary key for status authority lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabletScanIntent {
+    pub key: Vec<u8>,
+    pub lock: LockRecord,
+}
+
+impl TabletScanIntent {
+    fn to_proto(&self) -> Result<rpc::TabletScanIntent, &'static str> {
+        Ok(rpc::TabletScanIntent {
+            key: self.key.clone(),
+            intent: Some(self.lock.to_proto()?),
+        })
+    }
+
+    fn from_proto(proto: rpc::TabletScanIntent) -> Result<Self, &'static str> {
+        let intent = Self {
+            key: proto.key,
+            lock: LockRecord::from_proto(proto.intent.ok_or("scan intent is missing its lock")?)?,
+        };
+        if intent.key.is_empty() {
+            return Err("tablet scan intent key must not be empty");
+        }
+        Ok(intent)
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.key
+            .len()
+            .saturating_add(self.lock.to_proto().map_or(0, |lock| lock.encoded_len()))
+    }
+}
+
 /// One bounded tablet response batch. A non-exhausted batch must publish the
 /// last delivered key as `next_resume_after`; the next request can then use it
 /// as an exclusive cursor after a timeout, leader retry, or range refresh.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TabletScanBatch {
     pub rows: Vec<TabletScanRow>,
+    /// Non-empty only when a foreground scan must resolve these intents and
+    /// retry from its existing cursor before returning any rows.
+    pub intents: Vec<TabletScanIntent>,
     pub next_resume_after: Option<Vec<u8>>,
     pub exhausted: bool,
 }
 
 impl TabletScanBatch {
-    pub fn to_proto(&self) -> rpc::TabletScanBatch {
-        rpc::TabletScanBatch {
+    pub fn to_proto(&self) -> Result<rpc::TabletScanBatch, &'static str> {
+        Ok(rpc::TabletScanBatch {
             rows: self.rows.iter().map(TabletScanRow::to_proto).collect(),
             next_resume_after: self.next_resume_after.clone(),
             exhausted: self.exhausted,
-        }
+            intents: self
+                .intents
+                .iter()
+                .map(TabletScanIntent::to_proto)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     pub fn from_proto(proto: rpc::TabletScanBatch) -> Result<Self, &'static str> {
@@ -502,6 +710,11 @@ impl TabletScanBatch {
                 .into_iter()
                 .map(TabletScanRow::from_proto)
                 .collect(),
+            intents: proto
+                .intents
+                .into_iter()
+                .map(TabletScanIntent::from_proto)
+                .collect::<Result<Vec<_>, _>>()?,
             next_resume_after: proto.next_resume_after,
             exhausted: proto.exhausted,
         };
@@ -513,6 +726,35 @@ impl TabletScanBatch {
         if self.rows.windows(2).any(|rows| rows[0].key >= rows[1].key) {
             return Err("tablet scan rows must be strictly ordered by key");
         }
+        if self
+            .intents
+            .windows(2)
+            .any(|intents| intents[0].key >= intents[1].key)
+        {
+            return Err("tablet scan intents must be strictly ordered by key");
+        }
+        for intent in &self.intents {
+            if intent.key.is_empty() {
+                return Err("tablet scan intent key must not be empty");
+            }
+            intent.lock.validate()?;
+        }
+        if !self.intents.is_empty() {
+            if !self.rows.is_empty() {
+                return Err("intent scan response must not contain MVCC rows");
+            }
+            return match (
+                &self.intents.last(),
+                &self.next_resume_after,
+                self.exhausted,
+            ) {
+                (Some(_), None, false) | (Some(_), None, true) => Ok(()),
+                (Some(last), Some(cursor), false) if last.key.as_slice() == cursor.as_slice() => {
+                    Ok(())
+                }
+                _ => Err("intent scan continuation must match its last key"),
+            };
+        }
         match (&self.rows.last(), &self.next_resume_after) {
             (Some(last_row), Some(next_resume_after)) if last_row.key != *next_resume_after => {
                 Err("tablet scan resume cursor must equal the last row key")
@@ -521,6 +763,9 @@ impl TabletScanBatch {
             (Some(_), None) if !self.exhausted => {
                 Err("non-exhausted tablet scan batch must publish a resume cursor")
             }
+            (None, None) if !self.exhausted => {
+                Err("empty non-exhausted tablet scan batch must contain intents")
+            }
             _ => Ok(()),
         }
     }
@@ -528,11 +773,31 @@ impl TabletScanBatch {
     pub fn validate_for(&self, request: &TabletScanRequest) -> Result<(), &'static str> {
         request.validate()?;
         self.validate()?;
-        if self.rows.len() > request.max_rows as usize {
+        if self.rows.len().max(self.intents.len()) > request.max_rows as usize {
             return Err("tablet scan batch exceeds max_rows");
         }
         if self.byte_len() > request.max_bytes as usize {
             return Err("tablet scan batch exceeds max_bytes");
+        }
+        if request.intent_only {
+            if !self.rows.is_empty() {
+                return Err("intent-only scan must not return MVCC rows");
+            }
+            if self.intents.is_empty() {
+                if !self.exhausted || self.next_resume_after.is_some() {
+                    return Err("empty intent-only scan response must be exhausted");
+                }
+            } else if self.exhausted {
+                if self.next_resume_after.is_some() {
+                    return Err("exhausted intent scan must not publish a continuation");
+                }
+            } else if self.next_resume_after.as_ref()
+                != self.intents.last().map(|intent| &intent.key)
+            {
+                return Err("non-exhausted intent scan must resume after its last key");
+            }
+        } else if !self.intents.is_empty() && (self.next_resume_after.is_some() || self.exhausted) {
+            return Err("foreground intent response must retry the same cursor");
         }
         for row in &self.rows {
             if request
@@ -557,6 +822,29 @@ impl TabletScanBatch {
                 return Err("tablet scan row is not after resume_after");
             }
         }
+        for intent in &self.intents {
+            if request
+                .start_key
+                .as_ref()
+                .is_some_and(|start_key| intent.key < *start_key)
+            {
+                return Err("tablet scan intent is before start_key");
+            }
+            if request
+                .end_key
+                .as_ref()
+                .is_some_and(|end_key| intent.key >= *end_key)
+            {
+                return Err("tablet scan intent is at or beyond end_key");
+            }
+            if request
+                .resume_after
+                .as_ref()
+                .is_some_and(|resume_after| intent.key <= *resume_after)
+            {
+                return Err("tablet scan intent is not after resume_after");
+            }
+        }
         if let Some(next_resume_after) = &self.next_resume_after
             && request
                 .end_key
@@ -569,7 +857,11 @@ impl TabletScanBatch {
     }
 
     pub fn byte_len(&self) -> usize {
-        self.rows.iter().map(TabletScanRow::byte_len).sum()
+        self.rows
+            .iter()
+            .map(TabletScanRow::byte_len)
+            .chain(self.intents.iter().map(TabletScanIntent::byte_len))
+            .sum()
     }
 }
 
@@ -666,6 +958,14 @@ pub enum MetadataProposalOutcome {
         tablet_id: TabletId,
         raft_group_id: RaftGroupId,
     },
+    TimestampsReserved {
+        reserved_from: Timestamp,
+        reserved_until: Timestamp,
+    },
+    TimestampReservationRegressed {
+        current: Timestamp,
+        received: Timestamp,
+    },
     Rejected {
         reason: String,
     },
@@ -673,67 +973,131 @@ pub enum MetadataProposalOutcome {
 
 impl MetadataProposalOutcome {
     pub fn to_proto(&self) -> rpc::MetadataProposalOutcome {
-        let (kind, client_id, session_epoch, table_id, tablet_id, raft_group_id, rejection) =
-            match self {
-                Self::Applied => (
-                    rpc::metadata_proposal_outcome::Kind::Applied,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::AlreadyApplied => (
-                    rpc::metadata_proposal_outcome::Kind::AlreadyApplied,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::ClientRegistered { session_epoch } => (
-                    rpc::metadata_proposal_outcome::Kind::ClientRegistered,
-                    0,
-                    *session_epoch,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::ClientRenewed => (
-                    rpc::metadata_proposal_outcome::Kind::ClientRenewed,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    String::new(),
-                ),
-                Self::TableCreated {
-                    table_id,
-                    tablet_id,
-                    raft_group_id,
-                } => (
-                    rpc::metadata_proposal_outcome::Kind::TableCreated,
-                    0,
-                    0,
-                    table_id.0,
-                    tablet_id.0,
-                    raft_group_id.0,
-                    String::new(),
-                ),
-                Self::Rejected { reason } => (
-                    rpc::metadata_proposal_outcome::Kind::Rejected,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    reason.clone(),
-                ),
-            };
+        let (
+            kind,
+            client_id,
+            session_epoch,
+            table_id,
+            tablet_id,
+            raft_group_id,
+            rejection,
+            timestamp_reserved_until,
+            timestamp_current,
+            timestamp_received,
+            timestamp_reserved_from,
+        ) = match self {
+            Self::Applied => (
+                rpc::metadata_proposal_outcome::Kind::Applied,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::AlreadyApplied => (
+                rpc::metadata_proposal_outcome::Kind::AlreadyApplied,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::ClientRegistered { session_epoch } => (
+                rpc::metadata_proposal_outcome::Kind::ClientRegistered,
+                0,
+                *session_epoch,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::ClientRenewed => (
+                rpc::metadata_proposal_outcome::Kind::ClientRenewed,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::TableCreated {
+                table_id,
+                tablet_id,
+                raft_group_id,
+            } => (
+                rpc::metadata_proposal_outcome::Kind::TableCreated,
+                0,
+                0,
+                table_id.0,
+                tablet_id.0,
+                raft_group_id.0,
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+            Self::TimestampsReserved {
+                reserved_from,
+                reserved_until,
+            } => (
+                rpc::metadata_proposal_outcome::Kind::TimestampsReserved,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                reserved_until.0,
+                0,
+                0,
+                reserved_from.0,
+            ),
+            Self::TimestampReservationRegressed { current, received } => (
+                rpc::metadata_proposal_outcome::Kind::TimestampReservationRegressed,
+                0,
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                current.0,
+                received.0,
+                0,
+            ),
+            Self::Rejected { reason } => (
+                rpc::metadata_proposal_outcome::Kind::Rejected,
+                0,
+                0,
+                0,
+                0,
+                0,
+                reason.clone(),
+                0,
+                0,
+                0,
+                0,
+            ),
+        };
         rpc::MetadataProposalOutcome {
             kind: kind as i32,
             client_id,
@@ -742,6 +1106,10 @@ impl MetadataProposalOutcome {
             tablet_id,
             raft_group_id,
             rejection,
+            timestamp_reserved_until,
+            timestamp_current,
+            timestamp_received,
+            timestamp_reserved_from,
         }
     }
 
@@ -768,6 +1136,24 @@ impl MetadataProposalOutcome {
                     table_id: TableId(proto.table_id),
                     tablet_id: TabletId(proto.tablet_id),
                     raft_group_id: RaftGroupId(proto.raft_group_id),
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::TimestampsReserved => {
+                if proto.timestamp_reserved_until == 0 {
+                    return Err("timestamp reservation outcome has zero frontier");
+                }
+                Ok(Self::TimestampsReserved {
+                    reserved_from: Timestamp(proto.timestamp_reserved_from),
+                    reserved_until: Timestamp(proto.timestamp_reserved_until),
+                })
+            }
+            rpc::metadata_proposal_outcome::Kind::TimestampReservationRegressed => {
+                if proto.timestamp_current == 0 || proto.timestamp_received == 0 {
+                    return Err("timestamp regression outcome contains a zero frontier");
+                }
+                Ok(Self::TimestampReservationRegressed {
+                    current: Timestamp(proto.timestamp_current),
+                    received: Timestamp(proto.timestamp_received),
                 })
             }
             rpc::metadata_proposal_outcome::Kind::Rejected => Ok(Self::Rejected {
@@ -1464,6 +1850,7 @@ mod tests {
                 start_timestamp: Timestamp(100),
                 commit_timestamp: Timestamp(105),
                 keys: vec![b"/table/1/pk/1".to_vec()],
+                committed_status: None,
             }),
         };
         let proto = req.to_proto().unwrap();
@@ -1520,6 +1907,72 @@ mod tests {
         };
         let decoded = TabletReadRequest::from_proto(request.to_proto()).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn transaction_status_request_and_point_inspection_roundtrip() {
+        use crate::codec::{TxnStatus, TxnStatusRecord, WriteKind};
+
+        let request_id = RequestId {
+            client_id: 77,
+            sequence: 5,
+            raft_group_id: RaftGroupId(8),
+        };
+        let status_request = TabletTransactionStatusRequest {
+            request_id: request_id.clone(),
+            tablet_id: TabletId(12),
+            tablet_epoch: 9,
+            txn_id: TxnId(51),
+            deadline_remaining_ms: Some(123),
+        };
+        assert_eq!(
+            TabletTransactionStatusRequest::from_proto(status_request.to_proto()).unwrap(),
+            status_request
+        );
+
+        let point_request = TabletPointInspectionRequest {
+            request_id,
+            tablet_id: TabletId(12),
+            tablet_epoch: 9,
+            row_key: crate::ids::RowKey {
+                table_id: TableId(12),
+                primary_key_bytes: b"pk".to_vec(),
+            },
+            read_timestamp: Timestamp(100),
+            deadline_remaining_ms: Some(123),
+        };
+        assert_eq!(
+            TabletPointInspectionRequest::from_proto(point_request.to_proto()).unwrap(),
+            point_request
+        );
+
+        let inspection = TabletPointReadInspection {
+            visible_row: Some(vec![1, 2, 3]),
+            intent: Some(LockRecord {
+                txn_id: TxnId(51),
+                primary_key: b"canonical-primary".to_vec(),
+                start_timestamp: Timestamp(10),
+                ttl_ms: 1_000,
+                op: WriteKind::Put,
+            }),
+        };
+        assert_eq!(
+            TabletPointReadInspection::from_proto(inspection.to_proto().unwrap()).unwrap(),
+            inspection
+        );
+
+        let status = TxnStatusRecord {
+            txn_id: TxnId(51),
+            start_timestamp: Timestamp(10),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: b"canonical-primary".to_vec(),
+            participant_tablet_ids: vec![12, 13],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let decoded_status = TxnStatusRecord::from_proto(status.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded_status, status);
     }
 
     #[test]
@@ -1869,6 +2322,12 @@ mod tests {
         assert_eq!(MessageType::MetadataRequest.wire_value(), 0x04);
         assert_eq!(MessageType::TabletScanRequest.wire_value(), 0x08);
         assert_eq!(
+            MessageType::TabletTransactionStatusRequest.wire_value(),
+            0x0D
+        );
+        assert!(MessageType::from_wire_value(0x0B).is_err());
+        assert_eq!(MessageType::TabletPointInspectionRequest.wire_value(), 0x0C);
+        assert_eq!(
             MessageType::from_wire_value(0x05),
             Ok(MessageType::MetadataResponse)
         );
@@ -1893,6 +2352,7 @@ mod tests {
             max_bytes: 64,
             rpc_attempt_id: Some(41),
             deadline_remaining_ms: Some(456),
+            intent_only: false,
         };
         let batch = TabletScanBatch {
             rows: vec![
@@ -1905,16 +2365,66 @@ mod tests {
                     row: b"row-o".to_vec(),
                 },
             ],
+            intents: Vec::new(),
             next_resume_after: Some(b"o".to_vec()),
             exhausted: false,
         };
 
         let decoded_request = TabletScanRequest::from_proto(request.to_proto()).unwrap();
-        let decoded_batch = TabletScanBatch::from_proto(batch.to_proto()).unwrap();
+        let decoded_batch = TabletScanBatch::from_proto(batch.to_proto().unwrap()).unwrap();
 
         assert_eq!(decoded_request, request);
         assert_eq!(decoded_batch, batch);
         assert!(decoded_batch.validate_for(&decoded_request).is_ok());
+    }
+
+    #[test]
+    fn tablet_scan_intent_batch_roundtrip_retries_without_advancing_the_cursor() {
+        let request = TabletScanRequest {
+            request_id: RequestId {
+                client_id: 77,
+                sequence: 12,
+                raft_group_id: RaftGroupId(8),
+            },
+            tablet_id: TabletId(12),
+            tablet_epoch: 9,
+            start_key: Some(b"a".to_vec()),
+            end_key: Some(b"z".to_vec()),
+            resume_after: Some(b"m".to_vec()),
+            read_timestamp: Timestamp(100),
+            max_rows: 2,
+            max_bytes: 64,
+            rpc_attempt_id: Some(41),
+            deadline_remaining_ms: Some(456),
+            intent_only: false,
+        };
+        let batch = TabletScanBatch {
+            rows: Vec::new(),
+            intents: vec![TabletScanIntent {
+                key: b"n".to_vec(),
+                lock: LockRecord {
+                    txn_id: TxnId(10),
+                    primary_key: b"p".to_vec(),
+                    start_timestamp: Timestamp(50),
+                    ttl_ms: 1_000,
+                    op: crate::codec::WriteKind::Put,
+                },
+            }],
+            next_resume_after: None,
+            exhausted: false,
+        };
+
+        let decoded = TabletScanBatch::from_proto(batch.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded, batch);
+        assert!(decoded.validate_for(&request).is_ok());
+
+        let invalid = TabletScanBatch {
+            rows: Vec::new(),
+            intents: Vec::new(),
+            next_resume_after: None,
+            exhausted: false,
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -1938,6 +2448,7 @@ mod tests {
             max_bytes: 32,
             rpc_attempt_id: Some(1),
             deadline_remaining_ms: None,
+            intent_only: false,
         };
 
         assert_eq!(

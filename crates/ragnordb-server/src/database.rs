@@ -19,13 +19,14 @@ use std::{
 };
 
 use crate::data_directory_lock::DataDirectoryLock;
+use crate::transaction_lifecycle::TransactionRuntime;
 use raft::types::ConfState;
 use ragnordb_catalog::Catalog;
 use ragnordb_common::{
     Error, Result,
     command_codec::SingleShardCommitCommand,
     durability::DurabilityGate,
-    ids::{NodeId, RequestId, TableId},
+    ids::{NodeId, RequestId, TableId, Timestamp, TxnId},
     proto::snapshot as snapshot_proto,
 };
 use ragnordb_exec::{
@@ -49,7 +50,10 @@ use ragnordb_storage::{
     },
     wal::{CheckpointRetentionPin, RagnorDbWalAdapter},
 };
-use ragnordb_txn::{LocalTransactionManager, TransactionManager};
+use ragnordb_txn::{
+    LocalTransactionManager, ReservedTimestampTransactionManager, TimestampReservationProvider,
+    TransactionManager,
+};
 use tokio::sync::{Mutex, Semaphore};
 use wal::{
     config::WalConfig,
@@ -76,10 +80,15 @@ pub type SharedDatabaseServices = Arc<DatabaseServices>;
 /// compatibility runtime.
 pub struct DatabaseServices {
     executor: Arc<RwLock<LocalExecutor>>,
-    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
+    transaction_manager: Arc<StdMutex<Box<dyn TransactionManager + Send>>>,
     durability_gate: DurabilityGate,
     statement_permits: Arc<Semaphore>,
     published_view_generation: AtomicU64,
+    timestamp_allocations_reported: AtomicU64,
+    timestamp_reservations_reported: AtomicU64,
+    timestamp_allocation_latency_reported: AtomicU64,
+    timestamp_reservation_latency_reported: AtomicU64,
+    transaction_runtime: Option<Arc<TransactionRuntime>>,
 }
 
 impl fmt::Debug for DatabaseServices {
@@ -139,6 +148,56 @@ impl DatabaseServices {
         }
     }
 
+    fn record_timestamp_metrics(&self) {
+        let stats = self
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .timestamp_oracle_stats();
+        let allocations =
+            take_counter_delta(&self.timestamp_allocations_reported, stats.allocations);
+        let reservations =
+            take_counter_delta(&self.timestamp_reservations_reported, stats.reservations);
+        let allocation_latency = take_counter_delta(
+            &self.timestamp_allocation_latency_reported,
+            stats.allocation_latency_nanos,
+        );
+        let reservation_latency = take_counter_delta(
+            &self.timestamp_reservation_latency_reported,
+            stats.reservation_latency_nanos,
+        );
+
+        if allocations != 0 {
+            crate::metrics::counter_add("ragnordb_timestamp_allocations_total", allocations);
+            crate::metrics::histogram_record(
+                "ragnordb_timestamp_allocation_latency_seconds",
+                allocation_latency as f64 / allocations as f64 / 1_000_000_000.0,
+            );
+        }
+        if reservations != 0 {
+            crate::metrics::counter_add("ragnordb_timestamp_reservations_total", reservations);
+            crate::metrics::histogram_record(
+                "ragnordb_timestamp_reservation_latency_seconds",
+                reservation_latency as f64 / reservations as f64 / 1_000_000_000.0,
+            );
+        }
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_last_allocated",
+            stats.last_allocated.0 as f64,
+        );
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_reserved_until",
+            stats.reserved_until.0 as f64,
+        );
+        crate::metrics::gauge_set(
+            "ragnordb_timestamp_unused_reserved_gap",
+            stats
+                .reserved_until
+                .0
+                .saturating_sub(stats.last_allocated.0) as f64,
+        );
+    }
+
     /// Return the generation pinned by the next shared executor read section.
     /// A generation changes only after a complete schema/routing publication.
     pub fn published_view_generation(&self) -> u64 {
@@ -183,9 +242,41 @@ impl DatabaseServices {
                     .transaction_manager
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                session.begin_with_transaction_manager(&mut *transaction_manager)
+                self.observe_gc_safe_point(&mut **transaction_manager);
+                let started = session.begin_with_transaction_manager(&mut *transaction_manager)?;
+                drop(transaction_manager);
+                let transaction = session.current_transaction_mut().ok_or_else(|| {
+                    Error::CorruptData("BEGIN did not retain its allocated transaction".into())
+                })?;
+                transaction.set_footprint_policy(
+                    self.transaction_runtime
+                        .as_ref()
+                        .map_or_else(Default::default, |runtime| runtime.config.footprint),
+                )?;
+                if let Some(runtime) = &self.transaction_runtime {
+                    if let Err(error) =
+                        runtime.register_gc_protection(transaction.id(), transaction.start_ts())
+                    {
+                        let _ = session.rollback_current_transaction();
+                        return Err(error);
+                    }
+                }
+                Ok(started)
             }
-            Plan::Rollback => session.rollback_current_transaction(),
+            Plan::Rollback => {
+                let txn_id = session.current_transaction_id();
+                let result = session.rollback_current_transaction();
+                if result.is_ok() {
+                    if let (Some(runtime), Some(txn_id)) = (&self.transaction_runtime, txn_id) {
+                        release_gc_protection_best_effort(runtime, txn_id);
+                    }
+                }
+                result
+            }
+            Plan::ShowTransactions => {
+                let snapshot = self.transaction_status_snapshot(100);
+                Ok(ExecutionResult::Query(snapshot.into_result_set()))
+            }
             Plan::ShowTables => {
                 let executor = self
                     .executor
@@ -234,8 +325,12 @@ impl DatabaseServices {
             }
             Plan::Commit => {
                 let transaction = session.take_transaction_for_commit()?;
+                let transaction_id = transaction.id();
                 let outcome =
                     self.commit_transaction(transaction, session.request_context_mut())?;
+                if let Some(runtime) = &self.transaction_runtime {
+                    release_gc_protection_best_effort(runtime, transaction_id);
+                }
                 Ok(ExecutionResult::TransactionCommitted {
                     transaction_id: outcome.transaction_id,
                     commit_ts: outcome.commit_timestamp,
@@ -268,8 +363,18 @@ impl DatabaseServices {
                             .transaction_manager
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        self.observe_gc_safe_point(&mut **transaction_manager);
                         transaction_manager.begin_transaction()?
                     };
+                    transaction.set_footprint_policy(
+                        self.transaction_runtime
+                            .as_ref()
+                            .map_or_else(Default::default, |runtime| runtime.config.footprint),
+                    )?;
+                    if let Some(runtime) = &self.transaction_runtime {
+                        runtime.register_gc_protection(transaction.id(), transaction.start_ts())?;
+                    }
+                    let transaction_id = transaction.id();
                     let statement_result = {
                         if let Some(executor) = detached_executor.as_ref() {
                             executor.execute_data_plan_with_request_context(
@@ -290,6 +395,9 @@ impl DatabaseServices {
                         }
                     }?;
                     let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+                    if let Some(runtime) = &self.transaction_runtime {
+                        release_gc_protection_best_effort(runtime, transaction_id);
+                    }
                     Ok(statement_result)
                 }
             }
@@ -298,10 +406,44 @@ impl DatabaseServices {
         if let Err(error) = &result {
             self.durability_gate.observe_error(error);
         }
+        self.record_timestamp_metrics();
         result
     }
 
     fn commit_transaction(
+        &self,
+        transaction: ragnordb_txn::Transaction,
+        request_context: &mut ragnordb_exec::TabletRequestContext,
+    ) -> Result<ragnordb_txn::SingleNodeCommitOutcome> {
+        let transaction_id = transaction.id();
+        if let Some(runtime) = &self.transaction_runtime
+            && !transaction.is_empty()
+        {
+            if let Err(error) = runtime
+                .lifecycle
+                .record_transaction_footprint(transaction.id(), transaction.footprint())
+            {
+                release_gc_protection_best_effort(runtime, transaction_id);
+                return Err(error);
+            }
+        }
+
+        let result = self.commit_transaction_inner(transaction, request_context);
+        if result.is_err()
+            && let Some(runtime) = &self.transaction_runtime
+            && !runtime.lifecycle.is_active(transaction_id)
+        {
+            // A definite pre-admission rejection has no durable participant
+            // state to protect. Clear its bounded registry reservation and
+            // release the history pin; uncertain or prepared outcomes remain
+            // active and keep both protections until authoritative resolution.
+            runtime.lifecycle.unregister(transaction_id);
+            release_gc_protection_best_effort(runtime, transaction_id);
+        }
+        result
+    }
+
+    fn commit_transaction_inner(
         &self,
         transaction: ragnordb_txn::Transaction,
         request_context: &mut ragnordb_exec::TabletRequestContext,
@@ -315,20 +457,24 @@ impl DatabaseServices {
             });
         }
 
-        let commit_timestamp = {
-            let mut transaction_manager = self
-                .transaction_manager
-                .lock()
+        let (local_target, distributed_target) = {
+            let executor = self
+                .executor
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+            (
+                executor.transaction_targets_local_table(&transaction)?,
+                executor.transaction_requires_distributed_coordination(&transaction)?,
+            )
         };
-
-        let local_target = self
-            .executor
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .transaction_targets_local_table(&transaction)?;
         if local_target {
+            let commit_timestamp = {
+                let mut transaction_manager = self
+                    .transaction_manager
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+            };
             let mut executor = self
                 .executor
                 .write()
@@ -342,12 +488,69 @@ impl DatabaseServices {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 executor.detached_remote_execution_view()
             };
-            executor.commit_remote_transaction_outcome_with_timestamp(
-                transaction,
-                commit_timestamp,
-                request_context,
-            )
+            if distributed_target {
+                let start_timestamp = transaction.start_ts();
+                let coordinator =
+                    executor.prepare_distributed_transaction(transaction, request_context)?;
+                let commit_timestamp = {
+                    let mut transaction_manager = self
+                        .transaction_manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    transaction_manager.allocate_commit_timestamp(start_timestamp)
+                };
+                match commit_timestamp {
+                    Ok(commit_timestamp) => executor.commit_prepared_distributed_transaction(
+                        coordinator,
+                        commit_timestamp,
+                        request_context,
+                    ),
+                    Err(error) => {
+                        executor.rollback_prepared_distributed_transaction(
+                            coordinator,
+                            request_context,
+                        )?;
+                        Err(error)
+                    }
+                }
+            } else {
+                let commit_timestamp = {
+                    let mut transaction_manager = self
+                        .transaction_manager
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    transaction_manager.allocate_commit_timestamp(transaction.start_ts())?
+                };
+                executor.commit_remote_transaction_outcome_with_timestamp(
+                    transaction,
+                    commit_timestamp,
+                    request_context,
+                )
+            }
         }
+    }
+
+    fn observe_gc_safe_point(&self, transaction_manager: &mut dyn TransactionManager) {
+        if let Some(runtime) = &self.transaction_runtime {
+            transaction_manager.observe_replicated_high_water(
+                ragnordb_common::ids::TxnId(0),
+                runtime.gc_safe_point(),
+            );
+        }
+    }
+
+    pub fn transaction_status_snapshot(
+        &self,
+        limit: usize,
+    ) -> crate::transaction_lifecycle::TransactionStatusSnapshot {
+        self.transaction_runtime.as_ref().map_or(
+            crate::transaction_lifecycle::TransactionStatusSnapshot {
+                active_count: 0,
+                truncated: false,
+                transactions: Vec::new(),
+            },
+            |runtime| runtime.lifecycle.status_snapshot(limit),
+        )
     }
 
     /// Execute a bounded streaming SELECT through the same split ownership
@@ -379,7 +582,7 @@ impl DatabaseServices {
                 .map(|_| executor.detached_remote_execution_view())
         };
 
-        if session.has_active_transaction() {
+        let result = if session.has_active_transaction() {
             if let Some(executor) = detached_executor.as_ref() {
                 session.execute_select_streaming_with_shared_executor(
                     plan, executor, sink, max_rows, max_bytes,
@@ -399,8 +602,18 @@ impl DatabaseServices {
                     .transaction_manager
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.observe_gc_safe_point(&mut **transaction_manager);
                 transaction_manager.begin_transaction()?
             };
+            transaction.set_footprint_policy(
+                self.transaction_runtime
+                    .as_ref()
+                    .map_or_else(Default::default, |runtime| runtime.config.footprint),
+            )?;
+            if let Some(runtime) = &self.transaction_runtime {
+                runtime.register_gc_protection(transaction.id(), transaction.start_ts())?;
+            }
+            let transaction_id = transaction.id();
             let summary = {
                 if let Some(executor) = detached_executor.as_ref() {
                     executor.execute_select_streaming(
@@ -427,8 +640,13 @@ impl DatabaseServices {
                 }
             };
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
+            if let Some(runtime) = &self.transaction_runtime {
+                release_gc_protection_best_effort(runtime, transaction_id);
+            }
             Ok(summary)
-        }
+        };
+        self.record_timestamp_metrics();
+        result
     }
 }
 
@@ -439,6 +657,29 @@ fn data_plan_table_id(plan: &Plan) -> Option<TableId> {
         Plan::Update(plan) => Some(plan.table.table_id),
         Plan::Delete(plan) => Some(plan.table.table_id),
         _ => None,
+    }
+}
+
+fn take_counter_delta(counter: &AtomicU64, current: u64) -> u64 {
+    loop {
+        let previous = counter.load(Ordering::Acquire);
+        if current <= previous {
+            return 0;
+        }
+        if counter
+            .compare_exchange(previous, current, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current - previous;
+        }
+    }
+}
+
+fn release_gc_protection_best_effort(runtime: &TransactionRuntime, txn_id: TxnId) {
+    if let Err(error) = runtime.release_gc_protection(txn_id) {
+        crate::metrics::counter_inc("ragnordb_txn_gc_protection_release_failures_total");
+        tracing::warn!(transaction_id = txn_id.0, error = %error,
+            "failed to release durable transaction GC protection; its lease will expire safely");
     }
 }
 
@@ -484,7 +725,7 @@ pub struct LiveCheckpointPublication {
 /// out of order
 pub struct LocalDatabase {
     executor: Arc<RwLock<LocalExecutor>>,
-    transaction_manager: Arc<StdMutex<LocalTransactionManager>>,
+    transaction_manager: Arc<StdMutex<Box<dyn TransactionManager + Send>>>,
     next_snapshot_id: Option<u64>,
     data_dir: Option<PathBuf>,
     checkpoint_adapter: Option<Arc<LocalWalAdapter>>,
@@ -501,7 +742,7 @@ impl fmt::Debug for LocalDatabase {
         formatter
             .debug_struct("LocalDatabase")
             .field("executor", &self.executor)
-            .field("transaction_manager", &self.transaction_manager)
+            .field("has_transaction_manager", &true)
             .field("next_snapshot_id", &self.next_snapshot_id)
             .field("data_dir", &self.data_dir)
             .field("has_checkpoint_adapter", &self.checkpoint_adapter.is_some())
@@ -514,7 +755,9 @@ impl Default for LocalDatabase {
     fn default() -> Self {
         Self {
             executor: Arc::new(RwLock::new(LocalExecutor::default())),
-            transaction_manager: Arc::new(StdMutex::new(LocalTransactionManager::default())),
+            transaction_manager: Arc::new(StdMutex::new(Box::new(
+                LocalTransactionManager::default(),
+            ))),
             next_snapshot_id: Some(1),
             data_dir: None,
             checkpoint_adapter: None,
@@ -532,6 +775,29 @@ impl LocalDatabase {
     /// construct an in memory runtime for tests that do not exercise durability
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the compatibility allocator with the metadata-backed oracle
+    /// before distributed SQL admission begins. The replacement is startup-only
+    /// so no active session can retain a reference to the previous allocator.
+    pub fn install_reserved_timestamp_manager<P>(
+        &mut self,
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<()>
+    where
+        P: TimestampReservationProvider + Send + 'static,
+    {
+        let manager = ReservedTimestampTransactionManager::from_durable_frontier(
+            provider,
+            durable_frontier,
+            reservation_size,
+            prefetch_threshold,
+        )?;
+        self.transaction_manager = Arc::new(StdMutex::new(Box::new(manager)));
+        Ok(())
     }
 
     /// recover a complete local runtime from the node's A-WAL directory
@@ -647,8 +913,11 @@ impl LocalDatabase {
         let directory = FsSegmentDirectory::new(wal_dir);
 
         let (wal, recovery_report) =
-            WalHandle::open(directory, wal_config, ()).map_err(|source| Error::RecoveryFailed {
-                reason: format!("failed to open and physically recover A-WAL: {source}"),
+            WalHandle::open(directory, wal_config, ()).map_err(|source| {
+                Error::RecoveryFailedWithSource {
+                    context: "failed to open and physically recover A-WAL".to_string(),
+                    source: Box::new(source),
+                }
             })?;
 
         // recovery begins at the first retained record rather than assuming that
@@ -657,11 +926,12 @@ impl LocalDatabase {
 
         let recovery_pin = wal
             .acquire_retention_pin("ragnordb-startup-recovery", first_retained_lsn)
-            .map_err(|source| Error::RecoveryFailed {
-                reason: format!(
-                    "failed to pin WAL retention at startup LSN {}: {source}",
+            .map_err(|source| Error::RecoveryFailedWithSource {
+                context: format!(
+                    "failed to pin WAL retention at startup LSN {}",
                     first_retained_lsn.as_u64()
                 ),
+                source: Box::new(source),
             })?;
 
         let checkpoint_stream = scan_recovery_records(&wal, first_retained_lsn)?;
@@ -697,19 +967,21 @@ impl LocalDatabase {
 
         let (recovered_state, recovered_raft) = match configurations {
             Some(configurations) => {
-                let mut replay_stream =
-                    wal.iter_from(first_retained_lsn)
-                        .map_err(|source| Error::RecoveryFailed {
-                            reason: format!("open shared database/Raft recovery stream: {source}"),
-                        })?;
+                let mut replay_stream = wal.iter_from(first_retained_lsn).map_err(|source| {
+                    Error::RecoveryFailedWithSource {
+                        context: "open shared database/Raft recovery stream".to_string(),
+                        source: Box::new(source),
+                    }
+                })?;
                 let recovered = recover_shared_storage_from_state(
                     &mut replay_stream,
                     recovered_state,
                     replay_from_lsn,
                     configurations,
                 )
-                .map_err(|source| Error::RecoveryFailed {
-                    reason: source.to_string(),
+                .map_err(|source| Error::RecoveryFailedWithSource {
+                    context: "replay shared database/Raft recovery stream".to_string(),
+                    source: Box::new(source),
                 })?;
                 (recovered.database, Some(recovered.raft))
             }
@@ -760,7 +1032,7 @@ impl LocalDatabase {
         Ok((
             Self {
                 executor: Arc::new(RwLock::new(executor)),
-                transaction_manager: Arc::new(StdMutex::new(transaction_manager)),
+                transaction_manager: Arc::new(StdMutex::new(Box::new(transaction_manager))),
                 next_snapshot_id: Some(floors.next_snapshot_id),
                 data_dir: Some(data_dir),
                 checkpoint_adapter: Some(adapter),
@@ -794,6 +1066,22 @@ impl LocalDatabase {
     /// planning, CPU operators, and blocking tablet waits as one admission
     /// domain until dedicated query workers are introduced.
     pub fn database_services(&self) -> SharedDatabaseServices {
+        self.build_database_services(None)
+    }
+
+    /// Build distributed SQL services with the metadata-owned transaction
+    /// lifecycle and MVCC history-protection boundary installed.
+    pub fn database_services_with_transaction_runtime(
+        &self,
+        runtime: Arc<TransactionRuntime>,
+    ) -> SharedDatabaseServices {
+        self.build_database_services(Some(runtime))
+    }
+
+    fn build_database_services(
+        &self,
+        transaction_runtime: Option<Arc<TransactionRuntime>>,
+    ) -> SharedDatabaseServices {
         let parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
@@ -811,6 +1099,11 @@ impl LocalDatabase {
             durability_gate: self.durability_gate.clone(),
             statement_permits: Arc::new(Semaphore::new(parallelism)),
             published_view_generation: AtomicU64::new(published_view_generation),
+            timestamp_allocations_reported: AtomicU64::new(0),
+            timestamp_reservations_reported: AtomicU64::new(0),
+            timestamp_allocation_latency_reported: AtomicU64::new(0),
+            timestamp_reservation_latency_reported: AtomicU64::new(0),
+            transaction_runtime,
         })
     }
 

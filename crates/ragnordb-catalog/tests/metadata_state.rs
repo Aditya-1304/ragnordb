@@ -6,7 +6,7 @@ use ragnordb_common::{
     catalog_codec::{ColumnDefinition, DataType, TableDefinition},
     ids::{
         ClientRequestId, ColumnId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId,
-        RequestId, TableId, TabletId,
+        RequestId, TableId, TabletId, Timestamp,
     },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
@@ -1288,5 +1288,236 @@ fn metadata_snapshot_roundtrip_preserves_replica_tombstones() {
             .unwrap()
             .configuration_epoch,
         2
+    );
+}
+
+#[test]
+fn timestamp_reservation_is_monotonic_deduplicated_and_snapshot_durable() {
+    let mut state = MetadataState::new();
+
+    assert_eq!(
+        state.apply(MetadataCommand::ClusterInitialized {
+            cluster_id: "cluster-a".to_string(),
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    let request_id = RequestId {
+        client_id: 91,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    let command = MetadataCommand::ReserveTimestamps {
+        reserved_until: Timestamp(100),
+    };
+
+    assert_eq!(
+        state.apply_with_request_id(request_id, command.clone()),
+        MetadataApplyOutcome::TimestampsReserved {
+            reserved_from: Timestamp(1),
+            reserved_until: Timestamp(100),
+        },
+    );
+    assert_eq!(state.timestamp_reserved_until(), Timestamp(100));
+
+    assert_eq!(
+        state.apply(MetadataCommand::ReserveTimestamps {
+            reserved_until: Timestamp(99),
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::TimestampReservationRegressed {
+            current: Timestamp(100),
+            received: Timestamp(99),
+        }),
+    );
+    assert_eq!(state.timestamp_reserved_until(), Timestamp(100));
+
+    let replay_request_id = RequestId {
+        client_id: 91,
+        sequence: 1,
+        raft_group_id: RaftGroupId(2),
+    };
+    assert_eq!(
+        state.apply_with_request_id(
+            replay_request_id,
+            MetadataCommand::ReserveTimestamps {
+                reserved_until: Timestamp(200),
+            },
+        ),
+        MetadataApplyOutcome::TimestampsReserved {
+            reserved_from: Timestamp(1),
+            reserved_until: Timestamp(100),
+        },
+    );
+    assert_eq!(state.timestamp_reserved_until(), Timestamp(100));
+
+    let recovered = MetadataState::from_snapshot(state.to_snapshot()).unwrap();
+    assert_eq!(recovered.timestamp_reserved_until(), Timestamp(100));
+}
+
+#[test]
+fn live_gc_protection_clamps_safe_point_advancement() {
+    // This catches a readable-history bug where the metadata leader publishes
+    // a candidate GC boundary past a durable transaction/read lease.
+    let mut state = MetadataState::new();
+    state.apply(MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    });
+
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterGcProtection {
+            owner_id: 4,
+            protection_id: 8,
+            protected_timestamp: Timestamp(40),
+            lease_deadline_ms: 1_000,
+            now_ms: 100,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+
+    assert_eq!(
+        state.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: 200,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(state.gc_safe_point(), Timestamp(40));
+}
+
+#[test]
+fn gc_protection_survives_snapshot_restore_and_release_unpins_history() {
+    // This catches a restart that forgets a reader lease and allows history
+    // reclamation before the reader can continue at its original timestamp.
+    let mut state = MetadataState::new();
+    state.apply(MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    });
+    state.apply(MetadataCommand::RegisterGcProtection {
+        owner_id: 10,
+        protection_id: 20,
+        protected_timestamp: Timestamp(40),
+        lease_deadline_ms: 1_000,
+        now_ms: 100,
+    });
+
+    let mut recovered = MetadataState::from_snapshot(state.to_snapshot()).unwrap();
+    assert_eq!(recovered.gc_safe_point(), Timestamp(0));
+    assert_eq!(
+        recovered.gc_protection(10, 20).copied(),
+        Some(ragnordb_common::metadata_codec::MetadataGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            protected_timestamp: Timestamp(40),
+            lease_deadline_ms: 1_000,
+        }),
+    );
+
+    assert_eq!(
+        recovered.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: 200,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        recovered.apply(MetadataCommand::ReleaseGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        recovered.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: 300,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+}
+
+#[test]
+fn expired_gc_protection_is_pruned_and_cannot_be_renewed() {
+    // This catches crashed owners pinning MVCC history forever or extending a
+    // protection after its lease has already elapsed.
+    let mut state = MetadataState::new();
+    state.apply(MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    });
+    state.apply(MetadataCommand::RegisterGcProtection {
+        owner_id: 10,
+        protection_id: 20,
+        protected_timestamp: Timestamp(40),
+        lease_deadline_ms: 300,
+        now_ms: 100,
+    });
+
+    assert_eq!(
+        state.apply(MetadataCommand::RenewGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            lease_deadline_ms: 900,
+            now_ms: 300,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::ExpiredGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            deadline_ms: 300,
+            now_ms: 300,
+        }),
+    );
+    assert_eq!(
+        state.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: 300,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(state.gc_protection(10, 20), None);
+}
+
+#[test]
+fn gc_protection_identity_and_safe_point_are_monotonic() {
+    // This catches a retried identity silently moving to a different history
+    // timestamp or a stale metadata leader moving the published floor backward.
+    let mut state = MetadataState::new();
+    state.apply(MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    });
+    state.apply(MetadataCommand::RegisterGcProtection {
+        owner_id: 10,
+        protection_id: 20,
+        protected_timestamp: Timestamp(40),
+        lease_deadline_ms: 1_000,
+        now_ms: 100,
+    });
+
+    assert_eq!(
+        state.apply(MetadataCommand::RegisterGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            protected_timestamp: Timestamp(41),
+            lease_deadline_ms: 1_000,
+            now_ms: 100,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::GcProtectionIdentityConflict {
+            owner_id: 10,
+            protection_id: 20,
+            existing: Timestamp(40),
+            received: Timestamp(41),
+        }),
+    );
+    state.apply(MetadataCommand::AdvanceGcSafePoint {
+        candidate: Timestamp(40),
+        now_ms: 200,
+    });
+    assert_eq!(
+        state.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(39),
+            now_ms: 200,
+        }),
+        MetadataApplyOutcome::Rejected(MetadataRejection::GcSafePointRegressed {
+            current: Timestamp(40),
+            received: Timestamp(39),
+        }),
     );
 }

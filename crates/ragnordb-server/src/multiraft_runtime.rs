@@ -24,6 +24,7 @@ use ragnordb_common::{
     Error, Result,
     ids::{
         ClientRequestId, CommandKind, LogicalCommandId, NodeId, RaftGroupId, ReplicaId, RequestId,
+        Timestamp,
     },
     metadata_codec::{
         CreateTableRequest, DesiredReplica, DesiredReplicaPlacement, DesiredReplicaRole,
@@ -55,6 +56,7 @@ use ragnordb_multiraft::{
 use ragnordb_exec::{MetadataTableCreator, MetadataTableTopology, SharedMetadataTableCreator};
 use ragnordb_tablet::snapshot::FileTabletSnapshotStore;
 use ragnordb_tablet::snapshot::TabletSnapshotInstallTarget;
+use ragnordb_txn::{TimestampReservation, TimestampReservationProvider};
 
 use wal::{io::directory::FsSegmentDirectory, wal::WalHandle};
 
@@ -2404,6 +2406,141 @@ impl MetadataProposalClient {
         )
     }
 
+    /// Reserve a monotonically increasing timestamp frontier through the
+    /// metadata Raft group. Completion means the reservation command was
+    /// applied, not merely queued, so the returned interval survives restart.
+    pub fn reserve_timestamps(
+        &self,
+        reserved_until: Timestamp,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let sequence = self
+            .next_admin_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::InvalidArgument("timestamp reservation sequence exhausted".into())
+            })?;
+        let request_id = RequestId {
+            client_id: self.admin_client_id,
+            sequence,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+        };
+
+        self.propose_metadata_command(
+            MetadataCommand::ReserveTimestamps { reserved_until },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Durably pin MVCC history for one active transaction or supported
+    /// historical reader. The metadata apply result is the visibility boundary
+    /// callers must cross before issuing reads at `protected_timestamp`.
+    pub fn register_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Extend a live MVCC history pin without changing its protected
+    /// timestamp. The catalog rejects terminal, expired, or regressed leases.
+    pub fn renew_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::RenewGcProtection {
+                owner_id,
+                protection_id,
+                lease_deadline_ms,
+                now_ms,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Release one durable history pin after its reader or transaction has
+    /// finished. A process crash instead relies on the replicated lease expiry.
+    pub fn release_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::ReleaseGcProtection {
+                owner_id,
+                protection_id,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    /// Ask metadata to monotonically advance the global MVCC history boundary.
+    /// Its state machine clamps the candidate against every protection live at
+    /// `now_ms`; this command is independent of A-WAL retention.
+    pub fn advance_gc_safe_point(
+        &self,
+        candidate: Timestamp,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::AdvanceGcSafePoint { candidate, now_ms },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
+    fn next_metadata_admin_request_id(&self) -> Result<RequestId> {
+        let sequence = self
+            .next_admin_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::InvalidArgument("administrative request sequence exhausted".into())
+            })?;
+        Ok(RequestId {
+            client_id: self.admin_client_id,
+            sequence,
+            raft_group_id: METADATA_RAFT_GROUP_ID,
+        })
+    }
+
     /// Propose removal of one physical metadata member through the metadata
     /// leader. A draining node is commonly a follower, so this path first
     /// attempts the local Ready owner and then uses the authenticated metadata
@@ -2501,7 +2638,8 @@ impl MetadataProposalClient {
                 MetadataApplyOutcome::Applied
                 | MetadataApplyOutcome::AlreadyApplied
                 | MetadataApplyOutcome::ClientRegistered { .. }
-                | MetadataApplyOutcome::ClientRenewed => Err(Error::CorruptData(
+                | MetadataApplyOutcome::ClientRenewed
+                | MetadataApplyOutcome::TimestampsReserved { .. } => Err(Error::CorruptData(
                     "metadata CREATE TABLE apply did not return allocated topology".to_string(),
                 )),
 
@@ -2697,6 +2835,67 @@ impl MetadataProposalClient {
     }
 }
 
+/// Synchronous adapter used by the SQL transaction manager. The manager holds
+/// its own mutex while reserving a range, so this call must not depend on a
+/// callback from SQL or on the database mutex that owns the manager.
+#[derive(Clone)]
+pub struct MetadataTimestampReservationClient {
+    metadata: MetadataProposalClient,
+    timeout: Duration,
+}
+
+impl MetadataTimestampReservationClient {
+    pub fn new(metadata: MetadataProposalClient, timeout: Duration) -> Self {
+        Self { metadata, timeout }
+    }
+}
+
+impl TimestampReservationProvider for MetadataTimestampReservationClient {
+    fn reserve_timestamps(&mut self, requested_until: Timestamp) -> Result<TimestampReservation> {
+        let mut requested_until = requested_until;
+        for _ in 0..8 {
+            match self
+                .metadata
+                .reserve_timestamps(requested_until, self.timeout)?
+            {
+                MetadataApplyOutcome::TimestampsReserved {
+                    reserved_from,
+                    reserved_until,
+                } => {
+                    return Ok(TimestampReservation {
+                        reserved_from,
+                        reserved_until,
+                    });
+                }
+                MetadataApplyOutcome::Rejected(
+                    ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                        current,
+                        ..
+                    },
+                ) => {
+                    requested_until = Timestamp(current.0.checked_add(1).ok_or_else(|| {
+                        Error::Configuration(
+                            "timestamp reservation frontier is exhausted".to_string(),
+                        )
+                    })?);
+                }
+                MetadataApplyOutcome::Rejected(rejection) => {
+                    return Err(Error::ConstraintViolation(rejection.to_string()));
+                }
+                other => {
+                    return Err(Error::CorruptData(format!(
+                        "timestamp reservation returned unexpected metadata outcome {other:?}"
+                    )));
+                }
+            }
+        }
+        Err(Error::ProposalUnavailable {
+            reason: "timestamp reservation conflicted repeatedly with concurrent owners"
+                .to_string(),
+        })
+    }
+}
+
 fn metadata_error_can_forward(error: &Error) -> bool {
     matches!(
         error,
@@ -2750,6 +2949,22 @@ fn metadata_response_to_outcome(
         ragnordb_common::rpc_codec::MetadataProposalOutcome::ClientRenewed => {
             Ok(MetadataApplyOutcome::ClientRenewed)
         }
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        } => Ok(MetadataApplyOutcome::TimestampsReserved {
+            reserved_from,
+            reserved_until,
+        }),
+        ragnordb_common::rpc_codec::MetadataProposalOutcome::TimestampReservationRegressed {
+            current,
+            received,
+        } => Ok(MetadataApplyOutcome::Rejected(
+            ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                current,
+                received,
+            },
+        )),
         ragnordb_common::rpc_codec::MetadataProposalOutcome::TableCreated {
             table_id,
             tablet_id,
@@ -3619,12 +3834,12 @@ fn run_host(
     inbound.bind_current_thread();
     let mut timer_clock = SparseTickClock::new(TICK_INTERVAL);
 
-    host.schedule_all_groups_after(1)
-        .expect("active MultiRaft host must accept startup timer scheduling");
-    publish_host_status(&host_status, &host);
-
     let mut pending_metadata = BTreeMap::<u64, PendingMetadataProposal>::new();
     let mut pending_metadata_by_request = HashMap::<RequestId, u64>::new();
+
+    host.schedule_all_groups_after(1)
+        .expect("active MultiRaft host must accept startup timer scheduling");
+    publish_host_status(&host_status, &host, pending_metadata.len());
 
     let mut next_metadata_attempt = Instant::now();
 
@@ -3637,7 +3852,7 @@ fn run_host(
             &metadata,
             &metadata_replica_to_node,
         ) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             signal_metadata_failure(&mut startup_sender, error.to_string());
             fail_pending_metadata(
                 &mut pending_metadata,
@@ -3683,7 +3898,7 @@ fn run_host(
             &mut pending_metadata_by_request,
             METADATA_REQUEST_BUDGET,
         ) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             fail_pending_metadata(
                 &mut pending_metadata,
                 &mut pending_metadata_by_request,
@@ -3704,7 +3919,7 @@ fn run_host(
                 Ok(()) => admitted_messages += 1,
 
                 Err(MultiRaftHostError::RecoveryRequired) => {
-                    publish_host_status(&host_status, &host);
+                    publish_host_status(&host_status, &host, pending_metadata.len());
                     signal_metadata_failure(
                         &mut startup_sender,
                         "shared Raft WAL requires node recovery".to_string(),
@@ -3744,7 +3959,7 @@ fn run_host(
             Ok(turn) => send_outbound(&transport, turn.outbound),
 
             Err(MultiRaftHostError::RecoveryRequired) => {
-                publish_host_status(&host_status, &host);
+                publish_host_status(&host_status, &host, pending_metadata.len());
                 signal_metadata_failure(
                     &mut startup_sender,
                     "shared Raft WAL requires node recovery".to_string(),
@@ -3779,7 +3994,7 @@ fn run_host(
             &mut pending_metadata_by_request,
         );
         if let Err(error) = tablet_lifecycle.reconcile(&mut host, &metadata, true) {
-            publish_host_status(&host_status, &host);
+            publish_host_status(&host_status, &host, pending_metadata.len());
             signal_metadata_failure(&mut startup_sender, error.to_string());
             fail_pending_metadata(
                 &mut pending_metadata,
@@ -3877,7 +4092,7 @@ fn run_host(
             next_metadata_attempt = now + METADATA_BOOTSTRAP_RETRY_INTERVAL;
         }
 
-        publish_host_status(&host_status, &host);
+        publish_host_status(&host_status, &host, pending_metadata.len());
 
         let wait = if host.has_runnable_work() {
             Duration::ZERO
@@ -3904,7 +4119,7 @@ fn run_host(
         &metadata_replica_to_node,
     );
 
-    publish_host_status(&host_status, &host);
+    publish_host_status(&host_status, &host, pending_metadata.len());
 }
 
 /// Select the smallest eligible replica ID so transfer decisions are stable
@@ -4229,10 +4444,19 @@ fn graceful_leadership_handoff(
 fn publish_host_status(
     status: &SharedMultiRaftHostStatus,
     host: &MultiRaftHost<impl RaftWal + Send + 'static>,
+    metadata_pending_proposals: usize,
 ) {
+    let mut snapshot = host.status();
+    if let Some(metadata_group) = snapshot
+        .groups
+        .iter_mut()
+        .find(|group| group.identity.raft_group_id == METADATA_RAFT_GROUP_ID)
+    {
+        metadata_group.pending_proposals = metadata_pending_proposals;
+    }
     *status
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = host.status();
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
 }
 
 fn service_metadata_requests<W>(
@@ -4395,6 +4619,12 @@ fn drain_metadata_results(
             )))
         } else {
             match applied.outcome {
+                MetadataApplyOutcome::Rejected(
+                    rejection
+                    @ ragnordb_catalog::MetadataRejection::TimestampReservationRegressed {
+                        ..
+                    },
+                ) => Ok(MetadataApplyOutcome::Rejected(rejection)),
                 MetadataApplyOutcome::Rejected(rejection) => {
                     Err(Error::ConstraintViolation(rejection.to_string()))
                 }

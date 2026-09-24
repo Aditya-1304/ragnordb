@@ -54,7 +54,48 @@ message MetadataCommand {
         // directory record so administrative control cannot rewrite endpoint
         // identity while advancing a node through the drain protocol.
         SetNodeLifecycle set_node_lifecycle = 15;
+
+        // Durable timestamp high-water reservation. Individual timestamp
+        // allocations are served from the committed interval in memory.
+        ReserveTimestamps reserve_timestamps = 16;
+
+        // Leased protection for an MVCC history timestamp. These records are
+        // metadata state and do not control Raft log or WAL retention.
+        RegisterGcProtection register_gc_protection = 17;
+        RenewGcProtection renew_gc_protection = 18;
+        ReleaseGcProtection release_gc_protection = 19;
+        AdvanceGcSafePoint advance_gc_safe_point = 20;
     }
+}
+
+message ReserveTimestamps {
+    // Highest MVCC timestamp covered by the durable reservation.
+    uint64 reserved_until = 1;
+}
+
+message RegisterGcProtection {
+    bytes owner_id = 1;
+    bytes protection_id = 2;
+    uint64 protected_timestamp = 3;
+    uint64 lease_deadline_ms = 4;
+    uint64 now_ms = 5;
+}
+
+message RenewGcProtection {
+    bytes owner_id = 1;
+    bytes protection_id = 2;
+    uint64 lease_deadline_ms = 3;
+    uint64 now_ms = 4;
+}
+
+message ReleaseGcProtection {
+    bytes owner_id = 1;
+    bytes protection_id = 2;
+}
+
+message AdvanceGcSafePoint {
+    uint64 candidate_timestamp = 1;
+    uint64 now_ms = 2;
 }
 
 message ClusterInitialized {
@@ -276,6 +317,22 @@ message MetadataSnapshot {
     repeated MetadataRequestDeduplication request_deduplication = 10;
 
     repeated ClientSession client_sessions = 11;
+
+    // Highest MVCC timestamp durably reserved by the metadata oracle. A zero
+    // value is valid for legacy snapshots created before Phase 6.1.
+    uint64 timestamp_reserved_until = 12;
+
+    // Monotonic MVCC history boundary and its durable, expiring readers.
+    // These fields are absent in snapshots before format version 3.
+    uint64 gc_safe_point = 13;
+    repeated GcProtection gc_protections = 14;
+}
+
+message GcProtection {
+    bytes owner_id = 1;
+    bytes protection_id = 2;
+    uint64 protected_timestamp = 3;
+    uint64 lease_deadline_ms = 4;
 }
 
 message ClientSession {
@@ -293,6 +350,8 @@ enum MetadataCachedOutcomeKind {
     METADATA_CACHED_OUTCOME_REJECTED = 4;
     METADATA_CACHED_OUTCOME_CLIENT_REGISTERED = 5;
     METADATA_CACHED_OUTCOME_CLIENT_RENEWED = 6;
+    METADATA_CACHED_OUTCOME_TIMESTAMPS_RESERVED = 7;
+    METADATA_CACHED_OUTCOME_TIMESTAMP_RESERVATION_REGRESSED = 8;
 }
 
 message MetadataRequestDeduplication {
@@ -316,4 +375,10 @@ message MetadataRequestDeduplication {
     // group-qualified request correlation ID. Readers of older snapshots may
     // derive the compatibility identity from request_id.
     ragnordb.ids.LogicalCommandId logical_command_id = 9;
+
+    // Populated only for METADATA_CACHED_OUTCOME_TIMESTAMPS_RESERVED.
+    uint64 timestamp_reserved_until = 10;
+    uint64 timestamp_reserved_from = 11;
+    uint64 timestamp_reservation_current = 12;
+    uint64 timestamp_reservation_received = 13;
 }

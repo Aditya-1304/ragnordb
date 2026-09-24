@@ -102,6 +102,12 @@ impl SqlSession {
         self.current_transaction.as_ref().map(Transaction::id)
     }
 
+    /// Borrow the current transaction so the server can install durable
+    /// transaction policies before the session is allowed to execute SQL.
+    pub fn current_transaction_mut(&mut self) -> Option<&mut Transaction> {
+        self.current_transaction.as_mut()
+    }
+
     /// Begin an explicit transaction for the shared distributed SQL owner.
     ///
     /// The allocator is borrowed only for the identity allocation itself; the
@@ -261,7 +267,7 @@ impl SqlSession {
                 return Err(error);
             }
         };
-        let _ = executor.commit_transaction_outcome_with_request_context(
+        let _ = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,
@@ -393,6 +399,11 @@ impl SqlSession {
             // transaction. An existing explicit transaction remains attached.
             Plan::ShowTables => executor.execute(Plan::ShowTables, None),
 
+            // Replicated servers replace this with their bounded lifecycle
+            // snapshot before the executor boundary. The local compatibility
+            // executor has no shared distributed lifecycle registry.
+            Plan::ShowTransactions => executor.execute(Plan::ShowTransactions, None),
+
             plan @ (Plan::Insert(_) | Plan::Select(_) | Plan::Update(_) | Plan::Delete(_)) => {
                 self.execute_data_plan(plan, executor, transaction_manager)
             }
@@ -438,7 +449,7 @@ impl SqlSession {
             )
         })?;
 
-        let outcome = executor.commit_transaction_outcome_with_request_context(
+        let outcome = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,
@@ -514,7 +525,7 @@ impl SqlSession {
         // The implicit statement already has its client-facing result. The
         // commit outcome is consumed here as the required durability and MVCC
         // publication gate before that statement result can be acknowledged.
-        let _commit_outcome = executor.commit_transaction_outcome_with_request_context(
+        let _commit_outcome = executor.commit_sql_transaction_outcome_with_request_context(
             transaction,
             transaction_manager,
             &mut self.tablet_request_context,

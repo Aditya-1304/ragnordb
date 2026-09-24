@@ -27,6 +27,7 @@ use crate::node_lifecycle::{
     NodeDrainBlocker, NodeDrainGroupStatus, NodeDrainStatus, compute_node_drain_status,
 };
 use crate::replicated_tablet::ReplicatedTabletHandle;
+use crate::transaction_lifecycle::TransactionRuntime;
 use ragnordb_multiraft::host::{MultiRaftHostStatus, SharedMultiRaftHostStatus};
 
 /// Thread-safe error type returned by administrative server tasks.
@@ -55,6 +56,7 @@ pub struct AdminState {
     pub replicated_tablet: Option<Arc<ReplicatedTabletHandle>>,
     pub multiraft_status: Option<SharedMultiRaftHostStatus>,
     pub node_lifecycle: Option<NodeLifecycleAdminState>,
+    pub transaction_runtime: Option<Arc<TransactionRuntime>>,
 }
 
 pub async fn start_admin_server(
@@ -148,6 +150,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
             "snapshot_index": status.snapshot_index,
             "uncommitted_bytes": status.uncommitted_bytes,
             "replication_inflight_bytes": status.replication_inflight_bytes,
+            "pending_proposals": status.pending_proposals,
             "is_leader": status.serving_leader,
             "runtime_error": status.runtime_error,
         })
@@ -166,6 +169,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
                     "raft_group_id": group.identity.raft_group_id.0,
                     "replica_id": group.identity.replica_id.0,
                     "role": group.role.map(|role| role.as_str()),
+                    "pending_proposals": group.pending_proposals,
                     "pending_messages": group.pending_messages,
                     "pending_message_bytes": group.pending_message_bytes,
                 })
@@ -180,6 +184,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
             "pending_persistence_groups": summary.pending_persistence_groups,
             "pending_persistence_records": summary.pending_persistence_records,
             "pending_persistence_bytes": summary.pending_persistence_bytes,
+            "pending_proposal_count": summary.pending_proposal_count,
             "group_count": summary.group_count,
             "leader_count": summary.leader_count,
             "candidate_count": summary.candidate_count,
@@ -190,6 +195,42 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
     let node_lifecycle = current_node_lifecycle_status(&state)
         .as_ref()
         .map(node_drain_status_json);
+    let transaction_runtime = state.transaction_runtime.as_ref().map(|runtime| {
+        let snapshot = runtime.lifecycle.status_snapshot(32);
+        let rows = snapshot
+            .transactions
+            .iter()
+            .map(|transaction| {
+                serde_json::json!({
+                    "transaction_id": transaction.transaction_id,
+                    "status": transaction.status,
+                    "age_ms": transaction.age_ms,
+                    "participant_tablets": transaction.participant_tablets,
+                    "write_keys": transaction.write_keys,
+                    "write_bytes": transaction.write_bytes,
+                    "read_spans": transaction.read_spans,
+                    "intent_accounting_bytes": transaction.intent_accounting_bytes,
+                    "participant_command_bytes": transaction.participant_command_bytes,
+                    "last_heartbeat_timestamp": transaction.last_heartbeat_timestamp,
+                    "lease_deadline_ms": transaction.lease_deadline_ms,
+                    "lease_remaining_ms": transaction.lease_remaining_ms,
+                    "last_heartbeat_age_ms": transaction.last_heartbeat_age_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let gc = runtime.gc_protection_snapshot();
+        serde_json::json!({
+            "active_count": snapshot.active_count,
+            "truncated": snapshot.truncated,
+            "transactions": rows,
+            "gc": {
+                "safe_point": gc.safe_point.0,
+                "active_protections": gc.active_protections,
+                "minimum_protected_timestamp": gc.minimum_protected_timestamp.map(|ts| ts.0),
+                "earliest_lease_deadline_ms": gc.earliest_lease_deadline_ms,
+            },
+        })
+    });
 
     Json(serde_json::json!({
         "build": {
@@ -216,6 +257,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
         "replication": replication,
         "multiraft": multiraft,
         "node_lifecycle": node_lifecycle,
+        "transactions": transaction_runtime,
         "storage": storage.map(|storage| serde_json::json!({
             "durable_lsn": storage.durable_lsn,
             "replay_frontier": storage.replay_frontier,
@@ -273,6 +315,7 @@ fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
                 "uncommitted_bytes": group.uncommitted_bytes,
                 "replication_inflight_bytes": group.replication_inflight_bytes,
                 "pending_work": group.pending_work,
+                "pending_proposals": group.pending_proposals,
                 "apply_backlog_entries": group.apply_backlog_entries,
                 "apply_backlog_bytes": group.apply_backlog_bytes,
                 "apply_backlog_age_ms": group.apply_backlog_age_ms,
@@ -481,6 +524,7 @@ fn metadata_outcome_name(outcome: &ragnordb_catalog::MetadataApplyOutcome) -> &'
         ragnordb_catalog::MetadataApplyOutcome::AlreadyApplied => "already_applied",
         ragnordb_catalog::MetadataApplyOutcome::ClientRegistered { .. } => "client_registered",
         ragnordb_catalog::MetadataApplyOutcome::ClientRenewed => "client_renewed",
+        ragnordb_catalog::MetadataApplyOutcome::TimestampsReserved { .. } => "timestamps_reserved",
         ragnordb_catalog::MetadataApplyOutcome::TableCreated(_) => "table_created",
         ragnordb_catalog::MetadataApplyOutcome::Rejected(_) => "rejected",
     }
@@ -586,4 +630,64 @@ fn replica_blocker_json(
         "raft_group_id": raft_group_id.0,
         "replica_id": replica_id.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::multiraft_detail_json;
+    use ragnordb_common::ids::{NodeId, RaftGroupId, ReplicaId};
+    use ragnordb_multiraft::host::{MultiRaftGroupStatus, MultiRaftHostState, MultiRaftHostStatus};
+    use ragnordb_multiraft::storage::codec::RaftReplicaIdentity;
+
+    /// This catches an admin regression where applied progress remains
+    /// visible but the pending-proposal diagnostic is omitted from each group.
+    #[test]
+    fn group_diagnostics_include_pending_proposals_and_applied_index() {
+        let status = MultiRaftHostStatus {
+            node_id: NodeId(7),
+            state: MultiRaftHostState::Active,
+            pending_message_count: 0,
+            pending_message_bytes: 0,
+            pending_persistence_groups: 0,
+            pending_persistence_records: 0,
+            pending_persistence_bytes: 0,
+            groups: vec![MultiRaftGroupStatus {
+                identity: RaftReplicaIdentity {
+                    raft_group_id: RaftGroupId(2),
+                    replica_id: ReplicaId(1),
+                },
+                role: None,
+                leader_replica_id: None,
+                term: 3,
+                commit_index: 12,
+                last_log_index: 12,
+                applied_index: 11,
+                snapshot_index: 0,
+                uncommitted_bytes: 0,
+                replication_inflight_bytes: 0,
+                pending_work: false,
+                pending_proposals: 2,
+                apply_backlog_entries: 0,
+                apply_backlog_bytes: 0,
+                apply_backlog_age_ms: 0,
+                apply_backlog_generations: 0,
+                pending_messages: 0,
+                pending_message_bytes: 0,
+                quarantine_reason: None,
+                conf_state_version: None,
+                joining: false,
+                voters: Vec::new(),
+                learners: Vec::new(),
+                outgoing_voters: Vec::new(),
+                replica_match_indices: Vec::new(),
+                pending_conf_change_index: None,
+                last_conf_change: None,
+                last_removed_replica: None,
+            }],
+        };
+
+        let json = multiraft_detail_json(&status);
+        assert_eq!(json["groups"][0]["applied_index"], 11);
+        assert_eq!(json["groups"][0]["pending_proposals"], 2);
+    }
 }

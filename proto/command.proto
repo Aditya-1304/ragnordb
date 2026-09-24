@@ -42,6 +42,9 @@ message TabletCommand {
         ResolveIntentCommand resolve_intent = 5;
         CatalogCommand catalog_update = 6;
         NoopCommand noop = 7;
+        PublishAbortedTransactionStatus publish_aborted_transaction_status = 8;
+        HeartbeatTransactionStatus heartbeat_transaction_status = 9;
+        ExpirePendingTransactionStatus expire_pending_transaction_status = 10;
     }
 }
 
@@ -52,6 +55,9 @@ message PrewriteCommand {
     bytes primary_key = 5;
     uint64 ttl_ms = 7;
     repeated WriteEntry writes = 9;
+    // Present only on the primary participant. The state machine installs
+    // this pending decision atomically with the primary intent batch.
+    optional ragnordb.mvcc.TxnStatusRecord pending_status = 10;
 }
 
 message CommitCommand {
@@ -60,6 +66,30 @@ message CommitCommand {
     ragnordb.ids.Timestamp commit_timestamp = 3;
     reserved 4;
     repeated bytes keys = 5;
+    // Present only on the primary participant. Publication is atomic with
+    // committing the primary intent.
+    optional ragnordb.mvcc.TxnStatusRecord committed_status = 6;
+}
+
+// Publish a terminal abort decision after the coordinator has applied rollback
+// on every participant. This command changes status state only.
+message PublishAbortedTransactionStatus {
+    ragnordb.mvcc.TxnStatusRecord status_record = 1;
+}
+
+// Extend a pending lease only when the exact observed status is still current.
+// The supplied wall-clock sample keeps replicated apply deterministic.
+message HeartbeatTransactionStatus {
+    ragnordb.mvcc.TxnStatusRecord expected_status = 1;
+    ragnordb.mvcc.TxnStatusRecord next_status = 2;
+    uint64 now_ms = 3;
+}
+
+// Commit an expiry decision only when the exact pending status observed by
+// the cleaner is still current and its durable deadline has elapsed.
+message ExpirePendingTransactionStatus {
+    ragnordb.mvcc.TxnStatusRecord expected_status = 1;
+    uint64 now_ms = 2;
 }
 
 message RollbackCommand {
@@ -120,6 +150,8 @@ message TabletStateMachineSnapshot {
     ragnordb.ids.RaftGroupId raft_group_id = 5;
     repeated LogicalCommandDeduplicationSnapshot logical_commands = 6;
     repeated LogicalClientRetryHorizon logical_client_retry_horizons = 7;
+    // Old snapshots omit this field and restore with no durable status entries.
+    repeated ragnordb.mvcc.TxnStatusRecord transaction_statuses = 8;
 }
 
 // last applied request and cached result for one client in this Raft group
@@ -166,4 +198,6 @@ enum CachedTabletCommandResult {
     CACHED_TABLET_COMMAND_RESULT_COMMIT = 4;
     CACHED_TABLET_COMMAND_RESULT_ROLLBACK = 5;
     CACHED_TABLET_COMMAND_RESULT_RESOLVE_INTENT = 6;
+    CACHED_TABLET_COMMAND_RESULT_PUBLISH_ABORTED_TRANSACTION_STATUS = 7;
+    CACHED_TABLET_COMMAND_RESULT_HEARTBEAT_TRANSACTION_STATUS = 8;
 }
