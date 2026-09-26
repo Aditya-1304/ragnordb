@@ -537,9 +537,32 @@ pub struct GcProtectionSnapshot {
     pub earliest_lease_deadline_ms: Option<u64>,
 }
 
+/// Allocate an opaque identity for this process incarnation's GC protections.
+///
+/// The identity is durable metadata capability state: a restarted process must
+/// not inherit the previous process's owner key, even when the node ID, PID,
+/// and wall clock happen to repeat.
+fn new_gc_protection_owner_id() -> Result<u128> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::Configuration(format!(
+            "failed to generate GC protection owner identity: {error}"
+        ))
+    })?;
+
+    let owner_id = u128::from_le_bytes(bytes);
+    if owner_id == 0 {
+        return Err(Error::Configuration(
+            "generated GC protection owner identity is reserved zero".to_string(),
+        ));
+    }
+
+    Ok(owner_id)
+}
+
 impl TransactionRuntime {
     pub fn new(
-        node_id: NodeId,
+        _node_id: NodeId,
         config: TransactionRuntimeConfig,
         metadata: MetadataRuntimeHandle,
         metadata_control: MetadataProposalClient,
@@ -549,14 +572,7 @@ impl TransactionRuntime {
             config.status_lease_ms,
             config.status_lease_ms,
         )?;
-        let process_nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(1);
-        let owner_id = process_nonce
-            .wrapping_add(u128::from(node_id.0) << 64)
-            .wrapping_add(u128::from(std::process::id()))
-            .max(1);
+        let owner_id = new_gc_protection_owner_id()?;
 
         Ok(Self {
             lifecycle,
@@ -2507,6 +2523,79 @@ mod tests {
 
         assert!(matches!(error, Error::ProposalUnavailable { .. }));
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic bug caught: after a process restarts, a delayed renewal from
+    /// the previous owner must not extend the replacement process's lease.
+    #[test]
+    fn restarted_gc_owner_cannot_revive_an_expired_previous_owner() {
+        use ragnordb_catalog::MetadataState;
+        use ragnordb_common::metadata_codec::MetadataCommand;
+
+        let previous_owner_id = new_gc_protection_owner_id().unwrap();
+        let restarted_owner_id = new_gc_protection_owner_id().unwrap();
+        assert_ne!(previous_owner_id, restarted_owner_id);
+
+        let protection_id = 1;
+        let protected_timestamp = Timestamp(40);
+        let mut metadata = MetadataState::new();
+        assert_eq!(
+            metadata.apply(MetadataCommand::ClusterInitialized {
+                cluster_id: "gc-owner-restart-test".to_string(),
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms: 300,
+                now_ms: 100,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+                candidate: protected_timestamp,
+                now_ms: 300,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.gc_protection(previous_owner_id, protection_id),
+            None,
+        );
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id: restarted_owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms: 900,
+                now_ms: 301,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::RenewGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+                lease_deadline_ms: 1_200,
+                now_ms: 400,
+            }),
+            MetadataApplyOutcome::Rejected(MetadataRejection::UnknownGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+            }),
+        );
+        assert_eq!(
+            metadata
+                .gc_protection(restarted_owner_id, protection_id)
+                .map(|protection| protection.lease_deadline_ms),
+            Some(900),
+        );
     }
 
     #[test]
