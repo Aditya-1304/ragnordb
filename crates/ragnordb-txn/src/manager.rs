@@ -82,6 +82,10 @@ pub struct TimestampOracleStats {
     pub reservations: u64,
     pub allocation_latency_nanos: u64,
     pub reservation_latency_nanos: u64,
+    /// Number of concurrent refill-lock wait samples recorded.
+    pub refill_lock_waits: u64,
+    /// Cumulative time spent acquiring the concurrent refill lock.
+    pub refill_lock_wait_nanos: u64,
     pub last_allocated: Timestamp,
     pub reserved_until: Timestamp,
 }
@@ -93,6 +97,8 @@ impl Default for TimestampOracleStats {
             reservations: 0,
             allocation_latency_nanos: 0,
             reservation_latency_nanos: 0,
+            refill_lock_waits: 0,
+            refill_lock_wait_nanos: 0,
             last_allocated: Timestamp(0),
             reserved_until: Timestamp(0),
         }
@@ -306,6 +312,8 @@ where
             reservations: self.reservations,
             allocation_latency_nanos: self.allocation_latency_nanos,
             reservation_latency_nanos: self.reservation_latency_nanos,
+            refill_lock_waits: 0,
+            refill_lock_wait_nanos: 0,
             last_allocated: self.last_allocated,
             reserved_until: self.reserved_until,
         }
@@ -811,6 +819,8 @@ pub struct ConcurrentTimestampOracle<P> {
     reservations: std::sync::atomic::AtomicU64,
     allocation_latency_nanos: std::sync::atomic::AtomicU64,
     reservation_latency_nanos: std::sync::atomic::AtomicU64,
+    refill_lock_waits: std::sync::atomic::AtomicU64,
+    refill_lock_wait_nanos: std::sync::atomic::AtomicU64,
 }
 
 impl<P> ConcurrentTimestampOracle<P>
@@ -831,6 +841,8 @@ where
             reservations: std::sync::atomic::AtomicU64::new(0),
             allocation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
             reservation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+            refill_lock_waits: std::sync::atomic::AtomicU64::new(0),
+            refill_lock_wait_nanos: std::sync::atomic::AtomicU64::new(0),
         };
         oracle.ensure_reserved_through(Timestamp(1))?;
         Ok(oracle)
@@ -858,6 +870,8 @@ where
             reservations: std::sync::atomic::AtomicU64::new(0),
             allocation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
             reservation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+            refill_lock_waits: std::sync::atomic::AtomicU64::new(0),
+            refill_lock_wait_nanos: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1019,16 +1033,33 @@ where
             reservation_latency_nanos: self
                 .reservation_latency_nanos
                 .load(std::sync::atomic::Ordering::Acquire),
+            refill_lock_waits: self
+                .refill_lock_waits
+                .load(std::sync::atomic::Ordering::Acquire),
+            refill_lock_wait_nanos: self
+                .refill_lock_wait_nanos
+                .load(std::sync::atomic::Ordering::Acquire),
             last_allocated: self.last_allocated(),
             reserved_until: self.reserved_until(),
         }
     }
 
     fn ensure_reserved_through(&self, target: Timestamp) -> Result<()> {
+        let wait_started = Instant::now();
         let _guard = self
             .refill_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.refill_lock_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.refill_lock_wait_nanos.fetch_add(
+            wait_started
+                .elapsed()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let current = self
             .reserved_until
             .load(std::sync::atomic::Ordering::Acquire);

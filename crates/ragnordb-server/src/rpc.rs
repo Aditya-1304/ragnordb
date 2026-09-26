@@ -40,6 +40,9 @@ use ragnordb_exec::{TabletGateway, TabletScanRoute};
 use ragnordb_multiraft::meta::MetadataRuntimeHandle;
 use ragnordb_multiraft::transport::{NodeRaftTransport, NodeRpcInbound};
 use ragnordb_tablet::command::{TabletCommandApplyOutcome, TabletCommandApplyResult};
+
+/// One bounded route page and the generation of its committed metadata view.
+pub type TabletRoutePage = (u64, Vec<(TableId, TabletRoute)>, bool);
 use ragnordb_tablet::{ScanSpan, TabletRouter};
 
 use crate::bootstrap::METADATA_RAFT_GROUP_ID;
@@ -679,7 +682,7 @@ impl TabletRpcClient {
         &self,
         after: Option<(TableId, TabletId)>,
         limit: usize,
-    ) -> Result<(u64, Vec<(TableId, TabletRoute)>, bool)> {
+    ) -> Result<TabletRoutePage> {
         if limit == 0 {
             return Err(Error::InvalidArgument(
                 "tablet route page limit must be non-zero".into(),

@@ -91,6 +91,8 @@ pub struct DatabaseServices {
     timestamp_reservations_reported: AtomicU64,
     timestamp_allocation_latency_reported: AtomicU64,
     timestamp_reservation_latency_reported: AtomicU64,
+    timestamp_refill_waits_reported: AtomicU64,
+    timestamp_refill_wait_latency_reported: AtomicU64,
     transaction_runtime: Option<Arc<TransactionRuntime>>,
 }
 
@@ -212,6 +214,14 @@ impl DatabaseServices {
             &self.timestamp_reservation_latency_reported,
             stats.reservation_latency_nanos,
         );
+        let refill_waits = take_counter_delta(
+            &self.timestamp_refill_waits_reported,
+            stats.refill_lock_waits,
+        );
+        let refill_wait_latency = take_counter_delta(
+            &self.timestamp_refill_wait_latency_reported,
+            stats.refill_lock_wait_nanos,
+        );
 
         if allocations != 0 {
             crate::metrics::counter_add("ragnordb_timestamp_allocations_total", allocations);
@@ -222,9 +232,18 @@ impl DatabaseServices {
         }
         if reservations != 0 {
             crate::metrics::counter_add("ragnordb_timestamp_reservations_total", reservations);
+            crate::metrics::counter_add("ragnordb_timestamp_refill_total", reservations);
+            let refill_seconds = reservation_latency as f64 / reservations as f64 / 1_000_000_000.0;
             crate::metrics::histogram_record(
                 "ragnordb_timestamp_reservation_latency_seconds",
-                reservation_latency as f64 / reservations as f64 / 1_000_000_000.0,
+                refill_seconds,
+            );
+            crate::metrics::histogram_record("ragnordb_timestamp_refill_seconds", refill_seconds);
+        }
+        if refill_waits != 0 {
+            crate::metrics::histogram_record(
+                "ragnordb_timestamp_refill_wait_seconds",
+                refill_wait_latency as f64 / refill_waits as f64 / 1_000_000_000.0,
             );
         }
         crate::metrics::gauge_set(
@@ -308,10 +327,10 @@ impl DatabaseServices {
             Plan::Rollback => {
                 let txn_id = session.current_transaction_id();
                 let result = session.rollback_current_transaction();
-                if result.is_ok() {
-                    if let (Some(runtime), Some(txn_id)) = (&self.transaction_runtime, txn_id) {
-                        release_gc_protection_best_effort(runtime, txn_id);
-                    }
+                if result.is_ok()
+                    && let (Some(runtime), Some(txn_id)) = (&self.transaction_runtime, txn_id)
+                {
+                    release_gc_protection_best_effort(runtime, txn_id);
                 }
                 result
             }
@@ -457,27 +476,34 @@ impl DatabaseServices {
         let transaction_id = transaction.id();
         if let Some(runtime) = &self.transaction_runtime
             && !transaction.is_empty()
-        {
-            if let Err(error) = runtime
+            && let Err(error) = runtime
                 .lifecycle
                 .record_transaction_footprint(transaction.id(), transaction.footprint())
-            {
-                release_gc_protection_best_effort(runtime, transaction_id);
-                return Err(error);
-            }
+        {
+            release_gc_protection_best_effort(runtime, transaction_id);
+            return Err(error);
         }
 
         let result = self.commit_transaction_inner(transaction, request_context);
-        if result.is_err()
-            && let Some(runtime) = &self.transaction_runtime
-            && !runtime.lifecycle.is_active(transaction_id)
-        {
-            // A definite pre-admission rejection has no durable participant
-            // state to protect. Clear its bounded registry reservation and
-            // release the history pin; uncertain or prepared outcomes remain
-            // active and keep both protections until authoritative resolution.
-            runtime.lifecycle.unregister(transaction_id);
-            release_gc_protection_best_effort(runtime, transaction_id);
+        if let Some(runtime) = &self.transaction_runtime {
+            match &result {
+                Ok(_) => {
+                    // SQL success is terminal. A distributed primary COMMIT
+                    // may already have unregistered this ID; unregister is
+                    // idempotent and also releases SingleShardCommit staging.
+                    runtime.lifecycle.unregister(transaction_id);
+                }
+                Err(_) if !runtime.lifecycle.is_active(transaction_id) => {
+                    // A definite rejection before durable participant state
+                    // existed needs no recovery authority or history pin.
+                    runtime.lifecycle.unregister(transaction_id);
+                    release_gc_protection_best_effort(runtime, transaction_id);
+                }
+                Err(_) => {
+                    // Prepared or outcome-unknown work remains registered so
+                    // authoritative recovery retains its bounded state and pin.
+                }
+            }
         }
         result
     }
@@ -1152,6 +1178,8 @@ impl LocalDatabase {
             timestamp_reservations_reported: AtomicU64::new(0),
             timestamp_allocation_latency_reported: AtomicU64::new(0),
             timestamp_reservation_latency_reported: AtomicU64::new(0),
+            timestamp_refill_waits_reported: AtomicU64::new(0),
+            timestamp_refill_wait_latency_reported: AtomicU64::new(0),
             transaction_runtime,
         })
     }
@@ -1717,6 +1745,37 @@ impl LocalDatabase {
     }
 }
 
+struct SharedTransactionManagerAdapter<'a> {
+    manager: &'a dyn SharedTransactionManager,
+}
+
+impl TransactionManager for SharedTransactionManagerAdapter<'_> {
+    fn begin_transaction(&mut self) -> Result<ragnordb_txn::Transaction> {
+        self.manager.begin_transaction_shared()
+    }
+
+    fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.manager.allocate_commit_timestamp_shared(start_ts)
+    }
+
+    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
+        self.manager
+            .observe_replicated_high_water_shared(transaction_id, timestamp);
+    }
+
+    fn last_allocated_transaction_id(&self) -> TxnId {
+        self.manager.last_allocated_transaction_id_shared()
+    }
+
+    fn last_allocated_timestamp(&self) -> Timestamp {
+        self.manager.last_allocated_timestamp_shared()
+    }
+
+    fn timestamp_oracle_stats(&self) -> ragnordb_txn::TimestampOracleStats {
+        self.manager.timestamp_oracle_stats_shared()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,35 +1965,5 @@ mod tests {
 
         release.wait();
         assert!(slow.join().expect("slow statement thread panicked").is_ok());
-    }
-}
-struct SharedTransactionManagerAdapter<'a> {
-    manager: &'a dyn SharedTransactionManager,
-}
-
-impl TransactionManager for SharedTransactionManagerAdapter<'_> {
-    fn begin_transaction(&mut self) -> Result<ragnordb_txn::Transaction> {
-        self.manager.begin_transaction_shared()
-    }
-
-    fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
-        self.manager.allocate_commit_timestamp_shared(start_ts)
-    }
-
-    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
-        self.manager
-            .observe_replicated_high_water_shared(transaction_id, timestamp);
-    }
-
-    fn last_allocated_transaction_id(&self) -> TxnId {
-        self.manager.last_allocated_transaction_id_shared()
-    }
-
-    fn last_allocated_timestamp(&self) -> Timestamp {
-        self.manager.last_allocated_timestamp_shared()
-    }
-
-    fn timestamp_oracle_stats(&self) -> ragnordb_txn::TimestampOracleStats {
-        self.manager.timestamp_oracle_stats_shared()
     }
 }

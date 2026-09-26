@@ -471,6 +471,9 @@ fn transaction_workload_sql(
     statements
 }
 
+// Each argument is an independently configured workload input; keeping them
+// explicit makes the dimensions consumed by this generator easy to audit.
+#[allow(clippy::too_many_arguments)]
 fn workload_statements(
     workload: Workload,
     random: &mut SplitMix64,
