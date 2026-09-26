@@ -2401,6 +2401,60 @@ mod tests {
         assert_eq!(state_machine.tablet().stats().default_versions, 1);
     }
 
+    /// A semantically identical prewrite with a fresh request sequence must succeed
+    /// without adding another intent or changing the participant's MVCC state.
+    #[test]
+    fn successful_prewrite_replay_with_fresh_request_sequence_is_idempotent() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(77)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+
+        let prewrite = PrewriteCommand {
+            txn_id: TxnId(126),
+            start_timestamp: Timestamp(480),
+            writes: vec![WriteEntry {
+                key: encoded_key.clone(),
+                row: Some(test_row(77, "fresh replay")),
+                op: WriteKind::Put,
+            }],
+            primary_key: encoded_key,
+            ttl_ms: 30_000,
+            pending_status: None,
+        };
+
+        let first = state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(prewrite.clone()),
+            ))
+            .unwrap();
+
+        assert_eq!(first.result, TabletCommandApplyResult::Prewrite);
+        let state_after_first = state_machine.tablet().stats();
+
+        // Sequence two is a new command request, so this exercises the storage
+        // layer's semantic retry handling rather than request-ID result caching.
+        let replay = state_machine
+            .apply(command_envelope(2, TabletCommand::Prewrite(prewrite)))
+            .unwrap();
+
+        assert_eq!(replay.result, TabletCommandApplyResult::Prewrite);
+        let state_after_replay = state_machine.tablet().stats();
+
+        assert_eq!(
+            state_after_replay.default_versions,
+            state_after_first.default_versions
+        );
+        assert_eq!(state_after_replay.locks, state_after_first.locks);
+        assert_eq!(
+            state_after_replay.write_records,
+            state_after_first.write_records
+        );
+        assert_eq!(state_after_replay.default_versions, 1);
+        assert_eq!(state_after_replay.locks, 1);
+        assert_eq!(state_after_replay.write_records, 0);
+    }
+
     #[test]
     fn commit_resolves_prewrite_and_is_safe_to_replay() {
         let mut state_machine = state_machine();

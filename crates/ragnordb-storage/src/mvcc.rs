@@ -2037,6 +2037,26 @@ mod tests {
         BTreeMap::from([(key, Mutation::Delete)])
     }
 
+    /// Install a valid single-key Put intent for batch atomicity tests.
+    fn install_test_put_intent(
+        engine: &mut InMemoryMvcc,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        key: &[u8],
+        row_id: i64,
+    ) {
+        engine
+            .prewrite(
+                txn_id,
+                start_ts,
+                key,
+                &Mutation::Put(encoded_row(row_id, "intent")),
+                key,
+                30_000,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn snapshot_reads_select_latest_visible_version() {
         let key = encoded_key(1);
@@ -2659,5 +2679,87 @@ mod tests {
             .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
             .unwrap_err();
         assert!(matches!(error, Error::CorruptData(_)));
+    }
+
+    #[test]
+    fn prewrite_batch_leaves_earlier_key_untouched_when_last_key_conflicts() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        assert!(first_key.as_slice() < second_key.as_slice());
+
+        let mut engine = InMemoryMvcc::new();
+
+        // A separate transaction owns the later key in the ordered batch.
+        install_test_put_intent(&mut engine, TxnId(2), Timestamp(20), &second_key, 2);
+        let before = engine.stats();
+
+        let mutations = BTreeMap::from([
+            (
+                first_key.clone(),
+                Mutation::Put(encoded_row(1, "must not be installed")),
+            ),
+            (
+                second_key.clone(),
+                Mutation::Put(encoded_row(2, "conflicting mutation")),
+            ),
+        ]);
+
+        let error = engine
+            .prewrite_batch(TxnId(1), Timestamp(10), &mutations, &first_key, 30_000)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::WriteConflict(_)));
+        assert_eq!(engine.stats().default_versions, before.default_versions);
+        assert_eq!(engine.stats().locks, before.locks);
+        assert_eq!(engine.stats().write_records, before.write_records);
+        assert!(!engine.default.contains_key(&first_key));
+        assert!(!engine.locks.contains_key(&first_key));
+        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
+    }
+
+    #[test]
+    fn commit_intents_batch_leaves_earlier_intent_untouched_when_last_key_conflicts() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        assert!(first_key.as_slice() < second_key.as_slice());
+
+        let mut engine = InMemoryMvcc::new();
+        install_test_put_intent(&mut engine, TxnId(1), Timestamp(10), &first_key, 1);
+        install_test_put_intent(&mut engine, TxnId(2), Timestamp(20), &second_key, 2);
+        let keys = BTreeSet::from([first_key.clone(), second_key.clone()]);
+
+        let error = engine
+            .commit_intents_batch(TxnId(1), Timestamp(10), Timestamp(30), &keys)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::WriteConflict(_)));
+        assert_eq!(engine.stats().default_versions, 2);
+        assert_eq!(engine.stats().locks, 2);
+        assert_eq!(engine.stats().write_records, 0);
+        assert_eq!(engine.locks.get(&first_key).unwrap().txn_id, TxnId(1));
+        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
+    }
+
+    #[test]
+    fn rollback_intents_batch_leaves_earlier_intent_untouched_when_last_key_conflicts() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+        assert!(first_key.as_slice() < second_key.as_slice());
+
+        let mut engine = InMemoryMvcc::new();
+        install_test_put_intent(&mut engine, TxnId(1), Timestamp(10), &first_key, 1);
+        install_test_put_intent(&mut engine, TxnId(2), Timestamp(20), &second_key, 2);
+        let keys = BTreeSet::from([first_key.clone(), second_key.clone()]);
+
+        let error = engine
+            .rollback_intents_batch(TxnId(1), Timestamp(10), &keys)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::WriteConflict(_)));
+        assert_eq!(engine.stats().default_versions, 2);
+        assert_eq!(engine.stats().locks, 2);
+        assert_eq!(engine.stats().write_records, 0);
+        assert_eq!(engine.locks.get(&first_key).unwrap().txn_id, TxnId(1));
+        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
     }
 }
