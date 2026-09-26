@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use crate::result::StreamingResultFrame;
@@ -10,6 +11,83 @@ const V2_STREAMING_MAGIC: &[u8; 4] = b"RDBS";
 
 pub const MAX_STREAMING_BATCH_ROWS: u32 = 65_536;
 pub const MAX_STREAMING_BATCH_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Builds one length-prefixed frame while enforcing the body limit before
+/// serialized JSON bytes are appended to the output buffer.
+struct BoundedFrameBodyWriter {
+    buffer: Vec<u8>,
+    max_body_bytes: usize,
+}
+
+impl BoundedFrameBodyWriter {
+    fn new(max_body_bytes: usize) -> io::Result<Self> {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(LEN_SIZE)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        buffer.resize(LEN_SIZE, 0);
+
+        Ok(Self {
+            buffer,
+            max_body_bytes,
+        })
+    }
+}
+
+impl Write for BoundedFrameBodyWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let current_body_len =
+            self.buffer.len().checked_sub(LEN_SIZE).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing frame prefix")
+            })?;
+        let next_body_len = current_body_len
+            .checked_add(bytes.len())
+            .filter(|length| *length <= self.max_body_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "streaming result frame body exceeds maximum of {} bytes",
+                        self.max_body_bytes
+                    ),
+                )
+            })?;
+        let required_capacity = LEN_SIZE.checked_add(next_body_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "streaming frame size overflowed",
+            )
+        })?;
+        let maximum_capacity = LEN_SIZE.checked_add(self.max_body_bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "streaming frame limit overflowed",
+            )
+        })?;
+
+        if required_capacity > self.buffer.capacity() {
+            // Grow geometrically for normal serialization, but never request
+            // capacity beyond the length prefix plus the configured body cap.
+            let target_capacity = self
+                .buffer
+                .capacity()
+                .saturating_mul(2)
+                .max(required_capacity)
+                .min(maximum_capacity);
+            let additional = target_capacity.saturating_sub(self.buffer.len());
+            self.buffer
+                .try_reserve_exact(additional)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        }
+
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Client-owned V2 request envelope. The root identity is preserved across
 /// gateways and topology changes; only the tablet route is allowed to change.
@@ -178,20 +256,15 @@ pub fn encode_client_request_v2_streaming(
 pub fn encode_streaming_result_frame(
     frame: &StreamingResultFrame,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let body = serde_json::to_vec(frame)?;
-    if body.len() > MAX_FRAME_SIZE {
-        return Err(format!(
-            "streaming result frame size {} exceeds maximum of {MAX_FRAME_SIZE}",
-            body.len()
-        )
-        .into());
-    }
-    let mut encoded = Vec::with_capacity(LEN_SIZE + body.len());
-    encoded.extend_from_slice(&u32::try_from(body.len())?.to_le_bytes());
-    encoded.extend_from_slice(&body);
-    Ok(encoded)
-}
+    let mut output = BoundedFrameBodyWriter::new(MAX_FRAME_SIZE)?;
+    serde_json::to_writer(&mut output, frame)?;
 
+    let body_len = output.buffer.len() - LEN_SIZE;
+    let encoded_body_len = u32::try_from(body_len)?;
+    output.buffer[..LEN_SIZE].copy_from_slice(&encoded_body_len.to_le_bytes());
+
+    Ok(output.buffer)
+}
 pub fn decode_streaming_result_frame(
     frame: &[u8],
 ) -> Result<StreamingResultFrame, Box<dyn std::error::Error>> {
