@@ -1521,3 +1521,37 @@ fn gc_protection_identity_and_safe_point_are_monotonic() {
         }),
     );
 }
+
+#[test]
+fn aggregate_gc_protection_can_update_floor_atomically() {
+    // This catches the unsafe release-then-register gap: a lower active
+    // transaction timestamp must replace the durable floor in one apply.
+    let mut state = MetadataState::new();
+    state.apply(MetadataCommand::ClusterInitialized {
+        cluster_id: "cluster-a".to_string(),
+    });
+    state.apply(MetadataCommand::RegisterGcProtection {
+        owner_id: 10,
+        protection_id: 20,
+        protected_timestamp: Timestamp(40),
+        lease_deadline_ms: 1_000,
+        now_ms: 100,
+    });
+
+    assert_eq!(
+        state.apply(MetadataCommand::UpdateGcProtection {
+            owner_id: 10,
+            protection_id: 20,
+            protected_timestamp: Timestamp(20),
+            lease_deadline_ms: 2_000,
+            now_ms: 200,
+        }),
+        MetadataApplyOutcome::Applied,
+    );
+    assert_eq!(
+        state
+            .gc_protection(10, 20)
+            .map(|protection| protection.protected_timestamp),
+        Some(Timestamp(20)),
+    );
+}

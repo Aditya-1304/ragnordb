@@ -23,9 +23,11 @@ mod result;
 mod session;
 
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -127,7 +129,7 @@ struct GatewayTransactionDispatcher {
     acknowledged_through: Option<u64>,
     primary_prewrite_applied: bool,
     primary_commit_applied: bool,
-    owner_change_after_pending: Cell<bool>,
+    owner_change_after_pending: AtomicBool,
 }
 
 struct GatewayParticipantRouteRefresher {
@@ -164,7 +166,7 @@ impl GatewayTransactionDispatcher {
             acknowledged_through,
             primary_prewrite_applied,
             primary_commit_applied: false,
-            owner_change_after_pending: Cell::new(false),
+            owner_change_after_pending: AtomicBool::new(false),
         }
     }
 
@@ -192,7 +194,8 @@ impl GatewayTransactionDispatcher {
                 && (route.tablet_id != plan.route.tablet_id
                     || route.raft_group_id != plan.route.raft_group_id)
             {
-                self.owner_change_after_pending.set(true);
+                self.owner_change_after_pending
+                    .store(true, Ordering::Release);
                 return Err(ParticipantDispatchError::Unavailable {
                     reason: format!(
                         "transaction {} participant ownership moved from tablet {} group {} to tablet {} group {} after Pending was durable; participant migration is required before continuing",
@@ -277,6 +280,44 @@ impl GatewayTransactionDispatcher {
     }
 }
 
+fn dispatch_prewrite_batch(
+    dispatcher: &GatewayTransactionDispatcher,
+    plan: &ragnordb_txn::PrewriteBatchPlan,
+) -> std::result::Result<Vec<TabletCommandApplyOutcome>, ParticipantDispatchError> {
+    if plan.command.writes.len() != plan.participant_plans.len() {
+        return Err(ParticipantDispatchError::Rejected {
+            reason: "prewrite command lost its per-key logical identities".to_string(),
+        });
+    }
+
+    let mut writes = plan
+        .command
+        .writes
+        .iter()
+        .zip(&plan.participant_plans)
+        .collect::<Vec<_>>();
+    writes.sort_by_key(|(write, _)| write.key.as_slice() != plan.command.primary_key.as_slice());
+
+    let mut outcomes = Vec::with_capacity(writes.len());
+    for (write, participant) in writes {
+        let is_primary = write.key == plan.command.primary_key;
+        let command = TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: plan.command.txn_id,
+            start_timestamp: plan.command.start_timestamp,
+            writes: vec![write.clone()],
+            primary_key: plan.command.primary_key.clone(),
+            ttl_ms: plan.command.ttl_ms,
+            pending_status: if is_primary {
+                plan.command.pending_status.clone()
+            } else {
+                None
+            },
+        });
+        outcomes.push(dispatcher.dispatch_participant_key(participant, command)?);
+    }
+    Ok(outcomes)
+}
+
 impl PrewriteBatchDispatcher for GatewayTransactionDispatcher {
     type Output = Vec<TabletCommandApplyOutcome>;
 
@@ -284,43 +325,32 @@ impl PrewriteBatchDispatcher for GatewayTransactionDispatcher {
         &mut self,
         plan: &ragnordb_txn::PrewriteBatchPlan,
     ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
-        if plan.command.writes.len() != plan.participant_plans.len() {
-            return Err(ParticipantDispatchError::Rejected {
-                reason: "prewrite command lost its per-key logical identities".to_string(),
-            });
-        }
-
-        let mut writes = plan
-            .command
-            .writes
-            .iter()
-            .zip(&plan.participant_plans)
-            .collect::<Vec<_>>();
-        writes
-            .sort_by_key(|(write, _)| write.key.as_slice() != plan.command.primary_key.as_slice());
-
-        let mut outcomes = Vec::with_capacity(writes.len());
-        for (write, participant) in writes {
-            let is_primary = write.key == plan.command.primary_key;
-            let command = TabletCommand::Prewrite(PrewriteCommand {
-                txn_id: plan.command.txn_id,
-                start_timestamp: plan.command.start_timestamp,
-                writes: vec![write.clone()],
-                primary_key: plan.command.primary_key.clone(),
-                ttl_ms: plan.command.ttl_ms,
-                pending_status: if is_primary {
-                    plan.command.pending_status.clone()
-                } else {
-                    None
-                },
-            });
-            let outcome = self.dispatch_participant_key(participant, command)?;
-            if is_primary && plan.command.pending_status.is_some() {
-                self.primary_prewrite_applied = true;
-            }
-            outcomes.push(outcome);
+        let outcomes = dispatch_prewrite_batch(self, plan)?;
+        if plan.command.pending_status.is_some() {
+            self.primary_prewrite_applied = true;
         }
         Ok(outcomes)
+    }
+
+    fn dispatch_prewrite_parallel(
+        &mut self,
+        plans: &[ragnordb_txn::PrewriteBatchPlan],
+    ) -> Vec<std::result::Result<Self::Output, ParticipantDispatchError>> {
+        std::thread::scope(|scope| {
+            let handles = plans
+                .iter()
+                .map(|plan| scope.spawn(|| dispatch_prewrite_batch(self, plan)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(ParticipantDispatchError::Unavailable {
+                        reason: "parallel prewrite worker panicked".to_string(),
+                    }),
+                })
+                .collect()
+        })
     }
 }
 
@@ -427,7 +457,8 @@ impl RollbackPhaseDispatcher for GatewayTransactionDispatcher {
                 && (route.tablet_id != plan.status_route.tablet_id
                     || route.raft_group_id != plan.status_route.raft_group_id)
             {
-                self.owner_change_after_pending.set(true);
+                self.owner_change_after_pending
+                    .store(true, Ordering::Release);
                 return Err(ParticipantDispatchError::Unavailable {
                     reason: format!(
                         "transaction {} status authority moved from tablet {} group {} to tablet {} group {} after Pending was durable",
@@ -1847,7 +1878,10 @@ impl LocalExecutor {
             &mut dispatcher,
             3,
         ) {
-            if dispatcher.owner_change_after_pending.get() {
+            if dispatcher
+                .owner_change_after_pending
+                .load(Ordering::Acquire)
+            {
                 return Err(Error::RecoveryRequired {
                     reason: format!(
                         "transaction {} cannot be safely rolled back after participant ownership changed following Pending: {prewrite_error}",
@@ -1914,7 +1948,11 @@ impl LocalExecutor {
                 committed_writes,
                 wal_extent: None,
             }),
-            Err(error) if dispatcher.owner_change_after_pending.get() => {
+            Err(error)
+                if dispatcher
+                    .owner_change_after_pending
+                    .load(Ordering::Acquire) =>
+            {
                 Err(Error::RecoveryRequired {
                     reason: format!(
                         "transaction {} cannot continue because a participant moved after Pending became durable: {error}",
@@ -1951,7 +1989,11 @@ impl LocalExecutor {
         let mut refresher = GatewayParticipantRouteRefresher { gateway };
         match coordinator.execute_rollback_with_retry(&mut refresher, &mut dispatcher, 3) {
             Ok(_) => Ok(()),
-            Err(error) if dispatcher.owner_change_after_pending.get() => {
+            Err(error)
+                if dispatcher
+                    .owner_change_after_pending
+                    .load(Ordering::Acquire) =>
+            {
                 Err(Error::RecoveryRequired {
                     reason: format!(
                         "transaction {} cannot be rolled back because a participant moved after Pending became durable: {error}",
@@ -1966,7 +2008,7 @@ impl LocalExecutor {
     /// Commit a SQL transaction through the local one-tablet path or the
     /// metadata-backed distributed coordinator. Distributed timestamps are
     /// allocated strictly after every participant has durably prewritten.
-    pub fn commit_sql_transaction_outcome_with_request_context<M: TransactionManager>(
+    pub fn commit_sql_transaction_outcome_with_request_context<M: TransactionManager + ?Sized>(
         &mut self,
         transaction: Transaction,
         transaction_manager: &mut M,
@@ -2914,7 +2956,7 @@ impl LocalExecutor {
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult>
     where
-        M: TransactionManager,
+        M: TransactionManager + ?Sized,
     {
         let CreateTablePlan {
             table_name,
@@ -5119,7 +5161,11 @@ mod tests {
             error,
             ParticipantDispatchError::Unavailable { .. }
         ));
-        assert!(dispatcher.owner_change_after_pending.get());
+        assert!(
+            dispatcher
+                .owner_change_after_pending
+                .load(Ordering::Acquire)
+        );
     }
 
     fn remote_executor() -> (LocalExecutor, Arc<RecordingGateway>, RowKey) {

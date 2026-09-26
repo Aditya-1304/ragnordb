@@ -87,10 +87,21 @@ enum Command {
         #[arg(long)]
         addr: String,
 
-        /// SQL table identifier used by all workers in this run. The value is
-        /// validated before interpolation into generated benchmark SQL.
+        /// SQL table identifier used by all workers in this run.
         #[arg(long, default_value = "bench")]
         table: String,
+
+        /// Optional comma-separated table identifiers used by cross-tablet transactions.
+        #[arg(long, value_delimiter = ',')]
+        participant_tables: Vec<String>,
+
+        /// Number of writes issued between BEGIN and COMMIT for transaction workloads.
+        #[arg(long, default_value_t = 1)]
+        txn_writes: usize,
+
+        /// Key distribution used by the transaction-contention workload.
+        #[arg(long, value_enum, default_value_t = ContentionDistribution::Disjoint)]
+        contention: ContentionDistribution,
 
         #[arg(long, value_enum)]
         workload: Workload,
@@ -154,6 +165,17 @@ enum Workload {
     PointWrite,
     Mixed,
     RangeScan,
+    SingleShardTxn,
+    CrossShardTxn,
+    TxnContention,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum ContentionDistribution {
+    Disjoint,
+    Moderate,
+    Hotspot,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -412,6 +434,76 @@ fn workload_sql(
         }
 
         Workload::RangeScan => range_scan(table, scan_rows),
+        Workload::SingleShardTxn | Workload::CrossShardTxn | Workload::TxnContention => {
+            let row_id = random.next() % rows + 1;
+            point_write(table, row_id, write_value)
+        }
+    }
+}
+
+fn transaction_workload_sql(
+    workload: Workload,
+    random: &mut SplitMix64,
+    tables: &[Arc<str>],
+    rows: u64,
+    txn_writes: usize,
+    contention: ContentionDistribution,
+    write_value: &str,
+) -> Vec<String> {
+    let mut statements = vec!["BEGIN".to_string()];
+    for index in 0..txn_writes {
+        let row_id = match workload {
+            Workload::TxnContention => match contention {
+                ContentionDistribution::Disjoint => random.next() % rows + 1,
+                ContentionDistribution::Moderate => random.next() % 100 + 1,
+                ContentionDistribution::Hotspot => 1,
+            },
+            _ => random.next() % rows + 1,
+        };
+        let table = if matches!(workload, Workload::CrossShardTxn) {
+            &tables[index % tables.len()]
+        } else {
+            &tables[0]
+        };
+        statements.push(point_write(table, row_id, write_value));
+    }
+    statements.push("COMMIT".to_string());
+    statements
+}
+
+fn workload_statements(
+    workload: Workload,
+    random: &mut SplitMix64,
+    table: &str,
+    participant_tables: &[Arc<str>],
+    rows: u64,
+    read_percent: u64,
+    scan_rows: u64,
+    txn_writes: usize,
+    contention: ContentionDistribution,
+    write_value: &str,
+) -> Vec<String> {
+    match workload {
+        Workload::SingleShardTxn | Workload::CrossShardTxn | Workload::TxnContention => {
+            transaction_workload_sql(
+                workload,
+                random,
+                participant_tables,
+                rows,
+                txn_writes,
+                contention,
+                write_value,
+            )
+        }
+        _ => vec![workload_sql(
+            workload,
+            random,
+            table,
+            rows,
+            read_percent,
+            scan_rows,
+            write_value,
+        )],
     }
 }
 
@@ -458,6 +550,7 @@ impl WorkerStats {
 struct RunOptions {
     addr: Arc<str>,
     table: Arc<str>,
+    participant_tables: Arc<Vec<Arc<str>>>,
     workload: Workload,
     seconds: u64,
     rows: u64,
@@ -465,6 +558,8 @@ struct RunOptions {
     read_percent: u64,
     warmup: u64,
     scan_rows: u64,
+    txn_writes: usize,
+    contention: ContentionDistribution,
     timeout: Duration,
     seed: u64,
     protocol: Protocol,
@@ -503,47 +598,50 @@ async fn run_worker(
     let write_value = String::from_utf8(vec![write_byte; options.value_bytes])
         .expect("ASCII benchmark payload must be UTF-8");
 
-    // Warmup uses exactly the same workload generator as the measured phase.
+    // Warmup uses exactly the same operation generator as the measured phase.
     for operation in 0..options.warmup {
-        let sql = workload_sql(
+        let statements = workload_statements(
             options.workload,
             &mut random,
             &options.table,
+            &options.participant_tables,
             options.rows,
             options.read_percent,
             options.scan_rows,
+            options.txn_writes,
+            options.contention,
             &write_value,
         );
-
-        let response = match execute_benchmark_request(
-            &mut client,
-            options.protocol,
-            worker_client_id,
-            options.session_epoch,
-            request_sequence,
-            &sql,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        for (statement_index, sql) in statements.iter().enumerate() {
+            let response = match execute_benchmark_request(
+                &mut client,
+                options.protocol,
+                worker_client_id,
+                options.session_epoch,
+                request_sequence,
+                sql,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let message = format!(
+                        "client {client_number} warmup transport failure at operation {operation}, statement {statement_index}: {error:#}"
+                    );
+                    let _ = ready_tx.send(Err(message.clone())).await;
+                    bail!(message);
+                }
+            };
+            request_sequence = request_sequence
+                .checked_add(1)
+                .context("benchmark request sequence exhausted during warmup")?;
+            if !response_is_success(&response) {
                 let message = format!(
-                    "client {client_number} warmup transport failure at operation {operation}: {error:#}"
+                    "client {client_number} warmup SQL failure at operation {operation}, statement {statement_index}: {response}"
                 );
                 let _ = ready_tx.send(Err(message.clone())).await;
                 bail!(message);
             }
-        };
-        request_sequence = request_sequence
-            .checked_add(1)
-            .context("benchmark request sequence exhausted during warmup")?;
-
-        if !response_is_success(&response) {
-            let message = format!(
-                "client {client_number} warmup SQL failure at operation {operation}: {response}"
-            );
-            let _ = ready_tx.send(Err(message.clone())).await;
-            bail!(message);
         }
     }
 
@@ -565,74 +663,90 @@ async fn run_worker(
     let mut stats = WorkerStats::new()?;
 
     while Instant::now() < deadline {
-        let sql = workload_sql(
+        let statements = workload_statements(
             options.workload,
             &mut random,
             &options.table,
+            &options.participant_tables,
             options.rows,
             options.read_percent,
             options.scan_rows,
+            options.txn_writes,
+            options.contention,
             &write_value,
         );
 
         stats.attempted += 1;
         let operation_start = Instant::now();
+        let mut operation_success = true;
+        let mut failure_code = None;
+        let mut transport_failed = false;
 
-        match execute_benchmark_request_with_metrics(
-            &mut client,
-            options.protocol,
-            worker_client_id,
-            options.session_epoch,
-            request_sequence,
-            &sql,
-        )
-        .await
-        {
-            Ok((response, request_bytes, response_bytes)) if response_is_success(&response) => {
-                stats.request_bytes = stats.request_bytes.saturating_add(
-                    u64::try_from(request_bytes).context("request byte count does not fit u64")?,
-                );
-                stats.response_bytes = stats.response_bytes.saturating_add(
-                    u64::try_from(response_bytes)
-                        .context("response byte count does not fit u64")?,
-                );
-                stats.record_success(operation_start.elapsed())?;
-            }
-
-            Ok((response, request_bytes, response_bytes)) => {
-                stats.request_bytes = stats.request_bytes.saturating_add(
-                    u64::try_from(request_bytes).context("request byte count does not fit u64")?,
-                );
-                stats.response_bytes = stats.response_bytes.saturating_add(
-                    u64::try_from(response_bytes)
-                        .context("response byte count does not fit u64")?,
-                );
-                stats.record_failure(response_error_code(&response));
-            }
-
-            Err(_) => {
-                // The TCP stream may no longer be synchronized after a framing,
-                // EOF, timeout, or connection failure. Record the failure and
-                // stop this worker. The complete run will be marked invalid.
-                stats.record_failure("TRANSPORT");
-                break;
+        for sql in &statements {
+            match execute_benchmark_request_with_metrics(
+                &mut client,
+                options.protocol,
+                worker_client_id,
+                options.session_epoch,
+                request_sequence,
+                sql,
+            )
+            .await
+            {
+                Ok((response, request_bytes, response_bytes)) => {
+                    stats.request_bytes = stats.request_bytes.saturating_add(
+                        u64::try_from(request_bytes)
+                            .context("request byte count does not fit u64")?,
+                    );
+                    stats.response_bytes = stats.response_bytes.saturating_add(
+                        u64::try_from(response_bytes)
+                            .context("response byte count does not fit u64")?,
+                    );
+                    request_sequence = request_sequence
+                        .checked_add(1)
+                        .context("benchmark request sequence exhausted")?;
+                    if !response_is_success(&response) {
+                        operation_success = false;
+                        failure_code = Some(response_error_code(&response));
+                        break;
+                    }
+                }
+                Err(_) => {
+                    operation_success = false;
+                    transport_failed = true;
+                    failure_code = Some("TRANSPORT".to_string());
+                    request_sequence = request_sequence
+                        .checked_add(1)
+                        .context("benchmark request sequence exhausted")?;
+                    break;
+                }
             }
         }
 
-        request_sequence = request_sequence
-            .checked_add(1)
-            .context("benchmark request sequence exhausted")?;
+        if operation_success {
+            stats.record_success(operation_start.elapsed())?;
+        } else {
+            stats
+                .record_failure(failure_code.unwrap_or_else(|| "UNKNOWN_SERVER_ERROR".to_string()));
+        }
+        if transport_failed {
+            // The TCP stream may no longer be synchronized after a framing,
+            // EOF, timeout, or connection failure. The complete run is invalid.
+            break;
+        }
     }
 
     Ok(stats)
 }
-
 #[derive(Debug, Serialize)]
 struct RunReport {
     benchmark: &'static str,
     load_model: &'static str,
     addr: String,
     table: String,
+    participant_tables: Vec<String>,
+    txn_writes: usize,
+    contention: ContentionDistribution,
     protocol: Protocol,
     workload: Workload,
     clients: u32,
@@ -840,6 +954,9 @@ async fn load_table(config: LoadConfig) -> Result<()> {
 struct BenchmarkConfig {
     addr: String,
     table: String,
+    participant_tables: Vec<String>,
+    txn_writes: usize,
+    contention: ContentionDistribution,
     workload: Workload,
     clients: u32,
     seconds: u64,
@@ -860,6 +977,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     let BenchmarkConfig {
         addr,
         table,
+        participant_tables,
+        txn_writes,
+        contention,
         workload,
         clients,
         seconds,
@@ -881,6 +1001,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     }
 
     validate_table_name(&table)?;
+    for participant_table in &participant_tables {
+        validate_table_name(participant_table)?;
+    }
 
     if matches!(protocol, Protocol::V2) && client_id == 0 {
         bail!("client-id must be non-zero for V2");
@@ -907,6 +1030,16 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         bail!("rows must be greater than zero");
     }
 
+    let transaction_workload = matches!(
+        workload,
+        Workload::SingleShardTxn | Workload::CrossShardTxn | Workload::TxnContention
+    );
+    if transaction_workload && txn_writes == 0 {
+        bail!("txn-writes must be greater than zero for transaction workloads");
+    }
+    if matches!(workload, Workload::CrossShardTxn) && participant_tables.len() < 2 {
+        bail!("cross-shard-txn requires at least two --participant-tables");
+    }
     if read_percent > 100 {
         bail!("read-percent must be between 0 and 100");
     }
@@ -925,9 +1058,19 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         );
     }
 
+    let participant_table_names = if participant_tables.is_empty() {
+        vec![table.clone()]
+    } else {
+        participant_tables
+    };
+    let report_participant_tables = participant_table_names.clone();
+    let participant_table_arcs: Vec<Arc<str>> =
+        participant_table_names.into_iter().map(Arc::from).collect();
+
     let options = RunOptions {
         addr: Arc::from(addr.as_str()),
         table: Arc::from(table.as_str()),
+        participant_tables: Arc::new(participant_table_arcs),
         workload,
         seconds,
         rows,
@@ -935,6 +1078,8 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         read_percent,
         warmup,
         scan_rows,
+        txn_writes,
+        contention,
         timeout: Duration::from_millis(timeout_ms),
         seed,
         protocol,
@@ -1019,6 +1164,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         load_model: "closed-loop",
         addr,
         table,
+        participant_tables: report_participant_tables,
+        txn_writes,
+        contention,
         protocol,
         workload,
         clients,
@@ -1095,6 +1243,9 @@ async fn main() -> Result<()> {
         Command::Run {
             addr,
             table,
+            participant_tables,
+            txn_writes,
+            contention,
             workload,
             clients,
             seconds,
@@ -1113,6 +1264,9 @@ async fn main() -> Result<()> {
             run_benchmark(BenchmarkConfig {
                 addr,
                 table,
+                participant_tables,
+                txn_writes,
+                contention,
                 workload,
                 clients,
                 seconds,

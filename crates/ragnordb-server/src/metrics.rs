@@ -99,6 +99,30 @@ fn describe_metrics() {
         "Transaction history protections left to expire after release failures"
     );
     metrics::describe_counter!(
+        "ragnordb_txn_gc_protection_register_total",
+        "Ordinary transaction GC-protection registrations"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_gc_protection_aggregate_register_total",
+        "Aggregate GC-protection lease registrations"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_gc_protection_aggregate_update_total",
+        "Atomic aggregate GC-protection floor updates"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_gc_protection_aggregate_release_total",
+        "Aggregate GC-protection lease releases"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_gc_protection_register_seconds",
+        "Metadata latency for aggregate GC-protection registration"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_gc_protection_release_seconds",
+        "Metadata latency for aggregate GC-protection release/update"
+    );
+    metrics::describe_counter!(
         "ragnordb_txn_intent_cleaner_runs_total",
         "Background transaction intent-cleaner passes"
     );
@@ -109,6 +133,22 @@ fn describe_metrics() {
     metrics::describe_counter!(
         "ragnordb_txn_commit_unknown_total",
         "Commit attempts whose durable outcome requires recovery"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_prewrite_seconds",
+        "Distributed transaction prewrite phase latency"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_commit_seconds",
+        "Distributed transaction commit phase latency"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_rollback_seconds",
+        "Distributed transaction rollback phase latency"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_participant_batches_total",
+        "Participant batches dispatched by transaction phase"
     );
     metrics::describe_histogram!(
         "ragnordb_statement_execution_seconds",

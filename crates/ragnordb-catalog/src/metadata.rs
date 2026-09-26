@@ -729,6 +729,20 @@ impl MetadataState {
                 now_ms,
             ),
 
+            MetadataCommand::UpdateGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => self.apply_update_gc_protection(
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            ),
+
             MetadataCommand::RenewGcProtection {
                 owner_id,
                 protection_id,
@@ -1116,6 +1130,70 @@ impl MetadataState {
             );
         }
 
+        self.gc_protections.insert(
+            key,
+            MetadataGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+            },
+        );
+        MetadataApplyOutcome::Applied
+    }
+
+    fn apply_update_gc_protection(
+        &mut self,
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    ) -> MetadataApplyOutcome {
+        if let Err(rejection) = self.require_initialized() {
+            return MetadataApplyOutcome::Rejected(rejection);
+        }
+        if protected_timestamp < self.gc_safe_point {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::GcProtectionBelowSafePoint {
+                protected: protected_timestamp,
+                safe_point: self.gc_safe_point,
+            });
+        }
+
+        let key = (owner_id, protection_id);
+        let Some(existing) = self.gc_protections.get(&key).copied() else {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::UnknownGcProtection {
+                owner_id,
+                protection_id,
+            });
+        };
+        if existing.lease_deadline_ms <= now_ms {
+            return MetadataApplyOutcome::Rejected(MetadataRejection::ExpiredGcProtection {
+                owner_id,
+                protection_id,
+                deadline_ms: existing.lease_deadline_ms,
+                now_ms,
+            });
+        }
+        if lease_deadline_ms < existing.lease_deadline_ms {
+            return MetadataApplyOutcome::Rejected(
+                MetadataRejection::GcProtectionDeadlineRegressed {
+                    owner_id,
+                    protection_id,
+                    current_ms: existing.lease_deadline_ms,
+                    received_ms: lease_deadline_ms,
+                },
+            );
+        }
+        if protected_timestamp == existing.protected_timestamp
+            && lease_deadline_ms == existing.lease_deadline_ms
+        {
+            return MetadataApplyOutcome::AlreadyApplied;
+        }
+
+        // The timestamp and lease are replaced in one deterministic state
+        // transition. A safe-point evaluator therefore never observes a
+        // release gap between the old and new aggregate floor.
         self.gc_protections.insert(
             key,
             MetadataGcProtection {

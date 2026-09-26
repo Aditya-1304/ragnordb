@@ -2463,6 +2463,33 @@ impl MetadataProposalClient {
         )
     }
 
+    /// Atomically replace an aggregate protection floor and lease. The
+    /// metadata state machine applies both fields together so GC never observes
+    /// a release-then-register gap while the active transaction minimum moves.
+    pub fn update_gc_protection(
+        &self,
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<MetadataApplyOutcome> {
+        let request_id = self.next_metadata_admin_request_id()?;
+        self.propose_metadata_command(
+            MetadataCommand::UpdateGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            },
+            request_id,
+            None,
+            timeout,
+        )
+    }
+
     /// Extend a live MVCC history pin without changing its protected
     /// timestamp. The catalog rejects terminal, expired, or regressed leases.
     pub fn renew_gc_protection(

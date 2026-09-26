@@ -65,6 +65,7 @@ message MetadataCommand {
         RenewGcProtection renew_gc_protection = 18;
         ReleaseGcProtection release_gc_protection = 19;
         AdvanceGcSafePoint advance_gc_safe_point = 20;
+        UpdateGcProtection update_gc_protection = 21;
     }
 }
 
@@ -74,6 +75,14 @@ message ReserveTimestamps {
 }
 
 message RegisterGcProtection {
+    bytes owner_id = 1;
+    bytes protection_id = 2;
+    uint64 protected_timestamp = 3;
+    uint64 lease_deadline_ms = 4;
+    uint64 now_ms = 5;
+}
+
+message UpdateGcProtection {
     bytes owner_id = 1;
     bytes protection_id = 2;
     uint64 protected_timestamp = 3;

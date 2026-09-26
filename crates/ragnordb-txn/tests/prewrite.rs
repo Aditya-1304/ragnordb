@@ -1,3 +1,12 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
 use ragnordb_common::{
     Error,
     codec::{Row, Value},
@@ -552,4 +561,113 @@ fn expired_transaction_age_rejects_before_participant_dispatch() {
         Err(Error::InvalidArgument(message)) if message.contains("age milliseconds")
     ));
     assert_eq!(dispatcher.calls, 0);
+}
+
+fn four_key_coordinator() -> DistributedTransactionCoordinator {
+    let mut transaction = Transaction::new(TxnId(43), Timestamp(101)).unwrap();
+    for value in 1..=4 {
+        transaction.buffer_put(key(value), row(value)).unwrap();
+    }
+
+    let primary_key = key(1);
+    let mut coordinator =
+        DistributedTransactionCoordinator::new(transaction, root_request(), primary_key.clone())
+            .unwrap();
+    coordinator
+        .set_participant_route(primary_key, route(20, 4, 200))
+        .unwrap();
+    coordinator
+        .set_participant_route(key(2), route(10, 4, 100))
+        .unwrap();
+    coordinator
+        .set_participant_route(key(3), route(30, 4, 300))
+        .unwrap();
+    coordinator
+        .set_participant_route(key(4), route(40, 4, 400))
+        .unwrap();
+    coordinator.set_status_route(route(20, 4, 200)).unwrap();
+    coordinator
+}
+
+#[derive(Clone)]
+struct SlowParallelTrackingDispatcher {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl SlowParallelTrackingDispatcher {
+    fn record_peak(&self, current: usize) {
+        let mut observed = self.max_active.load(Ordering::SeqCst);
+        while current > observed {
+            match self.max_active.compare_exchange(
+                observed,
+                current,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+    }
+}
+
+impl PrewriteBatchDispatcher for SlowParallelTrackingDispatcher {
+    type Output = TabletId;
+
+    fn dispatch_prewrite(
+        &mut self,
+        plan: &PrewriteBatchPlan,
+    ) -> std::result::Result<Self::Output, ParticipantDispatchError> {
+        let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.record_peak(current);
+        thread::sleep(Duration::from_millis(25));
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(plan.tablet_id())
+    }
+
+    fn dispatch_prewrite_parallel(
+        &mut self,
+        plans: &[PrewriteBatchPlan],
+    ) -> Vec<std::result::Result<Self::Output, ParticipantDispatchError>> {
+        thread::scope(|scope| {
+            let handles = plans
+                .iter()
+                .map(|plan| {
+                    let mut dispatcher = self.clone();
+                    scope.spawn(move || dispatcher.dispatch_prewrite(plan))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("parallel prewrite worker panicked"))
+                .collect()
+        })
+    }
+}
+
+#[test]
+fn prewrite_execution_overlaps_independent_secondary_participants_after_primary() {
+    // This catches independent participant latency being added serially after
+    // the primary Pending boundary, which inflates cross-tablet transaction
+    // latency even when every secondary request is ready to run concurrently.
+    let mut coordinator = four_key_coordinator();
+    let mut refresher = UnexpectedRefresh { calls: 0 };
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = SlowParallelTrackingDispatcher {
+        active,
+        max_active: Arc::clone(&max_active),
+    };
+
+    let outcomes = coordinator
+        .execute_prewrite_with_retry(30_000, &mut refresher, &mut dispatcher, 1)
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 4);
+    assert!(
+        max_active.load(Ordering::SeqCst) >= 3,
+        "independent secondary prewrites did not overlap: max_active={}",
+        max_active.load(Ordering::SeqCst)
+    );
 }

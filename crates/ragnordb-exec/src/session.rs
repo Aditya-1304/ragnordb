@@ -113,7 +113,7 @@ impl SqlSession {
     /// The allocator is borrowed only for the identity allocation itself; the
     /// returned transaction remains owned by this connection while later
     /// tablet operations run outside the allocator lock.
-    pub fn begin_with_transaction_manager<M: TransactionManager>(
+    pub fn begin_with_transaction_manager<M: TransactionManager + ?Sized>(
         &mut self,
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
@@ -204,7 +204,7 @@ impl SqlSession {
     /// Parse and analysis failures occur before an implicit transaction is
     /// created. When an explicit transaction is active, these failures leave
     /// the transaction attached because no execution state was changed.
-    pub fn execute_sql<M: TransactionManager>(
+    pub fn execute_sql<M: TransactionManager + ?Sized>(
         &mut self,
         sql: &str,
         executor: &mut LocalExecutor,
@@ -223,7 +223,7 @@ impl SqlSession {
     /// transaction and metadata-refresh boundaries as the materialized path.
     /// The successful stream summary is returned only after an implicit
     /// transaction has crossed its commit boundary.
-    pub fn execute_sql_streaming<M: TransactionManager>(
+    pub fn execute_sql_streaming<M: TransactionManager + ?Sized>(
         &mut self,
         sql: &str,
         executor: &mut LocalExecutor,
@@ -277,7 +277,7 @@ impl SqlSession {
 
     /// Parse, analyze, and execute one SQL statement with an optional
     /// metadata-Raft request identity for CREATE TABLE.
-    pub fn execute_sql_with_metadata_request<M: TransactionManager>(
+    pub fn execute_sql_with_metadata_request<M: TransactionManager + ?Sized>(
         &mut self,
         sql: &str,
         executor: &mut LocalExecutor,
@@ -295,7 +295,7 @@ impl SqlSession {
         )
     }
 
-    pub fn execute_sql_with_metadata_request_and_identity<M: TransactionManager>(
+    pub fn execute_sql_with_metadata_request_and_identity<M: TransactionManager + ?Sized>(
         &mut self,
         sql: &str,
         executor: &mut LocalExecutor,
@@ -319,7 +319,7 @@ impl SqlSession {
     }
 
     /// Execute one parser-independent logical plan.
-    pub fn execute_plan<M: TransactionManager>(
+    pub fn execute_plan<M: TransactionManager + ?Sized>(
         &mut self,
         plan: Plan,
         executor: &mut LocalExecutor,
@@ -336,7 +336,7 @@ impl SqlSession {
 
     /// Execute one plan while preserving the optional metadata request
     /// identity across the SQL-session boundary.
-    pub fn execute_plan_with_metadata_request<M: TransactionManager>(
+    pub fn execute_plan_with_metadata_request<M: TransactionManager + ?Sized>(
         &mut self,
         plan: Plan,
         executor: &mut LocalExecutor,
@@ -354,7 +354,7 @@ impl SqlSession {
         )
     }
 
-    pub fn execute_plan_with_metadata_request_and_identity<M: TransactionManager>(
+    pub fn execute_plan_with_metadata_request_and_identity<M: TransactionManager + ?Sized>(
         &mut self,
         plan: Plan,
         executor: &mut LocalExecutor,
@@ -410,7 +410,7 @@ impl SqlSession {
         }
     }
 
-    fn begin<M: TransactionManager>(
+    fn begin<M: TransactionManager + ?Sized>(
         &mut self,
         transaction_manager: &mut M,
     ) -> Result<ExecutionResult> {
@@ -433,7 +433,7 @@ impl SqlSession {
         })
     }
 
-    fn commit<M: TransactionManager>(
+    fn commit<M: TransactionManager + ?Sized>(
         &mut self,
         executor: &mut LocalExecutor,
         transaction_manager: &mut M,
@@ -478,7 +478,7 @@ impl SqlSession {
         })
     }
 
-    fn execute_data_plan<M: TransactionManager>(
+    fn execute_data_plan<M: TransactionManager + ?Sized>(
         &mut self,
         plan: Plan,
         executor: &mut LocalExecutor,
@@ -499,7 +499,7 @@ impl SqlSession {
         self.execute_implicit(plan, executor, transaction_manager)
     }
 
-    fn execute_implicit<M: TransactionManager>(
+    fn execute_implicit<M: TransactionManager + ?Sized>(
         &mut self,
         plan: Plan,
         executor: &mut LocalExecutor,

@@ -26,7 +26,7 @@ pub struct MetadataCommand {
     pub logical_command_id: ::core::option::Option<super::ids::LogicalCommandId>,
     #[prost(
         oneof = "metadata_command::Command",
-        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20"
+        tags = "2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub command: ::core::option::Option<metadata_command::Command>,
 }
@@ -79,6 +79,8 @@ pub mod metadata_command {
         ReleaseGcProtection(super::ReleaseGcProtection),
         #[prost(message, tag = "20")]
         AdvanceGcSafePoint(super::AdvanceGcSafePoint),
+        #[prost(message, tag = "21")]
+        UpdateGcProtection(super::UpdateGcProtection),
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -89,6 +91,19 @@ pub struct ReserveTimestamps {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RegisterGcProtection {
+    #[prost(bytes = "vec", tag = "1")]
+    pub owner_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub protection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub protected_timestamp: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_deadline_ms: u64,
+    #[prost(uint64, tag = "5")]
+    pub now_ms: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateGcProtection {
     #[prost(bytes = "vec", tag = "1")]
     pub owner_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]

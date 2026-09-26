@@ -10,7 +10,10 @@ use ragnordb_common::{
     Error, Result,
     ids::{Timestamp, TxnId},
 };
-use std::time::Instant;
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 /// Allocates transaction identities and MVCC timestamps.
 ///
@@ -609,6 +612,7 @@ impl CommitTimestampAllocator for LocalTransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::Arc, thread};
 
     #[derive(Debug)]
     struct FakeReservationProvider {
@@ -647,6 +651,36 @@ mod tests {
                 reserved_until: self.durable_frontier,
             })
         }
+    }
+
+    #[test]
+    fn concurrent_timestamp_oracle_allocates_unique_values_without_serializing_fast_path() {
+        let oracle = Arc::new(
+            ConcurrentTimestampOracle::new(FakeReservationProvider::default(), 4_096, 1_024)
+                .unwrap(),
+        );
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let oracle = Arc::clone(&oracle);
+            workers.push(thread::spawn(move || {
+                (0..1_000)
+                    .map(|_| oracle.allocate_timestamp().unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut timestamps = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        timestamps.sort_unstable();
+
+        assert_eq!(timestamps.len(), 8_000);
+        assert_eq!(timestamps[0], Timestamp(1));
+        assert_eq!(timestamps[7_999], Timestamp(8_000));
+        assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(oracle.stats().allocations, 8_000);
     }
 
     #[test]
@@ -758,5 +792,392 @@ mod tests {
         assert!(matches!(error, Error::Configuration(_)));
         assert_eq!(manager.last_allocated_transaction_id(), TxnId(41));
         assert_eq!(manager.last_allocated_timestamp(), Timestamp(u64::MAX));
+    }
+}
+/// Thread-safe timestamp allocation for the replicated SQL fast path.
+///
+/// The atomic cursor is independent from the durable refill lock. Ordinary
+/// allocations therefore do not wait behind metadata Raft reservation work.
+#[derive(Debug)]
+pub struct ConcurrentTimestampOracle<P> {
+    provider: Mutex<P>,
+    refill_lock: Mutex<()>,
+    next_timestamp: std::sync::atomic::AtomicU64,
+    last_allocated: std::sync::atomic::AtomicU64,
+    reserved_until: std::sync::atomic::AtomicU64,
+    reservation_size: u64,
+    prefetch_threshold: u64,
+    allocations: std::sync::atomic::AtomicU64,
+    reservations: std::sync::atomic::AtomicU64,
+    allocation_latency_nanos: std::sync::atomic::AtomicU64,
+    reservation_latency_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl<P> ConcurrentTimestampOracle<P>
+where
+    P: TimestampReservationProvider,
+{
+    pub fn new(provider: P, reservation_size: u64, prefetch_threshold: u64) -> Result<Self> {
+        validate_reservation_policy(reservation_size, prefetch_threshold)?;
+        let oracle = Self {
+            provider: Mutex::new(provider),
+            refill_lock: Mutex::new(()),
+            next_timestamp: std::sync::atomic::AtomicU64::new(1),
+            last_allocated: std::sync::atomic::AtomicU64::new(0),
+            reserved_until: std::sync::atomic::AtomicU64::new(0),
+            reservation_size,
+            prefetch_threshold,
+            allocations: std::sync::atomic::AtomicU64::new(0),
+            reservations: std::sync::atomic::AtomicU64::new(0),
+            allocation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+            reservation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+        };
+        oracle.ensure_reserved_through(Timestamp(1))?;
+        Ok(oracle)
+    }
+
+    pub fn from_durable_frontier(
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<Self> {
+        validate_reservation_policy(reservation_size, prefetch_threshold)?;
+        let next_timestamp = durable_frontier.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration("timestamp oracle has exhausted the u64 timestamp space".into())
+        })?;
+        Ok(Self {
+            provider: Mutex::new(provider),
+            refill_lock: Mutex::new(()),
+            next_timestamp: std::sync::atomic::AtomicU64::new(next_timestamp),
+            last_allocated: std::sync::atomic::AtomicU64::new(durable_frontier.0),
+            reserved_until: std::sync::atomic::AtomicU64::new(durable_frontier.0),
+            reservation_size,
+            prefetch_threshold,
+            allocations: std::sync::atomic::AtomicU64::new(0),
+            reservations: std::sync::atomic::AtomicU64::new(0),
+            allocation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+            reservation_latency_nanos: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn allocate_timestamp(&self) -> Result<Timestamp> {
+        let started = Instant::now();
+        let result = loop {
+            let next = self
+                .next_timestamp
+                .load(std::sync::atomic::Ordering::Acquire);
+            if next == 0 {
+                break Err(Error::Configuration(
+                    "timestamp oracle generated the reserved zero timestamp".into(),
+                ));
+            }
+            let reserved = self
+                .reserved_until
+                .load(std::sync::atomic::Ordering::Acquire);
+            let remaining = reserved.saturating_sub(next).saturating_add(1);
+            if next > reserved || remaining <= self.prefetch_threshold {
+                let target = if next > reserved {
+                    next
+                } else {
+                    reserved.checked_add(1).ok_or_else(|| {
+                        Error::Configuration(
+                            "timestamp oracle has exhausted the u64 timestamp space".into(),
+                        )
+                    })?
+                };
+                self.ensure_reserved_through(Timestamp(target))?;
+                continue;
+            }
+            let next_after = next.checked_add(1).ok_or_else(|| {
+                Error::Configuration(
+                    "timestamp oracle has exhausted the u64 timestamp space".into(),
+                )
+            })?;
+            if self
+                .next_timestamp
+                .compare_exchange(
+                    next,
+                    next_after,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.last_allocated
+                    .fetch_max(next, std::sync::atomic::Ordering::AcqRel);
+                break Ok(Timestamp(next));
+            }
+        };
+        if result.is_ok() {
+            self.allocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.allocation_latency_nanos.fetch_add(
+                started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        result
+    }
+
+    pub fn allocate_commit_timestamp(&self, start_ts: Timestamp) -> Result<Timestamp> {
+        if start_ts.0 == 0 {
+            return Err(Error::InvalidArgument(
+                "transaction start timestamp 0 is reserved".into(),
+            ));
+        }
+        let minimum = start_ts.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration("commit timestamp cannot be newer than u64::MAX".into())
+        })?;
+        loop {
+            let current = self
+                .next_timestamp
+                .load(std::sync::atomic::Ordering::Acquire);
+            if current == 0 || current >= minimum {
+                break;
+            }
+            if self
+                .next_timestamp
+                .compare_exchange(
+                    current,
+                    minimum,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.allocate_timestamp()
+    }
+
+    /// Discard the current local interval after failover and restart above
+    /// the durable metadata frontier. The refill lock serializes this
+    /// transition with any in-flight reservation proposal.
+    pub fn reset_after_failover(&self, durable_frontier: Timestamp) -> Result<()> {
+        let _guard = self
+            .refill_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self
+            .reserved_until
+            .load(std::sync::atomic::Ordering::Acquire);
+        if durable_frontier.0 < current {
+            return Err(Error::Configuration(format!(
+                "failover frontier {} is below the local durable reservation {}",
+                durable_frontier.0, current
+            )));
+        }
+        let next = durable_frontier.0.checked_add(1).ok_or_else(|| {
+            Error::Configuration("timestamp oracle has exhausted the u64 timestamp space".into())
+        })?;
+        self.next_timestamp
+            .store(next, std::sync::atomic::Ordering::Release);
+        self.last_allocated
+            .store(durable_frontier.0, std::sync::atomic::Ordering::Release);
+        self.reserved_until
+            .store(durable_frontier.0, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn observe_replicated_high_water(&self, timestamp: Timestamp) {
+        self.last_allocated
+            .fetch_max(timestamp.0, std::sync::atomic::Ordering::AcqRel);
+        self.reserved_until
+            .fetch_max(timestamp.0, std::sync::atomic::Ordering::AcqRel);
+        if timestamp.0 == u64::MAX {
+            self.next_timestamp
+                .store(0, std::sync::atomic::Ordering::Release);
+        } else {
+            self.next_timestamp
+                .fetch_max(timestamp.0 + 1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    pub fn last_allocated(&self) -> Timestamp {
+        Timestamp(
+            self.last_allocated
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    pub fn reserved_until(&self) -> Timestamp {
+        Timestamp(
+            self.reserved_until
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    pub fn stats(&self) -> TimestampOracleStats {
+        TimestampOracleStats {
+            allocations: self.allocations.load(std::sync::atomic::Ordering::Acquire),
+            reservations: self.reservations.load(std::sync::atomic::Ordering::Acquire),
+            allocation_latency_nanos: self
+                .allocation_latency_nanos
+                .load(std::sync::atomic::Ordering::Acquire),
+            reservation_latency_nanos: self
+                .reservation_latency_nanos
+                .load(std::sync::atomic::Ordering::Acquire),
+            last_allocated: self.last_allocated(),
+            reserved_until: self.reserved_until(),
+        }
+    }
+
+    fn ensure_reserved_through(&self, target: Timestamp) -> Result<()> {
+        let _guard = self
+            .refill_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self
+            .reserved_until
+            .load(std::sync::atomic::Ordering::Acquire);
+        if target.0 <= current {
+            return Ok(());
+        }
+        let requested_until = current
+            .checked_add(self.reservation_size.max(target.0 - current))
+            .ok_or_else(|| {
+                Error::Configuration(
+                    "timestamp oracle has exhausted the u64 timestamp space".into(),
+                )
+            })?;
+        let started = Instant::now();
+        let reservation = self
+            .provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserve_timestamps(Timestamp(requested_until))?;
+        if reservation.reserved_from <= Timestamp(current)
+            || reservation.reserved_until < Timestamp(requested_until)
+            || reservation.reserved_from > reservation.reserved_until
+        {
+            return Err(Error::Configuration(format!(
+                "timestamp reservation provider returned invalid interval {}..={} for requested {}",
+                reservation.reserved_from.0, reservation.reserved_until.0, requested_until
+            )));
+        }
+        self.reserved_until.store(
+            reservation.reserved_until.0,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.reservations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.reservation_latency_nanos.fetch_add(
+            started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+}
+/// Shared allocator operations used by server request handlers without a
+/// process-wide mutex around the timestamp fast path.
+pub trait SharedTransactionManager: Send + Sync {
+    fn begin_transaction_shared(&self) -> Result<Transaction>;
+    fn allocate_commit_timestamp_shared(&self, start_ts: Timestamp) -> Result<Timestamp>;
+    fn observe_replicated_high_water_shared(&self, transaction_id: TxnId, timestamp: Timestamp);
+    fn last_allocated_transaction_id_shared(&self) -> TxnId;
+    fn last_allocated_timestamp_shared(&self) -> Timestamp;
+    fn timestamp_oracle_stats_shared(&self) -> TimestampOracleStats;
+}
+
+#[derive(Debug)]
+pub struct ConcurrentReservedTimestampTransactionManager<P> {
+    oracle: ConcurrentTimestampOracle<P>,
+}
+
+impl<P> ConcurrentReservedTimestampTransactionManager<P>
+where
+    P: TimestampReservationProvider,
+{
+    pub fn from_durable_frontier(
+        provider: P,
+        durable_frontier: Timestamp,
+        reservation_size: u64,
+        prefetch_threshold: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            oracle: ConcurrentTimestampOracle::from_durable_frontier(
+                provider,
+                durable_frontier,
+                reservation_size,
+                prefetch_threshold,
+            )?,
+        })
+    }
+
+    pub fn oracle(&self) -> &ConcurrentTimestampOracle<P> {
+        &self.oracle
+    }
+}
+
+impl<P> SharedTransactionManager for ConcurrentReservedTimestampTransactionManager<P>
+where
+    P: TimestampReservationProvider + Send,
+{
+    fn begin_transaction_shared(&self) -> Result<Transaction> {
+        let start_ts = self.oracle.allocate_timestamp()?;
+        Transaction::new(TxnId(start_ts.0), start_ts)
+    }
+
+    fn allocate_commit_timestamp_shared(&self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.oracle.allocate_commit_timestamp(start_ts)
+    }
+
+    fn observe_replicated_high_water_shared(&self, _transaction_id: TxnId, timestamp: Timestamp) {
+        self.oracle.observe_replicated_high_water(timestamp);
+    }
+
+    fn last_allocated_transaction_id_shared(&self) -> TxnId {
+        TxnId(self.oracle.last_allocated().0)
+    }
+
+    fn last_allocated_timestamp_shared(&self) -> Timestamp {
+        self.oracle.last_allocated()
+    }
+
+    fn timestamp_oracle_stats_shared(&self) -> TimestampOracleStats {
+        self.oracle.stats()
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedTransactionManagerHandle<P> {
+    inner: Arc<ConcurrentReservedTimestampTransactionManager<P>>,
+}
+
+impl<P> SharedTransactionManagerHandle<P> {
+    pub fn new(inner: Arc<ConcurrentReservedTimestampTransactionManager<P>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<P> TransactionManager for SharedTransactionManagerHandle<P>
+where
+    P: TimestampReservationProvider + Send,
+{
+    fn begin_transaction(&mut self) -> Result<Transaction> {
+        self.inner.begin_transaction_shared()
+    }
+
+    fn allocate_commit_timestamp(&mut self, start_ts: Timestamp) -> Result<Timestamp> {
+        self.inner.allocate_commit_timestamp_shared(start_ts)
+    }
+
+    fn observe_replicated_high_water(&mut self, transaction_id: TxnId, timestamp: Timestamp) {
+        self.inner
+            .observe_replicated_high_water_shared(transaction_id, timestamp);
+    }
+
+    fn last_allocated_transaction_id(&self) -> TxnId {
+        self.inner.last_allocated_transaction_id_shared()
+    }
+
+    fn last_allocated_timestamp(&self) -> Timestamp {
+        self.inner.last_allocated_timestamp_shared()
+    }
+
+    fn timestamp_oracle_stats(&self) -> TimestampOracleStats {
+        self.inner.timestamp_oracle_stats_shared()
     }
 }

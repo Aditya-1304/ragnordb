@@ -1502,6 +1502,7 @@ dependencies = [
  "ragnordb-multiraft",
  "ragnordb-storage",
  "ragnordb-tablet",
+ "ragnordb-txn",
  "serde",
  "serde_json",
  "tempfile",

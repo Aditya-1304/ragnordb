@@ -1489,6 +1489,22 @@ impl TabletRpcClient {
     }
 
     fn cache_authoritative_route(&self, route: &TabletRoute) {
+        // Route publication is immutable on the request path. The read check
+        // keeps the common route-cache hit off the write lock; only a new or
+        // topology-changed identity enters the short publication section.
+        {
+            let cache = self
+                .route_cache
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache
+                .get(route.tablet_id)
+                .is_some_and(|cached| same_route_identity(cached, route))
+            {
+                return;
+            }
+        }
+
         let mut cache = self
             .route_cache
             .write()

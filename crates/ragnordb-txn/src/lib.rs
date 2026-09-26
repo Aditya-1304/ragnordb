@@ -32,9 +32,10 @@ pub use heartbeat::{
     plan_transaction_heartbeat,
 };
 pub use manager::{
-    CommitTimestampAllocator, LocalTransactionManager, ReservedTimestampTransactionManager,
-    TimestampOracle, TimestampOracleStats, TimestampReservation, TimestampReservationProvider,
-    TransactionManager,
+    CommitTimestampAllocator, ConcurrentReservedTimestampTransactionManager,
+    ConcurrentTimestampOracle, LocalTransactionManager, ReservedTimestampTransactionManager,
+    SharedTransactionManager, SharedTransactionManagerHandle, TimestampOracle,
+    TimestampOracleStats, TimestampReservation, TimestampReservationProvider, TransactionManager,
 };
 pub use prewrite::PrewriteBatchPlan;
 pub use resolve::{

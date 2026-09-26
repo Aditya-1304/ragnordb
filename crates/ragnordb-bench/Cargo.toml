@@ -19,6 +19,7 @@ tempfile = "3"
 prost = { workspace = true }
 ragnordb-storage = { path = "../ragnordb-storage" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
+ragnordb-txn = { path = "../ragnordb-txn" }
 ragnordb-multiraft = { path = "../ragnordb-multiraft" }
 wal = { workspace = true }
 
@@ -28,4 +29,8 @@ harness = false
 
 [[bench]]
 name = "phase5a"
+harness = false
+
+[[bench]]
+name = "milestone6"
 harness = false

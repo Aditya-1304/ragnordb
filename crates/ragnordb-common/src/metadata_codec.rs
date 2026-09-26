@@ -92,6 +92,16 @@ pub enum MetadataCommand {
         now_ms: u64,
     },
 
+    /// Replace the protected floor and lease atomically for an aggregate
+    /// protection. This avoids a release-then-register visibility gap.
+    UpdateGcProtection {
+        owner_id: u128,
+        protection_id: u128,
+        protected_timestamp: Timestamp,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    },
+
     /// Extend an existing protection without changing its protected history.
     RenewGcProtection {
         owner_id: u128,
@@ -705,6 +715,20 @@ impl MetadataCommand {
                 validate_live_gc_lease(*lease_deadline_ms, *now_ms)
             }
 
+            Self::UpdateGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => {
+                validate_gc_protection_identity(*owner_id, *protection_id)?;
+                if protected_timestamp.0 == 0 {
+                    return Err(MetadataCommandCodecError::ZeroTimestamp);
+                }
+                validate_live_gc_lease(*lease_deadline_ms, *now_ms)
+            }
+
             Self::RenewGcProtection {
                 owner_id,
                 protection_id,
@@ -814,6 +838,20 @@ impl MetadataCommand {
                 lease_deadline_ms,
                 now_ms,
             } => Command::RegisterGcProtection(metadata::RegisterGcProtection {
+                owner_id: owner_id.to_le_bytes().to_vec(),
+                protection_id: protection_id.to_le_bytes().to_vec(),
+                protected_timestamp: protected_timestamp.0,
+                lease_deadline_ms: *lease_deadline_ms,
+                now_ms: *now_ms,
+            }),
+
+            Self::UpdateGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms,
+            } => Command::UpdateGcProtection(metadata::UpdateGcProtection {
                 owner_id: owner_id.to_le_bytes().to_vec(),
                 protection_id: protection_id.to_le_bytes().to_vec(),
                 protected_timestamp: protected_timestamp.0,
@@ -947,6 +985,17 @@ impl MetadataCommand {
                 protection_id: decode_gc_identity(
                     &command.protection_id,
                     "register_gc_protection.protection_id",
+                )?,
+                protected_timestamp: Timestamp(command.protected_timestamp),
+                lease_deadline_ms: command.lease_deadline_ms,
+                now_ms: command.now_ms,
+            },
+
+            Some(Command::UpdateGcProtection(command)) => Self::UpdateGcProtection {
+                owner_id: decode_gc_identity(&command.owner_id, "update_gc_protection.owner_id")?,
+                protection_id: decode_gc_identity(
+                    &command.protection_id,
+                    "update_gc_protection.protection_id",
                 )?,
                 protected_timestamp: Timestamp(command.protected_timestamp),
                 lease_deadline_ms: command.lease_deadline_ms,

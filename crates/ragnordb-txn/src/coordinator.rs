@@ -253,6 +253,20 @@ pub trait PrewriteBatchDispatcher {
         &mut self,
         plan: &crate::prewrite::PrewriteBatchPlan,
     ) -> std::result::Result<Self::Output, ParticipantDispatchError>;
+
+    /// Dispatch independent participant batches concurrently. Implementations
+    /// may override this when their transport can safely overlap requests; the
+    /// default preserves the original sequential baseline for simple test or
+    /// embedded dispatchers.
+    fn dispatch_prewrite_parallel(
+        &mut self,
+        plans: &[crate::prewrite::PrewriteBatchPlan],
+    ) -> Vec<std::result::Result<Self::Output, ParticipantDispatchError>> {
+        plans
+            .iter()
+            .map(|plan| self.dispatch_prewrite(plan))
+            .collect()
+    }
 }
 
 /// Dispatch the distributed commit decision in its required durability order.
@@ -1019,74 +1033,104 @@ impl DistributedTransactionCoordinator {
                     plan.command_id.logical_mutation_id().as_key() == primary_key.as_slice()
                 })
             });
-            let mut outcomes = Vec::with_capacity(batches.len());
+
+            let primary_batch = batches.first().cloned().ok_or_else(|| {
+                Error::CorruptData("prewrite planner produced no participant batches".to_string())
+            })?;
+            let secondary_batches = batches.into_iter().skip(1).collect::<Vec<_>>();
+            let mut outcomes = Vec::with_capacity(secondary_batches.len() + 1);
             let mut restart_phase = false;
 
-            for batch in batches {
-                match dispatcher.dispatch_prewrite(&batch) {
-                    Ok(outcome) => {
-                        any_batch_dispatched = true;
-                        outcomes.push(outcome);
-                    }
-                    Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
-                        if route_refreshes >= max_route_refreshes {
-                            return Err(Error::TabletUnavailable {
-                                reason: format!(
-                                    "prewrite route refresh budget exhausted for transaction {}: {reason}",
-                                    self.transaction.id().0
+            macro_rules! handle_prewrite_result {
+                ($batch:expr, $result:expr) => {{
+                    match $result {
+                        Ok(outcome) => {
+                            any_batch_dispatched = true;
+                            outcomes.push(outcome);
+                            Ok(false)
+                        }
+                        Err(ParticipantDispatchError::RouteRefreshRequired { reason }) => {
+                            if route_refreshes >= max_route_refreshes {
+                                Err(Error::TabletUnavailable {
+                                    reason: format!(
+                                        "prewrite route refresh budget exhausted for transaction {}: {reason}",
+                                        self.transaction.id().0
+                                    ),
+                                })
+                            } else {
+                                let refreshes_primary = $batch.participant_plans.iter().any(|plan| {
+                                    plan.command_id.logical_mutation_id().as_key()
+                                        == self.primary_key()
+                                });
+                                let primary_route = self.refresh_participant_batch_routes(
+                                    &$batch.participant_plans,
+                                    $batch.route,
+                                    refresher,
+                                )?;
+                                if refreshes_primary {
+                                    self.set_status_route(primary_route.ok_or_else(|| {
+                                        Error::CorruptData(
+                                            "primary prewrite batch omitted the primary logical key"
+                                                .to_string(),
+                                        )
+                                    })?)?;
+                                }
+                                route_refreshes += 1;
+                                Ok(true)
+                            }
+                        }
+                        Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
+                            let logical_command_id = $batch
+                                .participant_plans
+                                .first()
+                                .map(|plan| plan.logical_command_id)
+                                .ok_or_else(|| {
+                                    Error::CorruptData(
+                                        "prewrite batch has no participant command identity"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Err(Error::RequestOutcomeUnknown {
+                                identity: format!(
+                                    "transaction={} phase={:?} tablet={} logical_command={logical_command_id:?}: {reason}",
+                                    self.transaction.id().0,
+                                    ParticipantCommandPhase::Prewrite,
+                                    $batch.route.tablet_id.0,
                                 ),
-                            });
+                            })
                         }
-
-                        let refreshes_primary = batch.participant_plans.iter().any(|plan| {
-                            plan.command_id.logical_mutation_id().as_key() == self.primary_key()
-                        });
-                        let primary_route = self.refresh_participant_batch_routes(
-                            &batch.participant_plans,
-                            batch.route,
-                            refresher,
-                        )?;
-                        if refreshes_primary {
-                            self.set_status_route(primary_route.ok_or_else(|| {
-                                Error::CorruptData(
-                                    "primary prewrite batch omitted the primary logical key"
-                                        .to_string(),
-                                )
-                            })?)?;
+                        Err(ParticipantDispatchError::WriteConflict { reason }) => {
+                            Err(Error::WriteConflict(reason))
                         }
+                        Err(ParticipantDispatchError::Rejected { reason }) => {
+                            Err(Error::ConstraintViolation(reason))
+                        }
+                        Err(ParticipantDispatchError::Unavailable { reason }) => {
+                            Err(Error::TabletUnavailable { reason })
+                        }
+                    }
+                }};
+            }
 
-                        route_refreshes += 1;
+            if handle_prewrite_result!(
+                &primary_batch,
+                dispatcher.dispatch_prewrite(&primary_batch)
+            )? {
+                restart_phase = true;
+            }
+
+            if !restart_phase {
+                let secondary_results = dispatcher.dispatch_prewrite_parallel(&secondary_batches);
+                if secondary_results.len() != secondary_batches.len() {
+                    return Err(Error::CorruptData(
+                        "prewrite dispatcher returned an incomplete secondary result set"
+                            .to_string(),
+                    ));
+                }
+                for (batch, result) in secondary_batches.iter().zip(secondary_results) {
+                    if handle_prewrite_result!(batch, result)? {
                         restart_phase = true;
                         break;
-                    }
-                    Err(ParticipantDispatchError::OutcomeUnknown { reason }) => {
-                        let logical_command_id = batch
-                            .participant_plans
-                            .first()
-                            .map(|plan| plan.logical_command_id)
-                            .ok_or_else(|| {
-                                Error::CorruptData(
-                                    "prewrite batch has no participant command identity"
-                                        .to_string(),
-                                )
-                            })?;
-                        return Err(Error::RequestOutcomeUnknown {
-                            identity: format!(
-                                "transaction={} phase={:?} tablet={} logical_command={logical_command_id:?}: {reason}",
-                                self.transaction.id().0,
-                                ParticipantCommandPhase::Prewrite,
-                                batch.route.tablet_id.0,
-                            ),
-                        });
-                    }
-                    Err(ParticipantDispatchError::WriteConflict { reason }) => {
-                        return Err(Error::WriteConflict(reason));
-                    }
-                    Err(ParticipantDispatchError::Rejected { reason }) => {
-                        return Err(Error::ConstraintViolation(reason));
-                    }
-                    Err(ParticipantDispatchError::Unavailable { reason }) => {
-                        return Err(Error::TabletUnavailable { reason });
                     }
                 }
             }

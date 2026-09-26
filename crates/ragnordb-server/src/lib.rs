@@ -668,6 +668,9 @@ async fn handle_streaming_request(
     } else {
         None
     };
+    // Admission bounds CPU-side setup only; the blocking worker must not hold
+    // this permit while it waits on tablet/Raft completion.
+    drop(statement_permit);
     if shutdown.is_cancelled() {
         return Ok(());
     }
@@ -699,7 +702,6 @@ async fn handle_streaming_request(
                 max_rows: max_rows as usize,
                 max_bytes: max_bytes as usize,
             };
-            let _statement_permit = statement_permit;
             let result = services.execute_sql_streaming(
                 &mut sql_session,
                 &statement,
@@ -955,10 +957,11 @@ async fn handle_connection_with_policy(
                             session.acknowledged_through(),
                         )?;
                     }
+                    // Release CPU admission before entering the blocking RPC/Raft wait.
+                    drop(statement_permit);
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result) = tokio::task::spawn_blocking(move || {
-                        let _statement_permit = statement_permit;
                         let result = services.execute_sql(
                             &mut sql_session,
                             &statement,
