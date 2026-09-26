@@ -358,6 +358,12 @@ impl DatabaseServices {
                                 .to_string(),
                         )
                     })?;
+                    let remaining = session.remaining_tablet_request_timeout()?;
+                    let metadata_timeout = if metadata_timeout.is_zero() {
+                        remaining
+                    } else {
+                        metadata_timeout.min(remaining)
+                    };
                     let topology = {
                         let executor = self
                             .executor

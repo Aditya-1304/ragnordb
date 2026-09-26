@@ -35,10 +35,16 @@ message TabletCommandRequest {
         uint64 tablet_epoch = 4;
         ragnordb.ids.LogicalCommandId logical_command_id = 5;
         optional uint64 acknowledged_through = 6;
+
         // Physical transport-attempt correlation. This is deliberately
         // separate from RequestId and LogicalCommandId so a delayed response
         // from an earlier retry cannot satisfy a newer waiter.
         optional uint64 rpc_attempt_id = 7;
+
+        // Conservative remaining caller budget for one forwarded foreground
+        // attempt. This is a duration, never a wall-clock or process-local
+        // monotonic timestamp.
+        optional uint64 deadline_remaining_ms = 8;
 }
 
 message TabletOutcomeQueryRequest {
@@ -47,6 +53,10 @@ message TabletOutcomeQueryRequest {
         ragnordb.ids.TabletId tablet_id = 3;
         uint64 tablet_epoch = 4;
         optional uint64 rpc_attempt_id = 5;
+
+        // Conservative remaining caller budget for one forwarded foreground
+        // outcome lookup.
+        optional uint64 deadline_remaining_ms = 6;
 }
 
 message TabletReadRequest {

@@ -27,7 +27,7 @@ use multiraft_runtime::{MetadataTimestampReservationClient, MultiRaftRuntime};
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{
     ClientRequestFrame, ClientRequestV2, StreamingResultFrame, encode_streaming_result_frame,
-    read_client_frame, write_frame, write_streaming_result_frame,
+    read_client_frame, write_frame,
 };
 use ragnordb_common::{Error, Result as CommonResult, codec::Row, encoding::encode_row};
 use ragnordb_exec::{QueryResultSink, SharedMetadataTableCreator};
@@ -738,15 +738,17 @@ async fn handle_streaming_request(
     statement: String,
     root_request_sequence: Option<u64>,
     statement_timeout_ms: u64,
+    statement_deadline: Instant,
+    cancelled: Arc<AtomicBool>,
     max_rows: u32,
     max_bytes: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let admission_timeout = Duration::from_millis(statement_timeout_ms);
+    let tokio_deadline = tokio::time::Instant::from_std(statement_deadline);
     let database_guard = if database_services.is_none() {
-        match tokio::time::timeout(admission_timeout, database.lock_owned()).await {
+        match tokio::time::timeout_at(tokio_deadline, database.lock_owned()).await {
             Ok(guard) => Some(guard),
             Err(_) => {
-                write_streaming_result_frame(
+                write_streaming_frame_until(
                     writer,
                     &streaming_error_frame(
                         &Error::StatementTimeout {
@@ -754,6 +756,7 @@ async fn handle_streaming_request(
                         },
                         0,
                     ),
+                    statement_deadline,
                 )
                 .await?;
                 return Ok(());
@@ -763,10 +766,31 @@ async fn handle_streaming_request(
         None
     };
     let statement_permit = if let Some(services) = database_services.as_ref() {
-        match services.acquire_statement(admission_timeout).await {
+        let remaining = statement_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            write_streaming_frame_until(
+                writer,
+                &streaming_error_frame(
+                    &Error::StatementTimeout {
+                        timeout_ms: statement_timeout_ms,
+                    },
+                    0,
+                ),
+                statement_deadline,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        match services.acquire_statement(remaining).await {
             Ok(permit) => Some(permit),
             Err(error) => {
-                write_streaming_result_frame(writer, &streaming_error_frame(&error, 0)).await?;
+                write_streaming_frame_until(
+                    writer,
+                    &streaming_error_frame(&error, 0),
+                    statement_deadline,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -777,14 +801,13 @@ async fn handle_streaming_request(
     // this permit while it waits on tablet/Raft completion.
     drop(statement_permit);
     if shutdown.is_cancelled() {
+        cancelled.store(true, Ordering::Release);
         return Ok(());
     }
 
     let (sender, receiver) = mpsc::channel(2);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let producer_cancelled = cancelled.clone();
+    let producer_cancelled = Arc::clone(&cancelled);
     let mut sql_session = std::mem::take(&mut session.sql);
-    sql_session.set_tablet_request_timeout(admission_timeout);
     if let Some(root_sequence) = root_request_sequence {
         sql_session.set_client_request_identity_with_ack(
             session.client_id(),
@@ -795,15 +818,17 @@ async fn handle_streaming_request(
             session.acknowledged_through(),
         )?;
     }
-    let producer_deadline = Instant::now()
-        .checked_add(admission_timeout)
-        .ok_or("streaming statement deadline overflowed")?;
+    sql_session.set_tablet_request_deadline(
+        statement_deadline,
+        Arc::clone(&cancelled),
+        statement_timeout_ms,
+    )?;
     let producer = if let Some(services) = database_services {
         tokio::task::spawn_blocking(move || {
             let mut sink = ChannelQuerySink {
                 sender,
                 cancelled: producer_cancelled,
-                deadline: producer_deadline,
+                deadline: statement_deadline,
                 max_rows: max_rows as usize,
                 max_bytes: max_bytes as usize,
             };
@@ -823,7 +848,7 @@ async fn handle_streaming_request(
             let mut sink = ChannelQuerySink {
                 sender,
                 cancelled: producer_cancelled,
-                deadline: producer_deadline,
+                deadline: statement_deadline,
                 max_rows: max_rows as usize,
                 max_bytes: max_bytes as usize,
             };
@@ -840,7 +865,7 @@ async fn handle_streaming_request(
     };
 
     let stream_write =
-        write_streaming_events(writer, receiver, shutdown, cancelled, producer_deadline).await;
+        write_streaming_events(writer, receiver, shutdown, cancelled, statement_deadline).await;
 
     // Always join the producer and restore its SQL session before returning a
     // transport error to the connection owner.
@@ -862,7 +887,7 @@ async fn handle_streaming_request(
                 &StreamingResultFrame::ResultEnd {
                     row_count: rows_emitted,
                 },
-                producer_deadline,
+                statement_deadline,
             )
             .await?;
         }
@@ -870,7 +895,7 @@ async fn handle_streaming_request(
             write_streaming_frame_until(
                 writer,
                 &streaming_error_frame(&error, rows_emitted),
-                producer_deadline,
+                statement_deadline,
             )
             .await?;
         }
@@ -954,6 +979,11 @@ async fn handle_connection_with_policy(
             }
         };
         let statement_timeout_ms = session.statement_timeout_ms;
+        let statement_timeout = Duration::from_millis(statement_timeout_ms);
+        let statement_deadline = Instant::now()
+            .checked_add(statement_timeout)
+            .ok_or("statement deadline overflowed")?;
+        let statement_cancelled = Arc::new(AtomicBool::new(false));
 
         let trimmed = sql.trim().to_string();
 
@@ -993,6 +1023,8 @@ async fn handle_connection_with_policy(
                 trimmed,
                 root_request_sequence,
                 stream_timeout_ms,
+                statement_deadline,
+                Arc::clone(&statement_cancelled),
                 max_rows,
                 max_bytes,
             )
@@ -1005,10 +1037,16 @@ async fn handle_connection_with_policy(
         // admission so the Ready owner never waits on the SQL state mutex.
         let read_barrier_error = if metadata_creator.is_none() && is_latest_read(&trimmed) {
             if let Some(replicated) = replicated_tablet.clone() {
-                let timeout = Duration::from_millis(session.statement_timeout_ms);
-                tokio::task::spawn_blocking(move || replicated.read_barrier(timeout))
-                    .await?
-                    .err()
+                let remaining = statement_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Some(Error::StatementTimeout {
+                        timeout_ms: statement_timeout_ms,
+                    })
+                } else {
+                    tokio::task::spawn_blocking(move || replicated.read_barrier(remaining))
+                        .await?
+                        .err()
+                }
             } else {
                 None
             }
@@ -1016,22 +1054,26 @@ async fn handle_connection_with_policy(
             None
         };
 
-        // The deadline covers admission to the serialized owner. Once admitted,
-        // the operation runs to its authoritative durability outcome: timing out
-        // an already staged commit would incorrectly turn uncertainty into an
-        // ordinary cancellation. Synchronous SQL and fsync execute on the
-        // blocking pool so Tokio workers remain available to network tasks.
+        // One root deadline covers admission and all foreground SQL work. If a
+        // mutation may already have crossed its durability boundary, executor
+        // paths preserve an unknown outcome when the remaining budget expires.
+        // Synchronous SQL and fsync execute on the blocking pool so Tokio
+        // workers remain available to network tasks.
         let execution = if let Some(error) = read_barrier_error {
             Err(error)
         } else if let Some(services) = database_services.clone() {
-            match services
-                .acquire_statement(Duration::from_millis(session.statement_timeout_ms))
-                .await
-            {
+            let remaining = statement_deadline.saturating_duration_since(Instant::now());
+            let admission = if remaining.is_zero() {
+                Err(Error::StatementTimeout {
+                    timeout_ms: statement_timeout_ms,
+                })
+            } else {
+                services.acquire_statement(remaining).await
+            };
+
+            match admission {
                 Ok(statement_permit) if !shutdown.is_cancelled() => {
                     let mut sql_session = std::mem::take(&mut session.sql);
-                    sql_session
-                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
                     if let Some(root_sequence) = root_request_sequence {
                         sql_session.set_client_request_identity_with_ack(
                             session.client_id(),
@@ -1042,18 +1084,26 @@ async fn handle_connection_with_policy(
                             session.acknowledged_through(),
                         )?;
                     }
+                    sql_session.set_tablet_request_deadline(
+                        statement_deadline,
+                        Arc::clone(&statement_cancelled),
+                        statement_timeout_ms,
+                    )?;
                     // Release CPU admission before entering the blocking RPC/Raft wait.
                     drop(statement_permit);
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result) = tokio::task::spawn_blocking(move || {
-                        let result = services.execute_sql(
-                            &mut sql_session,
-                            &statement,
-                            metadata_request_id,
-                            metadata_logical_request_id,
-                            Duration::from_millis(statement_timeout_ms),
-                        );
+                        let result = match sql_session.remaining_tablet_request_timeout() {
+                            Ok(metadata_timeout) => services.execute_sql(
+                                &mut sql_session,
+                                &statement,
+                                metadata_request_id,
+                                metadata_logical_request_id,
+                                metadata_timeout,
+                            ),
+                            Err(error) => Err(error),
+                        };
                         (sql_session, result)
                     })
                     .await?;
@@ -1088,16 +1138,14 @@ async fn handle_connection_with_policy(
                 Err(error) => Err(error),
             }
         } else {
-            match tokio::time::timeout(
-                Duration::from_millis(session.statement_timeout_ms),
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(statement_deadline),
                 database.clone().lock_owned(),
             )
             .await
             {
                 Ok(database_guard) if !shutdown.is_cancelled() => {
                     let mut sql_session = std::mem::take(&mut session.sql);
-                    sql_session
-                        .set_tablet_request_timeout(Duration::from_millis(statement_timeout_ms));
                     if let Some(root_sequence) = root_request_sequence {
                         sql_session.set_client_request_identity_with_ack(
                             session.client_id(),
@@ -1108,18 +1156,27 @@ async fn handle_connection_with_policy(
                             session.acknowledged_through(),
                         )?;
                     }
+                    sql_session.set_tablet_request_deadline(
+                        statement_deadline,
+                        Arc::clone(&statement_cancelled),
+                        statement_timeout_ms,
+                    )?;
                     let started = Instant::now();
                     let statement = trimmed.clone();
                     let (returned_session, result, status) =
                         tokio::task::spawn_blocking(move || {
                             let mut database = database_guard;
-                            let result = database.execute_sql_with_metadata_request_and_identity(
-                                &mut sql_session,
-                                &statement,
-                                metadata_request_id,
-                                metadata_logical_request_id,
-                                Duration::from_millis(statement_timeout_ms),
-                            );
+                            let result = match sql_session.remaining_tablet_request_timeout() {
+                                Ok(metadata_timeout) => database
+                                    .execute_sql_with_metadata_request_and_identity(
+                                        &mut sql_session,
+                                        &statement,
+                                        metadata_request_id,
+                                        metadata_logical_request_id,
+                                        metadata_timeout,
+                                    ),
+                                Err(error) => Err(error),
+                            };
                             let status = database.status();
                             (sql_session, result, status)
                         })

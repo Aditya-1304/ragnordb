@@ -27,6 +27,11 @@ pub struct TabletCommandRequest {
     /// from an earlier retry cannot satisfy a newer waiter.
     #[prost(uint64, optional, tag = "7")]
     pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded foreground
+    /// attempt. This is a duration, never a wall-clock or process-local
+    /// monotonic timestamp.
+    #[prost(uint64, optional, tag = "8")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletOutcomeQueryRequest {
@@ -40,6 +45,10 @@ pub struct TabletOutcomeQueryRequest {
     pub tablet_epoch: u64,
     #[prost(uint64, optional, tag = "5")]
     pub rpc_attempt_id: ::core::option::Option<u64>,
+    /// Conservative remaining caller budget for one forwarded foreground
+    /// outcome lookup.
+    #[prost(uint64, optional, tag = "6")]
+    pub deadline_remaining_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletReadRequest {

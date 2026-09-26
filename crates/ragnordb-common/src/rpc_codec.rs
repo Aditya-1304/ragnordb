@@ -183,10 +183,19 @@ pub struct TabletCommandRequest {
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
     pub command: TabletCommand,
+
+    /// Conservative remaining foreground budget forwarded across one
+    /// node-to-node hop. This is transport metadata and is not part of the
+    /// logical command identity.
+    pub deadline_remaining_ms: Option<u64>,
 }
 
 impl TabletCommandRequest {
     pub fn to_proto(&self) -> Result<rpc::TabletCommandRequest, &'static str> {
+        if self.deadline_remaining_ms == Some(0) {
+            return Err("tablet command request deadline must be non-zero");
+        }
+
         Ok(rpc::TabletCommandRequest {
             request_id: Some(self.request_id.to_proto()),
             logical_command_id: self.logical_command_id.map(|id| id.to_proto()),
@@ -195,12 +204,14 @@ impl TabletCommandRequest {
             tablet_epoch: self.tablet_epoch,
             command: Some(self.command.to_proto()?),
             rpc_attempt_id: None,
+            deadline_remaining_ms: self.deadline_remaining_ms,
         })
     }
 
     pub fn from_proto(proto: rpc::TabletCommandRequest) -> Result<Self, &'static str> {
         let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
         let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+
         if request_id.client_id == 0
             || request_id.sequence == 0
             || request_id.raft_group_id.0 == 0
@@ -208,6 +219,10 @@ impl TabletCommandRequest {
             || proto.tablet_epoch == 0
         {
             return Err("tablet command request contains a reserved zero identity");
+        }
+
+        if proto.deadline_remaining_ms == Some(0) {
+            return Err("tablet command request deadline must be non-zero");
         }
 
         Ok(TabletCommandRequest {
@@ -220,6 +235,7 @@ impl TabletCommandRequest {
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
             command: TabletCommand::from_proto(proto.command.ok_or("missing command")?)?,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
         })
     }
 }
@@ -233,27 +249,37 @@ pub struct TabletOutcomeQueryRequest {
     pub logical_command_id: LogicalCommandId,
     pub tablet_id: TabletId,
     pub tablet_epoch: u64,
+
+    /// Conservative remaining foreground budget forwarded across one
+    /// node-to-node hop.
+    pub deadline_remaining_ms: Option<u64>,
 }
 
 impl TabletOutcomeQueryRequest {
     pub fn to_proto(&self) -> rpc::TabletOutcomeQueryRequest {
+        debug_assert_ne!(self.deadline_remaining_ms, Some(0));
+
         rpc::TabletOutcomeQueryRequest {
             request_id: Some(self.request_id.to_proto()),
             logical_command_id: Some(self.logical_command_id.to_proto()),
             tablet_id: Some(self.tablet_id.to_proto()),
             tablet_epoch: self.tablet_epoch,
             rpc_attempt_id: None,
+            deadline_remaining_ms: self.deadline_remaining_ms,
         }
     }
 
     pub fn from_proto(proto: rpc::TabletOutcomeQueryRequest) -> Result<Self, &'static str> {
         let request_id = RequestId::from_proto(proto.request_id.ok_or("missing request_id")?)?;
+
         let logical_command_id = LogicalCommandId::from_proto(
             proto
                 .logical_command_id
                 .ok_or("missing logical_command_id")?,
         )?;
+
         let tablet_id = TabletId::from_proto(proto.tablet_id.ok_or("missing tablet_id")?);
+
         if request_id.client_id == 0
             || request_id.sequence == 0
             || request_id.raft_group_id.0 == 0
@@ -262,6 +288,11 @@ impl TabletOutcomeQueryRequest {
         {
             return Err("tablet outcome query contains a reserved zero identity");
         }
+
+        if proto.deadline_remaining_ms == Some(0) {
+            return Err("tablet outcome query deadline must be non-zero");
+        }
+
         logical_command_id.validate()?;
 
         Ok(Self {
@@ -269,6 +300,7 @@ impl TabletOutcomeQueryRequest {
             logical_command_id,
             tablet_id,
             tablet_epoch: proto.tablet_epoch,
+            deadline_remaining_ms: proto.deadline_remaining_ms,
         })
     }
 }
@@ -1852,6 +1884,7 @@ mod tests {
                 keys: vec![b"/table/1/pk/1".to_vec()],
                 committed_status: None,
             }),
+            deadline_remaining_ms: Some(250),
         };
         let proto = req.to_proto().unwrap();
         let decoded = TabletCommandRequest::from_proto(proto).unwrap();
@@ -1859,6 +1892,7 @@ mod tests {
         assert_eq!(decoded.tablet_id, TabletId(9));
         assert_eq!(decoded.tablet_epoch, 3);
         assert!(matches!(decoded.command, TabletCommand::Commit(_)));
+        assert_eq!(decoded.deadline_remaining_ms, Some(250));
     }
 
     #[test]
@@ -1881,6 +1915,7 @@ mod tests {
             logical_command_id,
             tablet_id: TabletId(12),
             tablet_epoch: 3,
+            deadline_remaining_ms: Some(175),
         };
 
         let decoded = TabletOutcomeQueryRequest::from_proto(request.to_proto()).unwrap();
@@ -1996,6 +2031,7 @@ mod tests {
                     .unwrap(),
             ),
             rpc_attempt_id: None,
+            deadline_remaining_ms: None,
         };
         assert!(matches!(
             TabletCommandRequest::from_proto(command),
@@ -2478,5 +2514,56 @@ mod tests {
     fn metadata_response_missing_rejected() {
         let proto = rpc::MetadataResponse { response: None };
         assert!(MetadataResponse::from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn command_and_outcome_requests_reject_zero_deadline_budget() {
+        use crate::command_codec::{NoopCommand, TabletCommand};
+
+        let command = TabletCommandRequest {
+            request_id: RequestId {
+                client_id: 1,
+                sequence: 1,
+                raft_group_id: RaftGroupId(8),
+            },
+            logical_command_id: None,
+            acknowledged_through: None,
+            tablet_id: TabletId(12),
+            tablet_epoch: 1,
+            command: TabletCommand::Noop(NoopCommand),
+            deadline_remaining_ms: Some(0),
+        };
+
+        assert!(command.to_proto().is_err());
+
+        let logical_command_id = crate::ids::LogicalCommandId {
+            client_request_id: crate::ids::ClientRequestId {
+                client_id: 1,
+                session_epoch: 1,
+                request_sequence: 1,
+            },
+            command_ordinal: 1,
+            kind: crate::ids::CommandKind::Noop,
+        };
+
+        let outcome = TabletOutcomeQueryRequest {
+            request_id: RequestId {
+                client_id: 1,
+                sequence: 1,
+                raft_group_id: RaftGroupId(8),
+            },
+            logical_command_id,
+            tablet_id: TabletId(12),
+            tablet_epoch: 1,
+            deadline_remaining_ms: Some(1),
+        };
+
+        let mut proto = outcome.to_proto();
+        proto.deadline_remaining_ms = Some(0);
+
+        assert!(matches!(
+            TabletOutcomeQueryRequest::from_proto(proto),
+            Err("tablet outcome query deadline must be non-zero")
+        ));
     }
 }

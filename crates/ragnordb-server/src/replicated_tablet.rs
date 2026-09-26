@@ -4527,6 +4527,7 @@ fn envelope_from_tablet_command_request(
         tablet_id,
         tablet_epoch,
         command,
+        deadline_remaining_ms: _,
     } = request;
 
     match logical_command_id {

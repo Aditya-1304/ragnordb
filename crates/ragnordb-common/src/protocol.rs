@@ -24,7 +24,7 @@ impl BoundedFrameBodyWriter {
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(LEN_SIZE)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         buffer.resize(LEN_SIZE, 0);
 
         Ok(Self {
@@ -77,7 +77,7 @@ impl Write for BoundedFrameBodyWriter {
             let additional = target_capacity.saturating_sub(self.buffer.len());
             self.buffer
                 .try_reserve_exact(additional)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                .map_err(|error| io::Error::other(error.to_string()))?;
         }
 
         self.buffer.extend_from_slice(bytes);
