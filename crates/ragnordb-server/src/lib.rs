@@ -18,12 +18,6 @@ mod snapshot_transport;
 pub mod tasks;
 pub mod transaction_lifecycle;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
 use admin::AdminState;
 use build_info::BUILD_INFO;
 use config::{NodeConfig, StatementLogging};
@@ -32,13 +26,19 @@ use database::{LocalDatabase, SharedDatabaseServices, SharedLocalDatabase};
 use multiraft_runtime::{MetadataTimestampReservationClient, MultiRaftRuntime};
 use protocol::{error_response, execution_response, execution_stats, internal_error_response};
 use ragnordb_common::protocol::{
-    ClientRequestFrame, ClientRequestV2, StreamingResultFrame, read_client_frame, write_frame,
-    write_streaming_result_frame,
+    ClientRequestFrame, ClientRequestV2, StreamingResultFrame, encode_streaming_result_frame,
+    read_client_frame, write_frame, write_streaming_result_frame,
 };
 use ragnordb_common::{Error, Result as CommonResult, codec::Row, encoding::encode_row};
 use ragnordb_exec::{QueryResultSink, SharedMetadataTableCreator};
 use replicated_tablet::ReplicatedTabletHandle;
 use session::Session;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -624,6 +624,110 @@ impl QueryResultSink for ChannelQuerySink {
     }
 }
 
+/// Encodes and publishes one complete streaming frame before its deadline.
+///
+/// Encoding errors are reported as InvalidData before touching the socket.
+/// Any write or flush error is returned to the connection owner, which must
+/// close the connection because a partial frame may already have been sent.
+async fn write_streaming_frame_until<W>(
+    writer: &mut W,
+    frame: &StreamingResultFrame,
+    deadline: Instant,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "streaming statement deadline elapsed before frame encoding",
+        ));
+    }
+
+    let encoded = encode_streaming_result_frame(frame).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("streaming result frame encoding failed: {error}"),
+        )
+    })?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "streaming statement deadline elapsed before frame write",
+        ));
+    }
+
+    match tokio::time::timeout(remaining, async {
+        writer.write_all(&encoded).await?;
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(write_result) => write_result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "streaming frame write exceeded its deadline",
+        )),
+    }
+}
+
+/// Publishes queued result events in order and returns only rows whose complete
+/// frames were successfully written. Any failure cancels and drops the producer
+/// channel so no later page or terminal-success frame can be published.
+async fn write_streaming_events<W>(
+    writer: &mut W,
+    mut receiver: mpsc::Receiver<StreamingEvent>,
+    shutdown: &CancellationToken,
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+) -> std::io::Result<u64>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut rows_emitted = 0_u64;
+
+    loop {
+        let event = tokio::select! {
+            _ = shutdown.cancelled() => {
+                cancelled.store(true, Ordering::Release);
+                return Ok(rows_emitted);
+            }
+            event = receiver.recv() => event,
+        };
+
+        let Some(event) = event else {
+            return Ok(rows_emitted);
+        };
+
+        let (frame, rows_in_frame) = match event {
+            StreamingEvent::Start { columns, read_ts } => {
+                (StreamingResultFrame::ResultStart { columns, read_ts }, 0)
+            }
+            StreamingEvent::Batch { rows, byte_count } => {
+                let row_count = rows.len() as u32;
+                (
+                    StreamingResultFrame::RowBatch {
+                        rows,
+                        row_count,
+                        byte_count,
+                    },
+                    u64::from(row_count),
+                )
+            }
+        };
+
+        if let Err(error) = write_streaming_frame_until(writer, &frame, deadline).await {
+            cancelled.store(true, Ordering::Release);
+            return Err(error);
+        }
+
+        // A row is emitted only after its entire frame and flush succeeded.
+        rows_emitted = rows_emitted.saturating_add(rows_in_frame);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_request(
     database: SharedLocalDatabase,
@@ -676,7 +780,7 @@ async fn handle_streaming_request(
         return Ok(());
     }
 
-    let (sender, mut receiver) = mpsc::channel(2);
+    let (sender, receiver) = mpsc::channel(2);
     let cancelled = Arc::new(AtomicBool::new(false));
     let producer_cancelled = cancelled.clone();
     let mut sql_session = std::mem::take(&mut session.sql);
@@ -735,63 +839,43 @@ async fn handle_streaming_request(
         })
     };
 
-    let mut rows_emitted = 0_u64;
-    let mut write_failed = false;
-    while let Some(event) = tokio::select! {
-        _ = shutdown.cancelled() => {
-            cancelled.store(true, Ordering::Release);
-            None
-        }
-        event = receiver.recv() => event,
-    } {
-        let frame = match event {
-            StreamingEvent::Start { columns, read_ts } => {
-                StreamingResultFrame::ResultStart { columns, read_ts }
-            }
-            StreamingEvent::Batch { rows, byte_count } => {
-                rows_emitted = rows_emitted.saturating_add(rows.len() as u64);
-                StreamingResultFrame::RowBatch {
-                    row_count: rows.len() as u32,
-                    rows,
-                    byte_count,
-                }
-            }
-        };
-        let remaining = producer_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero()
-            || tokio::time::timeout(remaining, write_streaming_result_frame(writer, &frame))
-                .await
-                .is_err()
-        {
-            cancelled.store(true, Ordering::Release);
-            write_failed = true;
-            break;
-        }
-    }
-    if write_failed {
-        cancelled.store(true, Ordering::Release);
-    }
-    drop(receiver);
+    let stream_write =
+        write_streaming_events(writer, receiver, shutdown, cancelled, producer_deadline).await;
+
+    // Always join the producer and restore its SQL session before returning a
+    // transport error to the connection owner.
     let (returned_session, execution) = producer.await?;
     session.sql = returned_session;
-    if write_failed || shutdown.is_cancelled() {
+
+    // Propagating this error exits the connection handler. In particular, a
+    // possibly partial frame is never followed by another frame or ResultEnd.
+    let rows_emitted = stream_write?;
+
+    if shutdown.is_cancelled() {
         return Ok(());
     }
+
     match execution {
-        Ok(summary) => {
-            write_streaming_result_frame(
+        Ok(_) => {
+            write_streaming_frame_until(
                 writer,
                 &StreamingResultFrame::ResultEnd {
-                    row_count: summary.rows_read,
+                    row_count: rows_emitted,
                 },
+                producer_deadline,
             )
             .await?;
         }
         Err(error) => {
-            write_streaming_result_frame(writer, &streaming_error_frame(&error, rows_emitted))
-                .await?;
+            write_streaming_frame_until(
+                writer,
+                &streaming_error_frame(&error, rows_emitted),
+                producer_deadline,
+            )
+            .await?;
         }
     }
+
     Ok(())
 }
 
@@ -1259,6 +1343,51 @@ mod operational_tests {
     };
     use tokio::io::AsyncWriteExt;
 
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// Test writer that accepts a limited prefix, then simulates a broken socket.
+    struct FailAfterBytes {
+        remaining: usize,
+        write_calls: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FailAfterBytes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_calls += 1;
+
+            if self.remaining == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected client disconnect",
+                )));
+            }
+
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
     /// Realistic bug caught:
     ///
     /// A configured statement timeout could remain passive session metadata,
@@ -1466,5 +1595,137 @@ mod operational_tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancelled.store(true, Ordering::Release);
         assert!(producer.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn immediate_stream_write_failure_cancels_backpressured_producer() {
+        let (sender, receiver) = mpsc::channel(1);
+        assert!(
+            sender
+                .try_send(StreamingEvent::Start {
+                    columns: Vec::new(),
+                    read_ts: 1,
+                })
+                .is_ok()
+        );
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let producer_cancelled = cancelled.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelQuerySink {
+                sender,
+                cancelled: producer_cancelled,
+                deadline: Instant::now() + Duration::from_secs(2),
+                max_rows: 1,
+                max_bytes: 128,
+            };
+            let make_row = || Row {
+                values: vec![ragnordb_common::codec::Value::Int(1)],
+            };
+
+            // The second push remains blocked if the first one occupies the queue.
+            sink.push_batch(vec![make_row()])?;
+            sink.push_batch(vec![make_row()])
+        });
+
+        let shutdown = CancellationToken::new();
+        let mut writer = FailAfterBytes {
+            remaining: 0,
+            write_calls: 0,
+        };
+
+        let result = write_streaming_events(
+            &mut writer,
+            receiver,
+            &shutdown,
+            cancelled.clone(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(producer.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_stream_frame_write_returns_error_without_continuing() {
+        let (sender, receiver) = mpsc::channel(1);
+        assert!(
+            sender
+                .try_send(StreamingEvent::Batch {
+                    rows: vec![vec![1, 2, 3]],
+                    byte_count: 3,
+                })
+                .is_ok()
+        );
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let mut writer = FailAfterBytes {
+            remaining: 1,
+            write_calls: 0,
+        };
+
+        let result = write_streaming_events(
+            &mut writer,
+            receiver,
+            &shutdown,
+            cancelled.clone(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(writer.write_calls, 2);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn oversized_json_row_batch_is_rejected_before_socket_write() {
+        let (sender, receiver) = mpsc::channel(1);
+        let payload_len = ragnordb_common::protocol::MAX_FRAME_SIZE / 4 + 1;
+
+        // JSON renders each 255 as three digits plus a separator. This payload
+        // stays under the existing streaming payload cap but expands beyond the
+        // existing JSON frame-body limit.
+        assert!(payload_len <= ragnordb_common::protocol::MAX_STREAMING_BATCH_BYTES as usize);
+        assert!(
+            sender
+                .try_send(StreamingEvent::Batch {
+                    rows: vec![vec![u8::MAX; payload_len]],
+                    byte_count: payload_len as u32,
+                })
+                .is_ok()
+        );
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let mut writer = FailAfterBytes {
+            remaining: usize::MAX,
+            write_calls: 0,
+        };
+
+        let result = write_streaming_events(
+            &mut writer,
+            receiver,
+            &shutdown,
+            cancelled.clone(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(writer.write_calls, 0);
+        assert!(cancelled.load(Ordering::Acquire));
     }
 }
