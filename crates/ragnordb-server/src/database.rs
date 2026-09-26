@@ -301,11 +301,11 @@ impl DatabaseServices {
         logical_request_id: Option<ragnordb_common::ids::ClientRequestId>,
         metadata_timeout: std::time::Duration,
     ) -> Result<ExecutionResult> {
-        let gc_protection_health = self
+        let gc_protection_lease_state = self
             .transaction_runtime
             .as_ref()
-            .map(|runtime| runtime.gc_protection_lease_health());
-        session.set_tablet_request_gc_protection_health(gc_protection_health.clone(), false);
+            .map(|runtime| runtime.gc_protection_lease_state());
+        session.set_tablet_request_gc_protection_health(gc_protection_lease_state.clone(), false);
         self.durability_gate.ensure_healthy()?;
         self.refresh_metadata_catalog()?;
         let plan = self.plan_statement(sql)?;
@@ -315,10 +315,14 @@ impl DatabaseServices {
         ) || matches!(&plan, Plan::Commit)
             && session.has_active_transaction();
         let gc_protected_read = matches!(&plan, Plan::Select(_));
-        session
-            .set_tablet_request_gc_protection_health(gc_protection_health, gc_protection_required);
+        let existing_transaction_requires_protection =
+            gc_protection_required && session.has_active_transaction();
+        session.set_tablet_request_gc_protection_health(
+            gc_protection_lease_state.clone(),
+            existing_transaction_requires_protection,
+        );
 
-        let protection_check = if gc_protection_required {
+        let protection_check = if existing_transaction_requires_protection {
             session.remaining_tablet_request_timeout().map(|_| ())
         } else {
             Ok(())
@@ -465,6 +469,11 @@ impl DatabaseServices {
                         .transaction_runtime
                         .as_ref()
                         .map(|runtime| runtime.gc_protection_ownership(transaction_id));
+                    session.set_tablet_request_gc_protection_health(
+                        gc_protection_lease_state.clone(),
+                        true,
+                    );
+                    session.remaining_tablet_request_timeout()?;
                     let statement_result = {
                         if let Some(executor) = detached_executor.as_ref() {
                             executor.execute_data_plan_with_request_context(
@@ -508,6 +517,18 @@ impl DatabaseServices {
         request_context: &mut ragnordb_exec::TabletRequestContext,
     ) -> Result<ragnordb_txn::SingleNodeCommitOutcome> {
         let transaction_id = transaction.id();
+        if let Err(error) = request_context.check_active() {
+            if let Some(runtime) = &self.transaction_runtime
+                && !runtime.lifecycle.is_active(transaction_id)
+            {
+                // No durable participant state owns this transaction yet, so
+                // refusing commit also retires its local history membership.
+                runtime.lifecycle.unregister(transaction_id);
+                release_gc_protection_best_effort(runtime, transaction_id);
+            }
+            return Err(error);
+        }
+
         if let Some(runtime) = &self.transaction_runtime
             && !transaction.is_empty()
             && let Err(error) = runtime
@@ -567,11 +588,18 @@ impl DatabaseServices {
             )
         };
         if local_target {
+            request_context.check_active()?;
             let commit_timestamp = self.allocate_commit_timestamp(transaction.start_ts())?;
+            // Timestamp reservation may wait for a durable oracle refill. The
+            // lease must still be safe after that wait and before commit begins.
+            request_context.check_active()?;
             let mut executor = self
                 .executor
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Once the local commit method is entered, it owns the authoritative
+            // durability outcome and must not be interrupted by later fencing.
+            request_context.check_active()?;
             executor.commit_transaction_outcome(transaction, commit_timestamp)
         } else {
             let executor = {
@@ -667,11 +695,11 @@ impl DatabaseServices {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<QueryStreamSummary> {
-        let gc_protection_health = self
+        let gc_protection_lease_state = self
             .transaction_runtime
             .as_ref()
-            .map(|runtime| runtime.gc_protection_lease_health());
-        session.set_tablet_request_gc_protection_health(gc_protection_health.clone(), false);
+            .map(|runtime| runtime.gc_protection_lease_state());
+        session.set_tablet_request_gc_protection_health(gc_protection_lease_state.clone(), false);
         self.durability_gate.ensure_healthy()?;
         self.refresh_metadata_catalog()?;
         let plan = self.plan_statement(sql)?;
@@ -680,8 +708,11 @@ impl DatabaseServices {
                 "streaming result mode currently supports SELECT only".to_string(),
             ));
         }
-        session.set_tablet_request_gc_protection_health(gc_protection_health, true);
-        session.remaining_tablet_request_timeout()?;
+        if session.has_active_transaction() {
+            session
+                .set_tablet_request_gc_protection_health(gc_protection_lease_state.clone(), true);
+            session.remaining_tablet_request_timeout()?;
+        }
 
         let detached_executor = {
             let executor = self
@@ -725,6 +756,8 @@ impl DatabaseServices {
                 .transaction_runtime
                 .as_ref()
                 .map(|runtime| runtime.gc_protection_ownership(transaction_id));
+            session.set_tablet_request_gc_protection_health(gc_protection_lease_state, true);
+            session.remaining_tablet_request_timeout()?;
             let summary = {
                 if let Some(executor) = detached_executor.as_ref() {
                     executor.execute_select_streaming(
@@ -1823,10 +1856,11 @@ impl TransactionManager for SharedTransactionManagerAdapter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Barrier, Mutex as TestMutex};
+    use std::sync::{Barrier, Mutex as TestMutex, atomic::AtomicBool};
 
     use ragnordb_common::{
         catalog_codec::{ColumnDefinition, DataType, TableDefinition},
+        codec::Value,
         ids::{RaftGroupId, ReplicaId, TableId, TabletId},
         metadata_codec::{PartitionSpec, TabletDescriptor},
         rpc_codec::{ReplicaRoute, TabletRoute},
@@ -1864,6 +1898,23 @@ mod tests {
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
         reads: TestMutex<Vec<TableId>>,
+    }
+
+    struct LeaseFencingTimestampProvider {
+        lease_healthy: Arc<AtomicBool>,
+    }
+
+    impl TimestampReservationProvider for LeaseFencingTimestampProvider {
+        fn reserve_timestamps(
+            &mut self,
+            requested_until: Timestamp,
+        ) -> Result<ragnordb_txn::TimestampReservation> {
+            self.lease_healthy.store(false, Ordering::Release);
+            Ok(ragnordb_txn::TimestampReservation {
+                reserved_from: requested_until,
+                reserved_until: requested_until,
+            })
+        }
     }
 
     impl BlockingGateway {
@@ -2009,5 +2060,144 @@ mod tests {
 
         release.wait();
         assert!(slow.join().expect("slow statement thread panicked").is_ok());
+    }
+
+    /// Realistic bug caught: a local compatibility commit must not allocate a
+    /// commit timestamp after its process-local history protection is fenced.
+    #[test]
+    fn local_commit_rejects_an_unsafe_gc_lease_before_timestamp_allocation() {
+        let database = LocalDatabase::new();
+        let services = database.database_services();
+        let previous_timestamp = database
+            .transaction_manager
+            .lock()
+            .unwrap()
+            .last_allocated_timestamp();
+        let row_key = ragnordb_storage::key::make_row_key(TableId(1), &[Value::Int(1)]).unwrap();
+        let encoded_key = ragnordb_storage::key::encode_row_key(&row_key).unwrap();
+        let mut transaction = ragnordb_txn::Transaction::new(TxnId(91), Timestamp(100)).unwrap();
+        transaction.buffer_delete(encoded_key).unwrap();
+
+        let mut request_context = ragnordb_exec::TabletRequestContext::new(91).unwrap();
+        request_context.set_gc_protection_lease_health(
+            Some(Arc::new(AtomicBool::new(false))),
+            Some(Arc::new(AtomicU64::new(0))),
+            0,
+            true,
+        );
+
+        assert!(matches!(
+            services.commit_transaction(transaction, &mut request_context),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("history protection lease")
+        ));
+        assert_eq!(
+            database
+                .transaction_manager
+                .lock()
+                .unwrap()
+                .last_allocated_timestamp(),
+            previous_timestamp,
+        );
+    }
+
+    /// Realistic bug caught: the timestamp oracle can block while the lease
+    /// expires, so local commit must recheck after reservation and before the
+    /// executor takes authoritative commit ownership.
+    #[test]
+    fn local_commit_rechecks_gc_lease_after_timestamp_reservation() {
+        let mut database = LocalDatabase::new();
+        let mut setup_session = SqlSession::with_client_id(93);
+        database
+            .execute_sql(
+                &mut setup_session,
+                "CREATE TABLE items (id INT PRIMARY KEY, value INT)",
+            )
+            .unwrap();
+
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        database
+            .install_reserved_timestamp_manager(
+                LeaseFencingTimestampProvider {
+                    lease_healthy: Arc::clone(&lease_healthy),
+                },
+                Timestamp(1_000),
+                10,
+                0,
+            )
+            .unwrap();
+
+        let row_key = ragnordb_storage::key::make_row_key(TableId(1), &[Value::Int(1)]).unwrap();
+        let encoded_key = ragnordb_storage::key::encode_row_key(&row_key).unwrap();
+        let encoded_row = ragnordb_common::encoding::encode_row(&ragnordb_common::codec::Row {
+            values: vec![Value::Int(1), Value::Int(55)],
+        })
+        .unwrap();
+        let mut transaction =
+            ragnordb_txn::Transaction::new(TxnId(1_001), Timestamp(1_001)).unwrap();
+        transaction.buffer_put(encoded_key, encoded_row).unwrap();
+
+        let services = database.database_services();
+        let mut request_context = ragnordb_exec::TabletRequestContext::new(93).unwrap();
+        request_context.set_gc_protection_lease_health(
+            Some(Arc::clone(&lease_healthy)),
+            Some(Arc::new(AtomicU64::new(u64::MAX))),
+            0,
+            true,
+        );
+
+        assert!(matches!(
+            services.commit_transaction(transaction, &mut request_context),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("history protection lease")
+        ));
+        assert!(!lease_healthy.load(Ordering::Acquire));
+
+        let mut verify_session = SqlSession::with_client_id(94);
+        let result = database
+            .execute_sql(&mut verify_session, "SELECT value FROM items WHERE id = 1")
+            .unwrap();
+        let ExecutionResult::Query(result_set) = result else {
+            panic!("SELECT did not return rows");
+        };
+        assert!(result_set.rows.is_empty());
+    }
+
+    /// Realistic bug caught: rollback must remain available as cleanup after
+    /// history-dependent work is fenced by an expired aggregate lease.
+    #[test]
+    fn explicit_rollback_remains_available_with_an_unhealthy_gc_lease() {
+        let database = LocalDatabase::new();
+        let mut session = SqlSession::with_client_id(92);
+        let mut executor = database
+            .executor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut transaction_manager = database
+            .transaction_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        session
+            .execute_sql("BEGIN", &mut executor, &mut **transaction_manager)
+            .unwrap();
+        session
+            .request_context_mut()
+            .set_gc_protection_lease_health(
+                Some(Arc::new(AtomicBool::new(false))),
+                Some(Arc::new(AtomicU64::new(0))),
+                0,
+                true,
+            );
+
+        let result = session
+            .execute_sql("ROLLBACK", &mut executor, &mut **transaction_manager)
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ExecutionResult::TransactionRolledBack { .. }
+        ));
+        assert!(!session.has_active_transaction());
     }
 }

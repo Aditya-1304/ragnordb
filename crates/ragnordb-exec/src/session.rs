@@ -9,7 +9,10 @@
 //! active until COMMIT or ROLLBACK.
 
 use std::{
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
     time::{Duration, Instant},
 };
 
@@ -106,11 +109,18 @@ impl SqlSession {
     /// can opt out so they remain available for cleanup.
     pub fn set_tablet_request_gc_protection_health(
         &mut self,
-        healthy: Option<Arc<AtomicBool>>,
+        lease_state: Option<(Arc<AtomicBool>, Arc<AtomicU64>, u64)>,
         required: bool,
     ) {
-        self.tablet_request_context
-            .set_gc_protection_lease_health(healthy, required);
+        let (healthy, deadline_ms, clock_skew_guard_ms) = lease_state
+            .map(|(healthy, deadline_ms, skew_ms)| (Some(healthy), Some(deadline_ms), skew_ms))
+            .unwrap_or((None, None, 0));
+        self.tablet_request_context.set_gc_protection_lease_health(
+            healthy,
+            deadline_ms,
+            clock_skew_guard_ms,
+            required,
+        );
     }
 
     pub fn remaining_tablet_request_timeout(&self) -> Result<Duration> {

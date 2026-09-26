@@ -26,9 +26,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use expression::evaluate;
@@ -581,6 +581,15 @@ fn remaining_statement_budget(
     Ok(remaining)
 }
 
+/// Read the local Unix clock for lease checks. A clock before the Unix epoch
+/// is treated as unsafe so it cannot make an expired history pin appear live.
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(u64::MAX)
+}
+
 fn submit_with_outcome_recovery(
     gateway: &dyn TabletGateway,
     route: &TabletRoute,
@@ -1044,6 +1053,11 @@ pub struct TabletRequestContext {
     /// Runtime-wide validity of the durable MVCC history lease. Only
     /// statements that can depend on protected row history consult this flag.
     gc_protection_lease_healthy: Option<Arc<AtomicBool>>,
+    /// Shared replicated lease deadline, checked on every foreground
+    /// operation so process suspension cannot leave an old `true` health bit
+    /// authorizing reads after passive expiry.
+    gc_protection_lease_deadline_ms: Option<Arc<AtomicU64>>,
+    gc_protection_clock_skew_guard_ms: u64,
     gc_protection_required: bool,
 
     /// Original configured timeout, retained for stable timeout diagnostics.
@@ -1083,6 +1097,8 @@ impl TabletRequestContext {
             deadline,
             cancelled: Arc::new(AtomicBool::new(false)),
             gc_protection_lease_healthy: None,
+            gc_protection_lease_deadline_ms: None,
+            gc_protection_clock_skew_guard_ms: 0,
             gc_protection_required: false,
             configured_timeout_ms: 30_000,
         })
@@ -1210,29 +1226,51 @@ impl TabletRequestContext {
     pub fn set_gc_protection_lease_health(
         &mut self,
         healthy: Option<Arc<AtomicBool>>,
+        deadline_ms: Option<Arc<AtomicU64>>,
+        clock_skew_guard_ms: u64,
         required: bool,
     ) {
         self.gc_protection_lease_healthy = healthy;
+        self.gc_protection_lease_deadline_ms = deadline_ms;
+        self.gc_protection_clock_skew_guard_ms = clock_skew_guard_ms;
         self.gc_protection_required = required;
     }
 
     pub fn remaining_timeout(&self) -> Result<Duration> {
-        if self.gc_protection_required
-            && self
-                .gc_protection_lease_healthy
-                .as_ref()
-                .is_some_and(|healthy| !healthy.load(Ordering::Acquire))
-        {
-            return Err(Error::ProposalUnavailable {
-                reason: "MVCC history protection lease is not safely renewed".to_string(),
-            });
-        }
-
-        remaining_statement_budget(
+        let mut remaining = remaining_statement_budget(
             self.deadline,
             self.cancelled.as_ref(),
             self.configured_timeout_ms,
-        )
+        )?;
+
+        if self.gc_protection_required
+            && let Some(healthy) = self.gc_protection_lease_healthy.as_ref()
+        {
+            if !healthy.load(Ordering::Acquire) {
+                return Err(Error::ProposalUnavailable {
+                    reason: "MVCC history protection lease is not safely renewed".to_string(),
+                });
+            }
+
+            let deadline_ms = self
+                .gc_protection_lease_deadline_ms
+                .as_ref()
+                .map_or(0, |deadline| deadline.load(Ordering::Acquire));
+            let conservative_now_ms =
+                wall_clock_millis().saturating_add(self.gc_protection_clock_skew_guard_ms);
+            if deadline_ms == 0 || conservative_now_ms >= deadline_ms {
+                return Err(Error::ProposalUnavailable {
+                    reason: "MVCC history protection lease is expired or too close to expiry"
+                        .to_string(),
+                });
+            }
+
+            // Bound the operation itself so it cannot outlive the locally
+            // conservative lease-validity horizon.
+            remaining = remaining.min(Duration::from_millis(deadline_ms - conservative_now_ms));
+        }
+
+        Ok(remaining)
     }
 
     pub fn check_active(&self) -> Result<()> {
@@ -5031,7 +5069,13 @@ mod tests {
     fn unsafe_gc_lease_fences_history_work_but_keeps_cleanup_available() {
         let mut context = TabletRequestContext::new(91).unwrap();
         let lease_healthy = Arc::new(AtomicBool::new(true));
-        context.set_gc_protection_lease_health(Some(Arc::clone(&lease_healthy)), true);
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 60_000));
+        context.set_gc_protection_lease_health(
+            Some(Arc::clone(&lease_healthy)),
+            Some(Arc::clone(&lease_deadline)),
+            0,
+            true,
+        );
 
         assert!(context.remaining_timeout().is_ok());
         lease_healthy.store(false, Ordering::Release);
@@ -5042,8 +5086,51 @@ mod tests {
                 if reason.contains("history protection lease")
         ));
 
-        context.set_gc_protection_lease_health(Some(lease_healthy), false);
+        context.set_gc_protection_lease_health(Some(lease_healthy), Some(lease_deadline), 0, false);
         assert!(context.remaining_timeout().is_ok());
+    }
+
+    /// Realistic bug caught: after process suspension, the renewal task and
+    /// health bit may still look successful even though the replicated lease
+    /// expired while the process was stopped.
+    #[test]
+    fn resumed_request_context_rejects_a_passively_expired_gc_lease() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 60_000));
+        context.set_gc_protection_lease_health(
+            Some(lease_healthy),
+            Some(Arc::clone(&lease_deadline)),
+            0,
+            true,
+        );
+        assert!(context.remaining_timeout().is_ok());
+
+        // Model a scheduler pause that resumes after the shared wall-clock
+        // deadline without relying on a sleep or changing the process clock.
+        lease_deadline.store(wall_clock_millis().saturating_sub(1), Ordering::Release);
+
+        assert!(matches!(
+            context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("expired")
+        ));
+    }
+
+    #[test]
+    fn foreground_rpc_budget_ends_before_the_skew_adjusted_lease_deadline() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 10_000));
+        context.set_gc_protection_lease_health(
+            Some(lease_healthy),
+            Some(lease_deadline),
+            2_000,
+            true,
+        );
+
+        let remaining = context.remaining_timeout().unwrap();
+        assert!(remaining <= Duration::from_secs(8));
     }
 
     #[test]

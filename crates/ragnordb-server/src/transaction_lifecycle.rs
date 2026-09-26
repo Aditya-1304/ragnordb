@@ -9,7 +9,7 @@ use std::{
     env,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -64,6 +64,10 @@ pub struct TransactionRuntimeConfig {
     pub gc_sweep_interval: Duration,
     pub gc_protection_idle_grace: Duration,
     pub gc_protection_lease_ms: u64,
+    /// Maximum permitted pairwise wall-clock difference between cluster nodes.
+    /// GC lease expiry is delayed by this amount to prevent a fast proposer
+    /// from expiring a lease still considered live by its owner.
+    pub max_clock_skew_ms: u64,
     pub metadata_timeout: Duration,
 }
 
@@ -114,12 +118,14 @@ impl TransactionRuntimeConfig {
             "RAGNORDB_TXN_GC_PROTECTION_IDLE_GRACE_MS",
             5_000_u64,
         )?);
+        let max_clock_skew_ms = env_value("RAGNORDB_TXN_MAX_CLOCK_SKEW_MS", 30_000_u64)?;
         let gc_protection_lease_ms = env_value(
             "RAGNORDB_TXN_GC_PROTECTION_LEASE_MS",
             footprint
                 .max_age_ms
                 .saturating_add(status_lease_ms)
-                .saturating_add(statement_timeout_ms.saturating_mul(2)),
+                .saturating_add(statement_timeout_ms.saturating_mul(2))
+                .saturating_add(max_clock_skew_ms),
         )?;
         let config = Self {
             footprint,
@@ -136,6 +142,7 @@ impl TransactionRuntimeConfig {
             gc_sweep_interval,
             gc_protection_idle_grace,
             gc_protection_lease_ms,
+            max_clock_skew_ms,
             metadata_timeout: Duration::from_millis(env_value(
                 "RAGNORDB_TXN_METADATA_TIMEOUT_MS",
                 5_000_u64,
@@ -158,11 +165,13 @@ impl TransactionRuntimeConfig {
             || self.cleaner_interval.is_zero()
             || self.gc_sweep_interval.is_zero()
             || self.gc_protection_idle_grace.is_zero()
+            || self.max_clock_skew_ms == 0
             || self.gc_protection_idle_grace.as_millis() >= self.gc_protection_lease_ms as u128
             || self
                 .gc_sweep_interval
                 .as_millis()
                 .saturating_add(self.metadata_timeout.as_millis())
+                .saturating_add(u128::from(self.max_clock_skew_ms))
                 >= u128::from(self.gc_protection_lease_ms / 2)
             || self.gc_protection_lease_ms
                 < self
@@ -170,6 +179,7 @@ impl TransactionRuntimeConfig {
                     .max_age_ms
                     .saturating_add(self.status_lease_ms)
                     .saturating_add(statement_timeout_ms)
+                    .saturating_add(self.max_clock_skew_ms)
             || self.metadata_timeout.is_zero()
             || self.heartbeat_interval.as_millis() >= self.status_lease_ms as u128
         {
@@ -244,6 +254,9 @@ struct GcProtectionTracker {
     /// Shared with foreground request contexts so unsafe lease transitions
     /// fence work that is already in flight, not only later admissions.
     lease_healthy: Arc<AtomicBool>,
+    /// Latest locally-known durable deadline for the process aggregate. Zero
+    /// means there is no published aggregate lease.
+    published_deadline_ms: Arc<AtomicU64>,
 }
 
 impl Default for GcProtectionTracker {
@@ -252,6 +265,7 @@ impl Default for GcProtectionTracker {
             state: Arc::new(Mutex::new(GcProtectionTrackerState::default())),
             admission: Arc::new(Mutex::new(())),
             lease_healthy: Arc::new(AtomicBool::new(true)),
+            published_deadline_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -349,6 +363,12 @@ impl GcProtectionTracker {
             }
         };
 
+        if !matches!(publication, GcProtectionPublication::Register { .. }) {
+            // Existing readers must stop starting work while a transition
+            // that extends or relaxes their aggregate lease is unresolved.
+            self.lease_healthy.store(false, Ordering::Release);
+        }
+
         if let Err(error) = publish(publication) {
             state.active.remove(&txn_id);
             state.idle_since = previous_idle_since;
@@ -367,9 +387,13 @@ impl GcProtectionTracker {
             | GcProtectionPublication::Update { floor, deadline_ms } => {
                 state.published_floor = Some(floor);
                 state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
             }
             GcProtectionPublication::Renew { deadline_ms } => {
                 state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
             }
             GcProtectionPublication::Release => {
                 state.active.remove(&txn_id);
@@ -471,6 +495,13 @@ impl GcProtectionTracker {
             }
         };
 
+        if matches!(
+            publication,
+            GcProtectionPublication::Update { .. } | GcProtectionPublication::Renew { .. }
+        ) {
+            self.lease_healthy.store(false, Ordering::Release);
+        }
+
         if let Err(error) = publish(publication) {
             self.lease_healthy.store(false, Ordering::Release);
             return Err(error);
@@ -481,13 +512,18 @@ impl GcProtectionTracker {
                 state.published_floor = None;
                 state.published_deadline_ms = None;
                 state.idle_since = None;
+                self.published_deadline_ms.store(0, Ordering::Release);
             }
             GcProtectionPublication::Update { floor, deadline_ms } => {
                 state.published_floor = Some(floor);
                 state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
             }
             GcProtectionPublication::Renew { deadline_ms } => {
                 state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
             }
             GcProtectionPublication::Register { .. } => {
                 return Err(Error::CorruptData(
@@ -503,6 +539,10 @@ impl GcProtectionTracker {
         Arc::clone(&self.lease_healthy)
     }
 
+    fn lease_deadline(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.published_deadline_ms)
+    }
+
     fn renew<F>(&self, deadline_ms: u64, renew: F) -> Result<bool>
     where
         F: FnOnce() -> Result<()>,
@@ -515,11 +555,11 @@ impl GcProtectionTracker {
             return Ok(false);
         }
 
-        if let Err(error) = renew() {
-            self.lease_healthy.store(false, Ordering::Release);
-            return Err(error);
-        }
+        self.lease_healthy.store(false, Ordering::Release);
+        renew()?;
         state.published_deadline_ms = Some(deadline_ms);
+        self.published_deadline_ms
+            .store(deadline_ms, Ordering::Release);
         self.lease_healthy.store(true, Ordering::Release);
         Ok(true)
     }
@@ -642,8 +682,12 @@ impl TransactionRuntime {
         }
     }
 
-    pub(crate) fn gc_protection_lease_health(&self) -> Arc<AtomicBool> {
-        self.gc_protection_tracker.lease_health()
+    pub(crate) fn gc_protection_lease_state(&self) -> (Arc<AtomicBool>, Arc<AtomicU64>, u64) {
+        (
+            self.gc_protection_tracker.lease_health(),
+            self.gc_protection_tracker.lease_deadline(),
+            self.config.max_clock_skew_ms,
+        )
     }
 
     /// Hold the admission barrier across transaction timestamp allocation and
@@ -654,7 +698,8 @@ impl TransactionRuntime {
     }
 
     pub fn gc_protection_snapshot(&self) -> GcProtectionSnapshot {
-        let now_ms = unix_time_millis();
+        let now_ms =
+            conservative_gc_expiration_time_ms(unix_time_millis(), self.config.max_clock_skew_ms);
         let state = self.metadata.state_snapshot();
         let mut active_protections = 0usize;
         let mut minimum_protected_timestamp = None;
@@ -689,11 +734,13 @@ impl TransactionRuntime {
     /// no interval in which the GC safe point can pass an active reader.
     pub fn register_gc_protection(&self, txn_id: TxnId, read_ts: Timestamp) -> Result<()> {
         let now_ms = unix_time_millis();
+        let conservative_now_ms = now_ms.saturating_add(self.config.max_clock_skew_ms);
         let deadline_ms = now_ms
             .checked_add(self.config.gc_protection_lease_ms)
             .ok_or_else(|| Error::InvalidArgument("GC protection deadline overflowed".into()))?;
         let renew_before_ms = now_ms
             .checked_add(self.config.gc_protection_lease_ms / 2)
+            .and_then(|boundary| boundary.checked_add(self.config.max_clock_skew_ms))
             .ok_or_else(|| {
                 Error::InvalidArgument("GC protection renewal boundary overflowed".into())
             })?;
@@ -703,7 +750,7 @@ impl TransactionRuntime {
             txn_id,
             read_ts,
             deadline_ms,
-            now_ms,
+            conservative_now_ms,
             renew_before_ms,
             |publication| {
                 self.publish_gc_protection(publication, now_ms, self.config.metadata_timeout)
@@ -839,18 +886,20 @@ impl TransactionRuntime {
         let _admission = self.gc_protection_tracker.admission_guard();
         let now = Instant::now();
         let now_ms = unix_time_millis();
+        let conservative_now_ms = now_ms.saturating_add(self.config.max_clock_skew_ms);
         let next_deadline_ms = now_ms
             .checked_add(self.config.gc_protection_lease_ms)
             .ok_or_else(|| Error::InvalidArgument("GC protection deadline overflowed".into()))?;
         let renew_before_ms = now_ms
             .checked_add(self.config.gc_protection_lease_ms / 2)
+            .and_then(|boundary| boundary.checked_add(self.config.max_clock_skew_ms))
             .ok_or_else(|| Error::InvalidArgument("GC renewal boundary overflowed".into()))?;
         let tracker = self.gc_protection_tracker.clone();
         let publication = tracker.reconcile_with_publish(
             now,
             self.config.gc_protection_idle_grace,
             next_deadline_ms,
-            renew_before_ms,
+            renew_before_ms.max(conservative_now_ms),
             |publication| {
                 self.publish_gc_protection(publication, now_ms, self.config.metadata_timeout)
             },
@@ -873,7 +922,8 @@ impl TransactionRuntime {
         let _admission = self.gc_protection_tracker.admission_guard();
         let state = self.metadata.state_snapshot();
         let candidate = state.timestamp_reserved_until();
-        let now_ms = unix_time_millis();
+        let now_ms =
+            conservative_gc_expiration_time_ms(unix_time_millis(), self.config.max_clock_skew_ms);
         let published =
             advance_gc_safe_point_if_reserved(candidate, state.gc_safe_point(), |candidate| {
                 let outcome = self.metadata_control.advance_gc_safe_point(
@@ -1946,6 +1996,13 @@ pub fn unix_time_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Delay replicated lease expiry by the maximum permitted pairwise clock
+/// skew. A fast safe-point proposer must not expire a lease while its owner can
+/// still consider that lease live.
+fn conservative_gc_expiration_time_ms(now_ms: u64, max_clock_skew_ms: u64) -> u64 {
+    now_ms.saturating_sub(max_clock_skew_ms)
+}
+
 /// Per-node bounded work limits for one cleaner scheduling round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntentCleanerPolicy {
@@ -2266,6 +2323,7 @@ mod tests {
             gc_sweep_interval: Duration::from_millis(5_000),
             gc_protection_idle_grace: Duration::from_millis(5_000),
             gc_protection_lease_ms: 420_000,
+            max_clock_skew_ms: 30_000,
             metadata_timeout: Duration::from_millis(5_000),
         }
     }
@@ -2296,6 +2354,77 @@ mod tests {
                 .is_err(),
             "maintenance work that consumes the lease's remaining half must be rejected"
         );
+    }
+
+    /// Realistic bug caught: a lease shorter than the clock-skew safety window
+    /// can be expired by a fast node before its owner stops using the pin.
+    #[test]
+    fn configured_clock_skew_must_fit_inside_the_gc_lease_budget() {
+        let mut config = valid_transaction_runtime_config();
+        config.max_clock_skew_ms = 200_000;
+
+        assert!(
+            config
+                .validate(30_000, Duration::from_millis(1_000))
+                .is_err()
+        );
+    }
+
+    /// Realistic bug caught: a fast safe-point proposer must not expire a
+    /// protection until its wall clock is later than the deadline by the full
+    /// configured pairwise-skew allowance.
+    #[test]
+    fn safe_point_expiry_waits_until_deadline_plus_clock_skew() {
+        use ragnordb_catalog::MetadataState;
+        use ragnordb_common::metadata_codec::MetadataCommand;
+
+        let owner_id = 1;
+        let protection_id = 1;
+        let protected_timestamp = Timestamp(40);
+        let lease_deadline_ms = 1_000;
+        let max_clock_skew_ms = 30;
+        let mut metadata = MetadataState::new();
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::ClusterInitialized {
+                cluster_id: "gc-skew-test".to_string(),
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms: 100,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+
+        let before_safe_expiry = conservative_gc_expiration_time_ms(
+            lease_deadline_ms + max_clock_skew_ms - 1,
+            max_clock_skew_ms,
+        );
+        assert_eq!(before_safe_expiry, lease_deadline_ms - 1);
+        metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: before_safe_expiry,
+        });
+        assert!(metadata.gc_protection(owner_id, protection_id).is_some());
+        assert_eq!(metadata.gc_safe_point(), protected_timestamp);
+
+        let after_safe_expiry = conservative_gc_expiration_time_ms(
+            lease_deadline_ms + max_clock_skew_ms,
+            max_clock_skew_ms,
+        );
+        assert_eq!(after_safe_expiry, lease_deadline_ms);
+        metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: after_safe_expiry,
+        });
+        assert!(metadata.gc_protection(owner_id, protection_id).is_none());
+        assert_eq!(metadata.gc_safe_point(), Timestamp(100));
     }
 
     #[test]
@@ -2726,18 +2855,38 @@ mod tests {
     fn failed_active_gc_lease_renewal_fences_statement_contexts_until_retry() {
         let tracker = GcProtectionTracker::default();
         let mut request_context = ragnordb_exec::TabletRequestContext::new(91).unwrap();
-        request_context.set_gc_protection_lease_health(Some(tracker.lease_health()), true);
+        let published_deadline = tracker.lease_deadline();
+        request_context.set_gc_protection_lease_health(
+            Some(tracker.lease_health()),
+            Some(Arc::clone(&published_deadline)),
+            0,
+            true,
+        );
 
+        let now_ms = unix_time_millis();
+        let first_deadline_ms = now_ms + 10_000;
         tracker
-            .register_with_publish(TxnId(1), Timestamp(10), 100, 10, 50, |_| Ok(()))
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                first_deadline_ms,
+                now_ms,
+                now_ms + 5_000,
+                |_| Ok(()),
+            )
             .unwrap();
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            first_deadline_ms
+        );
         assert!(request_context.remaining_timeout().is_ok());
 
+        let renewed_deadline_ms = now_ms + 30_000;
         let renewal_error = tracker.reconcile_with_publish(
             Instant::now(),
             Duration::from_secs(1),
-            200,
-            100,
+            renewed_deadline_ms,
+            now_ms + 15_000,
             |_| {
                 Err(Error::ProposalUnavailable {
                     reason: "metadata renewal unavailable".to_string(),
@@ -2760,12 +2909,18 @@ mod tests {
                 .reconcile_with_publish(
                     Instant::now(),
                     Duration::from_secs(1),
-                    300,
-                    100,
+                    renewed_deadline_ms,
+                    now_ms + 15_000,
                     |_| Ok(()),
                 )
                 .unwrap(),
-            Some(GcProtectionPublication::Renew { deadline_ms: 300 }),
+            Some(GcProtectionPublication::Renew {
+                deadline_ms: renewed_deadline_ms,
+            }),
+        );
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            renewed_deadline_ms
         );
         assert!(request_context.remaining_timeout().is_ok());
     }
