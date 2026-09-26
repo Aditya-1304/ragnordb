@@ -363,12 +363,6 @@ impl GcProtectionTracker {
             }
         };
 
-        if !matches!(publication, GcProtectionPublication::Register { .. }) {
-            // Existing readers must stop starting work while a transition
-            // that extends or relaxes their aggregate lease is unresolved.
-            self.lease_healthy.store(false, Ordering::Release);
-        }
-
         if let Err(error) = publish(publication) {
             state.active.remove(&txn_id);
             state.idle_since = previous_idle_since;
@@ -495,13 +489,6 @@ impl GcProtectionTracker {
             }
         };
 
-        if matches!(
-            publication,
-            GcProtectionPublication::Update { .. } | GcProtectionPublication::Renew { .. }
-        ) {
-            self.lease_healthy.store(false, Ordering::Release);
-        }
-
         if let Err(error) = publish(publication) {
             self.lease_healthy.store(false, Ordering::Release);
             return Err(error);
@@ -555,8 +542,10 @@ impl GcProtectionTracker {
             return Ok(false);
         }
 
-        self.lease_healthy.store(false, Ordering::Release);
-        renew()?;
+        if let Err(error) = renew() {
+            self.lease_healthy.store(false, Ordering::Release);
+            return Err(error);
+        }
         state.published_deadline_ms = Some(deadline_ms);
         self.published_deadline_ms
             .store(deadline_ms, Ordering::Release);
@@ -2846,6 +2835,254 @@ mod tests {
 
         assert!(matches!(error, Error::ProposalUnavailable { .. }));
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic regression: registering a transaction with an older snapshot
+    /// requires lowering the aggregate floor, while the old durable floor
+    /// continues to protect transactions already in flight.
+    #[test]
+    fn successful_admission_floor_update_does_not_fence_existing_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 120_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let publication = tracker
+            .register_with_publish(
+                TxnId(2),
+                Timestamp(5),
+                now_ms + 180_000,
+                now_ms + 1,
+                now_ms + 60_000,
+                |publication| {
+                    assert!(matches!(
+                        publication,
+                        GcProtectionPublication::Update {
+                            floor: Timestamp(5),
+                            ..
+                        }
+                    ));
+                    assert!(
+                        health.load(Ordering::Acquire),
+                        "a valid old floor must remain usable during admission publication"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            publication,
+            Some(GcProtectionPublication::Update {
+                floor: Timestamp(5),
+                ..
+            })
+        ));
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: routine floor maintenance must not reject a
+    /// foreground operation while the more-conservative old durable floor is
+    /// still authoritative.
+    #[test]
+    fn successful_background_floor_update_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 120_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+        tracker
+            .register_with_publish(
+                TxnId(2),
+                Timestamp(20),
+                initial_deadline_ms,
+                now_ms + 1,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(tracker.release(TxnId(1)));
+
+        let health = tracker.lease_health();
+        let next_deadline_ms = now_ms + 180_000;
+        let publication = tracker
+            .reconcile_with_publish(
+                Instant::now(),
+                Duration::from_secs(5),
+                next_deadline_ms,
+                now_ms + 90_000,
+                |publication| {
+                    assert!(matches!(
+                        publication,
+                        GcProtectionPublication::Update {
+                            floor: Timestamp(20),
+                            ..
+                        }
+                    ));
+                    assert!(
+                        health.load(Ordering::Acquire),
+                        "a successful conservative floor update must not fence readers"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            publication,
+            Some(GcProtectionPublication::Update {
+                floor: Timestamp(20),
+                deadline_ms: next_deadline_ms,
+            })
+        );
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: the prior durable deadline stays authoritative
+    /// during a successful background renewal and must not create a brief
+    /// foreground availability failure.
+    #[test]
+    fn successful_background_renewal_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        let next_deadline_ms = now_ms + 120_000;
+        let publication = tracker
+            .reconcile_with_publish(
+                Instant::now(),
+                Duration::from_secs(5),
+                next_deadline_ms,
+                initial_deadline_ms,
+                |publication| {
+                    assert!(matches!(publication, GcProtectionPublication::Renew { .. }));
+                    assert!(health.load(Ordering::Acquire));
+                    assert_eq!(
+                        published_deadline.load(Ordering::Acquire),
+                        initial_deadline_ms,
+                        "the previous deadline remains published until renewal succeeds"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            publication,
+            Some(GcProtectionPublication::Renew {
+                deadline_ms: next_deadline_ms,
+            })
+        );
+        assert_eq!(published_deadline.load(Ordering::Acquire), next_deadline_ms);
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: heartbeat-driven renewals use a separate tracker
+    /// path and must leave existing readers usable until a proposal fails.
+    #[test]
+    fn successful_direct_renewal_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        let next_deadline_ms = now_ms + 120_000;
+        assert!(
+            tracker
+                .renew(next_deadline_ms, || {
+                    assert!(health.load(Ordering::Acquire));
+                    assert_eq!(
+                        published_deadline.load(Ordering::Acquire),
+                        initial_deadline_ms
+                    );
+                    Ok(())
+                })
+                .unwrap()
+        );
+
+        assert_eq!(published_deadline.load(Ordering::Acquire), next_deadline_ms);
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// A real metadata renewal failure must fence readers without publishing
+    /// the proposed deadline as though it had committed.
+    #[test]
+    fn failed_direct_renewal_fences_readers_and_keeps_the_old_deadline() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        assert!(matches!(
+            tracker.renew(now_ms + 120_000, || {
+                Err(Error::ProposalUnavailable {
+                    reason: "metadata renewal unavailable".to_string(),
+                })
+            }),
+            Err(Error::ProposalUnavailable { .. })
+        ));
+
+        assert!(!health.load(Ordering::Acquire));
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            initial_deadline_ms,
+            "failed renewal must not publish an uncommitted deadline"
+        );
     }
 
     /// Realistic bug caught: when Metadata Raft cannot renew a live aggregate
