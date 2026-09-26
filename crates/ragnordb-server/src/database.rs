@@ -301,11 +301,29 @@ impl DatabaseServices {
         logical_request_id: Option<ragnordb_common::ids::ClientRequestId>,
         metadata_timeout: std::time::Duration,
     ) -> Result<ExecutionResult> {
+        let gc_protection_health = self
+            .transaction_runtime
+            .as_ref()
+            .map(|runtime| runtime.gc_protection_lease_health());
+        session.set_tablet_request_gc_protection_health(gc_protection_health.clone(), false);
         self.durability_gate.ensure_healthy()?;
         self.refresh_metadata_catalog()?;
         let plan = self.plan_statement(sql)?;
+        let gc_protection_required = matches!(
+            &plan,
+            Plan::Insert(_) | Plan::Select(_) | Plan::Update(_) | Plan::Delete(_)
+        ) || matches!(&plan, Plan::Commit)
+            && session.has_active_transaction();
+        let gc_protected_read = matches!(&plan, Plan::Select(_));
+        session
+            .set_tablet_request_gc_protection_health(gc_protection_health, gc_protection_required);
 
-        let result = match plan {
+        let protection_check = if gc_protection_required {
+            session.remaining_tablet_request_timeout().map(|_| ())
+        } else {
+            Ok(())
+        };
+        let result = protection_check.and_then(|()| match plan {
             Plan::Begin => self.with_gc_protection_admission(|| {
                 let started = self.with_transaction_manager(|manager| {
                     self.observe_gc_safe_point(manager);
@@ -470,6 +488,11 @@ impl DatabaseServices {
                     Ok(statement_result)
                 }
             }
+        });
+        let result = if gc_protected_read {
+            result.and_then(|result| session.remaining_tablet_request_timeout().map(|_| result))
+        } else {
+            result
         };
 
         if let Err(error) = &result {
@@ -644,6 +667,11 @@ impl DatabaseServices {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<QueryStreamSummary> {
+        let gc_protection_health = self
+            .transaction_runtime
+            .as_ref()
+            .map(|runtime| runtime.gc_protection_lease_health());
+        session.set_tablet_request_gc_protection_health(gc_protection_health.clone(), false);
         self.durability_gate.ensure_healthy()?;
         self.refresh_metadata_catalog()?;
         let plan = self.plan_statement(sql)?;
@@ -652,6 +680,8 @@ impl DatabaseServices {
                 "streaming result mode currently supports SELECT only".to_string(),
             ));
         }
+        session.set_tablet_request_gc_protection_health(gc_protection_health, true);
+        session.remaining_tablet_request_timeout()?;
 
         let detached_executor = {
             let executor = self
@@ -723,6 +753,8 @@ impl DatabaseServices {
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
             Ok(summary)
         };
+        let result =
+            result.and_then(|summary| session.remaining_tablet_request_timeout().map(|_| summary));
         self.record_timestamp_metrics();
         result
     }

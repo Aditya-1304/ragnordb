@@ -678,19 +678,19 @@ fn resolve_foreground_intent(
         .validate()
         .map_err(|error| Error::CorruptData(error.to_string()))?;
     let status_request_id = request_context.next_read_request_id(status_route.raft_group_id)?;
-    let status = gateway
-        .transaction_status(
-            &status_route,
-            status_request_id,
-            lock.txn_id,
-            request_context.remaining_timeout()?,
-        )?
-        .ok_or_else(|| Error::TabletUnavailable {
-            reason: format!(
-                "transaction status for intent owner {} is not currently visible",
-                lock.txn_id.0
-            ),
-        })?;
+    let status = gateway.transaction_status(
+        &status_route,
+        status_request_id,
+        lock.txn_id,
+        request_context.remaining_timeout()?,
+    )?;
+    request_context.check_active()?;
+    let status = status.ok_or_else(|| Error::TabletUnavailable {
+        reason: format!(
+            "transaction status for intent owner {} is not currently visible",
+            lock.txn_id.0
+        ),
+    })?;
     if status.primary_tablet_id().map_err(|reason| {
         Error::CorruptData(format!(
             "transaction status has invalid authority: {reason}"
@@ -1041,6 +1041,11 @@ pub struct TabletRequestContext {
     /// participant operation.
     cancelled: Arc<AtomicBool>,
 
+    /// Runtime-wide validity of the durable MVCC history lease. Only
+    /// statements that can depend on protected row history consult this flag.
+    gc_protection_lease_healthy: Option<Arc<AtomicBool>>,
+    gc_protection_required: bool,
+
     /// Original configured timeout, retained for stable timeout diagnostics.
     configured_timeout_ms: u64,
 }
@@ -1077,6 +1082,8 @@ impl TabletRequestContext {
             acknowledged_through: None,
             deadline,
             cancelled: Arc::new(AtomicBool::new(false)),
+            gc_protection_lease_healthy: None,
+            gc_protection_required: false,
             configured_timeout_ms: 30_000,
         })
     }
@@ -1197,7 +1204,30 @@ impl TabletRequestContext {
         self.check_active()
     }
 
+    /// Bind protected foreground work to the owning runtime's aggregate GC
+    /// lease. Control statements can leave `required` false so rollback stays
+    /// available after a lease has been fenced.
+    pub fn set_gc_protection_lease_health(
+        &mut self,
+        healthy: Option<Arc<AtomicBool>>,
+        required: bool,
+    ) {
+        self.gc_protection_lease_healthy = healthy;
+        self.gc_protection_required = required;
+    }
+
     pub fn remaining_timeout(&self) -> Result<Duration> {
+        if self.gc_protection_required
+            && self
+                .gc_protection_lease_healthy
+                .as_ref()
+                .is_some_and(|healthy| !healthy.load(Ordering::Acquire))
+        {
+            return Err(Error::ProposalUnavailable {
+                reason: "MVCC history protection lease is not safely renewed".to_string(),
+            });
+        }
+
         remaining_statement_budget(
             self.deadline,
             self.cancelled.as_ref(),
@@ -2709,8 +2739,8 @@ impl LocalExecutor {
         match choose_access_path(schema.as_ref(), filter.as_ref())? {
             AccessPath::Empty => {}
             AccessPath::Point(key) => {
-                let mut request_context = Some(request_context);
-                if let Some(row) = self.point_row(transaction, &key, &mut request_context)? {
+                if let Some(row) = self.point_row(transaction, &key, &mut Some(request_context))? {
+                    request_context.check_active()?;
                     emit(key, row)?;
                 }
             }
@@ -2733,6 +2763,7 @@ impl LocalExecutor {
                         schema.id,
                         &mut Some(request_context),
                     )? {
+                        request_context.check_active()?;
                         emit(key, row)?;
                     }
                 }
@@ -4165,6 +4196,7 @@ impl LocalExecutor {
                 ));
             }
             for scan_row in &batch.rows {
+                request_context.check_active()?;
                 if last_key
                     .as_deref()
                     .is_some_and(|last_key| scan_row.key.as_slice() <= last_key)
@@ -4209,6 +4241,9 @@ impl LocalExecutor {
         row_key: &RowKey,
         request_context: &mut Option<&mut TabletRequestContext>,
     ) -> Result<Option<Row>> {
+        if let Some(context) = request_context.as_deref_mut() {
+            context.check_active()?;
+        }
         let encoded_key = ragnordb_storage::key::encode_row_key(row_key)?;
         transaction.record_read(encoded_key.clone())?;
         if let Some(mutation) = transaction.pending_write(&encoded_key) {
@@ -4220,9 +4255,13 @@ impl LocalExecutor {
 
         let tablet_id = self.route_row_key(row_key)?;
         if self.is_local_compatibility_route(row_key.table_id, tablet_id) {
-            return self
+            let row = self
                 .local_tablet_for_route(row_key.table_id, tablet_id)?
                 .get(transaction, row_key);
+            if let Some(context) = request_context.as_deref_mut() {
+                context.check_active()?;
+            }
+            return row;
         }
 
         let gateway = self.tablet_gateway.clone().ok_or_else(|| {
@@ -4264,6 +4303,7 @@ impl LocalExecutor {
                 transaction.start_ts(),
                 request_context.remaining_timeout()?,
             )?;
+            request_context.check_active()?;
 
             let Some(lock) = inspection.intent else {
                 return inspection
@@ -4985,6 +5025,25 @@ mod tests {
             context.remaining_timeout(),
             Err(Error::ProposalUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn unsafe_gc_lease_fences_history_work_but_keeps_cleanup_available() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        context.set_gc_protection_lease_health(Some(Arc::clone(&lease_healthy)), true);
+
+        assert!(context.remaining_timeout().is_ok());
+        lease_healthy.store(false, Ordering::Release);
+
+        assert!(matches!(
+            context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("history protection lease")
+        ));
+
+        context.set_gc_protection_lease_health(Some(lease_healthy), false);
+        assert!(context.remaining_timeout().is_ok());
     }
 
     #[test]

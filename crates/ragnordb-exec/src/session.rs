@@ -100,6 +100,19 @@ impl SqlSession {
         )
     }
 
+    /// Attach aggregate GC-lease health to the current statement context.
+    /// History-dependent work is fenced when its runtime cannot confirm that
+    /// the durable lease remains valid; rollback and other control operations
+    /// can opt out so they remain available for cleanup.
+    pub fn set_tablet_request_gc_protection_health(
+        &mut self,
+        healthy: Option<Arc<AtomicBool>>,
+        required: bool,
+    ) {
+        self.tablet_request_context
+            .set_gc_protection_lease_health(healthy, required);
+    }
+
     pub fn remaining_tablet_request_timeout(&self) -> Result<Duration> {
         self.tablet_request_context.remaining_timeout()
     }
