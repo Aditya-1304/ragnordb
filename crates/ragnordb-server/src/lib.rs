@@ -77,6 +77,7 @@ impl Server {
             admin = %admin_addr,
             max_connections,
             ragnordb_version = BUILD_INFO.ragnordb_version,
+            ragnordb_revision = BUILD_INFO.ragnordb_revision,
             raft_version = BUILD_INFO.raft_version,
             raft_revision = BUILD_INFO.raft_revision,
             wal_version = BUILD_INFO.wal_version,

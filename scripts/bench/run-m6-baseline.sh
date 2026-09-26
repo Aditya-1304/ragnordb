@@ -12,11 +12,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
-mkdir -p "$OUTPUT_DIR"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-BENCH_BIN="${RAGNORDB_BENCH_BIN:-$REPO_ROOT/target/release/ragnordb-bench}"
-SERVER_BIN="${RAGNORDB_BIN:-$REPO_ROOT/target/release/ragnordb}"
+BENCH_BIN="$REPO_ROOT/target/release/ragnordb-bench"
+SERVER_BIN="$REPO_ROOT/target/release/ragnordb"
 ROWS="${M6_ROWS:-1000}"
 VALUE_BYTES="${M6_VALUE_BYTES:-256}"
 LOAD_BATCH_SIZE="${M6_LOAD_BATCH_SIZE:-100}"
@@ -37,16 +36,38 @@ require_command() {
   }
 }
 
-for command_name in cargo curl date git jq lscpu ps rustc uname; do
+for command_name in cargo curl date git jq lscpu ps rustc sha256sum uname; do
   require_command "$command_name"
 done
 
-if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SERVER_BIN" ]; then
-  printf "release binaries are missing; build ragnordb-cli and ragnordb-bench first\n" >&2
+SOURCE_SHA="$(git rev-parse HEAD)"
+SOURCE_STATUS="$(git status --porcelain)"
+if [ -n "$SOURCE_STATUS" ] && [ "${RAGNORDB_ALLOW_DIRTY_BENCH:-0}" != "1" ]; then
+  printf 'refusing official benchmark from a dirty worktree\n' >&2
+  git status --short >&2
   exit 2
 fi
 
-git rev-parse HEAD > "$OUTPUT_DIR/git-commit.txt"
+RAGNORDB_BUILD_REVISION="$SOURCE_SHA"
+if [ -n "$SOURCE_STATUS" ]; then
+  RAGNORDB_BUILD_REVISION="${SOURCE_SHA}-dirty"
+fi
+export RAGNORDB_BUILD_REVISION
+
+mkdir -p "$OUTPUT_DIR"
+cargo build \
+  --release \
+  --locked \
+  -p ragnordb-cli \
+  -p ragnordb-bench \
+  > "$OUTPUT_DIR/release-build.txt" 2>&1
+
+if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SERVER_BIN" ]; then
+  printf 'release build completed without the expected benchmark binaries\n' >&2
+  exit 2
+fi
+
+printf '%s\n' "$SOURCE_SHA" > "$OUTPUT_DIR/git-commit.txt"
 git branch --show-current > "$OUTPUT_DIR/git-branch.txt"
 git status --short > "$OUTPUT_DIR/git-status.txt"
 git diff --stat > "$OUTPUT_DIR/git-diff-stat.txt"
@@ -58,8 +79,12 @@ lscpu > "$OUTPUT_DIR/lscpu.txt"
 rustc --version --verbose > "$OUTPUT_DIR/rustc.txt"
 cargo --version > "$OUTPUT_DIR/cargo.txt"
 awk "/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { print }" /proc/meminfo > "$OUTPUT_DIR/memory.txt"
+sha256sum "$SERVER_BIN" > "$OUTPUT_DIR/server-binary.sha256"
+sha256sum "$BENCH_BIN" > "$OUTPUT_DIR/bench-binary.sha256"
+"$SERVER_BIN" status --addr 127.0.0.1:1 > "$OUTPUT_DIR/server-build-info.txt" 2>&1 || true
 {
   printf "run_id=%s\n" "$RUN_ID"
+  printf "build_revision=%s\n" "$RAGNORDB_BUILD_REVISION"
   printf "repo_root=%s\n" "$REPO_ROOT"
   printf "bench_binary=%s\n" "$BENCH_BIN"
   printf "server_binary=%s\n" "$SERVER_BIN"

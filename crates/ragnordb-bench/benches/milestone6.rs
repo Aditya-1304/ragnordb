@@ -17,9 +17,12 @@ use ragnordb_common::{
 use ragnordb_txn::{ConcurrentTimestampOracle, TimestampReservation, TimestampReservationProvider};
 use std::hint::black_box;
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    thread,
+    collections::{BTreeMap, VecDeque},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
 };
 
 #[derive(Default)]
@@ -43,27 +46,65 @@ impl TimestampReservationProvider for BenchmarkReservationProvider {
     }
 }
 
-fn allocate_in_parallel(
-    oracle: &ConcurrentTimestampOracle<BenchmarkReservationProvider>,
-    workers: usize,
-    allocations_per_worker: usize,
-) -> u64 {
-    thread::scope(|scope| {
+/// Reusable benchmark workers keep thread creation and join costs outside the
+/// measured iteration. The two barriers bound only the concurrent operation;
+/// shutdown wakes workers once more so every owned thread can be joined.
+struct ReusableParallelWorkers {
+    start: Arc<Barrier>,
+    finish: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl ReusableParallelWorkers {
+    fn new<F>(workers: usize, operation: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let start = Arc::new(Barrier::new(workers + 1));
+        let finish = Arc::new(Barrier::new(workers + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let operation = Arc::new(operation);
         let handles = (0..workers)
             .map(|_| {
-                scope.spawn(|| {
-                    for _ in 0..allocations_per_worker {
-                        black_box(oracle.allocate_timestamp().unwrap());
+                let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
+                let stop = Arc::clone(&stop);
+                let operation = Arc::clone(&operation);
+                thread::spawn(move || {
+                    loop {
+                        start.wait();
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        operation();
+                        finish.wait();
                     }
-                    allocations_per_worker as u64
                 })
             })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("timestamp benchmark worker panicked"))
-            .sum()
-    })
+            .collect();
+        Self {
+            start,
+            finish,
+            stop,
+            handles,
+        }
+    }
+
+    fn run(&self) {
+        self.start.wait();
+        self.finish.wait();
+    }
+}
+
+impl Drop for ReusableParallelWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for handle in self.handles.drain(..) {
+            handle.join().expect("benchmark worker panicked");
+        }
+    }
 }
 
 fn bench_timestamp_oracle(c: &mut Criterion) {
@@ -73,20 +114,24 @@ fn bench_timestamp_oracle(c: &mut Criterion) {
             BenchmarkId::new("fast_path_allocations", workers),
             &workers,
             |b, &workers| {
-                b.iter_batched(
-                    || {
-                        Arc::new(
-                            ConcurrentTimestampOracle::new(
-                                BenchmarkReservationProvider::default(),
-                                65_536,
-                                16_384,
-                            )
-                            .unwrap(),
-                        )
-                    },
-                    |oracle| black_box(allocate_in_parallel(&oracle, workers, 1_024)),
-                    BatchSize::SmallInput,
+                let oracle = Arc::new(
+                    ConcurrentTimestampOracle::new(
+                        BenchmarkReservationProvider::default(),
+                        65_536,
+                        16_384,
+                    )
+                    .unwrap(),
                 );
+                let worker_oracle = Arc::clone(&oracle);
+                let worker_pool = ReusableParallelWorkers::new(workers, move || {
+                    for _ in 0..1_024 {
+                        black_box(worker_oracle.allocate_timestamp().unwrap());
+                    }
+                });
+                b.iter(|| {
+                    worker_pool.run();
+                    black_box(workers as u64 * 1_024)
+                });
             },
         );
     }
@@ -188,26 +233,27 @@ fn bench_single_shard_commit(c: &mut Criterion) {
     group.finish();
 }
 
+fn participant_enqueue_and_completion(participants: usize) -> usize {
+    let mut pending = VecDeque::with_capacity(participants);
+    for participant in 0..participants {
+        pending.push_back((participant, participant.saturating_mul(2).saturating_add(1)));
+    }
+
+    let mut completion_checksum = 0usize;
+    while let Some((participant, request_id)) = pending.pop_front() {
+        completion_checksum ^= participant ^ request_id;
+    }
+    completion_checksum
+}
+
 fn bench_participant_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("m6_cross_tablet_participants");
     for participants in [1_usize, 2, 4, 8] {
         group.bench_with_input(
-            BenchmarkId::new("parallel_dispatch_bookkeeping", participants),
+            BenchmarkId::new("bounded_enqueue_and_completion", participants),
             &participants,
             |b, &participants| {
-                b.iter(|| {
-                    thread::scope(|scope| {
-                        let handles = (0..participants)
-                            .map(|participant| scope.spawn(move || black_box(participant * 2 + 1)))
-                            .collect::<Vec<_>>();
-                        black_box(
-                            handles
-                                .into_iter()
-                                .map(|handle| handle.join().unwrap())
-                                .collect::<Vec<_>>(),
-                        );
-                    });
-                });
+                b.iter(|| black_box(participant_enqueue_and_completion(participants)));
             },
         );
     }
@@ -221,29 +267,18 @@ fn bench_contention(c: &mut Criterion) {
             BenchmarkId::new("hotspot_atomic_increment", clients),
             &clients,
             |b, &clients| {
-                b.iter_batched(
-                    || Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                    |counter| {
-                        thread::scope(|scope| {
-                            let handles = (0..clients)
-                                .map(|_| {
-                                    let counter = Arc::clone(&counter);
-                                    scope.spawn(move || {
-                                        for _ in 0..128 {
-                                            counter
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            for handle in handles {
-                                handle.join().unwrap();
-                            }
-                        });
-                        black_box(counter.load(std::sync::atomic::Ordering::Relaxed));
-                    },
-                    BatchSize::SmallInput,
-                );
+                let counter = Arc::new(AtomicU64::new(0));
+                let worker_counter = Arc::clone(&counter);
+                let worker_pool = ReusableParallelWorkers::new(clients, move || {
+                    for _ in 0..128 {
+                        worker_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                b.iter(|| {
+                    counter.store(0, Ordering::Relaxed);
+                    worker_pool.run();
+                    black_box(counter.load(Ordering::Relaxed))
+                });
             },
         );
     }

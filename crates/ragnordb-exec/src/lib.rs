@@ -331,27 +331,6 @@ impl PrewriteBatchDispatcher for GatewayTransactionDispatcher {
         }
         Ok(outcomes)
     }
-
-    fn dispatch_prewrite_parallel(
-        &mut self,
-        plans: &[ragnordb_txn::PrewriteBatchPlan],
-    ) -> Vec<std::result::Result<Self::Output, ParticipantDispatchError>> {
-        std::thread::scope(|scope| {
-            let handles = plans
-                .iter()
-                .map(|plan| scope.spawn(|| dispatch_prewrite_batch(self, plan)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| match handle.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(ParticipantDispatchError::Unavailable {
-                        reason: "parallel prewrite worker panicked".to_string(),
-                    }),
-                })
-                .collect()
-        })
-    }
 }
 
 impl CommitPhaseDispatcher for GatewayTransactionDispatcher {

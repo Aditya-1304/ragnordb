@@ -8,13 +8,20 @@ fn main() {
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be available"),
     );
 
+    let ragnordb_manifest = manifest_dir.join("../../Cargo.toml");
     let raft_manifest = manifest_dir.join("../../../Papers/raft/Cargo.toml");
     let wal_manifest = manifest_dir.join("../../../wal/Cargo.toml");
     let bloom_manifest = manifest_dir.join("../../../bloom-bloom/Cargo.toml");
 
+    emit_rerun_directive(&ragnordb_manifest);
     emit_rerun_directive(&raft_manifest);
     emit_rerun_directive(&wal_manifest);
     emit_rerun_directive(&bloom_manifest);
+    println!("cargo:rerun-if-env-changed=RAGNORDB_BUILD_REVISION");
+
+    let ragnordb_revision = env::var("RAGNORDB_BUILD_REVISION")
+        .unwrap_or_else(|_| repository_revision(&ragnordb_manifest));
+    println!("cargo:rustc-env=RAGNORDB_REVISION={ragnordb_revision}");
 
     println!(
         "cargo:rustc-env=TARGET={}",

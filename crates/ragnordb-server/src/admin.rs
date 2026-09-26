@@ -235,6 +235,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
     Json(serde_json::json!({
         "build": {
             "version": BUILD_INFO.ragnordb_version,
+            "revision": BUILD_INFO.ragnordb_revision,
             "target": BUILD_INFO.target,
             "built_at": BUILD_INFO.built_at,
             "rust_version": BUILD_INFO.rust_version,
