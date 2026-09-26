@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "milestone6"
 harness = false
+
+[[bench]]
+name = "mvcc_batch_scaling"
+harness = false
