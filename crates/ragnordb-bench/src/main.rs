@@ -99,7 +99,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         txn_writes: usize,
 
-        /// Key distribution used by the transaction-contention workload.
+        /// Key distribution used by transaction workloads.
         #[arg(long, value_enum, default_value_t = ContentionDistribution::Disjoint)]
         contention: ContentionDistribution,
 
@@ -441,23 +441,81 @@ fn workload_sql(
     }
 }
 
+/// Return inclusive, non-overlapping row bounds for a benchmark worker.
+///
+/// The partition is computed from half-open slices in u128, then converted
+/// to the table's one-based row IDs. This keeps every row assigned exactly
+/// once, even when the row count is not evenly divisible by the worker count.
+fn disjoint_worker_row_bounds(rows: u64, clients: u32, worker_number: u32) -> Result<(u64, u64)> {
+    validate_disjoint_transaction_rows(rows, clients)?;
+    if worker_number >= clients {
+        bail!("worker number {worker_number} is outside the configured client range 0..{clients}");
+    }
+
+    let rows = u128::from(rows);
+    let clients = u128::from(clients);
+    let worker_number = u128::from(worker_number);
+    let first_zero_based = u64::try_from(rows * worker_number / clients)
+        .context("convert disjoint worker partition start")?;
+    let end_exclusive = u64::try_from(rows * (worker_number + 1) / clients)
+        .context("convert disjoint worker partition end")?;
+    if first_zero_based >= end_exclusive {
+        bail!("worker {worker_number} received an empty disjoint row partition");
+    }
+
+    Ok((first_zero_based + 1, end_exclusive))
+}
+
+fn validate_disjoint_transaction_rows(rows: u64, clients: u32) -> Result<()> {
+    if clients == 0 {
+        bail!("clients must be greater than zero for disjoint transaction workloads");
+    }
+    if rows < u64::from(clients) {
+        bail!(
+            "disjoint transaction workloads require at least one row per client (rows: {rows}, clients: {clients})"
+        );
+    }
+    Ok(())
+}
+
+fn random_row_in_bounds(random: &mut SplitMix64, bounds: (u64, u64)) -> u64 {
+    let (first_row, last_row) = bounds;
+    first_row + random.next() % (last_row - first_row + 1)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn transaction_workload_sql(
     workload: Workload,
     random: &mut SplitMix64,
     tables: &[Arc<str>],
     rows: u64,
+    worker_number: u32,
+    clients: u32,
     txn_writes: usize,
     contention: ContentionDistribution,
     write_value: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
+    let disjoint_bounds = if matches!(contention, ContentionDistribution::Disjoint) {
+        Some(disjoint_worker_row_bounds(rows, clients, worker_number)?)
+    } else {
+        None
+    };
+
     let mut statements = vec!["BEGIN".to_string()];
     for index in 0..txn_writes {
         let row_id = match workload {
             Workload::TxnContention => match contention {
-                ContentionDistribution::Disjoint => random.next() % rows + 1,
-                ContentionDistribution::Moderate => random.next() % 100 + 1,
+                ContentionDistribution::Disjoint => {
+                    random_row_in_bounds(random, disjoint_bounds.expect("disjoint bounds computed"))
+                }
+                ContentionDistribution::Moderate => random.next() % rows.min(100) + 1,
                 ContentionDistribution::Hotspot => 1,
             },
+            Workload::SingleShardTxn | Workload::CrossShardTxn
+                if matches!(contention, ContentionDistribution::Disjoint) =>
+            {
+                random_row_in_bounds(random, disjoint_bounds.expect("disjoint bounds computed"))
+            }
             _ => random.next() % rows + 1,
         };
         let table = if matches!(workload, Workload::CrossShardTxn) {
@@ -468,7 +526,7 @@ fn transaction_workload_sql(
         statements.push(point_write(table, row_id, write_value));
     }
     statements.push("COMMIT".to_string());
-    statements
+    Ok(statements)
 }
 
 // Each argument is an independently configured workload input; keeping them
@@ -480,12 +538,14 @@ fn workload_statements(
     table: &str,
     participant_tables: &[Arc<str>],
     rows: u64,
+    worker_number: u32,
+    clients: u32,
     read_percent: u64,
     scan_rows: u64,
     txn_writes: usize,
     contention: ContentionDistribution,
     write_value: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     match workload {
         Workload::SingleShardTxn | Workload::CrossShardTxn | Workload::TxnContention => {
             transaction_workload_sql(
@@ -493,12 +553,14 @@ fn workload_statements(
                 random,
                 participant_tables,
                 rows,
+                worker_number,
+                clients,
                 txn_writes,
                 contention,
                 write_value,
             )
         }
-        _ => vec![workload_sql(
+        _ => Ok(vec![workload_sql(
             workload,
             random,
             table,
@@ -506,7 +568,7 @@ fn workload_statements(
             read_percent,
             scan_rows,
             write_value,
-        )],
+        )]),
     }
 }
 
@@ -555,6 +617,7 @@ struct RunOptions {
     table: Arc<str>,
     participant_tables: Arc<Vec<Arc<str>>>,
     workload: Workload,
+    clients: u32,
     seconds: u64,
     rows: u64,
     value_bytes: usize,
@@ -603,18 +666,29 @@ async fn run_worker(
 
     // Warmup uses exactly the same operation generator as the measured phase.
     for operation in 0..options.warmup {
-        let statements = workload_statements(
+        let statements = match workload_statements(
             options.workload,
             &mut random,
             &options.table,
             &options.participant_tables,
             options.rows,
+            client_number,
+            options.clients,
             options.read_percent,
             options.scan_rows,
             options.txn_writes,
             options.contention,
             &write_value,
-        );
+        ) {
+            Ok(statements) => statements,
+            Err(error) => {
+                let message = format!(
+                    "client {client_number} warmup workload generation failed at operation {operation}: {error:#}"
+                );
+                let _ = ready_tx.send(Err(message.clone())).await;
+                bail!(message);
+            }
+        };
         for (statement_index, sql) in statements.iter().enumerate() {
             let response = match execute_benchmark_request(
                 &mut client,
@@ -672,12 +746,14 @@ async fn run_worker(
             &options.table,
             &options.participant_tables,
             options.rows,
+            client_number,
+            options.clients,
             options.read_percent,
             options.scan_rows,
             options.txn_writes,
             options.contention,
             &write_value,
-        );
+        )?;
 
         stats.attempted += 1;
         let operation_start = Instant::now();
@@ -1040,6 +1116,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     if transaction_workload && txn_writes == 0 {
         bail!("txn-writes must be greater than zero for transaction workloads");
     }
+    if transaction_workload && matches!(contention, ContentionDistribution::Disjoint) {
+        validate_disjoint_transaction_rows(rows, clients)?;
+    }
     if matches!(workload, Workload::CrossShardTxn) && participant_tables.len() < 2 {
         bail!("cross-shard-txn requires at least two --participant-tables");
     }
@@ -1075,6 +1154,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         table: Arc::from(table.as_str()),
         participant_tables: Arc::new(participant_table_arcs),
         workload,
+        clients,
         seconds,
         rows,
         value_bytes,
@@ -1286,6 +1366,134 @@ async fn main() -> Result<()> {
                 session_epoch,
             })
             .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROWS: u64 = 64;
+    const CLIENTS: u32 = 4;
+
+    #[test]
+    fn disjoint_worker_partitions_cover_every_row_without_overlap() {
+        for (rows, clients) in [(10, 3), (7, 4), (8, 8)] {
+            let mut next_expected_row = 1;
+            for worker_number in 0..clients {
+                let (first_row, last_row) =
+                    disjoint_worker_row_bounds(rows, clients, worker_number)
+                        .expect("valid worker configuration should have a row partition");
+                assert_eq!(first_row, next_expected_row);
+                assert!(first_row <= last_row);
+                next_expected_row = last_row + 1;
+            }
+            assert_eq!(next_expected_row, rows + 1);
+        }
+    }
+
+    #[test]
+    fn moderate_transaction_contention_stays_within_small_dataset() {
+        let participant_tables = vec![Arc::from("bench")];
+        let mut random = SplitMix64(42);
+        let statements = workload_statements(
+            Workload::TxnContention,
+            &mut random,
+            "bench",
+            &participant_tables,
+            8,
+            0,
+            1,
+            80,
+            1,
+            32,
+            ContentionDistribution::Moderate,
+            "x",
+        )
+        .expect("valid moderate-contention parameters should generate statements");
+
+        let mut generated_writes = 0;
+        for statement in statements {
+            if let Some((_, row_id)) = statement.rsplit_once(" WHERE id = ") {
+                let row_id: u64 = row_id.parse().expect("generated row id is numeric");
+                assert!(
+                    row_id <= 8,
+                    "moderate contention selected row {row_id} outside the 8-row dataset"
+                );
+                generated_writes += 1;
+            }
+        }
+        assert_eq!(generated_writes, 32);
+    }
+
+    #[test]
+    fn disjoint_transaction_workloads_reject_invalid_partitions() {
+        let too_few_rows = validate_disjoint_transaction_rows(3, 4)
+            .expect_err("each disjoint worker needs at least one row");
+        assert!(
+            too_few_rows
+                .to_string()
+                .contains("at least one row per client")
+        );
+
+        let invalid_worker = disjoint_worker_row_bounds(4, 2, 2)
+            .expect_err("worker number must be less than the configured client count");
+        assert!(
+            invalid_worker
+                .to_string()
+                .contains("outside the configured client range")
+        );
+    }
+
+    #[test]
+    fn disjoint_transaction_workloads_keep_each_client_inside_its_partition() {
+        let participant_tables = vec![Arc::from("bench_a"), Arc::from("bench_b")];
+        let workloads = [
+            Workload::SingleShardTxn,
+            Workload::CrossShardTxn,
+            Workload::TxnContention,
+        ];
+
+        for workload in workloads {
+            for worker_number in 0..CLIENTS {
+                let partition_start =
+                    (u128::from(ROWS) * u128::from(worker_number) / u128::from(CLIENTS)) as u64 + 1;
+                let partition_end =
+                    (u128::from(ROWS) * u128::from(worker_number + 1) / u128::from(CLIENTS)) as u64;
+                let mut random = SplitMix64(100 + u64::from(worker_number));
+                let mut generated_writes = 0;
+
+                for _ in 0..64 {
+                    let statements = workload_statements(
+                        workload,
+                        &mut random,
+                        "bench_a",
+                        &participant_tables,
+                        ROWS,
+                        worker_number,
+                        CLIENTS,
+                        80,
+                        1,
+                        2,
+                        ContentionDistribution::Disjoint,
+                        "x",
+                    )
+                    .expect("valid disjoint workload parameters should generate statements");
+
+                    for statement in statements {
+                        if let Some((_, row_id)) = statement.rsplit_once(" WHERE id = ") {
+                            let row_id: u64 = row_id.parse().expect("generated row id is numeric");
+                            assert!(
+                                (partition_start..=partition_end).contains(&row_id),
+                                "{workload:?} worker {worker_number} wrote row {row_id}, outside its partition {partition_start}..={partition_end}"
+                            );
+                            generated_writes += 1;
+                        }
+                    }
+                }
+                assert_eq!(generated_writes, 128);
+            }
         }
     }
 }
