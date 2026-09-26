@@ -21,7 +21,9 @@ use ragnordb_common::{
     metadata_codec::CreateTableRequest,
     rpc_codec::{TabletPointReadInspection, TabletRoute, TabletScanBatch},
 };
-use ragnordb_exec::{ExecutionResult, SqlSession, TabletGateway, TabletScanRoute};
+use ragnordb_exec::{
+    ExecutionResult, QueryResultSink, ResultColumn, SqlSession, TabletGateway, TabletScanRoute,
+};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
     data_directory_lock::DataDirectoryLock,
@@ -49,6 +51,48 @@ struct TestNode {
     database: SharedLocalDatabase,
     runtime: MultiRaftRuntime,
     _data: Arc<TempDir>,
+}
+
+/// Simulates a streaming writer failure or a writer that has already closed.
+struct FailingQuerySink {
+    cancelled: bool,
+}
+
+impl QueryResultSink for FailingQuerySink {
+    fn start(&mut self, _columns: Vec<ResultColumn>, _read_ts: Timestamp) -> Result<()> {
+        Ok(())
+    }
+
+    fn push_batch(&mut self, _rows: Vec<ragnordb_common::codec::Row>) -> Result<()> {
+        Err(Error::ProposalUnavailable {
+            reason: "injected streaming sink failure".to_string(),
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
+async fn assert_gc_protection_released_after_idle(
+    runtime: Arc<TransactionRuntime>,
+    operation: &str,
+) {
+    // The durable aggregate may remain conservative during the configured
+    // grace period, but must become releasable once no local owner remains.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let reconcile_runtime = Arc::clone(&runtime);
+    tokio::task::spawn_blocking(move || reconcile_runtime.reconcile_gc_protection_once())
+        .await
+        .expect("GC protection reconciliation task must not panic")
+        .expect("GC protection reconciliation must complete");
+
+    assert_eq!(
+        runtime.gc_protection_snapshot().active_protections,
+        0,
+        "{operation} must leave no active GC history protection"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +666,7 @@ async fn repeated_single_shard_commits_do_not_exhaust_lifecycle_registry() {
     let mut lifecycle_config = TransactionRuntimeConfig::from_environment(5_000)
         .expect("production lifecycle configuration must be valid");
     lifecycle_config.max_active_transactions = 1_024;
+    lifecycle_config.gc_protection_idle_grace = Duration::from_millis(1);
     assert_eq!(
         lifecycle_config.max_active_transactions, 1_024,
         "the regression must exercise the normal bounded lifecycle capacity"
@@ -684,6 +729,67 @@ async fn repeated_single_shard_commits_do_not_exhaust_lifecycle_registry() {
             .active_count,
         0
     );
+
+    let duplicate_services = services.clone();
+    let duplicate = tokio::task::spawn_blocking(move || {
+        duplicate_services.execute_sql(
+            &mut SqlSession::with_client_id(0x7A12),
+            &format!(
+                "INSERT INTO lifecycle_stress (id, value) VALUES ({}, 'duplicate')",
+                TRANSACTIONS + 1,
+            ),
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .expect("duplicate statement task must not panic");
+    assert!(duplicate.is_err(), "duplicate primary keys must fail");
+    assert_gc_protection_released_after_idle(
+        Arc::clone(&transaction_runtime),
+        "autocommit execution failure",
+    )
+    .await;
+
+    let streaming_services = services.clone();
+    let stream_failure = tokio::task::spawn_blocking(move || {
+        streaming_services.execute_sql_streaming(
+            &mut SqlSession::with_client_id(0x7A13),
+            "SELECT id FROM lifecycle_stress",
+            &mut FailingQuerySink { cancelled: false },
+            1,
+            128,
+        )
+    })
+    .await
+    .expect("streaming failure task must not panic");
+    assert!(
+        stream_failure.is_err(),
+        "the injected sink error must propagate"
+    );
+    assert_gc_protection_released_after_idle(Arc::clone(&transaction_runtime), "streaming failure")
+        .await;
+
+    let cancelled_services = services.clone();
+    let cancelled_stream = tokio::task::spawn_blocking(move || {
+        cancelled_services.execute_sql_streaming(
+            &mut SqlSession::with_client_id(0x7A14),
+            "SELECT id FROM lifecycle_stress",
+            &mut FailingQuerySink { cancelled: true },
+            1,
+            128,
+        )
+    })
+    .await
+    .expect("cancelled streaming task must not panic");
+    assert!(cancelled_stream.is_err(), "cancellation must stop the scan");
+    assert_gc_protection_released_after_idle(
+        Arc::clone(&transaction_runtime),
+        "stream cancellation",
+    )
+    .await;
+
     drop(services);
     drop(transaction_runtime);
     drop(nodes);

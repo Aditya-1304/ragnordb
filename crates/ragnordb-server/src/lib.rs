@@ -29,7 +29,9 @@ use ragnordb_common::protocol::{
     ClientRequestFrame, ClientRequestV2, StreamingResultFrame, encode_streaming_result_frame,
     read_client_frame, write_frame,
 };
-use ragnordb_common::{Error, Result as CommonResult, codec::Row, encoding::encode_row};
+use ragnordb_common::{
+    Error, Result as CommonResult, codec::Row, encoding::encode_row, ids::TxnId,
+};
 use ragnordb_exec::{QueryResultSink, SharedMetadataTableCreator};
 use replicated_tablet::ReplicatedTabletHandle;
 use session::Session;
@@ -520,6 +522,46 @@ impl Server {
     }
 }
 
+/// Tracks the explicit SQL transaction whose read-history pin is owned by a
+/// client connection. Connection teardown drops the scoped owner, while a
+/// transaction already registered for recovery keeps its protection.
+struct ConnectionGcProtectionOwnership {
+    runtime: Option<Arc<TransactionRuntime>>,
+    transaction_id: Option<TxnId>,
+}
+
+impl ConnectionGcProtectionOwnership {
+    fn new(runtime: Option<Arc<TransactionRuntime>>) -> Self {
+        Self {
+            runtime,
+            transaction_id: None,
+        }
+    }
+
+    fn update(&mut self, transaction_id: Option<TxnId>) {
+        if self.transaction_id == transaction_id {
+            return;
+        }
+
+        self.release_current();
+        self.transaction_id = transaction_id;
+    }
+
+    fn release_current(&mut self) {
+        if let (Some(runtime), Some(transaction_id)) =
+            (self.runtime.as_ref(), self.transaction_id.take())
+        {
+            drop(runtime.gc_protection_ownership(transaction_id));
+        }
+    }
+}
+
+impl Drop for ConnectionGcProtectionOwnership {
+    fn drop(&mut self) {
+        self.release_current();
+    }
+}
+
 /// Handle one framed SQL client connection.
 ///
 /// Each connection owns one server session and processes at most one statement
@@ -938,6 +980,10 @@ async fn handle_connection_with_policy(
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
+    let protection_runtime = database_services
+        .as_ref()
+        .and_then(|services| services.gc_protection_runtime());
+    let mut connection_gc_protection = ConnectionGcProtectionOwnership::new(protection_runtime);
     let mut session = Session::new();
     session.statement_timeout_ms = statement_timeout_ms;
 
@@ -1211,6 +1257,8 @@ async fn handle_connection_with_policy(
                 }),
             }
         };
+
+        connection_gc_protection.update(session.current_transaction_id());
 
         let response = match execution {
             Ok(result) => {

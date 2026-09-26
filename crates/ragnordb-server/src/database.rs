@@ -113,6 +113,10 @@ impl fmt::Debug for DatabaseServices {
 }
 
 impl DatabaseServices {
+    pub(crate) fn gc_protection_runtime(&self) -> Option<Arc<TransactionRuntime>> {
+        self.transaction_runtime.clone()
+    }
+
     fn with_transaction_manager<R>(
         &self,
         operation: impl FnOnce(&mut dyn TransactionManager) -> Result<R>,
@@ -439,6 +443,10 @@ impl DatabaseServices {
                         Ok(transaction)
                     })?;
                     let transaction_id = transaction.id();
+                    let _gc_protection_ownership = self
+                        .transaction_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.gc_protection_ownership(transaction_id));
                     let statement_result = {
                         if let Some(executor) = detached_executor.as_ref() {
                             executor.execute_data_plan_with_request_context(
@@ -459,9 +467,6 @@ impl DatabaseServices {
                         }
                     }?;
                     let _ = self.commit_transaction(transaction, session.request_context_mut())?;
-                    if let Some(runtime) = &self.transaction_runtime {
-                        release_gc_protection_best_effort(runtime, transaction_id);
-                    }
                     Ok(statement_result)
                 }
             }
@@ -686,6 +691,10 @@ impl DatabaseServices {
                 Ok(transaction)
             })?;
             let transaction_id = transaction.id();
+            let _gc_protection_ownership = self
+                .transaction_runtime
+                .as_ref()
+                .map(|runtime| runtime.gc_protection_ownership(transaction_id));
             let summary = {
                 if let Some(executor) = detached_executor.as_ref() {
                     executor.execute_select_streaming(
@@ -712,9 +721,6 @@ impl DatabaseServices {
                 }
             };
             let _ = self.commit_transaction(transaction, session.request_context_mut())?;
-            if let Some(runtime) = &self.transaction_runtime {
-                release_gc_protection_best_effort(runtime, transaction_id);
-            }
             Ok(summary)
         };
         self.record_timestamp_metrics();

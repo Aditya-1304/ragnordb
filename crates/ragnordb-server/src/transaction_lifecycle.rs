@@ -504,6 +504,31 @@ pub struct TransactionRuntime {
     gc_protection_tracker: GcProtectionTracker,
 }
 
+/// Owns one autocommit or connection-scoped history pin until its SQL owner
+/// finishes. If durable transaction recovery has activated, the lifecycle
+/// registry becomes the owner and dropping this scope must retain the pin.
+#[derive(Debug)]
+pub(crate) struct GcProtectionOwnership {
+    tracker: GcProtectionTracker,
+    lifecycle: TransactionLifecycleRegistry,
+    txn_id: TxnId,
+}
+
+impl Drop for GcProtectionOwnership {
+    fn drop(&mut self) {
+        if self.lifecycle.is_active(self.txn_id) {
+            return;
+        }
+
+        let started = Instant::now();
+        self.tracker.release_local(self.txn_id);
+        metrics::histogram_record(
+            "ragnordb_txn_gc_protection_release_seconds",
+            started.elapsed().as_secs_f64(),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcProtectionSnapshot {
     pub safe_point: Timestamp,
@@ -545,6 +570,17 @@ impl TransactionRuntime {
 
     pub fn gc_safe_point(&self) -> Timestamp {
         self.metadata.state_snapshot().gc_safe_point()
+    }
+
+    /// Transfer autocommit or connection-owned protection to a scoped owner.
+    /// Dropping the scope releases the local membership unless transaction
+    /// recovery has already become authoritative for this transaction.
+    pub(crate) fn gc_protection_ownership(&self, txn_id: TxnId) -> GcProtectionOwnership {
+        GcProtectionOwnership {
+            tracker: self.gc_protection_tracker.clone(),
+            lifecycle: self.lifecycle.clone(),
+            txn_id,
+        }
     }
 
     /// Hold the admission barrier across transaction timestamp allocation and
@@ -2318,6 +2354,65 @@ mod tests {
         assert!(tracker.release(TxnId(1)));
         assert!(tracker.release(TxnId(2)));
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic bug caught: a statement error or streaming cancellation that
+    /// returns through `?` must not strand its process-local history pin.
+    #[test]
+    fn statement_scope_releases_gc_protection_after_success_failure_or_cancellation() {
+        for (result, expected_success) in [
+            (Ok(()), true),
+            (
+                Err(Error::WriteConflict(
+                    "statement execution failed".to_string(),
+                )),
+                false,
+            ),
+            (
+                Err(Error::ProposalUnavailable {
+                    reason: "stream was cancelled".to_string(),
+                }),
+                false,
+            ),
+        ] {
+            let tracker = GcProtectionTracker::default();
+            let lifecycle = TransactionLifecycleRegistry::new(4, 1_000, 1_000).unwrap();
+            assert!(tracker.register(TxnId(1), Timestamp(10), 100));
+
+            let result: Result<()> = {
+                let _ownership = GcProtectionOwnership {
+                    tracker: tracker.clone(),
+                    lifecycle,
+                    txn_id: TxnId(1),
+                };
+                result
+            };
+
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(tracker.active_count(), 0);
+        }
+    }
+
+    /// Realistic bug caught: dropping the SQL owner after an uncertain commit
+    /// must leave the history pin with the active transaction recovery owner.
+    #[test]
+    fn statement_scope_transfers_gc_protection_to_recovery_after_unknown_outcome() {
+        let tracker = GcProtectionTracker::default();
+        let lifecycle = TransactionLifecycleRegistry::new(4, 1_000, 1_000).unwrap();
+        assert!(tracker.register(TxnId(7), Timestamp(107), 100));
+
+        let status = pending_status(7);
+        let prepared = lifecycle.prepare_primary_status(&status, 1_000).unwrap();
+        lifecycle.activate(prepared, Instant::now());
+
+        drop(GcProtectionOwnership {
+            tracker: tracker.clone(),
+            lifecycle: lifecycle.clone(),
+            txn_id: TxnId(7),
+        });
+
+        assert!(lifecycle.is_active(TxnId(7)));
+        assert_eq!(tracker.active_count(), 1);
     }
 
     #[test]
