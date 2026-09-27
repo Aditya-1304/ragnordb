@@ -176,6 +176,8 @@ for table_number in 0 1 2 3 4 5 6 7; do
 done
 save_statuses after-load
 
+next_case_client_id=10000
+
 run_case() {
   local label="$1"
   local tables="$2"
@@ -183,7 +185,26 @@ run_case() {
   local clients="$4"
   local txn_writes="$5"
   local contention="$6"
-  local client_id="$7"
+
+  if [[ ! "$clients" =~ ^[0-9]+$ ]] || [ "$clients" -le 0 ]; then
+    printf 'invalid client count for %s: %s\n' "$label" "$clients" >&2
+    return 2
+  fi
+
+  # V2 workers use base_client_id + worker_number as their durable client ID.
+  # Reserve the entire range per invocation so a later case cannot reuse an
+  # earlier worker's session while restarting its request sequence at one.
+  local client_count=$((10#$clients))
+  local client_id="$next_case_client_id"
+  local last_client_id=$((client_id + client_count - 1))
+  next_case_client_id=$((next_case_client_id + client_count))
+
+  printf 'base_client_id=%s\nlast_client_id=%s\nclients=%s\n' \
+    "$client_id" \
+    "$last_client_id" \
+    "$client_count" \
+    > "$OUTPUT_DIR/$label-client-range.txt"
+
   local leader
   leader="$(wait_for_group_leader 2)"
   local addr="127.0.0.1:$((7100 + leader))"
@@ -211,15 +232,24 @@ run_case() {
   save_statuses "$label"
 }
 
-case_id=10000
 for clients in $CLIENT_COUNTS; do
-  run_case "single-shard-c${clients}-w1" "bench_0" single-shard-txn "$clients" 1 disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "single-shard-c${clients}-w1" \
+    "bench_0" \
+    single-shard-txn \
+    "$clients" \
+    1 \
+    disjoint
 done
 
 for write_count in 4 16 64; do
-  run_case "single-shard-c8-w${write_count}" "bench_0" single-shard-txn 8 "$write_count" disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "single-shard-c8-w${write_count}" \
+    "bench_0" \
+    single-shard-txn \
+    8 \
+    "$write_count" \
+    disjoint
 done
 
 for participant_count in 2 4 8; do
@@ -227,13 +257,23 @@ for participant_count in 2 4 8; do
   for table_number in $(seq 1 $((participant_count - 1))); do
     table_list="$table_list,bench_$table_number"
   done
-  run_case "cross-shard-p${participant_count}" "$table_list" cross-shard-txn 8 "$participant_count" disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "cross-shard-p${participant_count}" \
+    "$table_list" \
+    cross-shard-txn \
+    8 \
+    "$participant_count" \
+    disjoint
 done
 
 for distribution in disjoint moderate hotspot; do
-  run_case "contention-${distribution}" bench_0 txn-contention 32 1 "$distribution" "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "contention-${distribution}" \
+    bench_0 \
+    txn-contention \
+    32 \
+    1 \
+    "$distribution"
 done
 
 # Crash/recovery evidence: stop the exact PID-file cluster while a transaction
