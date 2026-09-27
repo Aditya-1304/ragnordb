@@ -376,7 +376,7 @@ impl Transaction {
             validate_buffered_mutation(key, mutation)?;
         }
 
-        self.check_projected_writes(writes.iter().map(|(key, mutation)| (key, mutation)))?;
+        self.check_projected_writes(writes.iter())?;
 
         self.writes.extend(writes);
         Ok(())
@@ -774,7 +774,7 @@ mod tests {
     fn transaction_age_allows_the_exact_limit_and_rejects_one_millisecond_over() {
         // Exact-time injection avoids a sleep race and protects the public
         // boundary rule from an accidental `>=` change.
-        let mut transaction = Transaction::new_with_policy(
+        let transaction = Transaction::new_with_policy(
             TxnId(1),
             Timestamp(1),
             TransactionFootprintPolicy {
@@ -784,7 +784,6 @@ mod tests {
         )
         .unwrap();
         let created_at = transaction.created_at;
-        transaction.created_at = created_at;
 
         assert!(
             transaction

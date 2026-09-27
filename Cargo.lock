@@ -1558,6 +1558,7 @@ dependencies = [
 name = "ragnordb-exec"
 version = "0.1.0"
 dependencies = [
+ "metrics",
  "ragnordb-catalog",
  "ragnordb-common",
  "ragnordb-sql",
@@ -1571,6 +1572,7 @@ name = "ragnordb-multiraft"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "metrics",
  "prost",
  "raft",
  "ragnordb-catalog",
@@ -1589,6 +1591,7 @@ name = "ragnordb-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "getrandom 0.3.4",
  "metrics",
  "metrics-exporter-prometheus",
  "prost",

@@ -3839,6 +3839,24 @@ impl MultiRaftRuntime {
     }
 }
 
+/// Compute the host parking interval without allowing a completed startup
+/// retry deadline to keep an idle host in a zero-duration yield loop.
+///
+/// Runnable work always wins. During bootstrap, the retry deadline may wake
+/// the host earlier than its next Raft timer; after bootstrap, the retry
+/// deadline is intentionally ignored because it is no longer maintained.
+fn host_scheduler_wait(
+    runnable: bool,
+    timer_wait: Duration,
+    startup_retry_wait: Option<Duration>,
+) -> Duration {
+    if runnable {
+        return Duration::ZERO;
+    }
+
+    startup_retry_wait.map_or(timer_wait, |retry_wait| timer_wait.min(retry_wait))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_host(
     mut host: MultiRaftHost<LocalWal>,
@@ -4121,15 +4139,14 @@ fn run_host(
 
         publish_host_status(&host_status, &host, pending_metadata.len());
 
-        let wait = if host.has_runnable_work() {
-            Duration::ZERO
-        } else {
-            let timer_wait = host
-                .next_timer_delay_ticks()
-                .map(|ticks| timer_clock.duration_until_ticks(ticks.max(1)))
-                .unwrap_or_else(|| Duration::from_secs(1));
-            timer_wait.min(next_metadata_attempt.saturating_duration_since(now))
-        };
+        let startup_retry_wait = startup_sender
+            .is_some()
+            .then(|| next_metadata_attempt.saturating_duration_since(now));
+        let timer_wait = host
+            .next_timer_delay_ticks()
+            .map(|ticks| timer_clock.duration_until_ticks(ticks.max(1)))
+            .unwrap_or_else(|| Duration::from_secs(1));
+        let wait = host_scheduler_wait(host.has_runnable_work(), timer_wait, startup_retry_wait);
 
         if wait.is_zero() {
             thread::yield_now();
@@ -4481,6 +4498,54 @@ fn publish_host_status(
     {
         metadata_group.pending_proposals = metadata_pending_proposals;
     }
+    // Publish one bounded node-wide load snapshot for Prometheus. These are
+    // aggregate gauges: tablet and request identities stay out of metric keys.
+    crate::metrics::gauge_set(
+        "ragnordb_raft_pending_proposals",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.pending_proposals)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_groups",
+        snapshot.pending_persistence_groups as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_records",
+        snapshot.pending_persistence_records as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_bytes",
+        snapshot.pending_persistence_bytes as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_entries",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_entries)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_bytes",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_bytes)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_oldest_age_seconds",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_age_ms)
+            .max()
+            .unwrap_or_default() as f64
+            / 1_000.0,
+    );
     *status
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
@@ -4849,6 +4914,14 @@ mod tests {
             MetadataCommand::ClusterInitialized {
                 cluster_id: "cluster-a".to_string(),
             },
+        );
+    }
+
+    #[test]
+    fn completed_startup_does_not_force_zero_scheduler_wait() {
+        assert_eq!(
+            host_scheduler_wait(false, Duration::from_millis(250), None),
+            Duration::from_millis(250),
         );
     }
 

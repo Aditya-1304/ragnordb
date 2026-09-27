@@ -21,13 +21,16 @@ use ragnordb_common::{
     metadata_codec::CreateTableRequest,
     rpc_codec::{TabletPointReadInspection, TabletRoute, TabletScanBatch},
 };
-use ragnordb_exec::{ExecutionResult, SqlSession, TabletGateway, TabletScanRoute};
+use ragnordb_exec::{
+    ExecutionResult, QueryResultSink, ResultColumn, SqlSession, TabletGateway, TabletScanRoute,
+};
 use ragnordb_server::{
     config::{NodeConfig, SeedNodeConfig},
     data_directory_lock::DataDirectoryLock,
     database::{LocalDatabase, SharedLocalDatabase},
     multiraft_runtime::{MetadataTimestampReservationClient, MultiRaftRuntime},
     rpc::TabletRpcClient,
+    transaction_lifecycle::{LifecycleTabletGateway, TransactionRuntime, TransactionRuntimeConfig},
 };
 use ragnordb_storage::key::make_row_key;
 use tempfile::TempDir;
@@ -48,6 +51,48 @@ struct TestNode {
     database: SharedLocalDatabase,
     runtime: MultiRaftRuntime,
     _data: Arc<TempDir>,
+}
+
+/// Simulates a streaming writer failure or a writer that has already closed.
+struct FailingQuerySink {
+    cancelled: bool,
+}
+
+impl QueryResultSink for FailingQuerySink {
+    fn start(&mut self, _columns: Vec<ResultColumn>, _read_ts: Timestamp) -> Result<()> {
+        Ok(())
+    }
+
+    fn push_batch(&mut self, _rows: Vec<ragnordb_common::codec::Row>) -> Result<()> {
+        Err(Error::ProposalUnavailable {
+            reason: "injected streaming sink failure".to_string(),
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
+async fn assert_gc_protection_released_after_idle(
+    runtime: Arc<TransactionRuntime>,
+    operation: &str,
+) {
+    // The durable aggregate may remain conservative during the configured
+    // grace period, but must become releasable once no local owner remains.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let reconcile_runtime = Arc::clone(&runtime);
+    tokio::task::spawn_blocking(move || reconcile_runtime.reconcile_gc_protection_once())
+        .await
+        .expect("GC protection reconciliation task must not panic")
+        .expect("GC protection reconciliation must complete");
+
+    assert_eq!(
+        runtime.gc_protection_snapshot().active_protections,
+        0,
+        "{operation} must leave no active GC history protection"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +117,7 @@ struct RuntimeFaultState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // Event names identify the applied command boundary under test.
 enum RuntimeCommandEvent {
     PrewriteApplied {
         txn_id: TxnId,
@@ -276,7 +322,7 @@ impl TabletGateway for RuntimeFaultGateway {
             }
             _ => None,
         };
-        if secondary_prewrite.is_some()
+        if let Some(txn_id) = secondary_prewrite
             && self
                 .fail_secondary_prewrite_once
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
@@ -284,7 +330,7 @@ impl TabletGateway for RuntimeFaultGateway {
         {
             return Err(Error::WriteConflict(format!(
                 "injected secondary prewrite conflict for transaction {}",
-                secondary_prewrite.unwrap().0
+                txn_id.0
             )));
         }
 
@@ -541,6 +587,212 @@ async fn start_failover_test_nodes() -> Vec<TestNode> {
         nodes.push(node);
     }
     nodes
+}
+
+/// Realistic bug caught: successful single-shard SQL commits do not pass
+/// through the primary-prewrite lifecycle hook, so each can leave a staged
+/// footprint behind and exhaust the configured registry after 1,024 commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_single_shard_commits_do_not_exhaust_lifecycle_registry() {
+    const TRANSACTIONS: u64 = 2_048;
+
+    let nodes = start_failover_test_nodes().await;
+    let leader = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(index) = nodes
+                .iter()
+                .position(|node| node.runtime.handle().is_leader())
+            {
+                break index;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the production hosts must elect a metadata leader");
+
+    for node in &nodes {
+        let creator = node.runtime.metadata_table_creator();
+        node.database
+            .lock()
+            .await
+            .replace_metadata_table_creator(creator);
+    }
+
+    let create_database = nodes[leader].database.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        create_database
+            .blocking_lock()
+            .execute_sql_with_metadata_request(
+                &mut SqlSession::with_client_id(0x7A10),
+                "CREATE TABLE lifecycle_stress (id INT PRIMARY KEY, value TEXT NOT NULL)",
+                Some(RequestId {
+                    client_id: 0x7A10,
+                    sequence: 1,
+                    raft_group_id: RaftGroupId(2),
+                }),
+                Duration::from_secs(5),
+            )
+    })
+    .await
+    .expect("metadata-backed table creation task must not panic")
+    .expect("metadata-backed lifecycle stress table must be created");
+    let ExecutionResult::CreatedTable { table_id } = created else {
+        panic!("lifecycle stress setup must create a metadata-owned table");
+    };
+    let tablet_group_id = nodes[leader]
+        .runtime
+        .metadata_table_creator()
+        .table_descriptors(table_id)
+        .expect("metadata must publish the lifecycle stress table descriptor")[0]
+        .raft_group_id;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if nodes.iter().all(|node| {
+                node.runtime
+                    .host_status()
+                    .groups
+                    .iter()
+                    .any(|group| group.identity.raft_group_id == tablet_group_id)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every assigned node must materialize the lifecycle stress tablet");
+
+    let mut lifecycle_config = TransactionRuntimeConfig::from_environment(5_000)
+        .expect("production lifecycle configuration must be valid");
+    lifecycle_config.max_active_transactions = 1_024;
+    lifecycle_config.gc_protection_idle_grace = Duration::from_millis(1);
+    assert_eq!(
+        lifecycle_config.max_active_transactions, 1_024,
+        "the regression must exercise the normal bounded lifecycle capacity"
+    );
+    let transaction_runtime = Arc::new(
+        TransactionRuntime::new(
+            NodeId((leader + 1) as u64),
+            lifecycle_config,
+            nodes[leader].runtime.metadata_handle(),
+            nodes[leader].runtime.metadata_control(),
+        )
+        .expect("production transaction runtime must initialize"),
+    );
+
+    let database = nodes[leader].database.clone();
+    let gateway = Arc::new(LifecycleTabletGateway::new(
+        nodes[leader].runtime.tablet_rpc_client(),
+        transaction_runtime.lifecycle.clone(),
+    ));
+    let services = {
+        let mut database = database.lock().await;
+        database.replace_tablet_gateway(gateway);
+        database.database_services_with_transaction_runtime(transaction_runtime.clone())
+    };
+
+    let stress_services = services.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut session = SqlSession::with_client_id(0x7A11);
+        for id in 1..=TRANSACTIONS {
+            let statement = format!("INSERT INTO lifecycle_stress (id, value) VALUES ({id}, 'v')");
+            stress_services.execute_sql(
+                &mut session,
+                &statement,
+                None,
+                None,
+                Duration::from_secs(5),
+            )?;
+        }
+
+        stress_services.execute_sql(
+            &mut session,
+            &format!(
+                "INSERT INTO lifecycle_stress (id, value) VALUES ({}, 'v')",
+                TRANSACTIONS + 1,
+            ),
+            None,
+            None,
+            Duration::from_secs(5),
+        )?;
+        Ok(())
+    })
+    .await
+    .expect("single-shard lifecycle stress task must not panic")
+    .expect("more than 1,024 successful SingleShardCommit transactions must remain admissible");
+
+    assert_eq!(
+        transaction_runtime
+            .lifecycle
+            .status_snapshot(8)
+            .active_count,
+        0
+    );
+
+    let duplicate_services = services.clone();
+    let duplicate = tokio::task::spawn_blocking(move || {
+        duplicate_services.execute_sql(
+            &mut SqlSession::with_client_id(0x7A12),
+            &format!(
+                "INSERT INTO lifecycle_stress (id, value) VALUES ({}, 'duplicate')",
+                TRANSACTIONS + 1,
+            ),
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .expect("duplicate statement task must not panic");
+    assert!(duplicate.is_err(), "duplicate primary keys must fail");
+    assert_gc_protection_released_after_idle(
+        Arc::clone(&transaction_runtime),
+        "autocommit execution failure",
+    )
+    .await;
+
+    let streaming_services = services.clone();
+    let stream_failure = tokio::task::spawn_blocking(move || {
+        streaming_services.execute_sql_streaming(
+            &mut SqlSession::with_client_id(0x7A13),
+            "SELECT id FROM lifecycle_stress",
+            &mut FailingQuerySink { cancelled: false },
+            1,
+            128,
+        )
+    })
+    .await
+    .expect("streaming failure task must not panic");
+    assert!(
+        stream_failure.is_err(),
+        "the injected sink error must propagate"
+    );
+    assert_gc_protection_released_after_idle(Arc::clone(&transaction_runtime), "streaming failure")
+        .await;
+
+    let cancelled_services = services.clone();
+    let cancelled_stream = tokio::task::spawn_blocking(move || {
+        cancelled_services.execute_sql_streaming(
+            &mut SqlSession::with_client_id(0x7A14),
+            "SELECT id FROM lifecycle_stress",
+            &mut FailingQuerySink { cancelled: true },
+            1,
+            128,
+        )
+    })
+    .await
+    .expect("cancelled streaming task must not panic");
+    assert!(cancelled_stream.is_err(), "cancellation must stop the scan");
+    assert_gc_protection_released_after_idle(
+        Arc::clone(&transaction_runtime),
+        "stream cancellation",
+    )
+    .await;
+
+    drop(services);
+    drop(transaction_runtime);
+    drop(nodes);
 }
 
 /// Realistic bugs caught:
@@ -1098,14 +1350,13 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
                 })
         })
         .expect("the primary group must have an activated leader");
-    let leader_replica = recovered_primary_route
+    let leader_replica = *recovered_primary_route
         .replicas
         .iter()
         .find(|replica| {
             replica.replica_id == leader_replica_id && replica.node_id == leader_node_id
         })
-        .expect("the active primary leader must be present in the recovered route")
-        .clone();
+        .expect("the active primary leader must be present in the recovered route");
     let leader_node_index = seeds
         .iter()
         .position(|seed| seed.id == leader_node_id)

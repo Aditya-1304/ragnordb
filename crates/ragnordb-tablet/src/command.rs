@@ -22,7 +22,7 @@ use ragnordb_common::{
 };
 use ragnordb_storage::{
     key::decode_row_key,
-    mvcc::{InMemoryMvcc, Mutation, MvccStorage},
+    mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
 
 use crate::Tablet;
@@ -57,6 +57,20 @@ pub struct TabletStateMachine<S = InMemoryMvcc> {
     transaction_statuses: BTreeMap<ragnordb_common::ids::TxnId, TxnStatusRecord>,
 }
 
+/// On-demand counts for investigating retained state growth in one tablet.
+///
+/// The MVCC portion walks the current in-memory version maps. Callers should
+/// sample this snapshot at diagnostic checkpoints, not on the transaction
+/// apply path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabletStateDiagnostics {
+    pub mvcc: MvccStats,
+    pub legacy_cached_outcomes: usize,
+    pub logical_cached_outcomes: usize,
+    pub retry_floor_entries: usize,
+    pub transaction_status_records: usize,
+}
+
 impl<S: MvccStorage> TabletStateMachine<S> {
     /// bind a tablet to the non-zero descriptor epoch represented by this
     /// state-machine instance
@@ -81,6 +95,17 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             logical_client_retry_horizons: BTreeMap::new(),
             transaction_statuses: BTreeMap::new(),
         })
+    }
+
+    /// Capture a state-growth snapshot for an explicit diagnostics sample.
+    pub fn state_diagnostics(&self) -> TabletStateDiagnostics {
+        TabletStateDiagnostics {
+            mvcc: self.tablet.stats(),
+            legacy_cached_outcomes: self.client_deduplication.len(),
+            logical_cached_outcomes: self.logical_command_deduplication.len(),
+            retry_floor_entries: self.logical_client_retry_horizons.len(),
+            transaction_status_records: self.transaction_statuses.len(),
+        }
     }
 
     /// Borrow the tablet state owned by this replicated state machine.
@@ -2399,6 +2424,60 @@ mod tests {
         assert_eq!(state_machine.apply(participant).unwrap_err(), first_error);
         assert_eq!(state_machine.tablet().stats().locks, 1);
         assert_eq!(state_machine.tablet().stats().default_versions, 1);
+    }
+
+    /// A semantically identical prewrite with a fresh request sequence must succeed
+    /// without adding another intent or changing the participant's MVCC state.
+    #[test]
+    fn successful_prewrite_replay_with_fresh_request_sequence_is_idempotent() {
+        let mut state_machine = state_machine();
+        let key = make_row_key(TableId(9), &[Value::Int(77)]).unwrap();
+        let encoded_key = encode_row_key(&key).unwrap();
+
+        let prewrite = PrewriteCommand {
+            txn_id: TxnId(126),
+            start_timestamp: Timestamp(480),
+            writes: vec![WriteEntry {
+                key: encoded_key.clone(),
+                row: Some(test_row(77, "fresh replay")),
+                op: WriteKind::Put,
+            }],
+            primary_key: encoded_key,
+            ttl_ms: 30_000,
+            pending_status: None,
+        };
+
+        let first = state_machine
+            .apply(command_envelope(
+                1,
+                TabletCommand::Prewrite(prewrite.clone()),
+            ))
+            .unwrap();
+
+        assert_eq!(first.result, TabletCommandApplyResult::Prewrite);
+        let state_after_first = state_machine.tablet().stats();
+
+        // Sequence two is a new command request, so this exercises the storage
+        // layer's semantic retry handling rather than request-ID result caching.
+        let replay = state_machine
+            .apply(command_envelope(2, TabletCommand::Prewrite(prewrite)))
+            .unwrap();
+
+        assert_eq!(replay.result, TabletCommandApplyResult::Prewrite);
+        let state_after_replay = state_machine.tablet().stats();
+
+        assert_eq!(
+            state_after_replay.default_versions,
+            state_after_first.default_versions
+        );
+        assert_eq!(state_after_replay.locks, state_after_first.locks);
+        assert_eq!(
+            state_after_replay.write_records,
+            state_after_first.write_records
+        );
+        assert_eq!(state_after_replay.default_versions, 1);
+        assert_eq!(state_after_replay.locks, 1);
+        assert_eq!(state_after_replay.write_records, 0);
     }
 
     #[test]

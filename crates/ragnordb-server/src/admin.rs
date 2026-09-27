@@ -195,6 +195,10 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
     let node_lifecycle = current_node_lifecycle_status(&state)
         .as_ref()
         .map(node_drain_status_json);
+    let metadata_cached_outcomes = state
+        .node_lifecycle
+        .as_ref()
+        .map(|node| node.metadata.state_snapshot().request_deduplication_count());
     let transaction_runtime = state.transaction_runtime.as_ref().map(|runtime| {
         let snapshot = runtime.lifecycle.status_snapshot(32);
         let rows = snapshot
@@ -235,6 +239,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
     Json(serde_json::json!({
         "build": {
             "version": BUILD_INFO.ragnordb_version,
+            "revision": BUILD_INFO.ragnordb_revision,
             "target": BUILD_INFO.target,
             "built_at": BUILD_INFO.built_at,
             "rust_version": BUILD_INFO.rust_version,
@@ -258,6 +263,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> Json<serde_json:
         "multiraft": multiraft,
         "node_lifecycle": node_lifecycle,
         "transactions": transaction_runtime,
+        "metadata_cached_outcomes": metadata_cached_outcomes,
         "storage": storage.map(|storage| serde_json::json!({
             "durable_lsn": storage.durable_lsn,
             "replay_frontier": storage.replay_frontier,
@@ -310,6 +316,7 @@ fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
                 "term": group.term,
                 "commit_index": group.commit_index,
                 "last_log_index": group.last_log_index,
+                "retained_log_entries": group.last_log_index.saturating_sub(group.snapshot_index),
                 "applied_index": group.applied_index,
                 "snapshot_index": group.snapshot_index,
                 "uncommitted_bytes": group.uncommitted_bytes,
@@ -322,6 +329,26 @@ fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
                 "apply_backlog_generations": group.apply_backlog_generations,
                 "pending_messages": group.pending_messages,
                 "pending_message_bytes": group.pending_message_bytes,
+                "replica_match_indices": group
+                    .replica_match_indices
+                    .iter()
+                    .map(|(replica_id, index)| serde_json::json!({
+                        "replica_id": replica_id.0,
+                        "match_index": index,
+                    }))
+                    .collect::<Vec<_>>(),
+                "replica_inflight_bytes": group
+                    .replica_inflight_bytes
+                    .iter()
+                    .map(|(replica_id, bytes)| serde_json::json!({
+                        "replica_id": replica_id.0,
+                        "bytes": bytes,
+                    }))
+                    .collect::<Vec<_>>(),
+                "state_diagnostics_sample_unix_nanos": group.state_diagnostics_sample_unix_nanos,
+                "tablet_state_diagnostics": group
+                    .tablet_state_diagnostics
+                    .map(tablet_state_diagnostics_json),
                 "quarantine_reason": group.quarantine_reason,
             })
         })
@@ -336,6 +363,39 @@ fn multiraft_detail_json(status: &MultiRaftHostStatus) -> serde_json::Value {
         "pending_persistence_records": status.pending_persistence_records,
         "pending_persistence_bytes": status.pending_persistence_bytes,
         "groups": groups,
+    })
+}
+
+fn tablet_state_diagnostics_json(
+    diagnostics: ragnordb_tablet::command::TabletStateDiagnostics,
+) -> serde_json::Value {
+    let mvcc = diagnostics.mvcc;
+    serde_json::json!({
+        "mvcc": {
+            "default_keys": mvcc.default_keys,
+            "default_versions": mvcc.default_versions,
+            "default_versions_per_key": {
+                "one": mvcc.default_version_chains.one,
+                "two_to_four": mvcc.default_version_chains.two_to_four,
+                "five_to_sixteen": mvcc.default_version_chains.five_to_sixteen,
+                "more_than_sixteen": mvcc.default_version_chains.more_than_sixteen,
+                "max": mvcc.default_version_chains.max_per_key,
+            },
+            "write_keys": mvcc.write_keys,
+            "write_records": mvcc.write_records,
+            "write_records_per_key": {
+                "one": mvcc.write_record_chains.one,
+                "two_to_four": mvcc.write_record_chains.two_to_four,
+                "five_to_sixteen": mvcc.write_record_chains.five_to_sixteen,
+                "more_than_sixteen": mvcc.write_record_chains.more_than_sixteen,
+                "max": mvcc.write_record_chains.max_per_key,
+            },
+            "locks": mvcc.locks,
+        },
+        "legacy_cached_outcomes": diagnostics.legacy_cached_outcomes,
+        "logical_cached_outcomes": diagnostics.logical_cached_outcomes,
+        "retry_floor_entries": diagnostics.retry_floor_entries,
+        "transaction_status_records": diagnostics.transaction_status_records,
     })
 }
 
@@ -680,6 +740,9 @@ mod tests {
                 learners: Vec::new(),
                 outgoing_voters: Vec::new(),
                 replica_match_indices: Vec::new(),
+                replica_inflight_bytes: Vec::new(),
+                tablet_state_diagnostics: None,
+                state_diagnostics_sample_unix_nanos: None,
                 pending_conf_change_index: None,
                 last_conf_change: None,
                 last_removed_replica: None,

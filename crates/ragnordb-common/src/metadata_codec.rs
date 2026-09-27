@@ -2020,7 +2020,7 @@ impl MetadataSnapshot {
             gc_protections: self
                 .gc_protections
                 .iter()
-                .map(MetadataGcProtection::to_proto)
+                .map(MetadataGcProtection::as_proto)
                 .collect(),
 
             request_deduplication: self
@@ -2233,7 +2233,7 @@ impl MetadataGcProtection {
         Ok(())
     }
 
-    fn to_proto(&self) -> metadata::GcProtection {
+    fn as_proto(&self) -> metadata::GcProtection {
         metadata::GcProtection {
             owner_id: self.owner_id.to_le_bytes().to_vec(),
             protection_id: self.protection_id.to_le_bytes().to_vec(),

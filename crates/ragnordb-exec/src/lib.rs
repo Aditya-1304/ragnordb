@@ -26,9 +26,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use expression::evaluate;
@@ -125,8 +125,7 @@ type LocalTablet = SingleNodeCommitCoordinator<Tablet, SharedCommitLog>;
 /// exact logical command outcome is known.
 struct GatewayTransactionDispatcher {
     gateway: SharedTabletGateway,
-    timeout: Duration,
-    acknowledged_through: Option<u64>,
+    request_context: TabletRequestContext,
     primary_prewrite_applied: bool,
     primary_commit_applied: bool,
     owner_change_after_pending: AtomicBool,
@@ -134,6 +133,29 @@ struct GatewayTransactionDispatcher {
 
 struct GatewayParticipantRouteRefresher {
     gateway: SharedTabletGateway,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    configured_timeout_ms: u64,
+}
+
+impl GatewayParticipantRouteRefresher {
+    fn new(gateway: SharedTabletGateway, request_context: &TabletRequestContext) -> Self {
+        Self {
+            gateway,
+            deadline: request_context.deadline,
+            cancelled: Arc::clone(&request_context.cancelled),
+            configured_timeout_ms: request_context.configured_timeout_ms,
+        }
+    }
+
+    fn check_active(&self) -> Result<()> {
+        remaining_statement_budget(
+            self.deadline,
+            self.cancelled.as_ref(),
+            self.configured_timeout_ms,
+        )
+        .map(|_| ())
+    }
 }
 
 impl ParticipantRouteRefresher for GatewayParticipantRouteRefresher {
@@ -142,10 +164,12 @@ impl ParticipantRouteRefresher for GatewayParticipantRouteRefresher {
         logical_mutation_id: &ragnordb_txn::LogicalMutationId,
         _previous_route: ParticipantRoute,
     ) -> Result<ParticipantRoute> {
+        self.check_active()?;
         let row_key = decode_row_key(logical_mutation_id.as_key())?;
         let route = self
             .gateway
             .lookup_tablet_route(row_key.table_id, &row_key.primary_key_bytes)?;
+        self.check_active()?;
         route
             .validate()
             .map_err(|error| Error::CorruptData(error.to_string()))?;
@@ -156,24 +180,31 @@ impl ParticipantRouteRefresher for GatewayParticipantRouteRefresher {
 impl GatewayTransactionDispatcher {
     fn new(
         gateway: SharedTabletGateway,
-        timeout: Duration,
-        acknowledged_through: Option<u64>,
+        request_context: &TabletRequestContext,
         primary_prewrite_applied: bool,
     ) -> Self {
         Self {
             gateway,
-            timeout,
-            acknowledged_through,
+            request_context: request_context.clone(),
             primary_prewrite_applied,
             primary_commit_applied: false,
             owner_change_after_pending: AtomicBool::new(false),
         }
     }
 
+    fn remaining_timeout(&self) -> Result<Duration> {
+        self.request_context.remaining_timeout()
+    }
+
+    fn check_active(&self) -> Result<()> {
+        self.remaining_timeout().map(|_| ())
+    }
+
     fn tablet_route_for_plan(
         &self,
         plan: &ParticipantCommandPlan,
     ) -> std::result::Result<TabletRoute, ParticipantDispatchError> {
+        self.check_active().map_err(dispatch_error)?;
         let row_key =
             decode_row_key(plan.command_id.logical_mutation_id().as_key()).map_err(|error| {
                 ParticipantDispatchError::Rejected {
@@ -229,9 +260,8 @@ impl GatewayTransactionDispatcher {
             route,
             request_id,
             logical_command_id,
-            self.acknowledged_through,
             command,
-            self.timeout,
+            &self.request_context,
         )
     }
 
@@ -331,27 +361,6 @@ impl PrewriteBatchDispatcher for GatewayTransactionDispatcher {
         }
         Ok(outcomes)
     }
-
-    fn dispatch_prewrite_parallel(
-        &mut self,
-        plans: &[ragnordb_txn::PrewriteBatchPlan],
-    ) -> Vec<std::result::Result<Self::Output, ParticipantDispatchError>> {
-        std::thread::scope(|scope| {
-            let handles = plans
-                .iter()
-                .map(|plan| scope.spawn(|| dispatch_prewrite_batch(self, plan)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| match handle.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(ParticipantDispatchError::Unavailable {
-                        reason: "parallel prewrite worker panicked".to_string(),
-                    }),
-                })
-                .collect()
-        })
-    }
 }
 
 impl CommitPhaseDispatcher for GatewayTransactionDispatcher {
@@ -443,6 +452,7 @@ impl RollbackPhaseDispatcher for GatewayTransactionDispatcher {
         &mut self,
         plan: &ragnordb_txn::RollbackPhasePlan,
     ) -> std::result::Result<Self::StatusOutput, ParticipantDispatchError> {
+        self.check_active().map_err(dispatch_error)?;
         let primary_key = plan.status_record.primary_key.as_slice();
         let row_key =
             decode_row_key(primary_key).map_err(|error| ParticipantDispatchError::Rejected {
@@ -534,6 +544,9 @@ fn dispatch_error(error: Error) -> ParticipantDispatchError {
         Error::RequestOutcomeUnknown { identity } => {
             ParticipantDispatchError::OutcomeUnknown { reason: identity }
         }
+        Error::StatementTimeout { timeout_ms } => ParticipantDispatchError::Unavailable {
+            reason: format!("statement deadline elapsed after {timeout_ms} ms"),
+        },
         Error::ProposalUnavailable { reason } | Error::TabletUnavailable { reason } => {
             ParticipantDispatchError::Unavailable { reason }
         }
@@ -546,26 +559,77 @@ fn dispatch_error(error: Error) -> ParticipantDispatchError {
     }
 }
 
+fn remaining_statement_budget(
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    configured_timeout_ms: u64,
+) -> Result<Duration> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Error::ProposalUnavailable {
+            reason: "foreground SQL statement was cancelled".to_string(),
+        });
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+
+    if remaining.is_zero() {
+        return Err(Error::StatementTimeout {
+            timeout_ms: configured_timeout_ms,
+        });
+    }
+
+    Ok(remaining)
+}
+
+/// Read the local Unix clock for lease checks. A clock before the Unix epoch
+/// is treated as unsafe so it cannot make an expired history pin appear live.
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(u64::MAX)
+}
+
 fn submit_with_outcome_recovery(
     gateway: &dyn TabletGateway,
     route: &TabletRoute,
     request_id: RequestId,
     logical_command_id: LogicalCommandId,
-    acknowledged_through: Option<u64>,
     command: TabletCommand,
-    timeout: Duration,
+    request_context: &TabletRequestContext,
 ) -> std::result::Result<TabletCommandApplyOutcome, ParticipantDispatchError> {
+    let submit_timeout = request_context
+        .remaining_timeout()
+        .map_err(dispatch_error)?;
+
     match gateway.submit_command_with_identity_and_ack(
         route,
         request_id.clone(),
         logical_command_id,
-        acknowledged_through,
+        request_context.acknowledged_through(),
         command,
-        timeout,
+        submit_timeout,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error @ (Error::RequestOutcomeUnknown { .. } | Error::ProposalUnavailable { .. })) => {
-            match gateway.query_original_outcome(route, request_id, logical_command_id, timeout) {
+            let original_error = error.to_string();
+            let query_timeout = match request_context.remaining_timeout() {
+                Ok(timeout) => timeout,
+                Err(budget_error) => {
+                    return Err(ParticipantDispatchError::OutcomeUnknown {
+                        reason: format!(
+                            "{original_error}; outcome lookup could not run because the root statement budget ended: {budget_error}"
+                        ),
+                    });
+                }
+            };
+
+            match gateway.query_original_outcome(
+                route,
+                request_id,
+                logical_command_id,
+                query_timeout,
+            ) {
                 Ok(Some(CachedTabletCommandOutcome::Applied(result))) => {
                     Ok(TabletCommandApplyOutcome {
                         result: result.into(),
@@ -588,10 +652,10 @@ fn submit_with_outcome_recovery(
                     })
                 }
                 Ok(None) => Err(ParticipantDispatchError::OutcomeUnknown {
-                    reason: error.to_string(),
+                    reason: original_error,
                 }),
                 Err(query_error) => Err(ParticipantDispatchError::OutcomeUnknown {
-                    reason: format!("{}; outcome lookup failed: {query_error}", error),
+                    reason: format!("{original_error}; outcome lookup failed: {query_error}"),
                 }),
             }
         }
@@ -608,6 +672,7 @@ fn resolve_foreground_intent(
     lock: &LockRecord,
     request_context: &mut TabletRequestContext,
 ) -> Result<()> {
+    request_context.check_active()?;
     let status_primary_key = decode_row_key(&lock.primary_key).map_err(|error| {
         Error::CorruptData(format!(
             "transaction {} intent has an invalid primary key: {error}",
@@ -622,19 +687,19 @@ fn resolve_foreground_intent(
         .validate()
         .map_err(|error| Error::CorruptData(error.to_string()))?;
     let status_request_id = request_context.next_read_request_id(status_route.raft_group_id)?;
-    let status = gateway
-        .transaction_status(
-            &status_route,
-            status_request_id,
-            lock.txn_id,
-            request_context.timeout(),
-        )?
-        .ok_or_else(|| Error::TabletUnavailable {
-            reason: format!(
-                "transaction status for intent owner {} is not currently visible",
-                lock.txn_id.0
-            ),
-        })?;
+    let status = gateway.transaction_status(
+        &status_route,
+        status_request_id,
+        lock.txn_id,
+        request_context.remaining_timeout()?,
+    )?;
+    request_context.check_active()?;
+    let status = status.ok_or_else(|| Error::TabletUnavailable {
+        reason: format!(
+            "transaction status for intent owner {} is not currently visible",
+            lock.txn_id.0
+        ),
+    })?;
     if status.primary_tablet_id().map_err(|reason| {
         Error::CorruptData(format!(
             "transaction status has invalid authority: {reason}"
@@ -671,9 +736,8 @@ fn resolve_foreground_intent(
                 &participant_route,
                 request_id,
                 plan.logical_command_id,
-                request_context.acknowledged_through(),
                 TabletCommand::ResolveIntent(plan.command),
-                request_context.timeout(),
+                request_context,
             )
             .map_err(participant_dispatch_error_to_error)?;
             if !matches!(
@@ -974,7 +1038,30 @@ pub struct TabletRequestContext {
     root_request_sequence: u64,
     next_command_ordinal: u32,
     acknowledged_through: Option<u64>,
-    timeout: Duration,
+
+    /// Process-local monotonic deadline for the current SQL statement.
+    ///
+    /// This value never crosses the network. Remote RPCs receive only a
+    /// conservative remaining-duration budget.
+    deadline: Instant,
+
+    /// Shared with the streaming transport owner. A failed socket/frame write
+    /// sets this flag so execution stops before requesting another page or
+    /// participant operation.
+    cancelled: Arc<AtomicBool>,
+
+    /// Runtime-wide validity of the durable MVCC history lease. Only
+    /// statements that can depend on protected row history consult this flag.
+    gc_protection_lease_healthy: Option<Arc<AtomicBool>>,
+    /// Shared replicated lease deadline, checked on every foreground
+    /// operation so process suspension cannot leave an old `true` health bit
+    /// authorizing reads after passive expiry.
+    gc_protection_lease_deadline_ms: Option<Arc<AtomicU64>>,
+    gc_protection_clock_skew_guard_ms: u64,
+    gc_protection_required: bool,
+
+    /// Original configured timeout, retained for stable timeout diagnostics.
+    configured_timeout_ms: u64,
 }
 
 impl TabletRequestContext {
@@ -994,6 +1081,11 @@ impl TabletRequestContext {
             ));
         }
 
+        let default_timeout = Duration::from_secs(30);
+        let deadline = Instant::now().checked_add(default_timeout).ok_or_else(|| {
+            Error::Configuration("default tablet request deadline overflowed".to_string())
+        })?;
+
         Ok(Self {
             client_id,
             session_epoch,
@@ -1002,7 +1094,13 @@ impl TabletRequestContext {
             root_request_sequence: 1,
             next_command_ordinal: 1,
             acknowledged_through: None,
-            timeout: Duration::from_secs(30),
+            deadline,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            gc_protection_lease_healthy: None,
+            gc_protection_lease_deadline_ms: None,
+            gc_protection_clock_skew_guard_ms: 0,
+            gc_protection_required: false,
+            configured_timeout_ms: 30_000,
         })
     }
 
@@ -1044,18 +1142,33 @@ impl TabletRequestContext {
         request_sequence: u64,
         acknowledged_through: Option<u64>,
     ) -> Result<()> {
-        let mut context = Self::new_with_session_epoch(client_id, session_epoch)?;
+        if client_id == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet request client ID 0 is reserved".to_string(),
+            ));
+        }
+
+        if session_epoch == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet request session epoch 0 is reserved".to_string(),
+            ));
+        }
+
         if request_sequence == 0 {
             return Err(Error::InvalidArgument(
                 "tablet root request sequence 0 is reserved".to_string(),
             ));
         }
-        context.next_read_sequence = request_sequence;
-        context.next_command_sequence = request_sequence;
-        context.root_request_sequence = request_sequence;
-        context.next_command_ordinal = 1;
-        context.acknowledged_through = acknowledged_through;
-        *self = context;
+
+        self.client_id = client_id;
+        self.session_epoch = session_epoch;
+        self.next_read_sequence = request_sequence;
+        self.next_command_sequence = request_sequence;
+        self.root_request_sequence = request_sequence;
+        self.next_command_ordinal = 1;
+        self.acknowledged_through = acknowledged_through;
+
+        // Request identity changes must never restart the statement budget.
         Ok(())
     }
 
@@ -1077,13 +1190,91 @@ impl TabletRequestContext {
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) {
-        if !timeout.is_zero() {
-            self.timeout = timeout;
+        if timeout.is_zero() {
+            return;
         }
+
+        let now = Instant::now();
+        self.deadline = now.checked_add(timeout).unwrap_or(now);
+        self.cancelled = Arc::new(AtomicBool::new(false));
+        self.configured_timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     }
 
-    fn timeout(&self) -> Duration {
-        self.timeout
+    /// Install the one authoritative process-local deadline for this statement.
+    pub fn set_statement_deadline(
+        &mut self,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        configured_timeout_ms: u64,
+    ) -> Result<()> {
+        if configured_timeout_ms == 0 {
+            return Err(Error::InvalidArgument(
+                "statement timeout must be non-zero".to_string(),
+            ));
+        }
+
+        self.deadline = deadline;
+        self.cancelled = cancelled;
+        self.configured_timeout_ms = configured_timeout_ms;
+
+        self.check_active()
+    }
+
+    /// Bind protected foreground work to the owning runtime's aggregate GC
+    /// lease. Control statements can leave `required` false so rollback stays
+    /// available after a lease has been fenced.
+    pub fn set_gc_protection_lease_health(
+        &mut self,
+        healthy: Option<Arc<AtomicBool>>,
+        deadline_ms: Option<Arc<AtomicU64>>,
+        clock_skew_guard_ms: u64,
+        required: bool,
+    ) {
+        self.gc_protection_lease_healthy = healthy;
+        self.gc_protection_lease_deadline_ms = deadline_ms;
+        self.gc_protection_clock_skew_guard_ms = clock_skew_guard_ms;
+        self.gc_protection_required = required;
+    }
+
+    pub fn remaining_timeout(&self) -> Result<Duration> {
+        let mut remaining = remaining_statement_budget(
+            self.deadline,
+            self.cancelled.as_ref(),
+            self.configured_timeout_ms,
+        )?;
+
+        if self.gc_protection_required
+            && let Some(healthy) = self.gc_protection_lease_healthy.as_ref()
+        {
+            if !healthy.load(Ordering::Acquire) {
+                return Err(Error::ProposalUnavailable {
+                    reason: "MVCC history protection lease is not safely renewed".to_string(),
+                });
+            }
+
+            let deadline_ms = self
+                .gc_protection_lease_deadline_ms
+                .as_ref()
+                .map_or(0, |deadline| deadline.load(Ordering::Acquire));
+            let conservative_now_ms =
+                wall_clock_millis().saturating_add(self.gc_protection_clock_skew_guard_ms);
+            if deadline_ms == 0 || conservative_now_ms >= deadline_ms {
+                return Err(Error::ProposalUnavailable {
+                    reason: "MVCC history protection lease is expired or too close to expiry"
+                        .to_string(),
+                });
+            }
+
+            // Bound the operation itself so it cannot outlive the locally
+            // conservative lease-validity horizon.
+            remaining = remaining.min(Duration::from_millis(deadline_ms - conservative_now_ms));
+        }
+
+        Ok(remaining)
+    }
+
+    pub fn check_active(&self) -> Result<()> {
+        self.remaining_timeout().map(|_| ())
     }
 
     fn next_request_id(
@@ -1864,13 +2055,9 @@ impl LocalExecutor {
             }
         }
 
-        let mut dispatcher = GatewayTransactionDispatcher::new(
-            Arc::clone(&gateway),
-            request_context.timeout(),
-            request_context.acknowledged_through(),
-            false,
-        );
-        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        let mut dispatcher =
+            GatewayTransactionDispatcher::new(Arc::clone(&gateway), request_context, false);
+        let mut refresher = GatewayParticipantRouteRefresher::new(gateway, request_context);
         if let Err(prewrite_error) = coordinator.execute_prewrite_with_retry_and_ack(
             30_000,
             request_context.acknowledged_through(),
@@ -1921,13 +2108,9 @@ impl LocalExecutor {
         let gateway = self.tablet_gateway.clone().ok_or_else(|| {
             Error::UnsupportedSql("metadata tablet gateway is not installed".to_string())
         })?;
-        let mut dispatcher = GatewayTransactionDispatcher::new(
-            Arc::clone(&gateway),
-            request_context.timeout(),
-            request_context.acknowledged_through(),
-            true,
-        );
-        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        let mut dispatcher =
+            GatewayTransactionDispatcher::new(Arc::clone(&gateway), request_context, true);
+        let mut refresher = GatewayParticipantRouteRefresher::new(gateway, request_context);
         let result = coordinator.execute_commit_with_retry(
             &mut timestamp_allocator,
             &mut refresher,
@@ -1980,13 +2163,9 @@ impl LocalExecutor {
         let gateway = self.tablet_gateway.clone().ok_or_else(|| {
             Error::UnsupportedSql("metadata tablet gateway is not installed".to_string())
         })?;
-        let mut dispatcher = GatewayTransactionDispatcher::new(
-            Arc::clone(&gateway),
-            request_context.timeout(),
-            request_context.acknowledged_through(),
-            true,
-        );
-        let mut refresher = GatewayParticipantRouteRefresher { gateway };
+        let mut dispatcher =
+            GatewayTransactionDispatcher::new(Arc::clone(&gateway), request_context, true);
+        let mut refresher = GatewayParticipantRouteRefresher::new(gateway, request_context);
         match coordinator.execute_rollback_with_retry(&mut refresher, &mut dispatcher, 3) {
             Ok(_) => Ok(()),
             Err(error)
@@ -2134,6 +2313,7 @@ impl LocalExecutor {
             )));
         }
 
+        let command_construction_started = Instant::now();
         let mut writes = Vec::with_capacity(transaction.write_set().len());
         for (encoded_key, mutation) in transaction.write_set() {
             let row_key = decode_row_key(encoded_key)?;
@@ -2159,32 +2339,40 @@ impl LocalExecutor {
             commit_timestamp,
             writes,
         });
+        metrics::histogram!("ragnordb_single_shard_command_construction_seconds")
+            .record(command_construction_started.elapsed().as_secs_f64());
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let logical_command_id =
             request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
+        let submit_timeout = request_context.remaining_timeout()?;
         let outcome = match gateway.submit_command_with_identity_and_ack(
             &route,
             request_id.clone(),
             logical_command_id,
             request_context.acknowledged_through(),
             command,
-            request_context.timeout(),
+            submit_timeout,
         ) {
             Ok(outcome) => outcome,
-            Err(error @ Error::RequestOutcomeUnknown { .. }) => {
+            Err(Error::RequestOutcomeUnknown { identity }) => {
+                let query_timeout = match request_context.remaining_timeout() {
+                    Ok(timeout) => timeout,
+                    Err(_) => return Err(Error::RequestOutcomeUnknown { identity }),
+                };
+
                 match gateway.query_original_outcome(
                     &route,
                     request_id,
                     logical_command_id,
-                    request_context.timeout(),
-                )? {
-                    Some(CachedTabletCommandOutcome::Applied(result)) => {
+                    query_timeout,
+                ) {
+                    Ok(Some(CachedTabletCommandOutcome::Applied(result))) => {
                         TabletCommandApplyOutcome {
                             result: result.into(),
                             deduplicated: true,
                         }
                     }
-                    Some(CachedTabletCommandOutcome::Rejected(rejection)) => {
+                    Ok(Some(CachedTabletCommandOutcome::Rejected(rejection))) => {
                         return Err(match rejection.kind {
                             CachedTabletCommandRejectionKind::WriteConflict => {
                                 Error::WriteConflict(rejection.reason)
@@ -2195,7 +2383,12 @@ impl LocalExecutor {
                             }
                         });
                     }
-                    None => return Err(error),
+                    Ok(None) => return Err(Error::RequestOutcomeUnknown { identity }),
+                    Err(query_error) => {
+                        return Err(Error::RequestOutcomeUnknown {
+                            identity: format!("{identity}; outcome lookup failed: {query_error}"),
+                        });
+                    }
                 }
             }
             Err(error) => return Err(error),
@@ -2587,14 +2780,14 @@ impl LocalExecutor {
         match choose_access_path(schema.as_ref(), filter.as_ref())? {
             AccessPath::Empty => {}
             AccessPath::Point(key) => {
-                let mut request_context = Some(request_context);
-                if let Some(row) = self.point_row(transaction, &key, &mut request_context)? {
+                if let Some(row) = self.point_row(transaction, &key, &mut Some(request_context))? {
+                    request_context.check_active()?;
                     emit(key, row)?;
                 }
             }
             AccessPath::Scan if self.is_local_compatibility_table(schema.id) => {
                 transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
-                self.local_scan_each_row(transaction, schema.id, &mut emit)?;
+                self.local_scan_each_row(transaction, schema.id, request_context, &mut emit)?;
             }
             AccessPath::Scan => {
                 transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
@@ -2611,6 +2804,7 @@ impl LocalExecutor {
                         schema.id,
                         &mut Some(request_context),
                     )? {
+                        request_context.check_active()?;
                         emit(key, row)?;
                     }
                 }
@@ -2834,6 +3028,7 @@ impl LocalExecutor {
             )));
         }
 
+        let command_construction_started = Instant::now();
         let mut writes = Vec::with_capacity(transaction.write_set().len());
         for (encoded_key, mutation) in transaction.write_set() {
             let row_key = decode_row_key(encoded_key)?;
@@ -2862,32 +3057,40 @@ impl LocalExecutor {
             commit_timestamp,
             writes,
         });
+        metrics::histogram!("ragnordb_single_shard_command_construction_seconds")
+            .record(command_construction_started.elapsed().as_secs_f64());
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let logical_command_id =
             request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
+        let submit_timeout = request_context.remaining_timeout()?;
         let outcome = match gateway.submit_command_with_identity_and_ack(
             &route,
             request_id.clone(),
             logical_command_id,
             request_context.acknowledged_through(),
             command,
-            request_context.timeout(),
+            submit_timeout,
         ) {
             Ok(outcome) => outcome,
-            Err(error @ Error::RequestOutcomeUnknown { .. }) => {
+            Err(Error::RequestOutcomeUnknown { identity }) => {
+                let query_timeout = match request_context.remaining_timeout() {
+                    Ok(timeout) => timeout,
+                    Err(_) => return Err(Error::RequestOutcomeUnknown { identity }),
+                };
+
                 match gateway.query_original_outcome(
                     &route,
                     request_id,
                     logical_command_id,
-                    request_context.timeout(),
-                )? {
-                    Some(CachedTabletCommandOutcome::Applied(result)) => {
+                    query_timeout,
+                ) {
+                    Ok(Some(CachedTabletCommandOutcome::Applied(result))) => {
                         TabletCommandApplyOutcome {
                             result: result.into(),
                             deduplicated: true,
                         }
                     }
-                    Some(CachedTabletCommandOutcome::Rejected(rejection)) => {
+                    Ok(Some(CachedTabletCommandOutcome::Rejected(rejection))) => {
                         return Err(match rejection.kind {
                             CachedTabletCommandRejectionKind::WriteConflict => {
                                 Error::WriteConflict(rejection.reason)
@@ -2898,7 +3101,12 @@ impl LocalExecutor {
                             }
                         });
                     }
-                    None => return Err(error),
+                    Ok(None) => return Err(Error::RequestOutcomeUnknown { identity }),
+                    Err(query_error) => {
+                        return Err(Error::RequestOutcomeUnknown {
+                            identity: format!("{identity}; outcome lookup failed: {query_error}"),
+                        });
+                    }
                 }
             }
             Err(error) => return Err(error),
@@ -3097,11 +3305,15 @@ impl LocalExecutor {
 
         if self.is_local_compatibility_route(schema.id, tablet_id) {
             let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-            tablet.buffer_batch(
-                transaction,
-                prepared
-                    .into_iter()
-                    .map(|(key, row)| RowMutation::Put { key, row }),
+            record_write_set_buffer(
+                Instant::now(),
+                affected_rows,
+                tablet.buffer_batch(
+                    transaction,
+                    prepared
+                        .into_iter()
+                        .map(|(key, row)| RowMutation::Put { key, row }),
+                ),
             )?;
         } else {
             let mut writes = BTreeMap::new();
@@ -3111,7 +3323,11 @@ impl LocalExecutor {
                     Mutation::Put(encode_row(&row)?),
                 );
             }
-            transaction.buffer_batch(writes)?;
+            record_write_set_buffer(
+                Instant::now(),
+                affected_rows,
+                transaction.buffer_batch(writes),
+            )?;
         }
 
         Ok(ExecutionResult::Mutation {
@@ -3198,8 +3414,12 @@ impl LocalExecutor {
             validate_update_assignment(schema.as_ref(), assignment)?;
         }
 
-        let matching =
-            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context)?;
+        let update_read_started = Instant::now();
+        let matching_result =
+            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context);
+        metrics::histogram!("ragnordb_txn_update_read_seconds")
+            .record(update_read_started.elapsed().as_secs_f64());
+        let matching = matching_result?;
 
         let mut prepared = Vec::with_capacity(matching.len());
 
@@ -3237,7 +3457,11 @@ impl LocalExecutor {
                 .map(|(key, row)| RowMutation::Put { key, row });
             if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-                tablet.buffer_batch(transaction, mutations)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    tablet.buffer_batch(transaction, mutations),
+                )?;
             } else {
                 let mut writes = BTreeMap::new();
                 for mutation in mutations {
@@ -3249,7 +3473,11 @@ impl LocalExecutor {
                         Mutation::Put(encode_row(&row)?),
                     );
                 }
-                transaction.buffer_batch(writes)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    transaction.buffer_batch(writes),
+                )?;
             }
         }
 
@@ -3286,7 +3514,11 @@ impl LocalExecutor {
                 .map(|keyed_row| RowMutation::Delete { key: keyed_row.key });
             if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-                tablet.buffer_batch(transaction, mutations)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    tablet.buffer_batch(transaction, mutations),
+                )?;
             } else {
                 let mut writes = BTreeMap::new();
                 for mutation in mutations {
@@ -3298,7 +3530,11 @@ impl LocalExecutor {
                         Mutation::Delete,
                     );
                 }
-                transaction.buffer_batch(writes)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    transaction.buffer_batch(writes),
+                )?;
             }
         }
 
@@ -3479,7 +3715,7 @@ impl LocalExecutor {
             AccessPath::Scan => {
                 transaction.record_read_span(TransactionReadSpan::new(schema.id, None, None)?)?;
                 if self.is_local_compatibility_table(schema.id) {
-                    self.local_scan_rows(transaction, schema.id)?
+                    self.local_scan_rows(transaction, schema.id, request_context.as_deref())?
                 } else {
                     self.distributed_scan_rows(transaction, schema.id, &mut request_context)?
                 }
@@ -3508,14 +3744,21 @@ impl LocalExecutor {
         &self,
         transaction: &Transaction,
         table_id: TableId,
+        request_context: Option<&TabletRequestContext>,
     ) -> Result<Vec<(RowKey, Row)>> {
         let tablet_ids = self.router_for(table_id)?.route_scan();
         let mut rows = Vec::new();
 
         for tablet_id in tablet_ids {
+            if let Some(context) = request_context {
+                context.check_active()?;
+            }
             let tablet = self.local_tablet_for_route(table_id, tablet_id)?;
             let mut resume_after = None;
             loop {
+                if let Some(context) = request_context {
+                    context.check_active()?;
+                }
                 let page = tablet.scan_page(
                     transaction,
                     None,
@@ -3524,6 +3767,9 @@ impl LocalExecutor {
                     TABLET_SCAN_PAGE_ROWS as usize,
                     TABLET_SCAN_PAGE_BYTES as usize,
                 )?;
+                if let Some(context) = request_context {
+                    context.check_active()?;
+                }
                 if page.rows.is_empty() && page.has_more {
                     return Err(Error::CorruptData(format!(
                         "tablet {} returned a non-progressing scan page",
@@ -3531,6 +3777,9 @@ impl LocalExecutor {
                     )));
                 }
                 for (key, row) in page.rows {
+                    if let Some(context) = request_context {
+                        context.check_active()?;
+                    }
                     if self.route_row_key(&key)? != tablet_id {
                         return Err(Error::CorruptData(format!(
                             "tablet {} returned row key routed to another tablet for table {}",
@@ -3553,12 +3802,15 @@ impl LocalExecutor {
         &self,
         transaction: &Transaction,
         table_id: TableId,
+        request_context: &TabletRequestContext,
         emit: &mut dyn FnMut(RowKey, Row) -> Result<()>,
     ) -> Result<()> {
         for tablet_id in self.router_for(table_id)?.route_scan() {
+            request_context.check_active()?;
             let tablet = self.local_tablet_for_route(table_id, tablet_id)?;
             let mut resume_after = None;
             loop {
+                request_context.check_active()?;
                 let page = tablet.scan_page(
                     transaction,
                     None,
@@ -3567,6 +3819,7 @@ impl LocalExecutor {
                     TABLET_SCAN_PAGE_ROWS as usize,
                     TABLET_SCAN_PAGE_BYTES as usize,
                 )?;
+                request_context.check_active()?;
                 if page.rows.is_empty() && page.has_more {
                     return Err(Error::CorruptData(format!(
                         "tablet {} returned a non-progressing scan page",
@@ -3574,6 +3827,7 @@ impl LocalExecutor {
                     )));
                 }
                 for (key, row) in page.rows {
+                    request_context.check_active()?;
                     if self.route_row_key(&key)? != tablet_id {
                         return Err(Error::CorruptData(format!(
                             "tablet {} returned row key routed to another tablet for table {}",
@@ -3665,7 +3919,9 @@ impl LocalExecutor {
             }
         };
         let logical_span = ScanSpan::unbounded();
+        context.check_active()?;
         let initial_routes = gateway.lookup_scan_routes(table_id, &logical_span)?;
+        context.check_active()?;
         validate_scan_route_cover(&logical_span, &initial_routes)?;
         let identical_hash_spans = initial_routes.len() > 1
             && initial_routes
@@ -3684,6 +3940,7 @@ impl LocalExecutor {
         let mut resolved_intents = 0usize;
 
         while let Some(mut pending) = work.pop_front() {
+            context.check_active()?;
             let request_id = context.next_read_request_id(pending.route.route.raft_group_id)?;
             let response =
                 if self.is_local_compatibility_route(table_id, pending.route.route.tablet_id) {
@@ -3704,7 +3961,7 @@ impl LocalExecutor {
                         progress.read_ts,
                         TABLET_SCAN_PAGE_ROWS,
                         TABLET_SCAN_PAGE_BYTES,
-                        context.timeout(),
+                        context.remaining_timeout()?,
                     )
                 };
 
@@ -3713,9 +3970,11 @@ impl LocalExecutor {
                 Err(Error::StaleTabletEpoch { .. })
                     if pending.topology_refreshes < MAX_SCAN_TOPOLOGY_REFRESHES =>
                 {
+                    context.check_active()?;
                     let refreshed = gateway
                         .lookup_scan_routes(table_id, &pending.route.span)
                         .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    context.check_active()?;
                     validate_scan_route_cover(&pending.route.span, &refreshed)
                         .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
                     let refreshed = resume_scan_routes(
@@ -3733,6 +3992,7 @@ impl LocalExecutor {
                 }
             };
 
+            context.check_active()?;
             let validation_request = ragnordb_common::rpc_codec::TabletScanRequest {
                 request_id,
                 tablet_id: pending.route.route.tablet_id,
@@ -3872,7 +4132,9 @@ impl LocalExecutor {
             ))
         })?;
         let logical_span = ScanSpan::unbounded();
+        request_context.check_active()?;
         let initial_routes = gateway.lookup_scan_routes(table_id, &logical_span)?;
+        request_context.check_active()?;
         validate_scan_route_cover(&logical_span, &initial_routes)?;
         if initial_routes.len() > 1
             && initial_routes
@@ -3896,6 +4158,7 @@ impl LocalExecutor {
         let mut resolved_intents = 0usize;
 
         while let Some(mut pending) = work.pop_front() {
+            request_context.check_active()?;
             let request_id =
                 request_context.next_read_request_id(pending.route.route.raft_group_id)?;
             let response =
@@ -3917,7 +4180,7 @@ impl LocalExecutor {
                         progress.read_ts,
                         TABLET_SCAN_PAGE_ROWS,
                         TABLET_SCAN_PAGE_BYTES,
-                        request_context.timeout(),
+                        request_context.remaining_timeout()?,
                     )
                 };
             let batch = match response {
@@ -3925,9 +4188,11 @@ impl LocalExecutor {
                 Err(Error::StaleTabletEpoch { .. })
                     if pending.topology_refreshes < MAX_SCAN_TOPOLOGY_REFRESHES =>
                 {
+                    request_context.check_active()?;
                     let refreshed = gateway
                         .lookup_scan_routes(table_id, &pending.route.span)
                         .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
+                    request_context.check_active()?;
                     validate_scan_route_cover(&pending.route.span, &refreshed)
                         .map_err(|error| scan_failure(pending.route.route.tablet_id, error))?;
                     for route in resume_scan_routes(
@@ -3944,6 +4209,7 @@ impl LocalExecutor {
                 }
                 Err(error) => return Err(scan_failure(pending.route.route.tablet_id, error)),
             };
+            request_context.check_active()?;
             let validation_request = ragnordb_common::rpc_codec::TabletScanRequest {
                 request_id,
                 tablet_id: pending.route.route.tablet_id,
@@ -4002,6 +4268,7 @@ impl LocalExecutor {
                 ));
             }
             for scan_row in &batch.rows {
+                request_context.check_active()?;
                 if last_key
                     .as_deref()
                     .is_some_and(|last_key| scan_row.key.as_slice() <= last_key)
@@ -4046,6 +4313,9 @@ impl LocalExecutor {
         row_key: &RowKey,
         request_context: &mut Option<&mut TabletRequestContext>,
     ) -> Result<Option<Row>> {
+        if let Some(context) = request_context.as_deref_mut() {
+            context.check_active()?;
+        }
         let encoded_key = ragnordb_storage::key::encode_row_key(row_key)?;
         transaction.record_read(encoded_key.clone())?;
         if let Some(mutation) = transaction.pending_write(&encoded_key) {
@@ -4057,9 +4327,13 @@ impl LocalExecutor {
 
         let tablet_id = self.route_row_key(row_key)?;
         if self.is_local_compatibility_route(row_key.table_id, tablet_id) {
-            return self
+            let row = self
                 .local_tablet_for_route(row_key.table_id, tablet_id)?
                 .get(transaction, row_key);
+            if let Some(context) = request_context.as_deref_mut() {
+                context.check_active()?;
+            }
+            return row;
         }
 
         let gateway = self.tablet_gateway.clone().ok_or_else(|| {
@@ -4099,8 +4373,9 @@ impl LocalExecutor {
                 request_context.next_read_request_id(route.raft_group_id)?,
                 row_key.clone(),
                 transaction.start_ts(),
-                request_context.timeout(),
+                request_context.remaining_timeout()?,
             )?;
+            request_context.check_active()?;
 
             let Some(lock) = inspection.intent else {
                 return inspection
@@ -4771,6 +5046,22 @@ fn data_type_name(data_type: DataType) -> &'static str {
     }
 }
 
+/// Records the cost and successful mutation count at the transaction write-set
+/// boundary shared by local and routed statement execution.
+fn record_write_set_buffer<T>(
+    started_at: Instant,
+    mutation_count: usize,
+    result: Result<T>,
+) -> Result<T> {
+    metrics::histogram!("ragnordb_txn_write_set_buffer_seconds")
+        .record(started_at.elapsed().as_secs_f64());
+    if result.is_ok() {
+        metrics::counter!("ragnordb_txn_write_set_mutations_total")
+            .increment(mutation_count as u64);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4784,6 +5075,132 @@ mod tests {
     use ragnordb_sql::{analyze, parse_one, plan};
     use ragnordb_tablet::command::TabletCommandApplyResult;
     use ragnordb_txn::{LocalTransactionManager, TransactionFootprintPolicy, TransactionManager};
+
+    #[test]
+    fn root_identity_reset_does_not_restart_statement_deadline() {
+        let mut context = TabletRequestContext::new_with_session_epoch(91, 4).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        context
+            .set_statement_deadline(deadline, cancelled, 5_000)
+            .unwrap();
+        context
+            .reset_for_root_request_with_ack(91, 4, 37, Some(36))
+            .unwrap();
+
+        assert_eq!(context.deadline, deadline);
+        assert_eq!(context.configured_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn cancelled_request_context_rejects_further_foreground_work() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        context
+            .set_statement_deadline(
+                Instant::now() + Duration::from_secs(5),
+                Arc::clone(&cancelled),
+                5_000,
+            )
+            .unwrap();
+
+        assert!(context.remaining_timeout().is_ok());
+        cancelled.store(true, Ordering::Release);
+
+        assert!(matches!(
+            context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn unsafe_gc_lease_fences_history_work_but_keeps_cleanup_available() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 60_000));
+        context.set_gc_protection_lease_health(
+            Some(Arc::clone(&lease_healthy)),
+            Some(Arc::clone(&lease_deadline)),
+            0,
+            true,
+        );
+
+        assert!(context.remaining_timeout().is_ok());
+        lease_healthy.store(false, Ordering::Release);
+
+        assert!(matches!(
+            context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("history protection lease")
+        ));
+
+        context.set_gc_protection_lease_health(Some(lease_healthy), Some(lease_deadline), 0, false);
+        assert!(context.remaining_timeout().is_ok());
+    }
+
+    /// Realistic bug caught: after process suspension, the renewal task and
+    /// health bit may still look successful even though the replicated lease
+    /// expired while the process was stopped.
+    #[test]
+    fn resumed_request_context_rejects_a_passively_expired_gc_lease() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 60_000));
+        context.set_gc_protection_lease_health(
+            Some(lease_healthy),
+            Some(Arc::clone(&lease_deadline)),
+            0,
+            true,
+        );
+        assert!(context.remaining_timeout().is_ok());
+
+        // Model a scheduler pause that resumes after the shared wall-clock
+        // deadline without relying on a sleep or changing the process clock.
+        lease_deadline.store(wall_clock_millis().saturating_sub(1), Ordering::Release);
+
+        assert!(matches!(
+            context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("expired")
+        ));
+    }
+
+    #[test]
+    fn foreground_rpc_budget_ends_before_the_skew_adjusted_lease_deadline() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+        let lease_healthy = Arc::new(AtomicBool::new(true));
+        let lease_deadline = Arc::new(AtomicU64::new(wall_clock_millis() + 10_000));
+        context.set_gc_protection_lease_health(
+            Some(lease_healthy),
+            Some(lease_deadline),
+            2_000,
+            true,
+        );
+
+        let remaining = context.remaining_timeout().unwrap();
+        assert!(remaining <= Duration::from_secs(8));
+    }
+
+    #[test]
+    fn statement_remaining_budget_only_decreases() {
+        let mut context = TabletRequestContext::new(91).unwrap();
+
+        context
+            .set_statement_deadline(
+                Instant::now() + Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+                5_000,
+            )
+            .unwrap();
+
+        let first = context.remaining_timeout().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let second = context.remaining_timeout().unwrap();
+
+        assert!(second < first);
+    }
 
     #[test]
     fn ddl_publishes_coherent_schema_and_routing_snapshots() {
@@ -5152,8 +5569,8 @@ mod tests {
         let plan = coordinator
             .participant_command_plan(ParticipantCommandPhase::Prewrite, &key)
             .unwrap();
-        let dispatcher =
-            GatewayTransactionDispatcher::new(gateway, Duration::from_secs(1), None, true);
+        let request_context = TabletRequestContext::new(700).unwrap();
+        let dispatcher = GatewayTransactionDispatcher::new(gateway, &request_context, true);
 
         let error = dispatcher.tablet_route_for_plan(&plan).unwrap_err();
 

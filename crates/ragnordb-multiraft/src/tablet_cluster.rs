@@ -934,6 +934,10 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             }
         }
 
+        if let Some(last_entry) = ready.committed_entries.last() {
+            self.proposals.advance_applied_frontier(last_entry.index);
+        }
+
         let applied_frontier = ready
             .committed_entries
             .last()

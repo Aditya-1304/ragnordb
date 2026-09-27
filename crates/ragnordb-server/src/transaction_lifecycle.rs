@@ -7,7 +7,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -59,7 +62,12 @@ pub struct TransactionRuntimeConfig {
     pub cleaner_interval: Duration,
     pub cleaner_policy: IntentCleanerPolicy,
     pub gc_sweep_interval: Duration,
+    pub gc_protection_idle_grace: Duration,
     pub gc_protection_lease_ms: u64,
+    /// Maximum permitted pairwise wall-clock difference between cluster nodes.
+    /// GC lease expiry is delayed by this amount to prevent a fast proposer
+    /// from expiring a lease still considered live by its owner.
+    pub max_clock_skew_ms: u64,
     pub metadata_timeout: Duration,
 }
 
@@ -104,12 +112,20 @@ impl TransactionRuntimeConfig {
             timeout: Duration::from_millis(cleaner_timeout_ms),
         }
         .validate()?;
+        let gc_sweep_interval =
+            Duration::from_millis(env_value("RAGNORDB_TXN_GC_SWEEP_INTERVAL_MS", 5_000_u64)?);
+        let gc_protection_idle_grace = Duration::from_millis(env_value(
+            "RAGNORDB_TXN_GC_PROTECTION_IDLE_GRACE_MS",
+            5_000_u64,
+        )?);
+        let max_clock_skew_ms = env_value("RAGNORDB_TXN_MAX_CLOCK_SKEW_MS", 30_000_u64)?;
         let gc_protection_lease_ms = env_value(
             "RAGNORDB_TXN_GC_PROTECTION_LEASE_MS",
             footprint
                 .max_age_ms
                 .saturating_add(status_lease_ms)
-                .saturating_add(statement_timeout_ms.saturating_mul(2)),
+                .saturating_add(statement_timeout_ms.saturating_mul(2))
+                .saturating_add(max_clock_skew_ms),
         )?;
         let config = Self {
             footprint,
@@ -123,11 +139,10 @@ impl TransactionRuntimeConfig {
                 1_000_u64,
             )?),
             cleaner_policy,
-            gc_sweep_interval: Duration::from_millis(env_value(
-                "RAGNORDB_TXN_GC_SWEEP_INTERVAL_MS",
-                5_000_u64,
-            )?),
+            gc_sweep_interval,
+            gc_protection_idle_grace,
             gc_protection_lease_ms,
+            max_clock_skew_ms,
             metadata_timeout: Duration::from_millis(env_value(
                 "RAGNORDB_TXN_METADATA_TIMEOUT_MS",
                 5_000_u64,
@@ -149,12 +164,22 @@ impl TransactionRuntimeConfig {
             || self.heartbeat_concurrency > self.heartbeat_batch_size
             || self.cleaner_interval.is_zero()
             || self.gc_sweep_interval.is_zero()
+            || self.gc_protection_idle_grace.is_zero()
+            || self.max_clock_skew_ms == 0
+            || self.gc_protection_idle_grace.as_millis() >= self.gc_protection_lease_ms as u128
+            || self
+                .gc_sweep_interval
+                .as_millis()
+                .saturating_add(self.metadata_timeout.as_millis())
+                .saturating_add(u128::from(self.max_clock_skew_ms))
+                >= u128::from(self.gc_protection_lease_ms / 2)
             || self.gc_protection_lease_ms
                 < self
                     .footprint
                     .max_age_ms
                     .saturating_add(self.status_lease_ms)
                     .saturating_add(statement_timeout_ms)
+                    .saturating_add(self.max_clock_skew_ms)
             || self.metadata_timeout.is_zero()
             || self.heartbeat_interval.as_millis() >= self.status_lease_ms as u128
         {
@@ -211,6 +236,7 @@ const AGGREGATE_GC_PROTECTION_ID: u128 = u128::MAX - 2;
 enum GcProtectionPublication {
     Register { floor: Timestamp, deadline_ms: u64 },
     Update { floor: Timestamp, deadline_ms: u64 },
+    Renew { deadline_ms: u64 },
     Release,
 }
 
@@ -218,13 +244,30 @@ enum GcProtectionPublication {
 /// metadata state machine stores one durable floor for this owner; this tracker
 /// keeps the transaction-to-floor relationship local and publishes only the
 /// transitions that can change the aggregate protection.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct GcProtectionTracker {
     state: Arc<Mutex<GcProtectionTrackerState>>,
     /// Serializes transaction admission with safe-point advancement. A newly
     /// allocated transaction must publish its protection before a sweep can
     /// advance past that transaction's read timestamp.
     admission: Arc<Mutex<()>>,
+    /// Shared with foreground request contexts so unsafe lease transitions
+    /// fence work that is already in flight, not only later admissions.
+    lease_healthy: Arc<AtomicBool>,
+    /// Latest locally-known durable deadline for the process aggregate. Zero
+    /// means there is no published aggregate lease.
+    published_deadline_ms: Arc<AtomicU64>,
+}
+
+impl Default for GcProtectionTracker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(GcProtectionTrackerState::default())),
+            admission: Arc::new(Mutex::new(())),
+            lease_healthy: Arc::new(AtomicBool::new(true)),
+            published_deadline_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -232,6 +275,7 @@ struct GcProtectionTrackerState {
     active: BTreeMap<TxnId, Timestamp>,
     published_floor: Option<Timestamp>,
     published_deadline_ms: Option<u64>,
+    idle_since: Option<Instant>,
 }
 
 impl GcProtectionTracker {
@@ -243,7 +287,7 @@ impl GcProtectionTracker {
 
     #[cfg(test)]
     fn register(&self, txn_id: TxnId, read_ts: Timestamp, deadline_ms: u64) -> bool {
-        self.register_with_publish(txn_id, read_ts, deadline_ms, |_| Ok(()))
+        self.register_with_publish(txn_id, read_ts, deadline_ms, 0, deadline_ms / 2, |_| Ok(()))
             .expect("in-memory GC protection publication cannot fail")
             .is_some()
     }
@@ -253,15 +297,24 @@ impl GcProtectionTracker {
         txn_id: TxnId,
         read_ts: Timestamp,
         deadline_ms: u64,
+        now_ms: u64,
+        renew_before_ms: u64,
         publish: F,
     ) -> Result<Option<GcProtectionPublication>>
     where
         F: FnOnce(GcProtectionPublication) -> Result<()>,
     {
         let mut state = self.state.lock().expect("GC protection tracker poisoned");
-        if state.active.insert(txn_id, read_ts).is_some() {
+
+        // A duplicate attempt belongs to the existing admission and must not
+        // replace that transaction's snapshot timestamp.
+        if state.active.contains_key(&txn_id) {
             return Ok(None);
         }
+
+        let previous_idle_since = state.idle_since;
+        state.active.insert(txn_id, read_ts);
+        state.idle_since = None;
 
         let floor = state
             .active
@@ -269,57 +322,175 @@ impl GcProtectionTracker {
             .min()
             .copied()
             .expect("newly registered transaction must establish an active floor");
+
+        // A cached local floor is authoritative only while the matching
+        // replicated lease remains live. Fail closed before admitting a reader.
+        if state
+            .published_deadline_ms
+            .is_some_and(|previous_deadline_ms| previous_deadline_ms <= now_ms)
+        {
+            self.lease_healthy.store(false, Ordering::Release);
+            state.active.remove(&txn_id);
+            state.idle_since = previous_idle_since;
+            return Err(Error::ProposalUnavailable {
+                reason: "aggregate GC protection lease expired before transaction admission"
+                    .to_string(),
+            });
+        }
+
         let publication = match state.published_floor {
             None => GcProtectionPublication::Register { floor, deadline_ms },
-            Some(previous_floor) if floor < previous_floor => {
-                GcProtectionPublication::Update { floor, deadline_ms }
+            Some(previous_floor) => {
+                let previous_deadline_ms = state
+                    .published_deadline_ms
+                    .expect("published GC floor must have a lease deadline");
+                if floor < previous_floor {
+                    GcProtectionPublication::Update {
+                        floor,
+                        deadline_ms: deadline_ms.max(previous_deadline_ms),
+                    }
+                } else if !self.lease_healthy.load(Ordering::Acquire)
+                    || previous_deadline_ms <= renew_before_ms
+                {
+                    GcProtectionPublication::Renew {
+                        deadline_ms: deadline_ms.max(previous_deadline_ms),
+                    }
+                } else {
+                    // The current durable floor protects this read timestamp
+                    // and retains enough lease lifetime for the new transaction.
+                    return Ok(None);
+                }
             }
-            Some(_) => return Ok(None),
         };
 
         if let Err(error) = publish(publication) {
             state.active.remove(&txn_id);
+            state.idle_since = previous_idle_since;
+            if matches!(
+                publication,
+                GcProtectionPublication::Update { .. } | GcProtectionPublication::Renew { .. }
+            ) && !state.active.is_empty()
+            {
+                self.lease_healthy.store(false, Ordering::Release);
+            }
             return Err(error);
         }
-        state.published_floor = Some(floor);
-        state.published_deadline_ms = Some(deadline_ms);
+
+        match publication {
+            GcProtectionPublication::Register { floor, deadline_ms }
+            | GcProtectionPublication::Update { floor, deadline_ms } => {
+                state.published_floor = Some(floor);
+                state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
+            }
+            GcProtectionPublication::Renew { deadline_ms } => {
+                state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
+            }
+            GcProtectionPublication::Release => {
+                state.active.remove(&txn_id);
+                state.idle_since = previous_idle_since;
+                return Err(Error::CorruptData(
+                    "transaction registration cannot release aggregate GC protection".to_string(),
+                ));
+            }
+        }
+        self.lease_healthy.store(true, Ordering::Release);
+
         Ok(Some(publication))
     }
 
     #[cfg(test)]
     fn release(&self, txn_id: TxnId) -> bool {
-        self.release_with(txn_id, |_| Ok(()))
-            .expect("in-memory GC protection release cannot fail")
-            .is_some()
+        self.release_local(txn_id)
     }
 
-    fn release_with<F>(&self, txn_id: TxnId, release: F) -> Result<Option<GcProtectionPublication>>
+    /// Remove one transaction from the process-local active set without
+    /// synchronously mutating Metadata Raft. The previously published floor
+    /// remains conservative until the background reconciler raises or releases
+    /// it after the configured idle grace period.
+    fn release_local(&self, txn_id: TxnId) -> bool {
+        let mut state = self.state.lock().expect("GC protection tracker poisoned");
+        if state.active.remove(&txn_id).is_none() {
+            return false;
+        }
+        if state.active.is_empty() {
+            state.idle_since = Some(Instant::now());
+        }
+        true
+    }
+
+    /// Reconcile only conservative durable-floor movement. A lower floor is
+    /// always published synchronously by `register_with_publish` before a new
+    /// reader is admitted; this background path may therefore only renew or
+    /// raise the floor, or release it after the process has remained idle.
+    fn reconcile_with_publish<F>(
+        &self,
+        now: Instant,
+        idle_grace: Duration,
+        next_deadline_ms: u64,
+        renew_before_ms: u64,
+        publish: F,
+    ) -> Result<Option<GcProtectionPublication>>
     where
         F: FnOnce(GcProtectionPublication) -> Result<()>,
     {
         let mut state = self.state.lock().expect("GC protection tracker poisoned");
-        if state.active.remove(&txn_id).is_none() {
-            return Ok(None);
-        }
-
-        let Some(previous_floor) = state.published_floor else {
-            return Ok(None);
-        };
         let publication = match state.active.values().min().copied() {
-            None => GcProtectionPublication::Release,
-            Some(floor) if floor != previous_floor => GcProtectionPublication::Update {
-                floor,
-                deadline_ms: state
+            Some(floor) => {
+                state.idle_since = None;
+                let Some(previous_floor) = state.published_floor else {
+                    return Ok(None);
+                };
+                let previous_deadline_ms = state
                     .published_deadline_ms
-                    .expect("published floor must have a lease deadline"),
-            },
-            Some(_) => return Ok(None),
+                    .expect("published floor must have a lease deadline");
+                if floor > previous_floor {
+                    GcProtectionPublication::Update {
+                        floor,
+                        deadline_ms: next_deadline_ms.max(previous_deadline_ms),
+                    }
+                } else if !self.lease_healthy.load(Ordering::Acquire)
+                    || previous_deadline_ms <= renew_before_ms
+                {
+                    GcProtectionPublication::Renew {
+                        deadline_ms: next_deadline_ms,
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => {
+                let Some(idle_since) = state.idle_since else {
+                    return Ok(None);
+                };
+                if state.published_floor.is_none() {
+                    state.idle_since = None;
+                    return Ok(None);
+                }
+                if now.saturating_duration_since(idle_since) >= idle_grace {
+                    GcProtectionPublication::Release
+                } else {
+                    let previous_deadline_ms = state
+                        .published_deadline_ms
+                        .expect("published floor must have a lease deadline");
+                    if !self.lease_healthy.load(Ordering::Acquire)
+                        || previous_deadline_ms <= renew_before_ms
+                    {
+                        GcProtectionPublication::Renew {
+                            deadline_ms: next_deadline_ms,
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
         };
 
-        if let Err(error) = release(publication) {
-            // Keep the old durable floor in local state. It remains
-            // conservative, and retaining it lets a later update/renew repair
-            // the metadata record without creating a protection gap.
+        if let Err(error) = publish(publication) {
+            self.lease_healthy.store(false, Ordering::Release);
             return Err(error);
         }
 
@@ -327,22 +498,36 @@ impl GcProtectionTracker {
             GcProtectionPublication::Release => {
                 state.published_floor = None;
                 state.published_deadline_ms = None;
+                state.idle_since = None;
+                self.published_deadline_ms.store(0, Ordering::Release);
             }
-            GcProtectionPublication::Register { .. }
-            | GcProtectionPublication::Update {
-                floor: _,
-                deadline_ms: _,
-            } => {
-                let floor = state
-                    .active
-                    .values()
-                    .min()
-                    .copied()
-                    .expect("non-release publication requires an active transaction");
+            GcProtectionPublication::Update { floor, deadline_ms } => {
                 state.published_floor = Some(floor);
+                state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
+            }
+            GcProtectionPublication::Renew { deadline_ms } => {
+                state.published_deadline_ms = Some(deadline_ms);
+                self.published_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
+            }
+            GcProtectionPublication::Register { .. } => {
+                return Err(Error::CorruptData(
+                    "GC reconciliation cannot register a new aggregate protection".to_string(),
+                ));
             }
         }
+        self.lease_healthy.store(true, Ordering::Release);
         Ok(Some(publication))
+    }
+
+    fn lease_health(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.lease_healthy)
+    }
+
+    fn lease_deadline(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.published_deadline_ms)
     }
 
     fn renew<F>(&self, deadline_ms: u64, renew: F) -> Result<bool>
@@ -357,8 +542,14 @@ impl GcProtectionTracker {
             return Ok(false);
         }
 
-        renew()?;
+        if let Err(error) = renew() {
+            self.lease_healthy.store(false, Ordering::Release);
+            return Err(error);
+        }
         state.published_deadline_ms = Some(deadline_ms);
+        self.published_deadline_ms
+            .store(deadline_ms, Ordering::Release);
+        self.lease_healthy.store(true, Ordering::Release);
         Ok(true)
     }
 
@@ -385,6 +576,31 @@ pub struct TransactionRuntime {
     gc_protection_tracker: GcProtectionTracker,
 }
 
+/// Owns one autocommit or connection-scoped history pin until its SQL owner
+/// finishes. If durable transaction recovery has activated, the lifecycle
+/// registry becomes the owner and dropping this scope must retain the pin.
+#[derive(Debug)]
+pub(crate) struct GcProtectionOwnership {
+    tracker: GcProtectionTracker,
+    lifecycle: TransactionLifecycleRegistry,
+    txn_id: TxnId,
+}
+
+impl Drop for GcProtectionOwnership {
+    fn drop(&mut self) {
+        if self.lifecycle.is_active(self.txn_id) {
+            return;
+        }
+
+        let started = Instant::now();
+        self.tracker.release_local(self.txn_id);
+        metrics::histogram_record(
+            "ragnordb_txn_gc_protection_release_seconds",
+            started.elapsed().as_secs_f64(),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcProtectionSnapshot {
     pub safe_point: Timestamp,
@@ -393,9 +609,32 @@ pub struct GcProtectionSnapshot {
     pub earliest_lease_deadline_ms: Option<u64>,
 }
 
+/// Allocate an opaque identity for this process incarnation's GC protections.
+///
+/// The identity is durable metadata capability state: a restarted process must
+/// not inherit the previous process's owner key, even when the node ID, PID,
+/// and wall clock happen to repeat.
+fn new_gc_protection_owner_id() -> Result<u128> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::Configuration(format!(
+            "failed to generate GC protection owner identity: {error}"
+        ))
+    })?;
+
+    let owner_id = u128::from_le_bytes(bytes);
+    if owner_id == 0 {
+        return Err(Error::Configuration(
+            "generated GC protection owner identity is reserved zero".to_string(),
+        ));
+    }
+
+    Ok(owner_id)
+}
+
 impl TransactionRuntime {
     pub fn new(
-        node_id: NodeId,
+        _node_id: NodeId,
         config: TransactionRuntimeConfig,
         metadata: MetadataRuntimeHandle,
         metadata_control: MetadataProposalClient,
@@ -405,14 +644,7 @@ impl TransactionRuntime {
             config.status_lease_ms,
             config.status_lease_ms,
         )?;
-        let process_nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(1);
-        let owner_id = process_nonce
-            .wrapping_add(u128::from(node_id.0) << 64)
-            .wrapping_add(u128::from(std::process::id()))
-            .max(1);
+        let owner_id = new_gc_protection_owner_id()?;
 
         Ok(Self {
             lifecycle,
@@ -428,6 +660,25 @@ impl TransactionRuntime {
         self.metadata.state_snapshot().gc_safe_point()
     }
 
+    /// Transfer autocommit or connection-owned protection to a scoped owner.
+    /// Dropping the scope releases the local membership unless transaction
+    /// recovery has already become authoritative for this transaction.
+    pub(crate) fn gc_protection_ownership(&self, txn_id: TxnId) -> GcProtectionOwnership {
+        GcProtectionOwnership {
+            tracker: self.gc_protection_tracker.clone(),
+            lifecycle: self.lifecycle.clone(),
+            txn_id,
+        }
+    }
+
+    pub(crate) fn gc_protection_lease_state(&self) -> (Arc<AtomicBool>, Arc<AtomicU64>, u64) {
+        (
+            self.gc_protection_tracker.lease_health(),
+            self.gc_protection_tracker.lease_deadline(),
+            self.config.max_clock_skew_ms,
+        )
+    }
+
     /// Hold the admission barrier across transaction timestamp allocation and
     /// GC-protection publication. The background safe-point worker acquires
     /// the same barrier before advancing the durable MVCC history floor.
@@ -436,7 +687,8 @@ impl TransactionRuntime {
     }
 
     pub fn gc_protection_snapshot(&self) -> GcProtectionSnapshot {
-        let now_ms = unix_time_millis();
+        let now_ms =
+            conservative_gc_expiration_time_ms(unix_time_millis(), self.config.max_clock_skew_ms);
         let state = self.metadata.state_snapshot();
         let mut active_protections = 0usize;
         let mut minimum_protected_timestamp = None;
@@ -471,15 +723,28 @@ impl TransactionRuntime {
     /// no interval in which the GC safe point can pass an active reader.
     pub fn register_gc_protection(&self, txn_id: TxnId, read_ts: Timestamp) -> Result<()> {
         let now_ms = unix_time_millis();
+        let conservative_now_ms = now_ms.saturating_add(self.config.max_clock_skew_ms);
         let deadline_ms = now_ms
             .checked_add(self.config.gc_protection_lease_ms)
             .ok_or_else(|| Error::InvalidArgument("GC protection deadline overflowed".into()))?;
+        let renew_before_ms = now_ms
+            .checked_add(self.config.gc_protection_lease_ms / 2)
+            .and_then(|boundary| boundary.checked_add(self.config.max_clock_skew_ms))
+            .ok_or_else(|| {
+                Error::InvalidArgument("GC protection renewal boundary overflowed".into())
+            })?;
         let tracker = self.gc_protection_tracker.clone();
         let started = Instant::now();
-        let publication =
-            tracker.register_with_publish(txn_id, read_ts, deadline_ms, |publication| {
+        let publication = tracker.register_with_publish(
+            txn_id,
+            read_ts,
+            deadline_ms,
+            conservative_now_ms,
+            renew_before_ms,
+            |publication| {
                 self.publish_gc_protection(publication, now_ms, self.config.metadata_timeout)
-            });
+            },
+        );
         metrics::histogram_record(
             "ragnordb_txn_gc_protection_register_seconds",
             started.elapsed().as_secs_f64(),
@@ -493,7 +758,9 @@ impl TransactionRuntime {
             Some(GcProtectionPublication::Update { .. }) => {
                 metrics::counter_inc("ragnordb_txn_gc_protection_aggregate_update_total");
             }
-            Some(GcProtectionPublication::Release) | None => {}
+            Some(GcProtectionPublication::Renew { .. })
+            | Some(GcProtectionPublication::Release)
+            | None => {}
         }
         Ok(())
     }
@@ -525,6 +792,15 @@ impl TransactionRuntime {
                     timeout,
                 )?
             }
+            GcProtectionPublication::Renew { deadline_ms } => {
+                self.metadata_control.renew_gc_protection(
+                    self.owner_id,
+                    AGGREGATE_GC_PROTECTION_ID,
+                    deadline_ms,
+                    now_ms,
+                    timeout,
+                )?
+            }
             GcProtectionPublication::Release => self.metadata_control.release_gc_protection(
                 self.owner_id,
                 AGGREGATE_GC_PROTECTION_ID,
@@ -534,6 +810,13 @@ impl TransactionRuntime {
 
         match outcome {
             MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => Ok(()),
+            MetadataApplyOutcome::Rejected(MetadataRejection::UnknownGcProtection { .. })
+                if publication == GcProtectionPublication::Release =>
+            {
+                // Release is idempotent: expiry or a previously committed
+                // timed-out release may already have removed the aggregate.
+                Ok(())
+            }
             MetadataApplyOutcome::Rejected(MetadataRejection::GcProtectionBelowSafePoint {
                 protected,
                 safe_point,
@@ -576,17 +859,40 @@ impl TransactionRuntime {
     }
 
     pub fn release_gc_protection(&self, txn_id: TxnId) -> Result<()> {
-        let now_ms = unix_time_millis();
-        let tracker = self.gc_protection_tracker.clone();
         let started = Instant::now();
-        let publication = tracker.release_with(txn_id, |publication| {
-            self.publish_gc_protection(publication, now_ms, self.config.metadata_timeout)
-        });
+        self.gc_protection_tracker.release_local(txn_id);
         metrics::histogram_record(
             "ragnordb_txn_gc_protection_release_seconds",
             started.elapsed().as_secs_f64(),
         );
-        let publication = publication?;
+        Ok(())
+    }
+
+    /// Move the durable aggregate floor only from the background maintenance
+    /// path. Foreground completion remains local, while registration still
+    /// synchronously lowers the floor before a transaction can issue reads.
+    pub fn reconcile_gc_protection_once(&self) -> Result<()> {
+        let _admission = self.gc_protection_tracker.admission_guard();
+        let now = Instant::now();
+        let now_ms = unix_time_millis();
+        let conservative_now_ms = now_ms.saturating_add(self.config.max_clock_skew_ms);
+        let next_deadline_ms = now_ms
+            .checked_add(self.config.gc_protection_lease_ms)
+            .ok_or_else(|| Error::InvalidArgument("GC protection deadline overflowed".into()))?;
+        let renew_before_ms = now_ms
+            .checked_add(self.config.gc_protection_lease_ms / 2)
+            .and_then(|boundary| boundary.checked_add(self.config.max_clock_skew_ms))
+            .ok_or_else(|| Error::InvalidArgument("GC renewal boundary overflowed".into()))?;
+        let tracker = self.gc_protection_tracker.clone();
+        let publication = tracker.reconcile_with_publish(
+            now,
+            self.config.gc_protection_idle_grace,
+            next_deadline_ms,
+            renew_before_ms.max(conservative_now_ms),
+            |publication| {
+                self.publish_gc_protection(publication, now_ms, self.config.metadata_timeout)
+            },
+        )?;
         match publication {
             Some(GcProtectionPublication::Release) => {
                 metrics::counter_inc("ragnordb_txn_gc_protection_aggregate_release_total");
@@ -594,42 +900,67 @@ impl TransactionRuntime {
             Some(GcProtectionPublication::Update { .. }) => {
                 metrics::counter_inc("ragnordb_txn_gc_protection_aggregate_update_total");
             }
-            Some(GcProtectionPublication::Register { .. }) | None => {}
+            Some(GcProtectionPublication::Renew { .. })
+            | Some(GcProtectionPublication::Register { .. })
+            | None => {}
         }
         Ok(())
     }
+
     pub fn advance_gc_safe_point_once(&self) -> Result<Timestamp> {
         let _admission = self.gc_protection_tracker.admission_guard();
         let state = self.metadata.state_snapshot();
         let candidate = state.timestamp_reserved_until();
-        let now_ms = unix_time_millis();
-        let outcome = self.metadata_control.advance_gc_safe_point(
-            candidate,
-            now_ms,
-            self.config.metadata_timeout,
-        )?;
-        match outcome {
-            MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => {
-                let published = self.metadata.state_snapshot().gc_safe_point();
-                metrics::gauge_set("ragnordb_txn_gc_safe_point", published.0 as f64);
-                metrics::gauge_set(
-                    "ragnordb_txn_gc_protections_active",
-                    self.metadata
-                        .state_snapshot()
-                        .gc_protections()
-                        .filter(|protection| protection.lease_deadline_ms > now_ms)
-                        .count() as f64,
-                );
-                Ok(published)
-            }
-            MetadataApplyOutcome::Rejected(rejection) => Err(Error::WriteConflict(format!(
-                "metadata rejected MVCC GC safe-point advancement: {rejection}"
-            ))),
-            other => Err(Error::CorruptData(format!(
-                "metadata returned unexpected GC safe-point result {other:?}"
-            ))),
+        let now_ms =
+            conservative_gc_expiration_time_ms(unix_time_millis(), self.config.max_clock_skew_ms);
+        let published =
+            advance_gc_safe_point_if_reserved(candidate, state.gc_safe_point(), |candidate| {
+                let outcome = self.metadata_control.advance_gc_safe_point(
+                    candidate,
+                    now_ms,
+                    self.config.metadata_timeout,
+                )?;
+                match outcome {
+                    MetadataApplyOutcome::Applied | MetadataApplyOutcome::AlreadyApplied => {
+                        Ok(self.metadata.state_snapshot().gc_safe_point())
+                    }
+                    MetadataApplyOutcome::Rejected(rejection) => Err(Error::WriteConflict(
+                        format!("metadata rejected MVCC GC safe-point advancement: {rejection}"),
+                    )),
+                    other => Err(Error::CorruptData(format!(
+                        "metadata returned unexpected GC safe-point result {other:?}"
+                    ))),
+                }
+            })?;
+        metrics::gauge_set("ragnordb_txn_gc_safe_point", published.0 as f64);
+        if candidate.0 != 0 {
+            metrics::gauge_set(
+                "ragnordb_txn_gc_protections_active",
+                self.metadata
+                    .state_snapshot()
+                    .gc_protections()
+                    .filter(|protection| protection.lease_deadline_ms > now_ms)
+                    .count() as f64,
+            );
         }
+        Ok(published)
     }
+}
+
+/// Skip safe-point proposals until the durable timestamp authority has a
+/// nonzero frontier; zero is reserved and cannot advance MVCC history.
+fn advance_gc_safe_point_if_reserved<F>(
+    candidate: Timestamp,
+    current: Timestamp,
+    advance: F,
+) -> Result<Timestamp>
+where
+    F: FnOnce(Timestamp) -> Result<Timestamp>,
+{
+    if candidate.0 == 0 {
+        return Ok(current);
+    }
+    advance(candidate)
 }
 
 /// Advance the global MVCC safe point only through metadata Raft apply. The
@@ -646,9 +977,15 @@ pub async fn run_gc_safe_point_loop(
             _ = shutdown.cancelled() => return Ok(()),
             _ = ticker.tick() => {
                 let worker = runtime.clone();
-                match tokio::task::spawn_blocking(move || worker.advance_gc_safe_point_once()).await {
+                match tokio::task::spawn_blocking(move || {
+                    worker.reconcile_gc_protection_once()?;
+                    worker.advance_gc_safe_point_once()
+                }).await {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => tracing::warn!(error = %error, "MVCC GC safe-point advance failed"),
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %error,
+                        "MVCC GC protection reconciliation or safe-point advance failed"
+                    ),
                     Err(error) => tracing::warn!(error = %error, "MVCC GC safe-point task failed"),
                 }
             }
@@ -1121,15 +1458,15 @@ impl LifecycleTabletGateway {
         timeout: Duration,
     ) -> Result<TabletCommandApplyOutcome> {
         let mut initial_status = None;
-        if let TabletCommand::Prewrite(prewrite) = &mut command {
-            if let Some(status) = prewrite.pending_status.as_ref() {
-                let prepared = self
-                    .registry
-                    .prepare_primary_status(status, unix_time_millis())?;
-                prewrite.pending_status = Some(prepared.clone());
-                prewrite.ttl_ms = self.registry.lock_ttl_ms;
-                initial_status = Some(prepared);
-            }
+        if let TabletCommand::Prewrite(prewrite) = &mut command
+            && let Some(status) = prewrite.pending_status.as_ref()
+        {
+            let prepared = self
+                .registry
+                .prepare_primary_status(status, unix_time_millis())?;
+            prewrite.pending_status = Some(prepared.clone());
+            prewrite.ttl_ms = self.registry.lock_ttl_ms;
+            initial_status = Some(prepared);
         }
 
         let encoded_command_bytes = measure_command_envelope(
@@ -1491,6 +1828,23 @@ pub async fn run_transaction_heartbeat_loop(
     }
 }
 
+/// Retire recovery ownership only after a terminal status is authoritative.
+/// The aggregate durable floor remains conservative until background
+/// reconciliation raises or releases it after the configured idle grace.
+fn release_recovered_transaction_ownership(
+    lifecycle: &TransactionLifecycleRegistry,
+    tracker: &GcProtectionTracker,
+    txn_id: TxnId,
+) {
+    lifecycle.unregister(txn_id);
+    let started = Instant::now();
+    tracker.release_local(txn_id);
+    metrics::histogram_record(
+        "ragnordb_txn_gc_protection_release_seconds",
+        started.elapsed().as_secs_f64(),
+    );
+}
+
 fn heartbeat_one(
     gateway: &TabletRpcClient,
     runtime: &TransactionRuntime,
@@ -1505,18 +1859,28 @@ fn heartbeat_one(
     let route = gateway.lookup_tablet_route(primary.table_id, &primary.primary_key_bytes)?;
     let request_id = status_read_request(txn_id, route.raft_group_id);
     let Some(current) = gateway.transaction_status(&route, request_id, txn_id, timeout)? else {
-        runtime.lifecycle.unregister(txn_id);
         metrics::record_heartbeat_failure();
-        return Ok(false);
+        return Err(Error::TabletUnavailable {
+            reason: format!(
+                "transaction status for recovery-owned transaction {} is unavailable",
+                txn_id.0
+            ),
+        });
     };
     if current.status != TxnStatus::Pending {
-        runtime.lifecycle.unregister(txn_id);
+        release_recovered_transaction_ownership(
+            &runtime.lifecycle,
+            &runtime.gc_protection_tracker,
+            txn_id,
+        );
         return Ok(false);
     }
     let Some(existing_deadline) = current.lease_deadline_ms else {
-        runtime.lifecycle.unregister(txn_id);
         metrics::record_heartbeat_failure();
-        return Ok(false);
+        return Err(Error::CorruptData(format!(
+            "pending transaction {} has no status lease deadline; retaining recovery ownership",
+            txn_id.0
+        )));
     };
     let now_ms = unix_time_millis();
     if now_ms >= existing_deadline {
@@ -1619,6 +1983,13 @@ pub fn unix_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+/// Delay replicated lease expiry by the maximum permitted pairwise clock
+/// skew. A fast safe-point proposer must not expire a lease while its owner can
+/// still consider that lease live.
+fn conservative_gc_expiration_time_ms(now_ms: u64, max_clock_skew_ms: u64) -> u64 {
+    now_ms.saturating_sub(max_clock_skew_ms)
 }
 
 /// Per-node bounded work limits for one cleaner scheduling round.
@@ -1922,11 +2293,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gc_protection_lease_cannot_expire_before_a_pending_status_lease() {
-        // This catches a crash-recovery hole where an abandoned transaction
-        // still has a live pending status after its MVCC history pin expires.
-        let config = TransactionRuntimeConfig {
+    fn valid_transaction_runtime_config() -> TransactionRuntimeConfig {
+        TransactionRuntimeConfig {
             footprint: TransactionFootprintPolicy::default(),
             max_active_transactions: 1,
             status_lease_ms: 300_000,
@@ -1942,15 +2310,110 @@ mod tests {
                 timeout: Duration::from_millis(2_000),
             },
             gc_sweep_interval: Duration::from_millis(5_000),
-            gc_protection_lease_ms: 120_000,
+            gc_protection_idle_grace: Duration::from_millis(5_000),
+            gc_protection_lease_ms: 420_000,
+            max_clock_skew_ms: 30_000,
             metadata_timeout: Duration::from_millis(5_000),
-        };
+        }
+    }
+
+    #[test]
+    fn gc_protection_lease_cannot_expire_before_a_pending_status_lease() {
+        // This catches a crash-recovery hole where an abandoned transaction
+        // still has a live pending status after its MVCC history pin expires.
+        let mut config = valid_transaction_runtime_config();
+        config.gc_protection_lease_ms = 120_000;
 
         assert!(
             config
                 .validate(30_000, Duration::from_millis(1_000))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn gc_lease_must_cover_a_sweep_and_metadata_proposal_after_renewal_threshold() {
+        let mut config = valid_transaction_runtime_config();
+        config.gc_protection_lease_ms = 400_000;
+        config.gc_sweep_interval = Duration::from_millis(195_000);
+
+        assert!(
+            config
+                .validate(30_000, Duration::from_millis(1_000))
+                .is_err(),
+            "maintenance work that consumes the lease's remaining half must be rejected"
+        );
+    }
+
+    /// Realistic bug caught: a lease shorter than the clock-skew safety window
+    /// can be expired by a fast node before its owner stops using the pin.
+    #[test]
+    fn configured_clock_skew_must_fit_inside_the_gc_lease_budget() {
+        let mut config = valid_transaction_runtime_config();
+        config.max_clock_skew_ms = 200_000;
+
+        assert!(
+            config
+                .validate(30_000, Duration::from_millis(1_000))
+                .is_err()
+        );
+    }
+
+    /// Realistic bug caught: a fast safe-point proposer must not expire a
+    /// protection until its wall clock is later than the deadline by the full
+    /// configured pairwise-skew allowance.
+    #[test]
+    fn safe_point_expiry_waits_until_deadline_plus_clock_skew() {
+        use ragnordb_catalog::MetadataState;
+        use ragnordb_common::metadata_codec::MetadataCommand;
+
+        let owner_id = 1;
+        let protection_id = 1;
+        let protected_timestamp = Timestamp(40);
+        let lease_deadline_ms = 1_000;
+        let max_clock_skew_ms = 30;
+        let mut metadata = MetadataState::new();
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::ClusterInitialized {
+                cluster_id: "gc-skew-test".to_string(),
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms,
+                now_ms: 100,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+
+        let before_safe_expiry = conservative_gc_expiration_time_ms(
+            lease_deadline_ms + max_clock_skew_ms - 1,
+            max_clock_skew_ms,
+        );
+        assert_eq!(before_safe_expiry, lease_deadline_ms - 1);
+        metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: before_safe_expiry,
+        });
+        assert!(metadata.gc_protection(owner_id, protection_id).is_some());
+        assert_eq!(metadata.gc_safe_point(), protected_timestamp);
+
+        let after_safe_expiry = conservative_gc_expiration_time_ms(
+            lease_deadline_ms + max_clock_skew_ms,
+            max_clock_skew_ms,
+        );
+        assert_eq!(after_safe_expiry, lease_deadline_ms);
+        metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+            candidate: Timestamp(100),
+            now_ms: after_safe_expiry,
+        });
+        assert!(metadata.gc_protection(owner_id, protection_id).is_none());
+        assert_eq!(metadata.gc_safe_point(), Timestamp(100));
     }
 
     #[test]
@@ -2007,8 +2470,9 @@ mod tests {
         );
     }
 
+    /// A terminal unregister must return a staged footprint slot to the bound.
     #[test]
-    fn unregister_releases_a_rejected_transactions_staged_footprint() {
+    fn terminal_transaction_releases_staged_footprint_capacity() {
         let registry = TransactionLifecycleRegistry::new(1, 1_000, 1_000).unwrap();
         let footprint = TransactionFootprint {
             age_ms: 10,
@@ -2105,6 +2569,719 @@ mod tests {
         assert!(tracker.release(TxnId(1)));
         assert!(tracker.release(TxnId(2)));
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic bug caught: a statement error or streaming cancellation that
+    /// returns through `?` must not strand its process-local history pin.
+    #[test]
+    fn statement_scope_releases_gc_protection_after_success_failure_or_cancellation() {
+        for (result, expected_success) in [
+            (Ok(()), true),
+            (
+                Err(Error::WriteConflict(
+                    "statement execution failed".to_string(),
+                )),
+                false,
+            ),
+            (
+                Err(Error::ProposalUnavailable {
+                    reason: "stream was cancelled".to_string(),
+                }),
+                false,
+            ),
+        ] {
+            let tracker = GcProtectionTracker::default();
+            let lifecycle = TransactionLifecycleRegistry::new(4, 1_000, 1_000).unwrap();
+            assert!(tracker.register(TxnId(1), Timestamp(10), 100));
+
+            let result: Result<()> = {
+                let _ownership = GcProtectionOwnership {
+                    tracker: tracker.clone(),
+                    lifecycle,
+                    txn_id: TxnId(1),
+                };
+                result
+            };
+
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(tracker.active_count(), 0);
+        }
+    }
+
+    /// Realistic bug caught: dropping the SQL owner after an uncertain commit
+    /// must leave the history pin with the active transaction recovery owner.
+    #[test]
+    fn statement_scope_transfers_gc_protection_to_recovery_after_unknown_outcome() {
+        let tracker = GcProtectionTracker::default();
+        let lifecycle = TransactionLifecycleRegistry::new(4, 1_000, 1_000).unwrap();
+        assert!(tracker.register(TxnId(7), Timestamp(107), 100));
+
+        let status = pending_status(7);
+        let prepared = lifecycle.prepare_primary_status(&status, 1_000).unwrap();
+        lifecycle.activate(prepared, Instant::now());
+
+        drop(GcProtectionOwnership {
+            tracker: tracker.clone(),
+            lifecycle: lifecycle.clone(),
+            txn_id: TxnId(7),
+        });
+
+        assert!(lifecycle.is_active(TxnId(7)));
+        assert_eq!(tracker.active_count(), 1);
+    }
+
+    /// Realistic bug caught: once recovery observes a terminal status, its
+    /// ownership must release the local pin so aggregate reconciliation can
+    /// eventually retire the durable floor.
+    #[test]
+    fn terminal_recovery_releases_transferred_gc_protection() {
+        let tracker = GcProtectionTracker::default();
+        let lifecycle = TransactionLifecycleRegistry::new(4, 1_000, 1_000).unwrap();
+        assert!(tracker.register(TxnId(8), Timestamp(108), 100));
+
+        let status = pending_status(8);
+        let prepared = lifecycle.prepare_primary_status(&status, 1_000).unwrap();
+        lifecycle.activate(prepared, Instant::now());
+        assert!(lifecycle.is_active(TxnId(8)));
+
+        release_recovered_transaction_ownership(&lifecycle, &tracker, TxnId(8));
+
+        assert!(!lifecycle.is_active(TxnId(8)));
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn healthy_cached_gc_floor_is_reused_without_publication() {
+        let tracker = GcProtectionTracker::default();
+
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(1), Timestamp(10), 1_000, 100, 500, |_| Ok(()),)
+                .unwrap(),
+            Some(GcProtectionPublication::Register {
+                floor: Timestamp(10),
+                deadline_ms: 1_000,
+            })
+        );
+
+        assert!(tracker.release(TxnId(1)));
+        let mut published = false;
+
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(2), Timestamp(20), 1_100, 200, 650, |_| {
+                    published = true;
+                    Ok(())
+                },)
+                .unwrap(),
+            None
+        );
+        assert!(
+            !published,
+            "healthy conservative floor must remain a local fast path"
+        );
+    }
+
+    #[test]
+    fn duplicate_gc_registration_does_not_replace_the_tracked_read_timestamp() {
+        let tracker = GcProtectionTracker::default();
+        tracker
+            .register_with_publish(TxnId(1), Timestamp(10), 1_000, 100, 500, |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(1), Timestamp(5), 1_100, 200, 650, |_| Ok(()))
+                .unwrap(),
+            None
+        );
+
+        let mut published = false;
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(2), Timestamp(20), 1_100, 200, 650, |_| {
+                    published = true;
+                    Ok(())
+                },)
+                .unwrap(),
+            None
+        );
+        assert!(
+            !published,
+            "duplicate admission must preserve the original aggregate floor"
+        );
+    }
+
+    #[test]
+    fn near_expiry_cached_gc_floor_is_renewed_before_reader_admission() {
+        let tracker = GcProtectionTracker::default();
+        tracker
+            .register_with_publish(TxnId(1), Timestamp(10), 1_000, 100, 500, |_| Ok(()))
+            .unwrap();
+        assert!(tracker.release(TxnId(1)));
+
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(2), Timestamp(20), 1_900, 900, 1_400, |_| Ok(()),)
+                .unwrap(),
+            Some(GcProtectionPublication::Renew { deadline_ms: 1_900 })
+        );
+    }
+
+    #[test]
+    fn expired_cached_gc_floor_fails_closed_before_reader_admission() {
+        let tracker = GcProtectionTracker::default();
+        tracker
+            .register_with_publish(TxnId(1), Timestamp(10), 1_000, 100, 500, |_| Ok(()))
+            .unwrap();
+        assert!(tracker.release(TxnId(1)));
+
+        let error = tracker
+            .register_with_publish(TxnId(2), Timestamp(20), 2_000, 1_001, 1_500, |_| Ok(()))
+            .unwrap_err();
+
+        assert!(matches!(error, Error::ProposalUnavailable { .. }));
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic bug caught: after a process restarts, a delayed renewal from
+    /// the previous owner must not extend the replacement process's lease.
+    #[test]
+    fn restarted_gc_owner_cannot_revive_an_expired_previous_owner() {
+        use ragnordb_catalog::MetadataState;
+        use ragnordb_common::metadata_codec::MetadataCommand;
+
+        let previous_owner_id = new_gc_protection_owner_id().unwrap();
+        let restarted_owner_id = new_gc_protection_owner_id().unwrap();
+        assert_ne!(previous_owner_id, restarted_owner_id);
+
+        let protection_id = 1;
+        let protected_timestamp = Timestamp(40);
+        let mut metadata = MetadataState::new();
+        assert_eq!(
+            metadata.apply(MetadataCommand::ClusterInitialized {
+                cluster_id: "gc-owner-restart-test".to_string(),
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms: 300,
+                now_ms: 100,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.apply(MetadataCommand::AdvanceGcSafePoint {
+                candidate: protected_timestamp,
+                now_ms: 300,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+        assert_eq!(
+            metadata.gc_protection(previous_owner_id, protection_id),
+            None,
+        );
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::RegisterGcProtection {
+                owner_id: restarted_owner_id,
+                protection_id,
+                protected_timestamp,
+                lease_deadline_ms: 900,
+                now_ms: 301,
+            }),
+            MetadataApplyOutcome::Applied,
+        );
+
+        assert_eq!(
+            metadata.apply(MetadataCommand::RenewGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+                lease_deadline_ms: 1_200,
+                now_ms: 400,
+            }),
+            MetadataApplyOutcome::Rejected(MetadataRejection::UnknownGcProtection {
+                owner_id: previous_owner_id,
+                protection_id,
+            }),
+        );
+        assert_eq!(
+            metadata
+                .gc_protection(restarted_owner_id, protection_id)
+                .map(|protection| protection.lease_deadline_ms),
+            Some(900),
+        );
+    }
+
+    #[test]
+    fn failed_admission_time_gc_renewal_rolls_back_local_membership() {
+        let tracker = GcProtectionTracker::default();
+        tracker
+            .register_with_publish(TxnId(1), Timestamp(10), 1_000, 100, 500, |_| Ok(()))
+            .unwrap();
+        assert!(tracker.release(TxnId(1)));
+
+        let error = tracker
+            .register_with_publish(TxnId(2), Timestamp(20), 1_900, 900, 1_400, |_| {
+                Err(Error::ProposalUnavailable {
+                    reason: "synthetic Metadata Raft failure".to_string(),
+                })
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, Error::ProposalUnavailable { .. }));
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Realistic regression: registering a transaction with an older snapshot
+    /// requires lowering the aggregate floor, while the old durable floor
+    /// continues to protect transactions already in flight.
+    #[test]
+    fn successful_admission_floor_update_does_not_fence_existing_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 120_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let publication = tracker
+            .register_with_publish(
+                TxnId(2),
+                Timestamp(5),
+                now_ms + 180_000,
+                now_ms + 1,
+                now_ms + 60_000,
+                |publication| {
+                    assert!(matches!(
+                        publication,
+                        GcProtectionPublication::Update {
+                            floor: Timestamp(5),
+                            ..
+                        }
+                    ));
+                    assert!(
+                        health.load(Ordering::Acquire),
+                        "a valid old floor must remain usable during admission publication"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            publication,
+            Some(GcProtectionPublication::Update {
+                floor: Timestamp(5),
+                ..
+            })
+        ));
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: routine floor maintenance must not reject a
+    /// foreground operation while the more-conservative old durable floor is
+    /// still authoritative.
+    #[test]
+    fn successful_background_floor_update_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 120_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+        tracker
+            .register_with_publish(
+                TxnId(2),
+                Timestamp(20),
+                initial_deadline_ms,
+                now_ms + 1,
+                now_ms + 60_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(tracker.release(TxnId(1)));
+
+        let health = tracker.lease_health();
+        let next_deadline_ms = now_ms + 180_000;
+        let publication = tracker
+            .reconcile_with_publish(
+                Instant::now(),
+                Duration::from_secs(5),
+                next_deadline_ms,
+                now_ms + 90_000,
+                |publication| {
+                    assert!(matches!(
+                        publication,
+                        GcProtectionPublication::Update {
+                            floor: Timestamp(20),
+                            ..
+                        }
+                    ));
+                    assert!(
+                        health.load(Ordering::Acquire),
+                        "a successful conservative floor update must not fence readers"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            publication,
+            Some(GcProtectionPublication::Update {
+                floor: Timestamp(20),
+                deadline_ms: next_deadline_ms,
+            })
+        );
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: the prior durable deadline stays authoritative
+    /// during a successful background renewal and must not create a brief
+    /// foreground availability failure.
+    #[test]
+    fn successful_background_renewal_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        let next_deadline_ms = now_ms + 120_000;
+        let publication = tracker
+            .reconcile_with_publish(
+                Instant::now(),
+                Duration::from_secs(5),
+                next_deadline_ms,
+                initial_deadline_ms,
+                |publication| {
+                    assert!(matches!(publication, GcProtectionPublication::Renew { .. }));
+                    assert!(health.load(Ordering::Acquire));
+                    assert_eq!(
+                        published_deadline.load(Ordering::Acquire),
+                        initial_deadline_ms,
+                        "the previous deadline remains published until renewal succeeds"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            publication,
+            Some(GcProtectionPublication::Renew {
+                deadline_ms: next_deadline_ms,
+            })
+        );
+        assert_eq!(published_deadline.load(Ordering::Acquire), next_deadline_ms);
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// Realistic regression: heartbeat-driven renewals use a separate tracker
+    /// path and must leave existing readers usable until a proposal fails.
+    #[test]
+    fn successful_direct_renewal_does_not_fence_live_readers() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        let next_deadline_ms = now_ms + 120_000;
+        assert!(
+            tracker
+                .renew(next_deadline_ms, || {
+                    assert!(health.load(Ordering::Acquire));
+                    assert_eq!(
+                        published_deadline.load(Ordering::Acquire),
+                        initial_deadline_ms
+                    );
+                    Ok(())
+                })
+                .unwrap()
+        );
+
+        assert_eq!(published_deadline.load(Ordering::Acquire), next_deadline_ms);
+        assert!(health.load(Ordering::Acquire));
+    }
+
+    /// A real metadata renewal failure must fence readers without publishing
+    /// the proposed deadline as though it had committed.
+    #[test]
+    fn failed_direct_renewal_fences_readers_and_keeps_the_old_deadline() {
+        let tracker = GcProtectionTracker::default();
+        let now_ms = unix_time_millis();
+        let initial_deadline_ms = now_ms + 60_000;
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                initial_deadline_ms,
+                now_ms,
+                now_ms + 30_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let health = tracker.lease_health();
+        let published_deadline = tracker.lease_deadline();
+        assert!(matches!(
+            tracker.renew(now_ms + 120_000, || {
+                Err(Error::ProposalUnavailable {
+                    reason: "metadata renewal unavailable".to_string(),
+                })
+            }),
+            Err(Error::ProposalUnavailable { .. })
+        ));
+
+        assert!(!health.load(Ordering::Acquire));
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            initial_deadline_ms,
+            "failed renewal must not publish an uncommitted deadline"
+        );
+    }
+
+    /// Realistic bug caught: when Metadata Raft cannot renew a live aggregate
+    /// lease, readers already using that lease must stop until a renewal is
+    /// acknowledged; rejecting only later admissions leaves them unfenced.
+    #[test]
+    fn failed_active_gc_lease_renewal_fences_statement_contexts_until_retry() {
+        let tracker = GcProtectionTracker::default();
+        let mut request_context = ragnordb_exec::TabletRequestContext::new(91).unwrap();
+        let published_deadline = tracker.lease_deadline();
+        request_context.set_gc_protection_lease_health(
+            Some(tracker.lease_health()),
+            Some(Arc::clone(&published_deadline)),
+            0,
+            true,
+        );
+
+        let now_ms = unix_time_millis();
+        let first_deadline_ms = now_ms + 10_000;
+        tracker
+            .register_with_publish(
+                TxnId(1),
+                Timestamp(10),
+                first_deadline_ms,
+                now_ms,
+                now_ms + 5_000,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            first_deadline_ms
+        );
+        assert!(request_context.remaining_timeout().is_ok());
+
+        let renewed_deadline_ms = now_ms + 30_000;
+        let renewal_error = tracker.reconcile_with_publish(
+            Instant::now(),
+            Duration::from_secs(1),
+            renewed_deadline_ms,
+            now_ms + 15_000,
+            |_| {
+                Err(Error::ProposalUnavailable {
+                    reason: "metadata renewal unavailable".to_string(),
+                })
+            },
+        );
+        assert!(matches!(
+            renewal_error,
+            Err(Error::ProposalUnavailable { .. })
+        ));
+        assert_eq!(tracker.active_count(), 1);
+        assert!(matches!(
+            request_context.remaining_timeout(),
+            Err(Error::ProposalUnavailable { reason })
+                if reason.contains("history protection lease")
+        ));
+
+        assert_eq!(
+            tracker
+                .reconcile_with_publish(
+                    Instant::now(),
+                    Duration::from_secs(1),
+                    renewed_deadline_ms,
+                    now_ms + 15_000,
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            Some(GcProtectionPublication::Renew {
+                deadline_ms: renewed_deadline_ms,
+            }),
+        );
+        assert_eq!(
+            published_deadline.load(Ordering::Acquire),
+            renewed_deadline_ms
+        );
+        assert!(request_context.remaining_timeout().is_ok());
+    }
+
+    /// Realistic bug caught: a timed-out aggregate release may already have
+    /// applied. Reconciliation retains one bounded retry state and treats an
+    /// already-removed protection as successful when that retry is acknowledged.
+    #[test]
+    fn failed_aggregate_release_is_retried_before_new_admission() {
+        let tracker = GcProtectionTracker::default();
+        assert!(tracker.register(TxnId(1), Timestamp(10), 100));
+        assert!(tracker.release(TxnId(1)));
+        let now = Instant::now();
+
+        assert!(matches!(
+            tracker.reconcile_with_publish(
+                now + Duration::from_secs(2),
+                Duration::from_secs(1),
+                200,
+                100,
+                |_| Err(Error::ProposalUnavailable {
+                    reason: "metadata release outcome unknown".to_string(),
+                }),
+            ),
+            Err(Error::ProposalUnavailable { .. })
+        ));
+        assert!(!tracker.lease_healthy.load(Ordering::Acquire));
+
+        assert_eq!(
+            tracker
+                .reconcile_with_publish(
+                    now + Duration::from_secs(3),
+                    Duration::from_secs(1),
+                    300,
+                    150,
+                    |_| Ok(()),
+                )
+                .unwrap(),
+            Some(GcProtectionPublication::Release),
+        );
+        assert!(tracker.lease_healthy.load(Ordering::Acquire));
+
+        assert!(
+            tracker
+                .register_with_publish(TxnId(2), Timestamp(20), 400, 150, 250, |_| Ok(()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn zero_timestamp_frontier_does_not_propose_gc_safe_point() {
+        let current = Timestamp(0);
+        let result = advance_gc_safe_point_if_reserved(Timestamp(0), current, |_| {
+            panic!("zero timestamp frontier must not reach metadata proposal")
+        })
+        .unwrap();
+
+        assert_eq!(result, current);
+    }
+
+    /// Realistic bug caught: sequential autocommit statements must reuse one
+    /// conservative durable floor instead of synchronously releasing and
+    /// registering it around every statement.
+    #[test]
+    fn gc_protection_release_is_deferred_until_idle_grace() {
+        let tracker = GcProtectionTracker::default();
+        assert!(
+            tracker
+                .register_with_publish(TxnId(1), Timestamp(10), 100, 10, 60, |_| Ok(()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(tracker.release(TxnId(1)));
+        assert_eq!(
+            tracker
+                .register_with_publish(TxnId(2), Timestamp(20), 200, 20, 70, |_| Ok(()))
+                .unwrap(),
+            None
+        );
+        assert!(tracker.release(TxnId(2)));
+        let now = Instant::now();
+        assert!(
+            tracker
+                .reconcile_with_publish(now, Duration::from_secs(1), 200, 99, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            tracker
+                .reconcile_with_publish(
+                    now + Duration::from_secs(2),
+                    Duration::from_secs(1),
+                    200,
+                    100,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            Some(GcProtectionPublication::Release)
+        );
+    }
+
+    /// Realistic bug caught: a sustained stream of short transactions can
+    /// reuse one durable floor longer than its first lease. Background renewal
+    /// must keep that conservative floor live without returning a Metadata
+    /// Raft round trip to the foreground path.
+    #[test]
+    fn gc_protection_reconciliation_renews_a_reused_floor_before_expiry() {
+        let tracker = GcProtectionTracker::default();
+        assert!(tracker.register(TxnId(1), Timestamp(10), 100));
+        assert!(tracker.release(TxnId(1)));
+
+        assert_eq!(
+            tracker
+                .reconcile_with_publish(
+                    Instant::now(),
+                    Duration::from_secs(1),
+                    200,
+                    100,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            Some(GcProtectionPublication::Renew { deadline_ms: 200 })
+        );
     }
 
     #[test]

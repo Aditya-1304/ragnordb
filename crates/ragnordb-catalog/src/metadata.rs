@@ -532,6 +532,11 @@ impl MetadataState {
         self.cluster_id.as_deref()
     }
 
+    /// Return the number of durable request outcomes retained for exact replay.
+    pub fn request_deduplication_count(&self) -> usize {
+        self.request_deduplication.len()
+    }
+
     pub const fn allocator_state(&self) -> MetadataAllocatorState {
         self.allocator
     }

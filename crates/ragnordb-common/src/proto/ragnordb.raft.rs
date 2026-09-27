@@ -138,6 +138,10 @@ pub struct RaftTransportEnvelope {
     pub to_replica_id: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub raft_message: ::prost::alloc::vec::Vec<u8>,
+    /// Opt-in diagnostic timestamp; zero when pipeline tracing is disabled.
+    /// This field is observational and is ignored by Raft consensus behavior.
+    #[prost(fixed64, tag = "4")]
+    pub diagnostic_transport_enqueue_unix_nanos: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

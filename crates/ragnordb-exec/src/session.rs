@@ -8,7 +8,13 @@
 //! an implicit transaction. BEGIN attaches an explicit transaction that remains
 //! active until COMMIT or ROLLBACK.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
+    time::{Duration, Instant},
+};
 
 use ragnordb_common::{Error, Result, ids::ClientRequestId, ids::RequestId, ids::TxnId};
 use ragnordb_sql::{Plan, analyze, parse_one, plan};
@@ -82,6 +88,43 @@ impl SqlSession {
     /// Update the bounded RPC deadline for this connection's next statement.
     pub fn set_tablet_request_timeout(&mut self, timeout: Duration) {
         self.tablet_request_context.set_timeout(timeout);
+    }
+
+    pub fn set_tablet_request_deadline(
+        &mut self,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        configured_timeout_ms: u64,
+    ) -> Result<()> {
+        self.tablet_request_context.set_statement_deadline(
+            deadline,
+            cancelled,
+            configured_timeout_ms,
+        )
+    }
+
+    /// Attach aggregate GC-lease health to the current statement context.
+    /// History-dependent work is fenced when its runtime cannot confirm that
+    /// the durable lease remains valid; rollback and other control operations
+    /// can opt out so they remain available for cleanup.
+    pub fn set_tablet_request_gc_protection_health(
+        &mut self,
+        lease_state: Option<(Arc<AtomicBool>, Arc<AtomicU64>, u64)>,
+        required: bool,
+    ) {
+        let (healthy, deadline_ms, clock_skew_guard_ms) = lease_state
+            .map(|(healthy, deadline_ms, skew_ms)| (Some(healthy), Some(deadline_ms), skew_ms))
+            .unwrap_or((None, None, 0));
+        self.tablet_request_context.set_gc_protection_lease_health(
+            healthy,
+            deadline_ms,
+            clock_skew_guard_ms,
+            required,
+        );
+    }
+
+    pub fn remaining_tablet_request_timeout(&self) -> Result<Duration> {
+        self.tablet_request_context.remaining_timeout()
     }
 
     /// Return whether standalone data statements use implicit transactions.
@@ -380,12 +423,21 @@ impl SqlSession {
                 }
 
                 match metadata_request_id {
-                    Some(request_id) => executor.execute_create_table_with_metadata_and_identity(
-                        plan,
-                        request_id,
-                        logical_request_id,
-                        metadata_timeout,
-                    ),
+                    Some(request_id) => {
+                        let remaining = self.tablet_request_context.remaining_timeout()?;
+                        let metadata_timeout = if metadata_timeout.is_zero() {
+                            remaining
+                        } else {
+                            remaining.min(metadata_timeout)
+                        };
+
+                        executor.execute_create_table_with_metadata_and_identity(
+                            plan,
+                            request_id,
+                            logical_request_id,
+                            metadata_timeout,
+                        )
+                    }
                     None if executor.metadata_table_creator_installed() => {
                         Err(Error::InvalidArgument(
                             "metadata-backed CREATE TABLE requires a request identity".to_string(),

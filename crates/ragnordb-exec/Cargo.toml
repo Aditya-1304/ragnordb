@@ -12,3 +12,4 @@ ragnordb-sql = { path = "../ragnordb-sql" }
 ragnordb-storage = { path = "../ragnordb-storage" }
 ragnordb-tablet = { path = "../ragnordb-tablet" }
 ragnordb-txn = { path = "../ragnordb-txn" }
+metrics.workspace = true

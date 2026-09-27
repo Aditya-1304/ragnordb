@@ -293,6 +293,7 @@ impl NodeRaftInbound {
 struct QueuedInbound {
     message: RoutedRaftMessage,
     wire_bytes: usize,
+    enqueued_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -358,11 +359,16 @@ impl InboundQueueSender {
 
         self.reserve(wire_bytes)?;
 
-        match self.sender.try_send(QueuedInbound {
+        let raft_group_id = message.raft_group_id;
+        let peer_replica_id = ReplicaId::from_raft(message.envelope.from);
+        let queued = QueuedInbound {
             message,
             wire_bytes,
-        }) {
+            enqueued_at: crate::diagnostics::enabled().then(Instant::now),
+        };
+        match self.sender.try_send(queued) {
             Ok(()) => {
+                record_inbound_queue_admission(raft_group_id, peer_replica_id, wire_bytes);
                 wake_thread(&self.wake);
                 Ok(())
             }
@@ -417,6 +423,7 @@ impl InboundQueueReceiver {
         self.receiver.try_recv().map(|queued| {
             self.available_bytes
                 .fetch_add(queued.wire_bytes, Ordering::Release);
+            record_inbound_queue_completion(&queued.message, queued.wire_bytes, queued.enqueued_at);
             queued.message
         })
     }
@@ -596,6 +603,24 @@ struct QueuedOutbound {
     raft_group_id: RaftGroupId,
     class: OutboundClass,
     coalescible_heartbeat: bool,
+    metric_members: Vec<OutboundMetricMember>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PipelineMessageKind {
+    AppendEntries { entry_count: usize },
+    AppendEntriesResponse,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundMetricMember {
+    raft_group_id: RaftGroupId,
+    follower_replica_id: ReplicaId,
+    wire_bytes: usize,
+    enqueued_at: Instant,
+    kind: PipelineMessageKind,
+    persistence_completed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,6 +658,7 @@ impl OutboundPeer {
         raft_group_id: RaftGroupId,
         class: OutboundClass,
         coalescible_heartbeat: bool,
+        metric_member: Option<OutboundMetricMember>,
     ) -> io::Result<()> {
         let wire_bytes = payload.len();
         let mut state = self
@@ -656,12 +682,22 @@ impl OutboundPeer {
             ));
         }
 
+        let metric_members = metric_member
+            .map(|mut member| {
+                member.enqueued_at = Instant::now();
+                member.wire_bytes = wire_bytes;
+                member
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let metric_member_for_record = metric_members.first().cloned();
         let queued = QueuedOutbound {
             payload,
             wire_bytes,
             raft_group_id,
             class,
             coalescible_heartbeat,
+            metric_members,
         };
         match class {
             OutboundClass::RaftControl => state.control.push_back(queued),
@@ -670,6 +706,9 @@ impl OutboundPeer {
         }
         state.queued_bytes = state.queued_bytes.saturating_add(wire_bytes);
         drop(state);
+        if let Some(member) = metric_member_for_record.as_ref() {
+            record_outbound_queue_admission(member);
+        }
         self.wake.notify_one();
         Ok(())
     }
@@ -730,17 +769,25 @@ impl OutboundPeer {
             let first = messages
                 .first()
                 .expect("heartbeat batch contains at least one item");
+            let raft_group_id = first.raft_group_id;
+            let class = first.class;
             let payloads = messages
                 .iter()
                 .map(|message| message.payload.as_slice())
                 .collect::<Vec<_>>();
+            let payload = encode_heartbeat_batch(&payloads, self.max_frame_bytes)
+                .expect("admitted heartbeat records must fit the batch frame limit");
+            let metric_members = messages
+                .into_iter()
+                .flat_map(|message| message.metric_members)
+                .collect();
             return Some(QueuedOutbound {
-                payload: encode_heartbeat_batch(&payloads, self.max_frame_bytes)
-                    .expect("admitted heartbeat records must fit the batch frame limit"),
+                payload,
                 wire_bytes,
-                raft_group_id: first.raft_group_id,
-                class: first.class,
+                raft_group_id,
+                class,
                 coalescible_heartbeat: false,
+                metric_members,
             });
         }
         if let Some(message) = state.rpc.pop_front() {
@@ -766,12 +813,244 @@ impl OutboundPeer {
         }
     }
 
-    fn finish(&self, wire_bytes: usize) {
+    fn finish(&self, message: &QueuedOutbound) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.queued_bytes = state.queued_bytes.saturating_sub(wire_bytes);
+        state.queued_bytes = state.queued_bytes.saturating_sub(message.wire_bytes);
+        drop(state);
+        for member in &message.metric_members {
+            record_outbound_queue_completion(member);
+        }
+    }
+}
+
+fn record_outbound_queue_admission(member: &OutboundMetricMember) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let group_id = member.raft_group_id.0.to_string();
+    let follower_id = member.follower_replica_id.0.to_string();
+    metrics::gauge!(
+        "ragnordb_raft_transport_outbound_queue_count",
+        "raft_group_id" => group_id.clone(),
+        "follower_replica_id" => follower_id.clone()
+    )
+    .increment(1.0);
+    metrics::gauge!(
+        "ragnordb_raft_transport_outbound_queue_bytes",
+        "raft_group_id" => group_id.clone(),
+        "follower_replica_id" => follower_id.clone()
+    )
+    .increment(member.wire_bytes as f64);
+
+    match member.kind {
+        PipelineMessageKind::AppendEntries { entry_count } => {
+            metrics::counter!(
+                "ragnordb_raft_pipeline_append_entries_total",
+                "raft_group_id" => group_id.clone(),
+                "follower_replica_id" => follower_id.clone()
+            )
+            .increment(1);
+            metrics::counter!(
+                "ragnordb_raft_pipeline_append_entries_bytes_total",
+                "raft_group_id" => group_id.clone(),
+                "follower_replica_id" => follower_id.clone()
+            )
+            .increment(member.wire_bytes as u64);
+            metrics::histogram!(
+                "ragnordb_raft_pipeline_append_entries_entries",
+                "raft_group_id" => group_id.clone(),
+                "follower_replica_id" => follower_id.clone()
+            )
+            .record(entry_count as f64);
+            metrics::histogram!(
+                "ragnordb_raft_pipeline_append_entries_bytes",
+                "raft_group_id" => group_id.clone(),
+                "follower_replica_id" => follower_id.clone()
+            )
+            .record(member.wire_bytes as f64);
+            if let Some(persisted_at) = member.persistence_completed_at {
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_persisted_to_append_entries_queued_seconds",
+                    "raft_group_id" => group_id,
+                    "follower_replica_id" => follower_id
+                )
+                .record(
+                    Instant::now()
+                        .saturating_duration_since(persisted_at)
+                        .as_secs_f64(),
+                );
+            }
+        }
+        PipelineMessageKind::AppendEntriesResponse => {
+            metrics::counter!(
+                "ragnordb_raft_pipeline_append_entries_responses_queued_total",
+                "raft_group_id" => group_id.clone(),
+                "follower_replica_id" => follower_id.clone()
+            )
+            .increment(1);
+            if let Some(persisted_at) = member.persistence_completed_at {
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_follower_persisted_to_response_queued_seconds",
+                    "raft_group_id" => group_id,
+                    "follower_replica_id" => follower_id
+                )
+                .record(
+                    Instant::now()
+                        .saturating_duration_since(persisted_at)
+                        .as_secs_f64(),
+                );
+            }
+        }
+        PipelineMessageKind::Other => {}
+    }
+}
+
+fn record_outbound_queue_completion(member: &OutboundMetricMember) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let group_id = member.raft_group_id.0.to_string();
+    let follower_id = member.follower_replica_id.0.to_string();
+    metrics::gauge!(
+        "ragnordb_raft_transport_outbound_queue_count",
+        "raft_group_id" => group_id.clone(),
+        "follower_replica_id" => follower_id.clone()
+    )
+    .decrement(1.0);
+    metrics::gauge!(
+        "ragnordb_raft_transport_outbound_queue_bytes",
+        "raft_group_id" => group_id,
+        "follower_replica_id" => follower_id
+    )
+    .decrement(member.wire_bytes as f64);
+}
+
+fn record_outbound_queue_wait(member: &OutboundMetricMember) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let (name, group_id, follower_id) = match member.kind {
+        PipelineMessageKind::AppendEntries { .. } => (
+            "ragnordb_raft_pipeline_append_entries_queue_wait_seconds",
+            member.raft_group_id.0.to_string(),
+            member.follower_replica_id.0.to_string(),
+        ),
+        PipelineMessageKind::AppendEntriesResponse => (
+            "ragnordb_raft_pipeline_response_queue_wait_seconds",
+            member.raft_group_id.0.to_string(),
+            member.follower_replica_id.0.to_string(),
+        ),
+        PipelineMessageKind::Other => return,
+    };
+    metrics::histogram!(
+        name,
+        "raft_group_id" => group_id,
+        "follower_replica_id" => follower_id
+    )
+    .record(member.enqueued_at.elapsed().as_secs_f64());
+}
+
+fn record_outbound_write_complete(
+    member: &OutboundMetricMember,
+    write_elapsed: Duration,
+    completed_at: Instant,
+) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let (queue_to_write_name, group_id, follower_id) = match member.kind {
+        PipelineMessageKind::AppendEntries { .. } => (
+            "ragnordb_raft_pipeline_append_entries_queued_to_socket_write_complete_seconds",
+            member.raft_group_id.0.to_string(),
+            member.follower_replica_id.0.to_string(),
+        ),
+        PipelineMessageKind::AppendEntriesResponse => (
+            "ragnordb_raft_pipeline_response_queued_to_socket_write_complete_seconds",
+            member.raft_group_id.0.to_string(),
+            member.follower_replica_id.0.to_string(),
+        ),
+        PipelineMessageKind::Other => return,
+    };
+    metrics::histogram!(
+        queue_to_write_name,
+        "raft_group_id" => group_id.clone(),
+        "follower_replica_id" => follower_id.clone()
+    )
+    .record(
+        completed_at
+            .saturating_duration_since(member.enqueued_at)
+            .as_secs_f64(),
+    );
+    metrics::histogram!(
+        "ragnordb_raft_pipeline_socket_write_seconds",
+        "raft_group_id" => group_id,
+        "follower_replica_id" => follower_id
+    )
+    .record(write_elapsed.as_secs_f64());
+}
+
+fn record_inbound_queue_admission(
+    raft_group_id: RaftGroupId,
+    peer_replica_id: ReplicaId,
+    wire_bytes: usize,
+) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let group_id = raft_group_id.0.to_string();
+    let peer_id = peer_replica_id.0.to_string();
+    metrics::gauge!(
+        "ragnordb_raft_transport_inbound_queue_count",
+        "raft_group_id" => group_id.clone(),
+        "peer_replica_id" => peer_id.clone()
+    )
+    .increment(1.0);
+    metrics::gauge!(
+        "ragnordb_raft_transport_inbound_queue_bytes",
+        "raft_group_id" => group_id,
+        "peer_replica_id" => peer_id
+    )
+    .increment(wire_bytes as f64);
+}
+
+fn record_inbound_queue_completion(
+    message: &RoutedRaftMessage,
+    wire_bytes: usize,
+    enqueued_at: Option<Instant>,
+) {
+    if !crate::diagnostics::enabled() {
+        return;
+    }
+
+    let group_id = message.raft_group_id.0.to_string();
+    let peer_id = ReplicaId::from_raft(message.envelope.from).0.to_string();
+    metrics::gauge!(
+        "ragnordb_raft_transport_inbound_queue_count",
+        "raft_group_id" => group_id.clone(),
+        "peer_replica_id" => peer_id.clone()
+    )
+    .decrement(1.0);
+    metrics::gauge!(
+        "ragnordb_raft_transport_inbound_queue_bytes",
+        "raft_group_id" => group_id.clone(),
+        "peer_replica_id" => peer_id.clone()
+    )
+    .decrement(wire_bytes as f64);
+    if let Some(enqueued_at) = enqueued_at {
+        metrics::histogram!(
+            "ragnordb_raft_transport_inbound_queue_wait_seconds",
+            "raft_group_id" => group_id,
+            "peer_replica_id" => peer_id
+        )
+        .record(enqueued_at.elapsed().as_secs_f64());
     }
 }
 
@@ -1085,7 +1364,7 @@ impl NodeRaftTransport {
         Ok(())
     }
 
-    pub fn try_send(&self, message: RoutedRaftMessage) -> io::Result<()> {
+    pub fn try_send(&self, mut message: RoutedRaftMessage) -> io::Result<()> {
         let target_replica = ReplicaId::from_raft(message.envelope.to);
 
         let target_node = {
@@ -1108,6 +1387,10 @@ impl NodeRaftTransport {
                 })?
         };
 
+        if crate::diagnostics::enabled() {
+            message.diagnostics.transport_enqueued_unix_nanos =
+                crate::diagnostics::unix_time_nanos();
+        }
         let payload = encode_routed_message(&self.codec, &message)?;
 
         if payload.len() - MULTIRAFT_FRAME_HEADER_BYTES > self.max_frame_bytes {
@@ -1153,7 +1436,21 @@ impl NodeRaftTransport {
         };
         let coalescible_heartbeat =
             class == OutboundClass::RaftControl && is_coalescible_heartbeat(&message.envelope);
-        peer.try_send(payload, message.raft_group_id, class, coalescible_heartbeat)
+        let metric_member = crate::diagnostics::enabled().then(|| OutboundMetricMember {
+            raft_group_id: message.raft_group_id,
+            follower_replica_id: pipeline_follower_replica_id(&message),
+            wire_bytes: payload.len(),
+            enqueued_at: Instant::now(),
+            kind: pipeline_message_kind(&message),
+            persistence_completed_at: message.diagnostics.persistence_completed_at,
+        });
+        peer.try_send(
+            payload,
+            message.raft_group_id,
+            class,
+            coalescible_heartbeat,
+            metric_member,
+        )
     }
 
     /// Send one logical RPC frame to a physical node.
@@ -1202,7 +1499,13 @@ impl NodeRaftTransport {
                 ),
             )
         })?;
-        peer.try_send(payload, frame.raft_group_id, OutboundClass::Rpc, false)
+        peer.try_send(
+            payload,
+            frame.raft_group_id,
+            OutboundClass::Rpc,
+            false,
+            None,
+        )
     }
 
     pub fn try_send_all(
@@ -1277,6 +1580,22 @@ impl GroupRaftTransport {
         self.transport.try_send(RoutedRaftMessage {
             raft_group_id: self.raft_group_id,
             envelope,
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
+        })
+    }
+
+    /// Queue output that has crossed the group's exact durable Ready boundary.
+    pub fn try_send_after_persistence(
+        &self,
+        envelope: Envelope<Vec<u8>, Vec<u8>>,
+    ) -> io::Result<()> {
+        self.transport.try_send(RoutedRaftMessage {
+            raft_group_id: self.raft_group_id,
+            envelope,
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics {
+                persistence_completed_at: Some(Instant::now()),
+                ..crate::host::RoutedRaftMessageDiagnostics::default()
+            },
         })
     }
 }
@@ -1299,6 +1618,7 @@ fn encode_routed_message(
         from_replica_id,
         to_replica_id,
         raft_message,
+        diagnostic_transport_enqueue_unix_nanos: message.diagnostics.transport_enqueued_unix_nanos,
     }
     .encode_to_vec();
 
@@ -1324,6 +1644,24 @@ fn is_coalescible_heartbeat(envelope: &RaftMessageEnvelope) -> bool {
         Message::AppendEntries(request) => request.entries.is_empty(),
         Message::AppendEntriesResponse(_) => true,
         _ => false,
+    }
+}
+
+fn pipeline_message_kind(message: &RoutedRaftMessage) -> PipelineMessageKind {
+    match &message.envelope.msg {
+        Message::AppendEntries(request) => PipelineMessageKind::AppendEntries {
+            entry_count: request.entries.len(),
+        },
+        Message::AppendEntriesResponse(_) => PipelineMessageKind::AppendEntriesResponse,
+        _ => PipelineMessageKind::Other,
+    }
+}
+
+fn pipeline_follower_replica_id(message: &RoutedRaftMessage) -> ReplicaId {
+    match &message.envelope.msg {
+        Message::AppendEntries(_) => ReplicaId::from_raft(message.envelope.to),
+        Message::AppendEntriesResponse(_) => ReplicaId::from_raft(message.envelope.from),
+        _ => ReplicaId::from_raft(message.envelope.to),
     }
 }
 
@@ -1684,6 +2022,10 @@ fn decode_routed_message(
     Ok(RoutedRaftMessage {
         raft_group_id,
         envelope,
+        diagnostics: crate::host::RoutedRaftMessageDiagnostics {
+            transport_enqueued_unix_nanos: wire.diagnostic_transport_enqueue_unix_nanos,
+            ..crate::host::RoutedRaftMessageDiagnostics::default()
+        },
     })
 }
 
@@ -1859,8 +2201,12 @@ async fn handle_connection(
         let result = (|| -> io::Result<()> {
             match payload.get(1).copied() {
                 Some(MULTIRAFT_RAFT_MESSAGE_TYPE) => {
-                    let message = decode_routed_message(&codec, &payload)?;
+                    let mut message = decode_routed_message(&codec, &payload)?;
                     validate_authenticated_raft_message(&routes, remote_node_id, &message)?;
+                    if crate::diagnostics::enabled() {
+                        message.diagnostics.transport_received_at = Some(Instant::now());
+                        record_cross_node_receive(&message);
+                    }
                     queue_raft_message(&inbound, message, payload.len())
                 }
                 Some(MULTIRAFT_HEARTBEAT_BATCH_TYPE) => {
@@ -1876,7 +2222,12 @@ async fn handle_connection(
                         )?;
                     }
                     for item in messages {
-                        queue_raft_message(&inbound, item.message, item.wire_bytes)?;
+                        let mut message = item.message;
+                        if crate::diagnostics::enabled() {
+                            message.diagnostics.transport_received_at = Some(Instant::now());
+                            record_cross_node_receive(&message);
+                        }
+                        queue_raft_message(&inbound, message, item.wire_bytes)?;
                     }
                     Ok(())
                 }
@@ -1952,6 +2303,33 @@ fn queue_raft_message(
     };
     queue.try_send(message, wire_bytes)?;
     Ok(())
+}
+
+fn record_cross_node_receive(message: &RoutedRaftMessage) {
+    let enqueued_at = message.diagnostics.transport_enqueued_unix_nanos;
+    if enqueued_at == 0 {
+        return;
+    }
+    let received_at = crate::diagnostics::unix_time_nanos();
+    let elapsed_nanos = received_at.saturating_sub(enqueued_at);
+    let group_id = message.raft_group_id.0.to_string();
+    let (follower_id, metric_name) = match pipeline_message_kind(message) {
+        PipelineMessageKind::AppendEntries { .. } => (
+            ReplicaId::from_raft(message.envelope.to).0.to_string(),
+            "ragnordb_raft_pipeline_append_entries_transport_enqueue_to_follower_receive_seconds",
+        ),
+        PipelineMessageKind::AppendEntriesResponse => (
+            ReplicaId::from_raft(message.envelope.from).0.to_string(),
+            "ragnordb_raft_pipeline_append_entries_response_latency_seconds",
+        ),
+        PipelineMessageKind::Other => return,
+    };
+    metrics::histogram!(
+        metric_name,
+        "raft_group_id" => group_id,
+        "follower_replica_id" => follower_id
+    )
+    .record(elapsed_nanos as f64 / 1_000_000_000.0);
 }
 
 async fn write_handshake(
@@ -2038,12 +2416,17 @@ async fn outbound_worker(peer: Arc<OutboundPeer>) {
     let mut write_buffer = Vec::new();
 
     while let Some(message) = peer.next().await {
+        for member in &message.metric_members {
+            record_outbound_queue_wait(member);
+        }
+
         // Queue admission owns the encoded payload until the message is
         // released. Copying into this worker-local buffer keeps the socket
         // write allocation reusable across frames while the queue's ownership
         // and byte accounting remain unchanged.
         write_buffer.clear();
         write_buffer.extend_from_slice(&message.payload);
+        let mut socket_write_elapsed = None;
         let result = async {
             if stream.is_none() {
                 let mut connected = timeout(CONNECT_TIMEOUT, TokioTcpStream::connect(peer.address))
@@ -2065,7 +2448,8 @@ async fn outbound_worker(peer: Arc<OutboundPeer>) {
             }
 
             let connected = stream.as_mut().expect("outbound stream is initialized");
-            timeout(
+            let write_started_at = Instant::now();
+            let write_result = timeout(
                 OUTBOUND_WRITE_TIMEOUT,
                 write_frame(connected, &write_buffer, peer.max_frame_bytes),
             )
@@ -2075,13 +2459,21 @@ async fn outbound_worker(peer: Arc<OutboundPeer>) {
                     io::ErrorKind::TimedOut,
                     "MultiRaft outbound write timed out",
                 )
-            })??;
+            });
+            socket_write_elapsed = Some(write_started_at.elapsed());
+            write_result??;
             Ok::<(), io::Error>(())
         }
         .await;
 
         write_buffer.clear();
-        peer.finish(message.wire_bytes);
+        if let Some(write_elapsed) = socket_write_elapsed {
+            let completed_at = Instant::now();
+            for member in &message.metric_members {
+                record_outbound_write_complete(member, write_elapsed, completed_at);
+            }
+        }
+        peer.finish(&message);
 
         if let Err(error) = result {
             tracing::debug!(
@@ -2178,7 +2570,55 @@ async fn read_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft::message::{AppendEntriesRequest, Message};
+    use raft::message::{AppendEntriesRequest, AppendEntriesResponse, Message};
+
+    /// Replication metrics identify the follower on both request and response
+    /// paths: the request destination and response source.
+    ///
+    /// Realistic bug caught: using the response destination for the follower
+    /// label merges both follower pipelines into one series and makes the
+    /// persisted-to-quorum decomposition attribute timing to the wrong peer.
+    #[test]
+    fn append_entries_response_metric_identity_uses_responding_follower() {
+        let response = RoutedRaftMessage {
+            raft_group_id: RaftGroupId(3),
+            envelope: Envelope {
+                from: raft::types::NodeId::must(3),
+                to: raft::types::NodeId::must(2),
+                msg: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    generation: 0,
+                    success: true,
+                    match_index: Some(1),
+                    conflict_term: None,
+                    conflict_index: None,
+                }),
+            },
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
+        };
+
+        assert_eq!(pipeline_follower_replica_id(&response), ReplicaId(3));
+
+        let request = RoutedRaftMessage {
+            raft_group_id: RaftGroupId(3),
+            envelope: Envelope {
+                from: raft::types::NodeId::must(2),
+                to: raft::types::NodeId::must(3),
+                msg: Message::AppendEntries(AppendEntriesRequest {
+                    term: 1,
+                    leader_id: raft::types::NodeId::must(2),
+                    generation: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            },
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
+        };
+
+        assert_eq!(pipeline_follower_replica_id(&request), ReplicaId(3));
+    }
 
     #[test]
     fn rpc_decoder_rejects_unknown_message_type() {
@@ -2255,6 +2695,7 @@ mod tests {
                             leader_commit: commit,
                         }),
                     },
+                    diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
                 },
             )
             .unwrap()
@@ -2278,6 +2719,7 @@ mod tests {
             RaftGroupId(10),
             OutboundClass::RaftControl,
             true,
+            None,
         )
         .unwrap();
         peer.try_send(
@@ -2285,6 +2727,7 @@ mod tests {
             RaftGroupId(11),
             OutboundClass::RaftControl,
             true,
+            None,
         )
         .unwrap();
 
@@ -2319,6 +2762,7 @@ mod tests {
                             leader_commit: 3,
                         }),
                     },
+                    diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
                 },
             )
             .unwrap()
@@ -2363,6 +2807,7 @@ mod tests {
                         leader_commit: 3,
                     }),
                 },
+                diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
             },
         )
         .unwrap();

@@ -12,11 +12,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
-mkdir -p "$OUTPUT_DIR"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-BENCH_BIN="${RAGNORDB_BENCH_BIN:-$REPO_ROOT/target/release/ragnordb-bench}"
-SERVER_BIN="${RAGNORDB_BIN:-$REPO_ROOT/target/release/ragnordb}"
+BENCH_BIN="$REPO_ROOT/target/release/ragnordb-bench"
+SERVER_BIN="$REPO_ROOT/target/release/ragnordb"
 ROWS="${M6_ROWS:-1000}"
 VALUE_BYTES="${M6_VALUE_BYTES:-256}"
 LOAD_BATCH_SIZE="${M6_LOAD_BATCH_SIZE:-100}"
@@ -37,16 +36,38 @@ require_command() {
   }
 }
 
-for command_name in cargo curl date git jq lscpu ps rustc uname; do
+for command_name in cargo curl date git jq lscpu ps rustc sha256sum uname; do
   require_command "$command_name"
 done
 
-if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SERVER_BIN" ]; then
-  printf "release binaries are missing; build ragnordb-cli and ragnordb-bench first\n" >&2
+SOURCE_SHA="$(git rev-parse HEAD)"
+SOURCE_STATUS="$(git status --porcelain)"
+if [ -n "$SOURCE_STATUS" ] && [ "${RAGNORDB_ALLOW_DIRTY_BENCH:-0}" != "1" ]; then
+  printf 'refusing official benchmark from a dirty worktree\n' >&2
+  git status --short >&2
   exit 2
 fi
 
-git rev-parse HEAD > "$OUTPUT_DIR/git-commit.txt"
+RAGNORDB_BUILD_REVISION="$SOURCE_SHA"
+if [ -n "$SOURCE_STATUS" ]; then
+  RAGNORDB_BUILD_REVISION="${SOURCE_SHA}-dirty"
+fi
+export RAGNORDB_BUILD_REVISION
+
+mkdir -p "$OUTPUT_DIR"
+cargo build \
+  --release \
+  --locked \
+  -p ragnordb-cli \
+  -p ragnordb-bench \
+  > "$OUTPUT_DIR/release-build.txt" 2>&1
+
+if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SERVER_BIN" ]; then
+  printf 'release build completed without the expected benchmark binaries\n' >&2
+  exit 2
+fi
+
+printf '%s\n' "$SOURCE_SHA" > "$OUTPUT_DIR/git-commit.txt"
 git branch --show-current > "$OUTPUT_DIR/git-branch.txt"
 git status --short > "$OUTPUT_DIR/git-status.txt"
 git diff --stat > "$OUTPUT_DIR/git-diff-stat.txt"
@@ -58,8 +79,12 @@ lscpu > "$OUTPUT_DIR/lscpu.txt"
 rustc --version --verbose > "$OUTPUT_DIR/rustc.txt"
 cargo --version > "$OUTPUT_DIR/cargo.txt"
 awk "/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { print }" /proc/meminfo > "$OUTPUT_DIR/memory.txt"
+sha256sum "$SERVER_BIN" > "$OUTPUT_DIR/server-binary.sha256"
+sha256sum "$BENCH_BIN" > "$OUTPUT_DIR/bench-binary.sha256"
+"$SERVER_BIN" status --addr 127.0.0.1:1 > "$OUTPUT_DIR/server-build-info.txt" 2>&1 || true
 {
   printf "run_id=%s\n" "$RUN_ID"
+  printf "build_revision=%s\n" "$RAGNORDB_BUILD_REVISION"
   printf "repo_root=%s\n" "$REPO_ROOT"
   printf "bench_binary=%s\n" "$BENCH_BIN"
   printf "server_binary=%s\n" "$SERVER_BIN"
@@ -151,6 +176,8 @@ for table_number in 0 1 2 3 4 5 6 7; do
 done
 save_statuses after-load
 
+next_case_client_id=10000
+
 run_case() {
   local label="$1"
   local tables="$2"
@@ -158,7 +185,26 @@ run_case() {
   local clients="$4"
   local txn_writes="$5"
   local contention="$6"
-  local client_id="$7"
+
+  if [[ ! "$clients" =~ ^[0-9]+$ ]] || [ "$clients" -le 0 ]; then
+    printf 'invalid client count for %s: %s\n' "$label" "$clients" >&2
+    return 2
+  fi
+
+  # V2 workers use base_client_id + worker_number as their durable client ID.
+  # Reserve the entire range per invocation so a later case cannot reuse an
+  # earlier worker's session while restarting its request sequence at one.
+  local client_count=$((10#$clients))
+  local client_id="$next_case_client_id"
+  local last_client_id=$((client_id + client_count - 1))
+  next_case_client_id=$((next_case_client_id + client_count))
+
+  printf 'base_client_id=%s\nlast_client_id=%s\nclients=%s\n' \
+    "$client_id" \
+    "$last_client_id" \
+    "$client_count" \
+    > "$OUTPUT_DIR/$label-client-range.txt"
+
   local leader
   leader="$(wait_for_group_leader 2)"
   local addr="127.0.0.1:$((7100 + leader))"
@@ -186,15 +232,24 @@ run_case() {
   save_statuses "$label"
 }
 
-case_id=10000
 for clients in $CLIENT_COUNTS; do
-  run_case "single-shard-c${clients}-w1" "bench_0" single-shard-txn "$clients" 1 disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "single-shard-c${clients}-w1" \
+    "bench_0" \
+    single-shard-txn \
+    "$clients" \
+    1 \
+    disjoint
 done
 
 for write_count in 4 16 64; do
-  run_case "single-shard-c8-w${write_count}" "bench_0" single-shard-txn 8 "$write_count" disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "single-shard-c8-w${write_count}" \
+    "bench_0" \
+    single-shard-txn \
+    8 \
+    "$write_count" \
+    disjoint
 done
 
 for participant_count in 2 4 8; do
@@ -202,13 +257,23 @@ for participant_count in 2 4 8; do
   for table_number in $(seq 1 $((participant_count - 1))); do
     table_list="$table_list,bench_$table_number"
   done
-  run_case "cross-shard-p${participant_count}" "$table_list" cross-shard-txn 8 "$participant_count" disjoint "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "cross-shard-p${participant_count}" \
+    "$table_list" \
+    cross-shard-txn \
+    8 \
+    "$participant_count" \
+    disjoint
 done
 
 for distribution in disjoint moderate hotspot; do
-  run_case "contention-${distribution}" bench_0 txn-contention 32 1 "$distribution" "$case_id"
-  case_id=$((case_id + 1))
+  run_case \
+    "contention-${distribution}" \
+    bench_0 \
+    txn-contention \
+    32 \
+    1 \
+    "$distribution"
 done
 
 # Crash/recovery evidence: stop the exact PID-file cluster while a transaction

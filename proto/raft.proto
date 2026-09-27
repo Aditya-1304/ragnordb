@@ -98,4 +98,7 @@ message RaftTransportEnvelope {
     uint64 from_replica_id = 1;
     uint64 to_replica_id = 2;
     bytes raft_message = 3;
+    // Opt-in diagnostic timestamp; zero when pipeline tracing is disabled.
+    // This field is observational and is ignored by Raft consensus behavior.
+    fixed64 diagnostic_transport_enqueue_unix_nanos = 4;
 }
