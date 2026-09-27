@@ -3640,6 +3640,7 @@ where
                         )
                         .map_err(|e| e.to_string())?;
                     }
+                    registry.advance_applied_frontier(frontier.index);
                     ready_loop
                         .advance_applied_frontier(frontier)
                         .map_err(|e| e.to_string())?;
@@ -6459,6 +6460,7 @@ where
             identity,
         )?;
     }
+    registry.advance_applied_frontier(frontier.index);
     ready_loop
         .advance_applied_frontier(frontier)
         .map_err(|error| error.to_string())?;
@@ -6773,6 +6775,7 @@ where
         .map_err(HostedGroupError::Group)?;
     }
     if let Some(frontier) = frontier {
+        registry.advance_applied_frontier(frontier.index);
         ready_loop
             .advance_applied_frontier(frontier)
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;

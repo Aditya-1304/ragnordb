@@ -135,7 +135,10 @@ impl<R, E> ProposalTicket<R, E> {
 struct PendingProposal<R, E> {
     position: ProposalPosition,
     deadline: Instant,
-    sender: SyncSender<ProposalCompletion<R, E>>,
+    /// `None` means the caller already received a retryable result. The
+    /// request ID remains reserved until its log position applies or is
+    /// superseded, preventing a late apply from matching a newer retry.
+    sender: Option<SyncSender<ProposalCompletion<R, E>>>,
 }
 
 /// Tracks proposals admitted by one Raft group.
@@ -172,7 +175,7 @@ impl<R, E> ProposalRegistry<R, E> {
             PendingProposal {
                 position,
                 deadline,
-                sender,
+                sender: Some(sender),
             },
         );
 
@@ -194,17 +197,16 @@ impl<R, E> ProposalRegistry<R, E> {
         applied_position: ProposalPosition,
         result: R,
     ) -> Result<(), ProposalRegistryError> {
-        let Some(expected_position) = self.pending.get(request_id).map(|pending| pending.position)
-        else {
+        let Some(pending) = self.pending.get(request_id) else {
             return Err(ProposalRegistryError::UnknownRequest {
                 request_id: request_id.clone(),
             });
         };
 
-        if expected_position != applied_position {
+        if pending.sender.is_some() && pending.position != applied_position {
             return Err(ProposalRegistryError::ApplyPositionMismatch {
                 request_id: request_id.clone(),
-                expected: expected_position,
+                expected: pending.position,
                 received: applied_position,
             });
         }
@@ -221,12 +223,15 @@ impl<R, E> ProposalRegistry<R, E> {
             result,
         };
 
-        pending
-            .sender
-            .send(completion)
-            .map_err(|_| ProposalRegistryError::ResponseChannelClosed {
-                request_id: request_id.clone(),
-            })
+        if let Some(sender) = pending.sender {
+            sender
+                .send(completion)
+                .map_err(|_| ProposalRegistryError::ResponseChannelClosed {
+                    request_id: request_id.clone(),
+                })?;
+        }
+
+        Ok(())
     }
 
     /// resolve a proposal after its committed entry reaches a deterministic,
@@ -240,17 +245,16 @@ impl<R, E> ProposalRegistry<R, E> {
         applied_position: ProposalPosition,
         rejection: E,
     ) -> Result<(), ProposalRegistryError> {
-        let Some(expected_position) = self.pending.get(request_id).map(|pending| pending.position)
-        else {
+        let Some(pending) = self.pending.get(request_id) else {
             return Err(ProposalRegistryError::UnknownRequest {
                 request_id: request_id.clone(),
             });
         };
 
-        if expected_position != applied_position {
+        if pending.sender.is_some() && pending.position != applied_position {
             return Err(ProposalRegistryError::ApplyPositionMismatch {
                 request_id: request_id.clone(),
-                expected: expected_position,
+                expected: pending.position,
                 received: applied_position,
             });
         }
@@ -267,54 +271,68 @@ impl<R, E> ProposalRegistry<R, E> {
             rejection,
         };
 
-        pending
-            .sender
-            .send(completion)
-            .map_err(|_| ProposalRegistryError::ResponseChannelClosed {
-                request_id: request_id.clone(),
-            })
+        if let Some(sender) = pending.sender {
+            sender
+                .send(completion)
+                .map_err(|_| ProposalRegistryError::ResponseChannelClosed {
+                    request_id: request_id.clone(),
+                })?;
+        }
+
+        Ok(())
     }
 
-    /// complete every outstanding proposal when this node loses leadership
+    /// Complete live waiters when this node loses leadership.
     ///
-    /// The state machine entry may still apply later on another node. That
-    /// later retry is reconciled through the same RequestId and replicated
-    /// deduplication state in the next slice
+    /// Keep each request ID reserved until the local applied frontier passes
+    /// its log position. A committed entry can still apply after leadership
+    /// loss, and a replacement leader must not let that late apply satisfy a
+    /// newer waiter at another position.
     pub fn mark_leadership_lost(&mut self, observed_term: Term) -> usize {
-        let pending = std::mem::take(&mut self.pending);
-        let count = pending.len();
+        let mut completed = 0;
 
-        for (request_id, pending) in pending {
-            let _ = pending.sender.send(ProposalCompletion::Retryable {
-                request_id,
+        for (request_id, pending) in &mut self.pending {
+            let Some(sender) = pending.sender.take() else {
+                continue;
+            };
+
+            let _ = sender.send(ProposalCompletion::Retryable {
+                request_id: request_id.clone(),
                 position: pending.position,
                 failure: ProposalFailure::LeadershipLost {
                     proposed_term: pending.position.term,
                     observed_term,
                 },
             });
+            completed += 1;
         }
 
-        count
+        completed
     }
 
-    /// Complete proposals whose client deadlines have elapsed.
+    /// Complete waiters whose client deadlines have elapsed.
+    ///
+    /// The request IDs remain reserved until apply or log replacement proves
+    /// that the original proposal can no longer produce a local completion.
     pub fn expire_deadlines(&mut self, now: Instant) -> usize {
         let expired = self
             .pending
             .iter()
-            .filter(|(_, pending)| pending.deadline <= now)
+            .filter(|(_, pending)| pending.sender.is_some() && pending.deadline <= now)
             .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
 
         let mut completed = 0;
 
         for request_id in expired {
-            let Some(pending) = self.pending.remove(&request_id) else {
+            let Some(pending) = self.pending.get_mut(&request_id) else {
+                continue;
+            };
+            let Some(sender) = pending.sender.take() else {
                 continue;
             };
 
-            let _ = pending.sender.send(ProposalCompletion::Retryable {
+            let _ = sender.send(ProposalCompletion::Retryable {
                 request_id,
                 position: pending.position,
                 failure: ProposalFailure::DeadlineExceeded,
@@ -326,12 +344,33 @@ impl<R, E> ProposalRegistry<R, E> {
         completed
     }
 
-    /// return the number of proposals still awaiting apply or retry completion
+    /// Release abandoned request IDs once the applied log has passed their
+    /// original positions. An entry that was overwritten or otherwise omitted
+    /// from the committed log can no longer produce a late apply notification.
+    pub fn advance_applied_frontier(&mut self, applied_index: LogIndex) -> usize {
+        let obsolete = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                pending.sender.is_none() && pending.position.index <= applied_index
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+
+        let removed = obsolete.len();
+        for request_id in obsolete {
+            self.pending.remove(&request_id);
+        }
+
+        removed
+    }
+
+    /// Return the number of proposal identities still awaiting apply or log replacement.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    /// return whether a request already has an outstanding response waiter.
+    /// Return whether a request ID is still reserved against duplicate admission.
     pub fn is_pending(&self, request_id: &RequestId) -> bool {
         self.pending.contains_key(request_id)
     }

@@ -353,6 +353,37 @@ fn response_error_code(response: &Value) -> String {
         .to_string()
 }
 
+fn warmup_contention_distribution(
+    workload: Workload,
+    requested: ContentionDistribution,
+) -> ContentionDistribution {
+    match workload {
+        // Warmup primes the transaction path but does not produce contention
+        // measurements. Keep those setup transactions independent so a valid
+        // benchmark cannot fail before measurement starts on an expected
+        // write conflict.
+        Workload::TxnContention => ContentionDistribution::Disjoint,
+        _ => requested,
+    }
+}
+
+fn benchmark_run_is_valid(
+    workload: Workload,
+    successful: u64,
+    failed: u64,
+    errors: &BTreeMap<String, u64>,
+) -> bool {
+    let failures_are_expected = if failed == 0 {
+        errors.is_empty()
+    } else {
+        matches!(workload, Workload::TxnContention)
+            && errors.get("WRITE_CONFLICT") == Some(&failed)
+            && errors.values().copied().sum::<u64>() == failed
+    };
+
+    successful > 0 && failures_are_expected
+}
+
 /// SplitMix64 is deterministic and has much better bit mixing than using
 /// low bits from a simple LCG. It is sufficient for reproducible benchmark
 /// key and operation selection.
@@ -664,7 +695,11 @@ async fn run_worker(
     let write_value = String::from_utf8(vec![write_byte; options.value_bytes])
         .expect("ASCII benchmark payload must be UTF-8");
 
-    // Warmup uses exactly the same operation generator as the measured phase.
+    // Warmup uses the same transaction shape as the measured phase. For the
+    // contention workload, use disjoint rows until measurement begins so an
+    // expected conflict cannot abort readiness before the run is recorded.
+    let warmup_contention = warmup_contention_distribution(options.workload, options.contention);
+
     for operation in 0..options.warmup {
         let statements = match workload_statements(
             options.workload,
@@ -677,7 +712,7 @@ async fn run_worker(
             options.read_percent,
             options.scan_rows,
             options.txn_writes,
-            options.contention,
+            warmup_contention,
             &write_value,
         ) {
             Ok(statements) => statements,
@@ -849,6 +884,8 @@ struct RunReport {
     p999_us: Option<u64>,
     max_us: Option<u64>,
     error_counts: BTreeMap<String, u64>,
+    /// A run is valid when it has successes and no unexpected failures.
+    /// `WRITE_CONFLICT` is an expected measured outcome for txn-contention.
     valid_run: bool,
     seed: u64,
     histogram_file: Option<String>,
@@ -1119,6 +1156,11 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     if transaction_workload && matches!(contention, ContentionDistribution::Disjoint) {
         validate_disjoint_transaction_rows(rows, clients)?;
     }
+    if matches!(workload, Workload::TxnContention) && warmup > 0 && rows < u64::from(clients) {
+        bail!(
+            "contention warmup requires at least one row per client for its disjoint setup phase (rows: {rows}, clients: {clients}); use --warmup 0 for a smaller intentionally contended dataset"
+        );
+    }
     if matches!(workload, Workload::CrossShardTxn) && participant_tables.len() < 2 {
         bail!("cross-shard-txn requires at least two --participant-tables");
     }
@@ -1241,6 +1283,12 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
     }
 
     let has_success = aggregate.successful > 0;
+    let valid_run = benchmark_run_is_valid(
+        workload,
+        aggregate.successful,
+        aggregate.failed,
+        &aggregate.errors,
+    );
 
     let report = RunReport {
         benchmark: "RagnorDB SQL",
@@ -1273,7 +1321,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> Result<()> {
         p999_us: has_success.then(|| aggregate.latency_us.value_at_quantile(0.999)),
         max_us: has_success.then(|| aggregate.latency_us.max()),
         error_counts: aggregate.errors,
-        valid_run: aggregate.failed == 0 && aggregate.successful > 0,
+        valid_run,
         seed,
         histogram_file: histogram_out.map(|path| path.display().to_string()),
     };
@@ -1425,6 +1473,62 @@ mod tests {
             }
         }
         assert_eq!(generated_writes, 32);
+    }
+
+    #[test]
+    fn contention_warmup_uses_disjoint_distribution() {
+        assert!(matches!(
+            warmup_contention_distribution(
+                Workload::TxnContention,
+                ContentionDistribution::Moderate,
+            ),
+            ContentionDistribution::Disjoint
+        ));
+        assert!(matches!(
+            warmup_contention_distribution(
+                Workload::TxnContention,
+                ContentionDistribution::Hotspot,
+            ),
+            ContentionDistribution::Disjoint
+        ));
+        assert!(matches!(
+            warmup_contention_distribution(
+                Workload::SingleShardTxn,
+                ContentionDistribution::Hotspot,
+            ),
+            ContentionDistribution::Hotspot
+        ));
+    }
+
+    #[test]
+    fn expected_write_conflicts_keep_contention_run_valid() {
+        let expected_conflicts = BTreeMap::from([("WRITE_CONFLICT".to_string(), 2)]);
+        assert!(benchmark_run_is_valid(
+            Workload::TxnContention,
+            8,
+            2,
+            &expected_conflicts,
+        ));
+
+        let unexpected_error = BTreeMap::from([("INTERNAL_ERROR".to_string(), 1)]);
+        assert!(!benchmark_run_is_valid(
+            Workload::TxnContention,
+            8,
+            1,
+            &unexpected_error,
+        ));
+        assert!(!benchmark_run_is_valid(
+            Workload::SingleShardTxn,
+            8,
+            1,
+            &expected_conflicts,
+        ));
+        assert!(!benchmark_run_is_valid(
+            Workload::TxnContention,
+            0,
+            2,
+            &expected_conflicts,
+        ));
     }
 
     #[test]
