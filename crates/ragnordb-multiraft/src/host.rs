@@ -676,11 +676,11 @@ struct PendingPersistenceGroup {
 #[derive(Debug)]
 enum PersistenceAdmissionError {
     /// The request is valid but cannot fit in the bounded staging window yet.
-    Capacity(PendingPersistenceGroup),
+    Capacity(Box<PendingPersistenceGroup>),
     /// A single request exceeds the configured service limit and cannot make
     /// progress without an operator-selected configuration change.
     RequestTooLarge {
-        pending: PendingPersistenceGroup,
+        pending: Box<PendingPersistenceGroup>,
         record_count: usize,
         encoded_bytes: usize,
     },
@@ -792,14 +792,14 @@ where
         mut pending: PendingPersistenceGroup,
     ) -> Result<(), PersistenceAdmissionError> {
         if self.pending_group_ids.contains(&pending.raft_group_id) {
-            return Err(PersistenceAdmissionError::Capacity(pending));
+            return Err(PersistenceAdmissionError::Capacity(Box::new(pending)));
         }
 
         let record_count = pending.batch.record_count();
         let encoded_bytes = pending.batch.encoded_bytes();
         if record_count > self.max_pending_records || encoded_bytes > self.max_pending_bytes {
             return Err(PersistenceAdmissionError::RequestTooLarge {
-                pending,
+                pending: Box::new(pending),
                 record_count,
                 encoded_bytes,
             });
@@ -817,7 +817,7 @@ where
                 .saturating_add(encoded_bytes)
                 > self.max_pending_bytes
         {
-            return Err(PersistenceAdmissionError::Capacity(pending));
+            return Err(PersistenceAdmissionError::Capacity(Box::new(pending)));
         }
 
         self.pending_records = self.pending_records.saturating_add(record_count);

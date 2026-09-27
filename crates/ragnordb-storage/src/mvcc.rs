@@ -2200,6 +2200,116 @@ mod tests {
         assert!(matches!(error, Error::WriteConflict(_)));
     }
 
+    /// Protects snapshot boundary semantics while newer rollback records are
+    /// present in the same key's retained history.
+    ///
+    /// Realistic bug caught: treating a write committed exactly at the
+    /// transaction start timestamp as newer, or treating an unrelated rollback
+    /// marker above that timestamp as a committed write, would reject a valid
+    /// transaction after the history lookup was narrowed.
+    #[test]
+    fn write_history_preflight_preserves_snapshot_boundary_and_ignores_newer_rollbacks() {
+        let key = encoded_key(1);
+        let mut engine = InMemoryMvcc::new();
+
+        engine
+            .commit_batch(
+                TxnId(1),
+                Timestamp(1),
+                Timestamp(2),
+                &put_batch(key.clone(), encoded_row(1, "older")),
+            )
+            .unwrap();
+        engine
+            .commit_batch(
+                TxnId(2),
+                Timestamp(6),
+                Timestamp(8),
+                &put_batch(key.clone(), encoded_row(1, "at-boundary")),
+            )
+            .unwrap();
+        engine.writes.entry(key.clone()).or_default().insert(
+            Timestamp(9),
+            WriteRecord {
+                start_timestamp: Timestamp(9),
+                commit_timestamp: Timestamp(9),
+                op: WriteKind::Rollback,
+            },
+        );
+
+        engine
+            .validate_commit_batch(
+                TxnId(3),
+                Timestamp(8),
+                &put_batch(key, encoded_row(1, "valid-at-boundary")),
+            )
+            .unwrap();
+    }
+
+    /// Exact intent retries must preserve one lock/default value, and replaying
+    /// its committed outcome must not create another write record.
+    ///
+    /// Realistic bug caught: a lookup optimization that loses the transaction's
+    /// original rollback or commit witness could reject a safe retry or apply
+    /// the same logical intent twice.
+    #[test]
+    fn exact_prewrite_and_intent_commit_replays_are_idempotent() {
+        let key = encoded_key(1);
+        let row = encoded_row(1, "intent");
+        let mutation = Mutation::Put(row.clone());
+        let mut engine = InMemoryMvcc::new();
+
+        engine
+            .prewrite(TxnId(44), Timestamp(100), &key, &mutation, &key, 3_000)
+            .unwrap();
+        let prewritten_stats = engine.stats();
+
+        engine
+            .prewrite(TxnId(44), Timestamp(100), &key, &mutation, &key, 3_000)
+            .unwrap();
+        assert_eq!(engine.stats(), prewritten_stats);
+
+        engine
+            .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
+            .unwrap();
+        engine
+            .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
+            .unwrap();
+
+        assert_eq!(engine.read(&key, Timestamp(110)).unwrap(), Some(row));
+        assert_eq!(engine.stats().write_records, 1);
+        assert_eq!(engine.stats().locks, 0);
+    }
+
+    /// Snapshot recovery must validate every persisted write record before the
+    /// restored maps become available to normal transaction validation.
+    ///
+    /// Realistic bug caught: skipping old history in the hot conflict path must
+    /// not allow malformed write metadata to enter state through a snapshot.
+    #[test]
+    fn snapshot_restore_rejects_invalid_write_timestamp_metadata() {
+        let key = encoded_key(1);
+        let invalid_record = WriteRecord {
+            start_timestamp: Timestamp(1),
+            commit_timestamp: Timestamp(4),
+            op: WriteKind::Put,
+        };
+
+        let error = InMemoryMvcc::restore_from_snapshot_entries(
+            TableId(1),
+            Vec::new(),
+            Vec::new(),
+            vec![snapshot_proto::WriteEntry {
+                key,
+                write_timestamp: Some(Timestamp(5).to_proto()),
+                record: Some(invalid_record.to_proto().unwrap()),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::CorruptData(_)));
+    }
+
     #[test]
     fn malformed_rollback_timestamp_is_corruption() {
         let key = encoded_key(1);

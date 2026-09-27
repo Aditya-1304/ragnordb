@@ -352,6 +352,9 @@ enum RaftHostControlResult {
     Transferred(LeadershipTransferStatus),
 }
 
+/// The bounded channel stores this enum inline to avoid allocating for every
+/// inbound Raft message; its fixed larger variant is deliberately accepted.
+#[allow(clippy::large_enum_variant)]
 enum RaftHostControl {
     Tick {
         ticks: u64,
@@ -4260,22 +4263,25 @@ where
         }
         publish_status(
             &ready_loop,
-            serving_leader,
-            latest_snapshot
-                .as_ref()
-                .map(|image| {
-                    (
-                        image.metadata.last_included_index,
-                        image.metadata.last_included_term,
-                    )
-                })
-                .unwrap_or((0, 0)),
-            pending_snapshot_install.is_some() || pending_local_snapshot.is_some(),
-            registry.pending_count(),
-            tablet,
-            last_state_diagnostics_sample_at,
-            *ownership,
-            &status,
+            ReactorStatusContext {
+                serving_leader,
+                snapshot: latest_snapshot
+                    .as_ref()
+                    .map(|image| {
+                        (
+                            image.metadata.last_included_index,
+                            image.metadata.last_included_term,
+                        )
+                    })
+                    .unwrap_or((0, 0)),
+                snapshot_install_pending: pending_snapshot_install.is_some()
+                    || pending_local_snapshot.is_some(),
+                pending_proposals: registry.pending_count(),
+                tablet,
+                last_state_diagnostics_sample_at,
+                ownership: *ownership,
+                status: &status,
+            },
         );
         Ok(())
     }
@@ -7204,21 +7210,39 @@ fn send_client_error(reply: ClientReply, error: Error) {
     }
 }
 
-fn publish_status<W, LS, SS>(
-    ready_loop: &RaftReadyLoop<W, LS, SS>,
+/// Inputs sampled together when publishing the reactor's read-only status.
+///
+/// Keeping owner references in one context makes the status boundary explicit
+/// without copying tablet state or splitting its sampling cadence.
+struct ReactorStatusContext<'a> {
     serving_leader: bool,
     snapshot: (u64, u64),
     snapshot_install_pending: bool,
     pending_proposals: usize,
-    tablet: &TabletCommandApplier,
-    last_state_diagnostics_sample_at: &mut Instant,
+    tablet: &'a TabletCommandApplier,
+    last_state_diagnostics_sample_at: &'a mut Instant,
     ownership: ReactorOwnership,
-    status: &RwLock<ReplicatedTabletStatus>,
+    status: &'a RwLock<ReplicatedTabletStatus>,
+}
+
+fn publish_status<W, LS, SS>(
+    ready_loop: &RaftReadyLoop<W, LS, SS>,
+    context: ReactorStatusContext<'_>,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
     SS: StableStore,
 {
+    let ReactorStatusContext {
+        serving_leader,
+        snapshot,
+        snapshot_install_pending,
+        pending_proposals,
+        tablet,
+        last_state_diagnostics_sample_at,
+        ownership,
+        status,
+    } = context;
     let sampled_state_diagnostics = if crate::metrics::stage35_diagnostics_enabled()
         && last_state_diagnostics_sample_at.elapsed() >= Duration::from_secs(5)
     {

@@ -1438,7 +1438,7 @@ impl NodeRaftTransport {
             class == OutboundClass::RaftControl && is_coalescible_heartbeat(&message.envelope);
         let metric_member = crate::diagnostics::enabled().then(|| OutboundMetricMember {
             raft_group_id: message.raft_group_id,
-            follower_replica_id: target_replica,
+            follower_replica_id: pipeline_follower_replica_id(&message),
             wire_bytes: payload.len(),
             enqueued_at: Instant::now(),
             kind: pipeline_message_kind(&message),
@@ -1654,6 +1654,14 @@ fn pipeline_message_kind(message: &RoutedRaftMessage) -> PipelineMessageKind {
         },
         Message::AppendEntriesResponse(_) => PipelineMessageKind::AppendEntriesResponse,
         _ => PipelineMessageKind::Other,
+    }
+}
+
+fn pipeline_follower_replica_id(message: &RoutedRaftMessage) -> ReplicaId {
+    match &message.envelope.msg {
+        Message::AppendEntries(_) => ReplicaId::from_raft(message.envelope.to),
+        Message::AppendEntriesResponse(_) => ReplicaId::from_raft(message.envelope.from),
+        _ => ReplicaId::from_raft(message.envelope.to),
     }
 }
 
@@ -2562,7 +2570,55 @@ async fn read_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft::message::{AppendEntriesRequest, Message};
+    use raft::message::{AppendEntriesRequest, AppendEntriesResponse, Message};
+
+    /// Replication metrics identify the follower on both request and response
+    /// paths: the request destination and response source.
+    ///
+    /// Realistic bug caught: using the response destination for the follower
+    /// label merges both follower pipelines into one series and makes the
+    /// persisted-to-quorum decomposition attribute timing to the wrong peer.
+    #[test]
+    fn append_entries_response_metric_identity_uses_responding_follower() {
+        let response = RoutedRaftMessage {
+            raft_group_id: RaftGroupId(3),
+            envelope: Envelope {
+                from: raft::types::NodeId::must(3),
+                to: raft::types::NodeId::must(2),
+                msg: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    generation: 0,
+                    success: true,
+                    match_index: Some(1),
+                    conflict_term: None,
+                    conflict_index: None,
+                }),
+            },
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
+        };
+
+        assert_eq!(pipeline_follower_replica_id(&response), ReplicaId(3));
+
+        let request = RoutedRaftMessage {
+            raft_group_id: RaftGroupId(3),
+            envelope: Envelope {
+                from: raft::types::NodeId::must(2),
+                to: raft::types::NodeId::must(3),
+                msg: Message::AppendEntries(AppendEntriesRequest {
+                    term: 1,
+                    leader_id: raft::types::NodeId::must(2),
+                    generation: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            },
+            diagnostics: crate::host::RoutedRaftMessageDiagnostics::default(),
+        };
+
+        assert_eq!(pipeline_follower_replica_id(&request), ReplicaId(3));
+    }
 
     #[test]
     fn rpc_decoder_rejects_unknown_message_type() {

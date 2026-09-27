@@ -763,23 +763,77 @@ where
         self.ensure_no_pending_ready()?;
 
         let is_append_entries = matches!(&message.msg, Message::AppendEntries(_));
+        let observe_append_entries = crate::diagnostics::enabled() && is_append_entries;
+        let append_entries_receive_to_step = observe_append_entries
+            .then(|| transport_received_at.map(|received_at| received_at.elapsed()))
+            .flatten();
+        let append_entries_step_started_at = observe_append_entries.then(Instant::now);
         let observe_response = crate::diagnostics::enabled()
             && matches!(&message.msg, Message::AppendEntriesResponse(_));
         let response_step_started_at = observe_response.then(Instant::now);
         let result = self.raft.step_checked(message);
+        let append_entries_step_completed_at =
+            append_entries_step_started_at.map(|_| Instant::now());
         if result.is_ok() && crate::diagnostics::enabled() {
             let identity = self.persistence.log_view().identity();
             let group_id = identity.raft_group_id.0.to_string();
-            if is_append_entries
-                && self.raft.ready().is_some()
-                && let Some(received_at) = transport_received_at
-            {
-                metrics::histogram!(
-                    "ragnordb_raft_pipeline_append_entries_receive_to_follower_ready_created_seconds",
-                    "raft_group_id" => group_id.clone(),
-                    "follower_replica_id" => identity.replica_id.0.to_string()
-                )
-                .record(received_at.elapsed().as_secs_f64());
+            if is_append_entries {
+                let ready_available = self.raft.ready().is_some();
+                let ready_available_at = ready_available.then(Instant::now);
+                let follower_replica_id = identity.replica_id.0.to_string();
+                let receive_to_ready = ready_available_at
+                    .zip(transport_received_at)
+                    .map(|(ready_at, received_at)| ready_at.saturating_duration_since(received_at));
+
+                if let Some(receive_to_step) = append_entries_receive_to_step {
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_append_entries_receive_to_follower_step_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_replica_id.clone()
+                    )
+                    .record(receive_to_step.as_secs_f64());
+                }
+
+                if let (Some(step_started_at), Some(step_completed_at)) = (
+                    append_entries_step_started_at,
+                    append_entries_step_completed_at,
+                ) {
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_append_entries_follower_raft_step_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_replica_id.clone()
+                    )
+                    .record(
+                        step_completed_at
+                            .saturating_duration_since(step_started_at)
+                            .as_secs_f64(),
+                    );
+                }
+
+                if ready_available
+                    && let Some(step_completed_at) = append_entries_step_completed_at
+                    && let Some(ready_available_at) = ready_available_at
+                {
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_append_entries_follower_step_to_ready_available_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_replica_id.clone()
+                    )
+                    .record(
+                        ready_available_at
+                            .saturating_duration_since(step_completed_at)
+                            .as_secs_f64(),
+                    );
+                }
+
+                if let Some(receive_to_ready) = receive_to_ready {
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_append_entries_receive_to_follower_ready_created_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_replica_id
+                    )
+                    .record(receive_to_ready.as_secs_f64());
+                }
             }
 
             if let Some(response_step_started_at) = response_step_started_at {
