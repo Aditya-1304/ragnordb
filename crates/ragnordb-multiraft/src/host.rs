@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, RwLock, mpsc},
     thread,
+    time::Instant,
 };
 
 use raft::{
@@ -634,6 +635,8 @@ struct PendingPersistenceGroup {
     raft_group_id: RaftGroupId,
     timer_due: bool,
     batch: HostedPersistenceBatch,
+    /// Monotonic admission time used to measure bounded-queue residence.
+    admitted_at: Instant,
     /// Outbound envelopes are held until the group's Ready persistence has
     /// completed. This keeps custom group adapters subject to the same
     /// persistence-before-message invariant as the built-in adapter.
@@ -760,7 +763,7 @@ where
 
     fn try_submit(
         &mut self,
-        pending: PendingPersistenceGroup,
+        mut pending: PendingPersistenceGroup,
     ) -> Result<(), PersistenceAdmissionError> {
         if self.pending_group_ids.contains(&pending.raft_group_id) {
             return Err(PersistenceAdmissionError::Capacity(pending));
@@ -794,7 +797,9 @@ where
         self.pending_records = self.pending_records.saturating_add(record_count);
         self.pending_bytes = self.pending_bytes.saturating_add(encoded_bytes);
         self.pending_group_ids.insert(pending.raft_group_id);
+        pending.admitted_at = Instant::now();
         self.pending.push_back(pending);
+        metrics::counter!("ragnordb_persistence_queue_admissions_total").increment(1);
         Ok(())
     }
 
@@ -828,6 +833,11 @@ where
 
         let work = PersistenceWork { groups };
         let group_count = work.groups.len();
+        let queue_wait_seconds = work
+            .groups
+            .first()
+            .map(|group| group.admitted_at.elapsed().as_secs_f64())
+            .unwrap_or_default();
         match self
             .work_tx
             .as_ref()
@@ -839,6 +849,8 @@ where
                 self.in_flight_groups = group_count;
                 self.in_flight_records = record_count;
                 self.in_flight_bytes = encoded_bytes;
+                metrics::histogram!("ragnordb_persistence_queue_wait_seconds")
+                    .record(queue_wait_seconds);
             }
             Err(mpsc::TrySendError::Full(work)) => {
                 for group in work.groups.into_iter().rev() {
@@ -924,6 +936,9 @@ fn append_prepared_batch<W: RaftWal>(
         // interpretation between preparation and the durable boundary.
         .map(|record| (record.record_type, record.payload.as_ref()))
         .collect();
+    let total_bytes = groups.iter().fold(0_usize, |total, pending| {
+        total.saturating_add(pending.batch.encoded_bytes())
+    });
 
     let mut outcome = if records.is_empty() {
         Ok(BatchAppendResult {
@@ -931,7 +946,20 @@ fn append_prepared_batch<W: RaftWal>(
             final_end_lsn: wal::lsn::Lsn::ZERO,
         })
     } else {
-        node_wal.append_batch_and_sync(&records)
+        let sync_started_at = Instant::now();
+        metrics::counter!("ragnordb_awal_sync_calls_total").increment(1);
+        metrics::counter!("ragnordb_awal_sync_records_total")
+            .increment(total_records as u64);
+        metrics::counter!("ragnordb_awal_sync_bytes_total").increment(total_bytes as u64);
+        metrics::counter!("ragnordb_awal_sync_groups_total").increment(groups.len() as u64);
+        metrics::histogram!("ragnordb_awal_records_per_sync")
+            .record(total_records as f64);
+        metrics::histogram!("ragnordb_awal_bytes_per_sync").record(total_bytes as f64);
+        metrics::histogram!("ragnordb_awal_groups_per_sync").record(groups.len() as f64);
+        let result = node_wal.append_batch_and_sync(&records);
+        metrics::histogram!("ragnordb_awal_sync_latency_seconds")
+            .record(sync_started_at.elapsed().as_secs_f64());
+        result
     };
 
     if let Ok(batch_result) = &outcome
@@ -2086,7 +2114,7 @@ where
                 status.quarantine_reason = self.quarantined.get(raft_group_id).cloned();
                 status
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         MultiRaftHostStatus {
             node_id: self.node_id,
@@ -2720,6 +2748,7 @@ where
                             raft_group_id,
                             timer_due: rearm_timer,
                             batch,
+                            admitted_at: Instant::now(),
                             outbound: turn.outbound,
                             read_states: turn.read_states,
                         };
@@ -4591,6 +4620,7 @@ mod tests {
                     (RecordType::new(101), b"first-entry".to_vec()),
                     (RecordType::new(102), b"first-hard-state".to_vec()),
                 ]),
+                admitted_at: Instant::now(),
                 outbound: Vec::new(),
                 read_states: Vec::new(),
             })
@@ -4612,6 +4642,7 @@ mod tests {
                     RecordType::new(201),
                     b"second-entry".to_vec(),
                 )]),
+                admitted_at: Instant::now(),
                 outbound: Vec::new(),
                 read_states: Vec::new(),
             }),

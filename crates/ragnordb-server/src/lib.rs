@@ -1055,6 +1055,9 @@ async fn handle_connection_with_policy(
                 });
 
         metrics::counter_inc("RagnorDB_requests_received_total");
+        let _sql_request_timer = metrics::HistogramTimer::start(
+            "ragnordb_sql_request_to_execution_complete_seconds",
+        );
 
         log_statement(statement_logging, session.session_id.0, &trimmed);
 

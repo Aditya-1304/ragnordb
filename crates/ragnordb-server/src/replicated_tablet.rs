@@ -1864,24 +1864,35 @@ impl ReplicatedTabletHandle {
         request: TabletCommandRequest,
         timeout: Duration,
     ) -> Result<TabletCommandApplyOutcome> {
+        let completion_timer =
+            crate::metrics::HistogramTimer::start("ragnordb_tablet_command_client_wait_seconds");
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("tablet request deadline overflowed".into()))?;
         let (reply, response) = mpsc::sync_channel(1);
-        self.requests
+        let queue_admission_started = Instant::now();
+        let admission = self
+            .requests
             .send(HostRequest::Command {
                 request,
                 reply,
                 deadline,
-            })
+            });
+        crate::metrics::histogram_record(
+            "ragnordb_tablet_command_queue_admission_seconds",
+            queue_admission_started.elapsed().as_secs_f64(),
+        );
+        admission
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "replicated tablet runtime has stopped".to_string(),
             })?;
-        response
+        let result = response
             .recv_timeout(timeout)
             .map_err(|_| Error::ProposalUnavailable {
                 reason: "tablet command deadline elapsed before apply".to_string(),
-            })?
+            })??;
+        drop(completion_timer);
+        Ok(result)
     }
 
     /// Read one committed row at a caller-supplied MVCC timestamp.
@@ -3899,9 +3910,16 @@ where
                             &mut registry,
                             &mut clients,
                             serving_leader,
+                            batch_started,
                         );
                     } else {
-                        admit_prepared_batch(batch, &mut ready_loop, &mut registry, &mut clients);
+                        admit_prepared_batch(
+                            batch,
+                            &mut ready_loop,
+                            &mut registry,
+                            &mut clients,
+                            batch_started,
+                        );
                     }
                 }
                 PendingTabletRequest::Raw(request) => match *request {
@@ -4544,6 +4562,22 @@ fn envelope_from_tablet_command_request(
     }
 }
 
+/// Publishes one semantic-batch sample using the exact bytes that are about to
+/// enter Raft, avoiding any additional command serialization for diagnostics.
+fn record_semantic_batch(command_count: usize, encoded_bytes: usize, started_at: Instant) {
+    crate::metrics::counter_inc("ragnordb_semantic_batches_total");
+    crate::metrics::counter_add(
+        "ragnordb_semantic_batch_commands_total",
+        command_count as u64,
+    );
+    crate::metrics::histogram_record("ragnordb_semantic_batch_commands", command_count as f64);
+    crate::metrics::histogram_record("ragnordb_semantic_batch_bytes", encoded_bytes as f64);
+    crate::metrics::histogram_record(
+        "ragnordb_semantic_batch_wait_seconds",
+        started_at.elapsed().as_secs_f64(),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_command<W, LS, SS>(
     prepared: PreparedCommandRequest,
@@ -4551,6 +4585,7 @@ fn admit_prepared_command<W, LS, SS>(
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
+    batch_started_at: Instant,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -4584,6 +4619,7 @@ fn admit_prepared_command<W, LS, SS>(
             return;
         }
     };
+    record_semantic_batch(1, bytes.len(), batch_started_at);
     let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
         Ok(index) => index,
         Err(source) => {
@@ -4617,6 +4653,7 @@ fn admit_prepared_batch<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
+    batch_started_at: Instant,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -4658,6 +4695,7 @@ fn admit_prepared_batch<W, LS, SS>(
             registry,
             clients,
             true,
+            batch_started_at,
         );
         return;
     }
@@ -4695,6 +4733,8 @@ fn admit_prepared_batch<W, LS, SS>(
         }
         return;
     }
+
+    record_semantic_batch(prepared.len(), bytes.len(), batch_started_at);
 
     let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
         Ok(index) => index,
@@ -6855,15 +6895,22 @@ fn forward_completions(
     let mut pending = Vec::with_capacity(clients.len());
     for client in clients.drain(..) {
         match client.ticket.try_recv() {
-            Ok(completion) => forward_completion(
-                client.reply,
-                completion,
-                tablet,
-                database,
-                serving_leader,
-                leader_replica_id,
-                identity,
-            ),
+            Ok(completion) => {
+                let reply_started = Instant::now();
+                forward_completion(
+                    client.reply,
+                    completion,
+                    tablet,
+                    database,
+                    serving_leader,
+                    leader_replica_id,
+                    identity,
+                );
+                crate::metrics::histogram_record(
+                    "ragnordb_tablet_apply_to_reply_seconds",
+                    reply_started.elapsed().as_secs_f64(),
+                );
+            }
             Err(mpsc::TryRecvError::Empty) => pending.push(client),
             Err(mpsc::TryRecvError::Disconnected) => send_client_error(
                 client.reply,

@@ -2313,6 +2313,7 @@ impl LocalExecutor {
             )));
         }
 
+        let command_construction_started = Instant::now();
         let mut writes = Vec::with_capacity(transaction.write_set().len());
         for (encoded_key, mutation) in transaction.write_set() {
             let row_key = decode_row_key(encoded_key)?;
@@ -2338,6 +2339,8 @@ impl LocalExecutor {
             commit_timestamp,
             writes,
         });
+        metrics::histogram!("ragnordb_single_shard_command_construction_seconds")
+            .record(command_construction_started.elapsed().as_secs_f64());
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let logical_command_id =
             request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
@@ -3025,6 +3028,7 @@ impl LocalExecutor {
             )));
         }
 
+        let command_construction_started = Instant::now();
         let mut writes = Vec::with_capacity(transaction.write_set().len());
         for (encoded_key, mutation) in transaction.write_set() {
             let row_key = decode_row_key(encoded_key)?;
@@ -3053,6 +3057,8 @@ impl LocalExecutor {
             commit_timestamp,
             writes,
         });
+        metrics::histogram!("ragnordb_single_shard_command_construction_seconds")
+            .record(command_construction_started.elapsed().as_secs_f64());
         let request_id = request_context.next_command_request_id(route.raft_group_id)?;
         let logical_command_id =
             request_context.next_logical_command_id(CommandKind::SingleShardCommit)?;
@@ -3299,11 +3305,15 @@ impl LocalExecutor {
 
         if self.is_local_compatibility_route(schema.id, tablet_id) {
             let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-            tablet.buffer_batch(
-                transaction,
-                prepared
-                    .into_iter()
-                    .map(|(key, row)| RowMutation::Put { key, row }),
+            record_write_set_buffer(
+                Instant::now(),
+                affected_rows,
+                tablet.buffer_batch(
+                    transaction,
+                    prepared
+                        .into_iter()
+                        .map(|(key, row)| RowMutation::Put { key, row }),
+                ),
             )?;
         } else {
             let mut writes = BTreeMap::new();
@@ -3313,7 +3323,11 @@ impl LocalExecutor {
                     Mutation::Put(encode_row(&row)?),
                 );
             }
-            transaction.buffer_batch(writes)?;
+            record_write_set_buffer(
+                Instant::now(),
+                affected_rows,
+                transaction.buffer_batch(writes),
+            )?;
         }
 
         Ok(ExecutionResult::Mutation {
@@ -3400,8 +3414,12 @@ impl LocalExecutor {
             validate_update_assignment(schema.as_ref(), assignment)?;
         }
 
-        let matching =
-            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context)?;
+        let update_read_started = Instant::now();
+        let matching_result =
+            self.matching_rows(transaction, schema.as_ref(), Some(&filter), request_context);
+        metrics::histogram!("ragnordb_txn_update_read_seconds")
+            .record(update_read_started.elapsed().as_secs_f64());
+        let matching = matching_result?;
 
         let mut prepared = Vec::with_capacity(matching.len());
 
@@ -3439,7 +3457,11 @@ impl LocalExecutor {
                 .map(|(key, row)| RowMutation::Put { key, row });
             if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-                tablet.buffer_batch(transaction, mutations)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    tablet.buffer_batch(transaction, mutations),
+                )?;
             } else {
                 let mut writes = BTreeMap::new();
                 for mutation in mutations {
@@ -3451,7 +3473,11 @@ impl LocalExecutor {
                         Mutation::Put(encode_row(&row)?),
                     );
                 }
-                transaction.buffer_batch(writes)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    transaction.buffer_batch(writes),
+                )?;
             }
         }
 
@@ -3488,7 +3514,11 @@ impl LocalExecutor {
                 .map(|keyed_row| RowMutation::Delete { key: keyed_row.key });
             if self.is_local_compatibility_route(schema.id, tablet_id) {
                 let tablet = self.local_tablet_for_route(schema.id, tablet_id)?;
-                tablet.buffer_batch(transaction, mutations)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    tablet.buffer_batch(transaction, mutations),
+                )?;
             } else {
                 let mut writes = BTreeMap::new();
                 for mutation in mutations {
@@ -3500,7 +3530,11 @@ impl LocalExecutor {
                         Mutation::Delete,
                     );
                 }
-                transaction.buffer_batch(writes)?;
+                record_write_set_buffer(
+                    Instant::now(),
+                    affected_rows,
+                    transaction.buffer_batch(writes),
+                )?;
             }
         }
 
@@ -5010,6 +5044,22 @@ fn data_type_name(data_type: DataType) -> &'static str {
         DataType::Text => "TEXT",
         DataType::Bool => "BOOL",
     }
+}
+
+/// Records the cost and successful mutation count at the transaction write-set
+/// boundary shared by local and routed statement execution.
+fn record_write_set_buffer<T>(
+    started_at: Instant,
+    mutation_count: usize,
+    result: Result<T>,
+) -> Result<T> {
+    metrics::histogram!("ragnordb_txn_write_set_buffer_seconds")
+        .record(started_at.elapsed().as_secs_f64());
+    if result.is_ok() {
+        metrics::counter!("ragnordb_txn_write_set_mutations_total")
+            .increment(mutation_count as u64);
+    }
+    result
 }
 
 #[cfg(test)]

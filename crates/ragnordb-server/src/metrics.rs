@@ -1,6 +1,6 @@
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use ragnordb_tablet::IntentCleanupReport;
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Instant};
 use tracing::warn;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -155,6 +155,170 @@ fn describe_metrics() {
         "Blocking SQL execution latency after admission"
     );
     metrics::describe_histogram!(
+        "ragnordb_sql_request_to_execution_complete_seconds",
+        "SQL request latency from server admission through response completion"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_begin_seconds",
+        "BEGIN transaction setup latency, including GC-history protection admission"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_commit_service_seconds",
+        "Time spent in the database service commit boundary"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_commit_timestamp_allocation_seconds",
+        "Commit timestamp allocation latency, including any durable oracle refill"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_update_read_seconds",
+        "Time spent reading rows selected by an UPDATE before buffering mutations"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_txn_write_set_buffer_seconds",
+        "Time spent adding a statement's mutations to its transaction write set"
+    );
+    metrics::describe_counter!(
+        "ragnordb_txn_write_set_mutations_total",
+        "Mutations successfully added to SQL transaction write sets"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_single_shard_command_construction_seconds",
+        "Time spent constructing a replicated SingleShardCommit command"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_tablet_command_queue_admission_seconds",
+        "Time spent admitting a tablet command to the bounded reactor mailbox"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_tablet_command_client_wait_seconds",
+        "Time from tablet command enqueue until its apply result reaches the caller"
+    );
+    metrics::describe_counter!(
+        "ragnordb_semantic_batches_total",
+        "Mutation batches formed by the tablet semantic batcher"
+    );
+    metrics::describe_counter!(
+        "ragnordb_semantic_batch_commands_total",
+        "Mutation commands included in tablet semantic batches"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_semantic_batch_commands",
+        "Number of commands in each tablet semantic batch"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_semantic_batch_bytes",
+        "Encoded bytes in each tablet semantic batch"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_semantic_batch_wait_seconds",
+        "Time spent forming a tablet semantic batch after its first request is dequeued"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_raft_proposal_admission_seconds",
+        "Raft-core proposal admission latency"
+    );
+    metrics::describe_counter!(
+        "ragnordb_raft_proposals_admitted_total",
+        "Application proposals admitted by local Raft groups"
+    );
+    metrics::describe_counter!(
+        "ragnordb_raft_proposal_payload_bytes_total",
+        "Encoded application proposal bytes admitted by local Raft groups"
+    );
+    metrics::describe_counter!(
+        "ragnordb_raft_ready_generations_total",
+        "New Raft Ready generations produced by local groups"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_raft_proposal_to_persisted_seconds",
+        "Time from local Raft proposal admission to successful A-WAL persistence"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_raft_persisted_to_quorum_seconds",
+        "Time from successful local persistence until the proposal is observed committed"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_raft_quorum_to_apply_seconds",
+        "Time from the committed Ready being observed until its proposal is applied"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_raft_state_machine_apply_seconds",
+        "State-machine apply duration for one committed Raft entry"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_tablet_apply_to_reply_seconds",
+        "Time to forward an applied tablet result to its waiting caller"
+    );
+    metrics::describe_counter!(
+        "ragnordb_persistence_queue_admissions_total",
+        "Ready persistence batches admitted to the node-wide A-WAL queue"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_persistence_queue_wait_seconds",
+        "Time a Ready persistence batch waits before dispatch to the A-WAL worker"
+    );
+    metrics::describe_counter!(
+        "ragnordb_awal_sync_calls_total",
+        "Node-wide Raft A-WAL append-and-sync calls"
+    );
+    metrics::describe_counter!(
+        "ragnordb_awal_sync_records_total",
+        "Raft WAL records included in node-wide append-and-sync calls"
+    );
+    metrics::describe_counter!(
+        "ragnordb_awal_sync_bytes_total",
+        "Raft WAL payload bytes included in node-wide append-and-sync calls"
+    );
+    metrics::describe_counter!(
+        "ragnordb_awal_sync_groups_total",
+        "Raft groups represented in node-wide append-and-sync calls"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_awal_sync_latency_seconds",
+        "A-WAL append-and-sync latency, one observation per physical sync"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_awal_records_per_sync",
+        "Raft WAL records included in each node-wide append-and-sync call"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_awal_bytes_per_sync",
+        "Raft WAL payload bytes included in each node-wide append-and-sync call"
+    );
+    metrics::describe_histogram!(
+        "ragnordb_awal_groups_per_sync",
+        "Raft groups included in each node-wide append-and-sync call"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_raft_pending_proposals",
+        "Current aggregate number of admitted proposals awaiting a terminal result"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_persistence_pending_groups",
+        "Current Ready persistence groups queued or in flight"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_persistence_pending_records",
+        "Current Ready persistence records queued or in flight"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_persistence_pending_bytes",
+        "Current Ready persistence bytes queued or in flight"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_raft_apply_backlog_entries",
+        "Current aggregate committed entries waiting for state-machine apply"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_raft_apply_backlog_bytes",
+        "Current aggregate committed bytes waiting for state-machine apply"
+    );
+    metrics::describe_gauge!(
+        "ragnordb_raft_apply_backlog_oldest_age_seconds",
+        "Age of the oldest committed Ready generation waiting for apply"
+    );
+    metrics::describe_histogram!(
         "ragnordb_wal_append_latency_seconds",
         "Latest observed A-WAL append latency"
     );
@@ -243,6 +407,31 @@ pub fn gauge_set(name: &'static str, value: f64) {
 
 pub fn histogram_record(name: &'static str, value: f64) {
     metrics::histogram!(name).record(value);
+}
+
+/// Records one monotonic duration sample when the guarded scope exits.
+///
+/// Keeping the timer as an RAII guard ensures early returns and `?` paths are
+/// included in the same latency distribution as successful operations.
+pub struct HistogramTimer {
+    name: &'static str,
+    started_at: Instant,
+}
+
+impl HistogramTimer {
+    /// Start a timer that records one histogram observation when dropped.
+    pub fn start(name: &'static str) -> Self {
+        Self {
+            name,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for HistogramTimer {
+    fn drop(&mut self) {
+        histogram_record(self.name, self.started_at.elapsed().as_secs_f64());
+    }
 }
 
 pub fn set_active_transactions(value: usize) {

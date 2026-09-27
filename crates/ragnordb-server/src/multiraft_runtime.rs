@@ -4498,6 +4498,54 @@ fn publish_host_status(
     {
         metadata_group.pending_proposals = metadata_pending_proposals;
     }
+    // Publish one bounded node-wide load snapshot for Prometheus. These are
+    // aggregate gauges: tablet and request identities stay out of metric keys.
+    crate::metrics::gauge_set(
+        "ragnordb_raft_pending_proposals",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.pending_proposals)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_groups",
+        snapshot.pending_persistence_groups as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_records",
+        snapshot.pending_persistence_records as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_persistence_pending_bytes",
+        snapshot.pending_persistence_bytes as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_entries",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_entries)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_bytes",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_bytes)
+            .sum::<usize>() as f64,
+    );
+    crate::metrics::gauge_set(
+        "ragnordb_raft_apply_backlog_oldest_age_seconds",
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.apply_backlog_age_ms)
+            .max()
+            .unwrap_or_default() as f64
+            / 1_000.0,
+    );
     *status
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;

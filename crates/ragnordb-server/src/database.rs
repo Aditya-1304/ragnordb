@@ -149,6 +149,9 @@ impl DatabaseServices {
     }
 
     fn allocate_commit_timestamp(&self, start_ts: Timestamp) -> Result<Timestamp> {
+        let _timer = crate::metrics::HistogramTimer::start(
+            "ragnordb_commit_timestamp_allocation_seconds",
+        );
         self.with_transaction_manager(|manager| manager.allocate_commit_timestamp(start_ts))
     }
 
@@ -328,28 +331,32 @@ impl DatabaseServices {
             Ok(())
         };
         let result = protection_check.and_then(|()| match plan {
-            Plan::Begin => self.with_gc_protection_admission(|| {
-                let started = self.with_transaction_manager(|manager| {
-                    self.observe_gc_safe_point(manager);
-                    session.begin_with_transaction_manager(manager)
-                })?;
-                let transaction = session.current_transaction_mut().ok_or_else(|| {
-                    Error::CorruptData("BEGIN did not retain its allocated transaction".into())
-                })?;
-                transaction.set_footprint_policy(
-                    self.transaction_runtime
-                        .as_ref()
-                        .map_or_else(Default::default, |runtime| runtime.config.footprint),
-                )?;
-                if let Some(runtime) = &self.transaction_runtime
-                    && let Err(error) =
-                        runtime.register_gc_protection(transaction.id(), transaction.start_ts())
-                {
-                    let _ = session.rollback_current_transaction();
-                    return Err(error);
-                }
-                Ok(started)
-            }),
+            Plan::Begin => {
+                let _timer =
+                    crate::metrics::HistogramTimer::start("ragnordb_txn_begin_seconds");
+                self.with_gc_protection_admission(|| {
+                    let started = self.with_transaction_manager(|manager| {
+                        self.observe_gc_safe_point(manager);
+                        session.begin_with_transaction_manager(manager)
+                    })?;
+                    let transaction = session.current_transaction_mut().ok_or_else(|| {
+                        Error::CorruptData("BEGIN did not retain its allocated transaction".into())
+                    })?;
+                    transaction.set_footprint_policy(
+                        self.transaction_runtime
+                            .as_ref()
+                            .map_or_else(Default::default, |runtime| runtime.config.footprint),
+                    )?;
+                    if let Some(runtime) = &self.transaction_runtime
+                        && let Err(error) = runtime
+                            .register_gc_protection(transaction.id(), transaction.start_ts())
+                    {
+                        let _ = session.rollback_current_transaction();
+                        return Err(error);
+                    }
+                    Ok(started)
+                })
+            }
             Plan::Rollback => {
                 let txn_id = session.current_transaction_id();
                 let result = session.rollback_current_transaction();
@@ -516,6 +523,9 @@ impl DatabaseServices {
         transaction: ragnordb_txn::Transaction,
         request_context: &mut ragnordb_exec::TabletRequestContext,
     ) -> Result<ragnordb_txn::SingleNodeCommitOutcome> {
+        let _timer = crate::metrics::HistogramTimer::start(
+            "ragnordb_txn_commit_service_seconds",
+        );
         let transaction_id = transaction.id();
         if let Err(error) = request_context.check_active() {
             if let Some(runtime) = &self.transaction_runtime

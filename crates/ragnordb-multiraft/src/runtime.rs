@@ -22,7 +22,7 @@
 //! restart and reconstruct the group from the recovered durable prefix
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt::Display,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -58,6 +58,20 @@ use wal::{error::BatchAppendFailure, types::RecordType, wal::BatchAppendResult};
 type ReadyGeneration = Ready<Vec<u8>, Vec<u8>>;
 type ReadyLoopResult = Result<Option<ReadyGeneration>, ReadyLoopError>;
 type ReadyApplyResult = Result<Option<ReadyGeneration>, ReadyApplyError>;
+
+/// Keep diagnostic timestamps only for a bounded number of local proposals.
+///
+/// A proposal that does not reach apply must not let observability grow memory
+/// without limit; once this cap is reached, consensus continues unchanged and
+/// new phase-latency samples are simply omitted until older entries drain.
+const MAX_TRACKED_PROPOSAL_TIMINGS: usize = 256;
+
+#[derive(Debug)]
+struct ProposalTiming {
+    proposed_at: Instant,
+    persisted_at: Option<Instant>,
+    quorum_observed_at: Option<Instant>,
+}
 
 /// Conservative per-group limits for work waiting at the state-machine
 /// boundary. A single oversized Ready is admitted so recovery cannot deadlock
@@ -502,6 +516,7 @@ where
     apply_backlog_entries: usize,
     apply_backlog_bytes: usize,
     apply_backlog_started_at: Option<Instant>,
+    proposal_timings: BTreeMap<LogIndex, ProposalTiming>,
 }
 
 impl<W, LS, SS> RaftReadyLoop<W, LS, SS>
@@ -525,6 +540,7 @@ where
             apply_backlog_entries: 0,
             apply_backlog_bytes: 0,
             apply_backlog_started_at: None,
+            proposal_timings: BTreeMap::new(),
         }
     }
 
@@ -566,6 +582,78 @@ where
             && (status.entries >= MAX_APPLY_BACKLOG_ENTRIES
                 || status.bytes >= MAX_APPLY_BACKLOG_BYTES
                 || status.age_ms >= MAX_APPLY_BACKLOG_AGE_MS)
+    }
+
+    fn record_persisted_proposals(&mut self, indices: impl IntoIterator<Item = LogIndex>) {
+        if self.proposal_timings.is_empty() {
+            return;
+        }
+        let persisted_at = Instant::now();
+        for index in indices {
+            let Some(timing) = self.proposal_timings.get_mut(&index) else {
+                continue;
+            };
+            if timing.persisted_at.is_some() {
+                continue;
+            }
+
+            timing.persisted_at = Some(persisted_at);
+            metrics::histogram!("ragnordb_raft_proposal_to_persisted_seconds")
+                .record(persisted_at.duration_since(timing.proposed_at).as_secs_f64());
+            if let Some(quorum_observed_at) = timing.quorum_observed_at {
+                metrics::histogram!("ragnordb_raft_persisted_to_quorum_seconds").record(
+                    quorum_observed_at
+                        .saturating_duration_since(persisted_at)
+                        .as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    fn record_quorum_observed(&mut self, indices: impl IntoIterator<Item = LogIndex>) {
+        if self.proposal_timings.is_empty() {
+            return;
+        }
+        let quorum_observed_at = Instant::now();
+        for index in indices {
+            let Some(timing) = self.proposal_timings.get_mut(&index) else {
+                continue;
+            };
+            if timing.quorum_observed_at.is_some() {
+                continue;
+            }
+
+            timing.quorum_observed_at = Some(quorum_observed_at);
+            if let Some(persisted_at) = timing.persisted_at {
+                metrics::histogram!("ragnordb_raft_persisted_to_quorum_seconds").record(
+                    quorum_observed_at
+                        .saturating_duration_since(persisted_at)
+                        .as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    fn record_proposal_applied(
+        &mut self,
+        index: LogIndex,
+        apply_started_at: Instant,
+        apply_duration: std::time::Duration,
+    ) {
+        metrics::histogram!("ragnordb_raft_state_machine_apply_seconds")
+            .record(apply_duration.as_secs_f64());
+        if self.proposal_timings.is_empty() {
+            return;
+        }
+        if let Some(timing) = self.proposal_timings.remove(&index)
+            && let Some(quorum_observed_at) = timing.quorum_observed_at
+        {
+            metrics::histogram!("ragnordb_raft_quorum_to_apply_seconds").record(
+                apply_started_at
+                    .saturating_duration_since(quorum_observed_at)
+                    .as_secs_f64(),
+            );
+        }
     }
 
     /// Returns whether this group has a Ready generation or an applied Ready
@@ -621,9 +709,29 @@ where
         self.ensure_active()?;
         self.ensure_no_pending_ready()?;
 
-        self.raft
+        let proposed_at = Instant::now();
+        let result = self
+            .raft
             .propose_with_size(command, encoded_len)
-            .map_err(ReadyLoopError::Proposal)
+            .map_err(ReadyLoopError::Proposal);
+        metrics::histogram!("ragnordb_raft_proposal_admission_seconds")
+            .record(proposed_at.elapsed().as_secs_f64());
+        if let Ok(index) = &result {
+            metrics::counter!("ragnordb_raft_proposals_admitted_total").increment(1);
+            metrics::counter!("ragnordb_raft_proposal_payload_bytes_total")
+                .increment(encoded_len as u64);
+            if self.proposal_timings.len() < MAX_TRACKED_PROPOSAL_TIMINGS {
+                self.proposal_timings.insert(
+                    *index,
+                    ProposalTiming {
+                        proposed_at,
+                        persisted_at: None,
+                        quorum_observed_at: None,
+                    },
+                );
+            }
+        }
+        result
     }
 
     /// Admits one typed Raft membership transition.
@@ -711,6 +819,7 @@ where
 
             return Ok(None);
         };
+        metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
 
         match (ready.snapshot.as_ref(), snapshot_pointer.as_ref()) {
             (Some(snapshot), Some(pointer)) => {
@@ -768,6 +877,10 @@ where
             }
         }
 
+        self.record_persisted_proposals(
+            ready.entries_to_persist.iter().map(|entry| entry.index),
+        );
+
         if let Err(error) = self.raft.advance_persisted(ready.id) {
             self.state = RuntimeState::RecoveryRequired;
             return Err(ReadyLoopError::Advance(error));
@@ -809,6 +922,7 @@ where
         let Some(ready) = self.raft.ready() else {
             return Ok(ReadyPersistenceProgress::default());
         };
+        metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
 
         let ready_entries = ready.committed_entries.len();
         let ready_bytes = ready_apply_bytes(&ready);
@@ -960,6 +1074,14 @@ where
                 }
             }
         }
+
+        self.record_persisted_proposals(
+            pending
+                .ready
+                .entries_to_persist
+                .iter()
+                .map(|entry| entry.index),
+        );
 
         self.raft
             .advance_persisted(pending.ready.id)
@@ -1132,6 +1254,7 @@ where
         let Some(ready) = self.raft.ready() else {
             return Ok(None);
         };
+        metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
 
         let Some(snapshot) = ready.snapshot.as_ref() else {
             return Err(ReadyLoopError::UnexpectedSnapshotPointer);
@@ -1183,6 +1306,10 @@ where
                 return Err(ReadyLoopError::PersistenceRejected(error));
             }
         }
+
+        self.record_persisted_proposals(
+            ready.entries_to_persist.iter().map(|entry| entry.index),
+        );
 
         self.raft.advance_persisted(ready.id).map_err(|error| {
             self.state = RuntimeState::RecoveryRequired;
@@ -1374,6 +1501,13 @@ where
     }
 
     fn enqueue_apply_bundle(&mut self, pending: PendingReadyApplication) {
+        self.record_quorum_observed(
+            pending
+                .ready
+                .committed_entries
+                .iter()
+                .map(|entry| entry.index),
+        );
         let entries = pending.ready.committed_entries.len();
         let bytes = ready_apply_bytes(&pending.ready);
         if self.apply_backlog_started_at.is_none() {
@@ -1445,14 +1579,21 @@ where
                 });
             }
 
-            if let EntryPayload::Normal(command) = &entry.payload
-                && let Err(error) = state_machine.apply(entry.index, command)
-            {
-                self.quarantine();
-                return Err(ReadyApplyError::Application {
-                    index: entry.index,
-                    reason: error.to_string(),
-                });
+            if let EntryPayload::Normal(command) = &entry.payload {
+                let apply_started_at = Instant::now();
+                let apply_result = state_machine.apply(entry.index, command);
+                self.record_proposal_applied(
+                    entry.index,
+                    apply_started_at,
+                    apply_started_at.elapsed(),
+                );
+                if let Err(error) = apply_result {
+                    self.quarantine();
+                    return Err(ReadyApplyError::Application {
+                        index: entry.index,
+                        reason: error.to_string(),
+                    });
+                }
             }
 
             pending.applied_through = Some(entry.index);
