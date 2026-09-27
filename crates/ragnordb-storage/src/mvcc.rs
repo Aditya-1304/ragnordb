@@ -1,4 +1,4 @@
-//! In memory multi version concurrency control
+//! Multi-version concurrency control over a pluggable ordered storage backend.
 //!
 //! the engine maintains the three logical maps used by RagnorDB's MVCC model:
 //!
@@ -40,7 +40,7 @@ use std::{
     ops::Bound::{self, Excluded, Included, Unbounded},
 };
 
-use crate::key::decode_row_key;
+use crate::{key::decode_row_key, lsm::RecoveryFrontier};
 use prost::Message;
 
 use ragnordb_common::{
@@ -55,6 +55,81 @@ use crate::checkpoint::CapturedMvccState;
 
 /// Owned range boundaries used for canonical encoded row-key scans.
 type EncodedScanBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// Maximum physical records or keys fetched by one MVCC cursor page.
+const MVCC_WRITE_CURSOR_PAGE_SIZE: usize = 128;
+const MVCC_ROW_CURSOR_PAGE_SIZE: usize = 128;
+
+fn max_lower_bound(left: Bound<Timestamp>, right: Bound<Timestamp>) -> Bound<Timestamp> {
+    match (left, right) {
+        (Unbounded, bound) | (bound, Unbounded) => bound,
+        (Included(left), Included(right)) => Included(left.max(right)),
+        (Excluded(left), Excluded(right)) => Excluded(left.max(right)),
+        (Included(left), Excluded(right)) | (Excluded(right), Included(left)) => {
+            if left > right {
+                Included(left)
+            } else if right > left {
+                Excluded(right)
+            } else {
+                Excluded(left)
+            }
+        }
+    }
+}
+
+fn min_upper_bound(left: Bound<Timestamp>, right: Bound<Timestamp>) -> Bound<Timestamp> {
+    match (left, right) {
+        (Unbounded, bound) | (bound, Unbounded) => bound,
+        (Included(left), Included(right)) => Included(left.min(right)),
+        (Excluded(left), Excluded(right)) => Excluded(left.min(right)),
+        (Included(left), Excluded(right)) | (Excluded(right), Included(left)) => {
+            if left < right {
+                Included(left)
+            } else if right < left {
+                Excluded(right)
+            } else {
+                Excluded(left)
+            }
+        }
+    }
+}
+
+fn timestamp_range_is_empty(lower: &Bound<Timestamp>, upper: &Bound<Timestamp>) -> bool {
+    match (lower, upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (Bound::Included(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper))
+        | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
+    }
+}
+
+fn merge_key_pages(left: Vec<Vec<u8>>, right: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut merged = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let (mut left_index, mut right_index) = (0, 0);
+
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(right[right_index].clone());
+                right_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    merged.extend(left[left_index..].iter().cloned());
+    merged.extend(right[right_index..].iter().cloned());
+    merged
+}
 
 /// A transaction local mutation waiting to be committed
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +228,345 @@ pub struct IntentScanPage {
     pub has_more: bool,
 }
 
+/// Identifies the logical record family whose distinct row keys are scanned.
+///
+/// The family is a logical API value. It does not prescribe whether the
+/// persistent implementation uses one ordered keyspace or separate trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccKeyFamily {
+    /// Committed write records, which provide the row-key scan domain.
+    Writes,
+    /// Current transaction intents, including keys with no committed history.
+    Locks,
+}
+
+/// Direction used to traverse one row's ordered write history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccCursorDirection {
+    /// Visit the oldest matching timestamp first.
+    Forward,
+    /// Visit the newest matching timestamp first.
+    Reverse,
+}
+
+/// A bounded page of distinct row keys from one logical MVCC family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccKeyPage {
+    /// Row keys in canonical byte order.
+    pub keys: Vec<Vec<u8>>,
+    /// Whether the backend has another matching key after this page.
+    pub has_more: bool,
+}
+
+/// A bounded page from one row's committed write history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MvccWritePage {
+    /// Timestamp and validated logical write-record pairs in requested order.
+    pub writes: Vec<(Timestamp, WriteRecord)>,
+    /// Whether another matching write record remains in the requested range.
+    pub has_more: bool,
+}
+
+/// One checked change to the logical MVCC record set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MvccRecordEdit {
+    /// Store a row payload under its transaction start timestamp.
+    PutDefault {
+        /// Canonical encoded row key.
+        key: Vec<u8>,
+        /// Transaction start timestamp that owns the payload.
+        start_ts: Timestamp,
+        /// Canonical encoded row bytes.
+        row: Vec<u8>,
+    },
+    /// Remove a row payload when an intent is rolled back.
+    DeleteDefault {
+        /// Canonical encoded row key.
+        key: Vec<u8>,
+        /// Transaction start timestamp whose payload is removed.
+        start_ts: Timestamp,
+    },
+    /// Install or replace one validated transaction lock.
+    PutLock {
+        /// Canonical encoded row key.
+        key: Vec<u8>,
+        /// Transaction lock record.
+        lock: LockRecord,
+    },
+    /// Remove the lock resolved by a committed or rolled-back intent.
+    DeleteLock {
+        /// Canonical encoded row key.
+        key: Vec<u8>,
+    },
+    /// Store a committed write or rollback witness.
+    PutWrite {
+        /// Canonical encoded row key.
+        key: Vec<u8>,
+        /// Timestamp used to order this record in the write family.
+        write_ts: Timestamp,
+        /// Logical write record.
+        write: WriteRecord,
+    },
+}
+
+/// An MVCC-only batch prepared by the shared transaction rules.
+///
+/// This does not yet represent the complete tablet `CommandDelta`: primary
+/// status, retry outcomes, processed Raft position, and other command-owned
+/// state are added at Stage 4.3. It gives backends one all-or-nothing boundary
+/// for the row/default, lock, and write records handled by the MVCC engine.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MvccDelta {
+    /// Ordered edits that become visible together when publication succeeds.
+    pub edits: Vec<MvccRecordEdit>,
+}
+
+/// Read-only physical interface for one immutable MVCC generation.
+///
+/// Implementations expose logical records, not persistent byte encodings.
+/// Cursor methods must enforce their row/record limits during traversal; they
+/// must not collect an unbounded range and trim it afterward. Implementations
+/// that can block on filesystem or cache-miss I/O belong behind the bounded
+/// node storage service, never inline on an ownership reactor.
+pub trait MvccReadGeneration {
+    /// Look up one row payload by its logical family key.
+    fn get_default(&self, key: &[u8], start_ts: Timestamp) -> Result<Option<Vec<u8>>>;
+
+    /// Look up the current transaction intent for one row key.
+    fn get_lock(&self, key: &[u8]) -> Result<Option<LockRecord>>;
+
+    /// Look up one write record by row key and ordering timestamp.
+    fn get_write(&self, key: &[u8], write_ts: Timestamp) -> Result<Option<WriteRecord>>;
+
+    /// Traverse one row's write history through a bounded ordered cursor.
+    fn write_page(
+        &self,
+        key: &[u8],
+        lower: Bound<Timestamp>,
+        upper: Bound<Timestamp>,
+        resume_after: Option<Timestamp>,
+        direction: MvccCursorDirection,
+        max_records: usize,
+    ) -> Result<MvccWritePage>;
+
+    /// Traverse distinct row keys in a family through a bounded ordered cursor.
+    fn key_page(
+        &self,
+        family: MvccKeyFamily,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_keys: usize,
+    ) -> Result<MvccKeyPage>;
+
+    /// Traverse lock records in canonical row-key order under row and byte caps.
+    fn lock_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage>;
+
+    /// Read the row version visible at `read_ts` using the shared MVCC rules.
+    fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        validate_encoded_key_argument(key, "read key")?;
+        read_visible_version(self, key, read_ts)
+    }
+
+    /// Return the lock that conflicts with a snapshot read, if any.
+    fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        intent_for_read(self, key, read_ts)
+    }
+
+    /// Scan unresolved intents in canonical key order using bounded cursors.
+    fn scan_intent_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        scan_intent_page(self, start, end, resume_after, max_locks)
+    }
+
+    /// Inspect the bounded intent page that conflicts with a snapshot read.
+    fn scan_conflicting_intents(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        scan_conflicting_intents(
+            self,
+            start,
+            end,
+            resume_after,
+            read_ts,
+            max_locks,
+            max_bytes,
+        )
+    }
+
+    /// Scan one bounded page of rows visible at `read_ts`.
+    fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        scan_page_from(self, start, end, resume_after, read_ts, max_rows, max_bytes)
+    }
+
+    /// Collect all visible rows by repeatedly using the bounded scan contract.
+    fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        read_ts: Timestamp,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .scan_page(start, end, None, read_ts, usize::MAX, usize::MAX)?
+            .rows)
+    }
+
+    /// Return the durable recovery boundary covered by this generation.
+    fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>>;
+
+    /// Export the legacy materialized snapshot image from this generation.
+    ///
+    /// This compatibility path is optional so a persistent backend is not
+    /// required to decode and reserialize its complete immutable file set.
+    /// Such a backend may return an explicit unsupported error until the
+    /// file-based snapshot contract is introduced.
+    fn export_snapshot(&self) -> Result<CapturedMvccState> {
+        Err(Error::NotImplemented(
+            "materialized MVCC snapshot export is not supported by this backend",
+        ))
+    }
+}
+
+/// Mutable physical backend consumed by the shared MVCC rules engine.
+///
+/// Its live read operations implement [`MvccReadGeneration`]. A pin returns
+/// another read generation that stays stable while newer deltas are published.
+pub trait MvccBackend: MvccReadGeneration {
+    /// Immutable generation handle returned by [`Self::pin_generation`].
+    type PinnedGeneration: MvccReadGeneration;
+
+    /// Publish all edits in one MVCC delta or leave the generation unchanged.
+    fn publish_atomic(&mut self, delta: MvccDelta) -> Result<()>;
+
+    /// Pin a stable view for serving reads, snapshot export, and compaction.
+    fn pin_generation(&self) -> Result<Self::PinnedGeneration>;
+
+    /// Return logical state counters without exposing backend representation.
+    fn stats(&self) -> MvccStats;
+
+    /// Return identifier and timestamp maxima represented by stored records.
+    fn allocator_high_water_marks(&self) -> (TxnId, Timestamp);
+}
+
+/// A stable physical generation with the shared logical MVCC read behavior.
+///
+/// Async readers retain this value for the duration of their read. A later
+/// backend publication may expose a newer generation without changing the
+/// records or recovery frontier observed through this view.
+pub struct MvccReadView<G> {
+    generation: G,
+}
+
+impl<G: MvccReadGeneration> MvccReadView<G> {
+    fn new(generation: G) -> Self {
+        Self { generation }
+    }
+
+    /// Read the row version visible at `read_ts` from this pinned generation.
+    pub fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        self.generation.read(key, read_ts)
+    }
+
+    /// Return the lock that conflicts with a snapshot read, if any.
+    pub fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        self.generation.intent_for_read(key, read_ts)
+    }
+
+    /// Scan unresolved intents in canonical key order using an exclusive
+    /// continuation key.
+    pub fn scan_intent_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        self.generation
+            .scan_intent_page(start, end, resume_after, max_locks)
+    }
+
+    /// Inspect a bounded page of intents that conflict with a foreground
+    /// snapshot read.
+    pub fn scan_conflicting_intents(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        self.generation.scan_conflicting_intents(
+            start,
+            end,
+            resume_after,
+            read_ts,
+            max_locks,
+            max_bytes,
+        )
+    }
+
+    /// Scan one bounded page of rows visible at `read_ts`.
+    pub fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        self.generation
+            .scan_page(start, end, resume_after, read_ts, max_rows, max_bytes)
+    }
+
+    /// Return all rows in the range from this generation.
+    pub fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        read_ts: Timestamp,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.generation.scan(start, end, read_ts)
+    }
+
+    /// Return the recovery boundary covered by this same pinned generation.
+    pub fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
+        self.generation.recovery_frontier()
+    }
+
+    /// Export checked snapshot state from this same pinned generation.
+    pub fn capture_snapshot_state(&self) -> Result<CapturedMvccState> {
+        self.generation.export_snapshot()
+    }
+}
+
 /// Storage contract required by the transaction-aware tablet layer.
 ///
 /// All keys passed to this trait must be complete canonical row-key encodings
@@ -222,9 +636,10 @@ pub trait MvccStorage {
 
     /// Scan one bounded page using an exclusive continuation key.
     ///
-    /// `max_bytes` counts encoded key bytes plus encoded row bytes. A backend
-    /// with an ordered native iterator should override this method so it does
-    /// not materialize the complete scan before applying the page boundary.
+    /// `max_bytes` counts encoded key bytes plus encoded row bytes. This method
+    /// is required so a physical backend must enforce the page bound while
+    /// traversing its ordered storage; a collecting `scan` fallback would let
+    /// an LSM cache miss materialize an unbounded range on the owner path.
     fn scan_page(
         &self,
         start: Option<&[u8]>,
@@ -233,10 +648,7 @@ pub trait MvccStorage {
         read_ts: Timestamp,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<MvccScanPage> {
-        let rows = self.scan(start, end, read_ts)?;
-        page_ordered_rows(rows, start, end, resume_after, max_rows, max_bytes)
-    }
+    ) -> Result<MvccScanPage>;
 
     /// Atomically install one distributed transaction intent.
     ///
@@ -355,12 +767,12 @@ pub trait MvccStorage {
     fn stats(&self) -> MvccStats;
 }
 
-/// In-memory implementation of RagnorDB's MVCC maps.
+/// In-memory physical implementation of the three logical MVCC families.
 ///
-/// Mutation methods require exclusive access. A future tablet state-machine
-/// actor will own and serialize access to this structure.
+/// The shared [`MvccEngine`] owns transaction semantics; this type owns only
+/// the reference engine's ordered record representation and atomic map edits.
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryMvcc {
+pub struct InMemoryMvccBackend {
     /// `row_key -> start_ts -> encoded row`.
     default: BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>>,
 
@@ -373,6 +785,18 @@ pub struct InMemoryMvcc {
     /// `row_key -> write_ts -> write record`.
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
 }
+
+/// Shared MVCC rules parameterized by a physical record backend.
+///
+/// Mutation methods require exclusive access. A tablet owner or bounded
+/// storage worker must serialize mutable access to one engine instance.
+#[derive(Debug, Clone, Default)]
+pub struct MvccEngine<B = InMemoryMvccBackend> {
+    backend: B,
+}
+
+/// Memory-backed MVCC reference engine retained for shadow comparisons.
+pub type InMemoryMvcc = MvccEngine<InMemoryMvccBackend>;
 
 /// A validated prewrite delta prepared while the tablet owner is exclusive.
 struct PreparedPrewrite {
@@ -403,42 +827,26 @@ pub(crate) struct RestoredMvccState {
     pub(crate) max_timestamp: Timestamp,
 }
 
-impl InMemoryMvcc {
+impl<B: MvccBackend> MvccEngine<B> {
+    /// Construct an MVCC engine over one physical record backend.
+    pub fn with_backend(backend: B) -> Self {
+        Self { backend }
+    }
+
     /// Return allocator maxima represented by committed values and live locks.
     ///
     /// Replicated startup uses these values to seed a node-local SQL allocator
     /// above the tablet state restored from Raft. They are observations, not a
     /// replacement for the future metadata timestamp authority.
     pub fn allocator_high_water_marks(&self) -> (TxnId, Timestamp) {
-        let mut max_transaction_id = TxnId(0);
-        let mut max_timestamp = Timestamp(0);
-
-        for versions in self.default.values() {
-            for start_timestamp in versions.keys() {
-                max_timestamp = Timestamp(max_timestamp.0.max(start_timestamp.0));
-            }
-        }
-        for lock in self.locks.values() {
-            max_transaction_id = TxnId(max_transaction_id.0.max(lock.txn_id.0));
-            max_timestamp = Timestamp(max_timestamp.0.max(lock.start_timestamp.0));
-        }
-        for versions in self.writes.values() {
-            for (commit_timestamp, record) in versions {
-                max_timestamp = Timestamp(
-                    max_timestamp
-                        .0
-                        .max(commit_timestamp.0)
-                        .max(record.start_timestamp.0),
-                );
-            }
-        }
-
-        (max_transaction_id, max_timestamp)
+        self.backend.allocator_high_water_marks()
     }
 
-    /// Construct an empty in-memory MVCC engine.
-    pub fn new() -> Self {
-        Self::default()
+    /// Pin one immutable generation for bounded reads outside the mutable
+    /// owner turn. The returned view shares the same MVCC visibility rules as
+    /// the live engine.
+    pub fn pin_read_view(&self) -> Result<MvccReadView<B::PinnedGeneration>> {
+        Ok(MvccReadView::new(self.backend.pin_generation()?))
     }
 
     /// clone the complete logical MVCC maps into an immutable snapshot image
@@ -448,56 +856,16 @@ impl InMemoryMvcc {
     /// state image and its deterministic protobuf ordering before that barrier
     /// is released
     pub fn capture_snapshot_state(&self) -> Result<CapturedMvccState> {
-        let default_values = self
-            .default
-            .iter()
-            .flat_map(|(key, versions)| {
-                versions.iter().map(move |(start_timestamp, row)| {
-                    snapshot_proto::DefaultValueEntry {
-                        key: key.clone(),
-                        start_timestamp: Some(start_timestamp.to_proto()),
-                        row: row.clone(),
-                    }
-                })
-            })
-            .collect();
-
-        let locks = self
-            .locks
-            .iter()
-            .map(|(key, record)| {
-                Ok(snapshot_proto::LockEntry {
-                    key: key.clone(),
-                    record: Some(record.to_proto().map_err(|error| {
-                        Error::CorruptData(format!(
-                            "in-memory lock record cannot be snapshotted: {error}"
-                        ))
-                    })?),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let writes = self
-            .writes
-            .iter()
-            .flat_map(|(key, versions)| {
-                versions.iter().map(move |(write_timestamp, record)| {
-                    Ok(snapshot_proto::WriteEntry {
-                        key: key.clone(),
-                        write_timestamp: Some(write_timestamp.to_proto()),
-                        record: Some(record.to_proto().map_err(|error| {
-                            Error::CorruptData(format!(
-                                "in-memory write record cannot be snapshotted: {error}"
-                            ))
-                        })?),
-                    })
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(CapturedMvccState::new(default_values, locks, writes))
+        self.pin_read_view()?.capture_snapshot_state()
     }
 
+    /// Return the recovery boundary belonging to one newly pinned generation.
+    pub fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
+        self.pin_read_view()?.recovery_frontier()
+    }
+}
+
+impl InMemoryMvcc {
     /// Reconstruct one table's complete MVCC maps from snapshot entries.
     ///
     /// Duplicate map keys, cross-table row keys, malformed rows, invalid
@@ -507,7 +875,7 @@ impl InMemoryMvcc {
         table_id: TableId,
         table: &snapshot_proto::SnapshotTable,
     ) -> Result<RestoredMvccState> {
-        let mut storage = Self::new();
+        let mut storage = InMemoryMvccBackend::default();
         let mut max_transaction_id = TxnId(0);
         let mut max_timestamp = Timestamp(0);
 
@@ -652,66 +1020,14 @@ impl InMemoryMvcc {
         }
 
         Ok(RestoredMvccState {
-            storage,
+            storage: MvccEngine::with_backend(storage),
             max_transaction_id,
             max_timestamp,
         })
     }
+}
 
-    fn read_visible_version(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
-        if let Some(lock) = self.locks.get(key)
-            && lock.start_timestamp <= read_ts
-        {
-            return Err(Error::WriteConflict(format!(
-                "row is locked by transaction {} at start timestamp {}",
-                lock.txn_id.0, lock.start_timestamp.0
-            )));
-        }
-
-        let Some(write_versions) = self.writes.get(key) else {
-            return Ok(None);
-        };
-
-        for (stored_write_ts, write) in write_versions.range(..=read_ts).rev() {
-            validate_write_record(*stored_write_ts, write)?;
-
-            match write.op {
-                WriteKind::Put => {
-                    let row = self
-                        .default
-                        .get(key)
-                        .and_then(|versions| versions.get(&write.start_timestamp))
-                        .ok_or_else(|| {
-                            Error::CorruptData(format!(
-                                "Put at write timestamp {} references missing default \
-                                 value at start timestamp {}",
-                                stored_write_ts.0, write.start_timestamp.0
-                            ))
-                        })?;
-
-                    // Validate persisted bytes at the storage boundary so
-                    // damaged row data cannot be returned as committed data.
-                    decode_row(row)?;
-
-                    return Ok(Some(row.clone()));
-                }
-
-                WriteKind::Delete => {
-                    // A Delete is a visible tombstone. Once encountered, older
-                    // committed versions remain hidden.
-                    return Ok(None);
-                }
-
-                WriteKind::Rollback => {
-                    // A Rollback describes an aborted transaction rather than
-                    // a logical deletion. Continue to older committed records.
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
+impl<B: MvccBackend> MvccEngine<B> {
     fn validate_mutation(
         &self,
         key: &[u8],
@@ -728,11 +1044,8 @@ impl InMemoryMvcc {
                     ))
                 })?;
 
-                if let Some(existing) = self
-                    .default
-                    .get(key)
-                    .and_then(|versions| versions.get(&start_ts))
-                    && existing != row
+                if let Some(existing) = self.backend.get_default(key, start_ts)?
+                    && existing != *row
                 {
                     return Err(Error::CorruptData(format!(
                         "start timestamp {} already has a different default value",
@@ -742,11 +1055,7 @@ impl InMemoryMvcc {
             }
 
             Mutation::Delete => {
-                if self
-                    .default
-                    .get(key)
-                    .is_some_and(|versions| versions.contains_key(&start_ts))
-                {
+                if self.backend.get_default(key, start_ts)?.is_some() {
                     return Err(Error::CorruptData(format!(
                         "Delete at start timestamp {} conflicts with an existing \
                          default value for the same transaction",
@@ -766,7 +1075,7 @@ impl InMemoryMvcc {
         txn_id: TxnId,
         start_ts: Timestamp,
     ) -> Result<()> {
-        let Some(lock) = self.locks.get(key) else {
+        let Some(lock) = self.backend.get_lock(key)? else {
             return Ok(());
         };
 
@@ -788,16 +1097,12 @@ impl InMemoryMvcc {
     }
 
     fn validate_write_history(&self, key: &[u8], start_ts: Timestamp) -> Result<()> {
-        let Some(write_versions) = self.writes.get(key) else {
-            return Ok(());
-        };
-
         // Write records are validated when they are published or restored. A
         // conflict check only needs this transaction's rollback witness and
         // writes newer than its snapshot; scanning older history on every
         // prewrite made steady-state writes slower as chains grew.
-        if let Some(write) = write_versions.get(&start_ts) {
-            validate_write_record(start_ts, write)?;
+        if let Some(write) = self.backend.get_write(key, start_ts)? {
+            validate_write_record(start_ts, &write)?;
             if write.op == WriteKind::Rollback && write.start_timestamp == start_ts {
                 return Err(Error::WriteConflict(format!(
                     "transaction starting at timestamp {} was already rolled back",
@@ -806,20 +1111,31 @@ impl InMemoryMvcc {
             }
         }
 
-        if let Some((conflicting_write_ts, conflicting_write)) = write_versions
-            .range((Excluded(start_ts), Unbounded))
-            .rev()
-            .find(|(_, write)| write.op != WriteKind::Rollback)
-        {
-            validate_write_record(*conflicting_write_ts, conflicting_write)?;
-            return Err(Error::WriteConflict(format!(
-                "row was modified at timestamp {} after transaction start \
-             timestamp {}",
-                conflicting_write_ts.0, start_ts.0
-            )));
+        let mut resume_after = None;
+        loop {
+            let page = self.backend.write_page(
+                key,
+                Excluded(start_ts),
+                Unbounded,
+                resume_after,
+                MvccCursorDirection::Reverse,
+                MVCC_WRITE_CURSOR_PAGE_SIZE,
+            )?;
+            for (write_ts, write) in &page.writes {
+                if write.op != WriteKind::Rollback {
+                    validate_write_record(*write_ts, write)?;
+                    return Err(Error::WriteConflict(format!(
+                        "row was modified at timestamp {} after transaction start \
+                         timestamp {}",
+                        write_ts.0, start_ts.0
+                    )));
+                }
+            }
+            if !page.has_more {
+                return Ok(());
+            }
+            resume_after = page.writes.last().map(|(timestamp, _)| *timestamp);
         }
-
-        Ok(())
     }
 
     /// the finalized commit timestamp can be inserted after every existing
@@ -829,11 +1145,16 @@ impl InMemoryMvcc {
     /// allocation. This second check protects the physical MVCC ordering invariant
     /// when applying an already finalized durable commit
     fn validate_commit_timestamp(&self, key: &[u8], commit_ts: Timestamp) -> Result<()> {
-        let Some(write_versions) = self.writes.get(key) else {
-            return Ok(());
-        };
+        let latest = self.backend.write_page(
+            key,
+            Unbounded,
+            Unbounded,
+            None,
+            MvccCursorDirection::Reverse,
+            1,
+        )?;
 
-        if let Some((latest_write_ts, _)) = write_versions.last_key_value()
+        if let Some((latest_write_ts, _)) = latest.writes.first()
             && *latest_write_ts >= commit_ts
         {
             return Err(Error::WriteConflict(format!(
@@ -853,15 +1174,11 @@ impl InMemoryMvcc {
         start_ts: Timestamp,
         commit_ts: Timestamp,
     ) -> Result<bool> {
-        let Some(write) = self
-            .writes
-            .get(key)
-            .and_then(|versions| versions.get(&commit_ts))
-        else {
+        let Some(write) = self.backend.get_write(key, commit_ts)? else {
             return Ok(false);
         };
 
-        validate_write_record(commit_ts, write)?;
+        validate_write_record(commit_ts, &write)?;
 
         if write.start_timestamp != start_ts || write.op != mutation.write_kind() {
             return Err(Error::CorruptData(format!(
@@ -871,18 +1188,14 @@ impl InMemoryMvcc {
         }
 
         if let Mutation::Put(expected_row) = mutation {
-            let stored_row = self
-                .default
-                .get(key)
-                .and_then(|versions| versions.get(&start_ts))
-                .ok_or_else(|| {
-                    Error::CorruptData(format!(
-                        "replayed Put at timestamp {} has no default value",
-                        commit_ts.0
-                    ))
-                })?;
+            let stored_row = self.backend.get_default(key, start_ts)?.ok_or_else(|| {
+                Error::CorruptData(format!(
+                    "replayed Put at timestamp {} has no default value",
+                    commit_ts.0
+                ))
+            })?;
 
-            if stored_row != expected_row {
+            if stored_row != *expected_row {
                 return Err(Error::CorruptData(format!(
                     "replayed Put at timestamp {} references different row bytes",
                     commit_ts.0
@@ -944,7 +1257,7 @@ impl InMemoryMvcc {
             op: mutation.write_kind(),
         };
 
-        if let Some(existing_lock) = self.locks.get(key) {
+        if let Some(existing_lock) = self.backend.get_lock(key)? {
             if existing_lock.txn_id != txn_id || existing_lock.start_timestamp != start_ts {
                 return Err(Error::WriteConflict(format!(
                     "row is locked by transaction {} at start timestamp {}",
@@ -952,7 +1265,7 @@ impl InMemoryMvcc {
                 )));
             }
 
-            if existing_lock != &expected_lock {
+            if existing_lock != expected_lock {
                 return Err(Error::CorruptData(format!(
                     "transaction {} replayed prewrite with different lock metadata",
                     txn_id.0
@@ -960,18 +1273,14 @@ impl InMemoryMvcc {
             }
 
             if let Mutation::Put(expected_row) = mutation {
-                let stored_row = self
-                    .default
-                    .get(key)
-                    .and_then(|versions| versions.get(&start_ts))
-                    .ok_or_else(|| {
-                        Error::CorruptData(format!(
-                            "transaction {} has a Put lock without its default value",
-                            txn_id.0
-                        ))
-                    })?;
+                let stored_row = self.backend.get_default(key, start_ts)?.ok_or_else(|| {
+                    Error::CorruptData(format!(
+                        "transaction {} has a Put lock without its default value",
+                        txn_id.0
+                    ))
+                })?;
 
-                if stored_row != expected_row {
+                if stored_row != *expected_row {
                     return Err(Error::CorruptData(format!(
                         "transaction {} replayed prewrite with different row bytes",
                         txn_id.0
@@ -982,11 +1291,7 @@ impl InMemoryMvcc {
             return Ok(None);
         }
 
-        if self
-            .default
-            .get(key)
-            .is_some_and(|versions| versions.contains_key(&start_ts))
-        {
+        if self.backend.get_default(key, start_ts)?.is_some() {
             return Err(Error::CorruptData(format!(
                 "transaction {} has a default value without its prewrite lock",
                 txn_id.0
@@ -1004,7 +1309,7 @@ impl InMemoryMvcc {
     }
 
     /// Publish a prevalidated prewrite delta.
-    fn apply_prewrite(&mut self, prepared: PreparedPrewrite) {
+    fn append_prewrite_edit(delta: &mut MvccDelta, prepared: PreparedPrewrite) {
         let PreparedPrewrite {
             key,
             default_value,
@@ -1012,13 +1317,14 @@ impl InMemoryMvcc {
         } = prepared;
 
         if let Some(row) = default_value {
-            self.default
-                .entry(key.clone())
-                .or_default()
-                .insert(lock.start_timestamp, row);
+            delta.edits.push(MvccRecordEdit::PutDefault {
+                key: key.clone(),
+                start_ts: lock.start_timestamp,
+                row,
+            });
         }
 
-        self.locks.insert(key, lock);
+        delta.edits.push(MvccRecordEdit::PutLock { key, lock });
     }
 
     /// Validate one intent commit. An exact replay returns no delta because its
@@ -1032,15 +1338,20 @@ impl InMemoryMvcc {
     ) -> Result<Option<PreparedIntentCommit>> {
         validate_encoded_key_argument(key, "intent commit key")?;
 
-        if let Some(write) = self
-            .writes
-            .get(key)
-            .and_then(|versions| versions.get(&commit_ts))
-        {
-            validate_write_record(commit_ts, write)?;
+        if let Some(write) = self.backend.get_write(key, commit_ts)? {
+            validate_write_record(commit_ts, &write)?;
 
-            if let Some(versions) = self.writes.get(key) {
-                for (other_write_ts, other) in versions {
+            let mut resume_after = None;
+            loop {
+                let page = self.backend.write_page(
+                    key,
+                    Unbounded,
+                    Unbounded,
+                    resume_after,
+                    MvccCursorDirection::Forward,
+                    MVCC_WRITE_CURSOR_PAGE_SIZE,
+                )?;
+                for (other_write_ts, other) in &page.writes {
                     validate_write_record(*other_write_ts, other)?;
 
                     if *other_write_ts != commit_ts && other.start_timestamp == start_ts {
@@ -1050,6 +1361,10 @@ impl InMemoryMvcc {
                         )));
                     }
                 }
+                if !page.has_more {
+                    break;
+                }
+                resume_after = page.writes.last().map(|(timestamp, _)| *timestamp);
             }
 
             if write.start_timestamp != start_ts || write.op == WriteKind::Rollback {
@@ -1060,8 +1375,8 @@ impl InMemoryMvcc {
             }
 
             if self
-                .locks
-                .get(key)
+                .backend
+                .get_lock(key)?
                 .is_some_and(|lock| lock.start_timestamp == start_ts)
             {
                 return Err(Error::CorruptData(format!(
@@ -1072,25 +1387,17 @@ impl InMemoryMvcc {
 
             match write.op {
                 WriteKind::Put => {
-                    let row = self
-                        .default
-                        .get(key)
-                        .and_then(|versions| versions.get(&start_ts))
-                        .ok_or_else(|| {
-                            Error::CorruptData(format!(
-                                "committed Put at timestamp {} has no default value",
-                                commit_ts.0
-                            ))
-                        })?;
+                    let row = self.backend.get_default(key, start_ts)?.ok_or_else(|| {
+                        Error::CorruptData(format!(
+                            "committed Put at timestamp {} has no default value",
+                            commit_ts.0
+                        ))
+                    })?;
 
-                    decode_row(row)?;
+                    decode_row(&row)?;
                 }
                 WriteKind::Delete => {
-                    if self
-                        .default
-                        .get(key)
-                        .is_some_and(|versions| versions.contains_key(&start_ts))
-                    {
+                    if self.backend.get_default(key, start_ts)?.is_some() {
                         return Err(Error::CorruptData(format!(
                             "committed Delete at timestamp {} retains a default value",
                             commit_ts.0
@@ -1103,7 +1410,7 @@ impl InMemoryMvcc {
             return Ok(None);
         }
 
-        let lock = self.locks.get(key).ok_or_else(|| {
+        let lock = self.backend.get_lock(key)?.ok_or_else(|| {
             Error::WriteConflict(format!(
                 "transaction {} has no intent to commit at start timestamp {}",
                 txn_id.0, start_ts.0
@@ -1119,25 +1426,17 @@ impl InMemoryMvcc {
 
         match lock.op {
             WriteKind::Put => {
-                let row = self
-                    .default
-                    .get(key)
-                    .and_then(|versions| versions.get(&start_ts))
-                    .ok_or_else(|| {
-                        Error::CorruptData(format!(
-                            "transaction {} has a Put lock without its default value",
-                            txn_id.0
-                        ))
-                    })?;
+                let row = self.backend.get_default(key, start_ts)?.ok_or_else(|| {
+                    Error::CorruptData(format!(
+                        "transaction {} has a Put lock without its default value",
+                        txn_id.0
+                    ))
+                })?;
 
-                decode_row(row)?;
+                decode_row(&row)?;
             }
             WriteKind::Delete => {
-                if self
-                    .default
-                    .get(key)
-                    .is_some_and(|versions| versions.contains_key(&start_ts))
-                {
+                if self.backend.get_default(key, start_ts)?.is_some() {
                     return Err(Error::CorruptData(format!(
                         "transaction {} has a Delete lock with a default value",
                         txn_id.0
@@ -1166,15 +1465,16 @@ impl InMemoryMvcc {
     }
 
     /// Publish a prevalidated intent commit delta.
-    fn apply_intent_commit(&mut self, prepared: PreparedIntentCommit) {
+    fn append_intent_commit_edit(delta: &mut MvccDelta, prepared: PreparedIntentCommit) {
         let PreparedIntentCommit { key, write } = prepared;
         let commit_ts = write.commit_timestamp;
 
-        self.writes
-            .entry(key.clone())
-            .or_default()
-            .insert(commit_ts, write);
-        self.locks.remove(&key);
+        delta.edits.push(MvccRecordEdit::PutWrite {
+            key: key.clone(),
+            write_ts: commit_ts,
+            write,
+        });
+        delta.edits.push(MvccRecordEdit::DeleteLock { key });
     }
 
     /// Validate one rollback. An existing rollback witness is an exact replay.
@@ -1186,8 +1486,18 @@ impl InMemoryMvcc {
     ) -> Result<Option<PreparedIntentRollback>> {
         validate_encoded_key_argument(key, "intent rollback key")?;
 
-        if let Some(write_versions) = self.writes.get(key) {
-            for (stored_write_ts, write) in write_versions {
+        let mut resume_after = None;
+        let mut rollback_witness = None;
+        loop {
+            let page = self.backend.write_page(
+                key,
+                Unbounded,
+                Unbounded,
+                resume_after,
+                MvccCursorDirection::Forward,
+                MVCC_WRITE_CURSOR_PAGE_SIZE,
+            )?;
+            for (stored_write_ts, write) in &page.writes {
                 validate_write_record(*stored_write_ts, write)?;
 
                 if write.start_timestamp == start_ts && write.op != WriteKind::Rollback {
@@ -1196,36 +1506,41 @@ impl InMemoryMvcc {
                         start_ts.0
                     )));
                 }
+                if *stored_write_ts == start_ts {
+                    if write.start_timestamp != start_ts || write.op != WriteKind::Rollback {
+                        return Err(Error::CorruptData(format!(
+                            "write timestamp {} is occupied by a non-rollback outcome",
+                            start_ts.0
+                        )));
+                    }
+                    rollback_witness = Some(write.clone());
+                }
             }
 
-            if let Some(rollback) = write_versions.get(&start_ts) {
-                if rollback.start_timestamp != start_ts || rollback.op != WriteKind::Rollback {
-                    return Err(Error::CorruptData(format!(
-                        "write timestamp {} is occupied by a non-rollback outcome",
-                        start_ts.0
-                    )));
-                }
-
-                if self
-                    .locks
-                    .get(key)
-                    .is_some_and(|lock| lock.start_timestamp == start_ts)
-                    || self
-                        .default
-                        .get(key)
-                        .is_some_and(|versions| versions.contains_key(&start_ts))
-                {
-                    return Err(Error::CorruptData(format!(
-                        "rolled-back transaction at timestamp {} retains intent state",
-                        start_ts.0
-                    )));
-                }
-
-                return Ok(None);
+            if !page.has_more {
+                break;
             }
+            resume_after = page.writes.last().map(|(timestamp, _)| *timestamp);
         }
 
-        let locked_op = match self.locks.get(key) {
+        if rollback_witness.is_some() {
+            if self
+                .backend
+                .get_lock(key)?
+                .is_some_and(|lock| lock.start_timestamp == start_ts)
+                || self.backend.get_default(key, start_ts)?.is_some()
+            {
+                return Err(Error::CorruptData(format!(
+                    "rolled-back transaction at timestamp {} retains intent state",
+                    start_ts.0
+                )));
+            }
+
+            return Ok(None);
+        }
+
+        let lock = self.backend.get_lock(key)?;
+        let locked_op = match lock.as_ref() {
             Some(lock) if lock.txn_id != txn_id || lock.start_timestamp != start_ts => {
                 return Err(Error::WriteConflict(format!(
                     "row is locked by transaction {} at start timestamp {}",
@@ -1238,25 +1553,17 @@ impl InMemoryMvcc {
 
         match locked_op {
             Some(WriteKind::Put) => {
-                let row = self
-                    .default
-                    .get(key)
-                    .and_then(|versions| versions.get(&start_ts))
-                    .ok_or_else(|| {
-                        Error::CorruptData(format!(
-                            "transaction {} has a Put lock without its default value",
-                            txn_id.0
-                        ))
-                    })?;
+                let row = self.backend.get_default(key, start_ts)?.ok_or_else(|| {
+                    Error::CorruptData(format!(
+                        "transaction {} has a Put lock without its default value",
+                        txn_id.0
+                    ))
+                })?;
 
-                decode_row(row)?;
+                decode_row(&row)?;
             }
             Some(WriteKind::Delete) | None => {
-                if self
-                    .default
-                    .get(key)
-                    .is_some_and(|versions| versions.contains_key(&start_ts))
-                {
+                if self.backend.get_default(key, start_ts)?.is_some() {
                     return Err(Error::CorruptData(format!(
                         "transaction {} has a default value without a matching Put lock",
                         txn_id.0
@@ -1278,34 +1585,35 @@ impl InMemoryMvcc {
     }
 
     /// Publish a prevalidated rollback delta and its replay witness.
-    fn apply_intent_rollback(&mut self, prepared: PreparedIntentRollback, start_ts: Timestamp) {
+    fn append_intent_rollback_edit(
+        delta: &mut MvccDelta,
+        prepared: PreparedIntentRollback,
+        start_ts: Timestamp,
+    ) {
         let PreparedIntentRollback {
             key,
             remove_default_value,
         } = prepared;
 
         if remove_default_value {
-            let remove_key = if let Some(versions) = self.default.get_mut(&key) {
-                versions.remove(&start_ts);
-                versions.is_empty()
-            } else {
-                false
-            };
-
-            if remove_key {
-                self.default.remove(&key);
-            }
+            delta.edits.push(MvccRecordEdit::DeleteDefault {
+                key: key.clone(),
+                start_ts,
+            });
         }
 
-        self.locks.remove(&key);
-        self.writes.entry(key).or_default().insert(
-            start_ts,
-            WriteRecord {
+        delta
+            .edits
+            .push(MvccRecordEdit::DeleteLock { key: key.clone() });
+        delta.edits.push(MvccRecordEdit::PutWrite {
+            key,
+            write_ts: start_ts,
+            write: WriteRecord {
                 start_timestamp: start_ts,
                 commit_timestamp: start_ts,
                 op: WriteKind::Rollback,
             },
-        );
+        });
     }
 
     /// restore one tablet's complete MVCC state from validated snapshot entries
@@ -1318,7 +1626,7 @@ impl InMemoryMvcc {
         default_values: Vec<snapshot_proto::DefaultValueEntry>,
         locks: Vec<snapshot_proto::LockEntry>,
         writes: Vec<snapshot_proto::WriteEntry>,
-    ) -> Result<Self> {
+    ) -> Result<InMemoryMvcc> {
         let table = snapshot_proto::SnapshotTable {
             definition: None,
             default_values,
@@ -1326,227 +1634,284 @@ impl InMemoryMvcc {
             writes,
         };
 
-        Ok(Self::from_snapshot_table(table_id, &table)?.storage)
+        Ok(MvccEngine::<InMemoryMvccBackend>::from_snapshot_table(table_id, &table)?.storage)
     }
 }
 
-impl MvccStorage for InMemoryMvcc {
-    fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
-        validate_encoded_key_argument(key, "read key")?;
-        self.read_visible_version(key, read_ts)
+impl InMemoryMvcc {
+    /// Construct an empty memory-backed MVCC reference engine.
+    pub fn new() -> Self {
+        Self::with_backend(InMemoryMvccBackend::default())
+    }
+}
+
+fn read_visible_version<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    key: &[u8],
+    read_ts: Timestamp,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(lock) = generation.get_lock(key)?
+        && lock.start_timestamp <= read_ts
+    {
+        return Err(Error::WriteConflict(format!(
+            "row is locked by transaction {} at start timestamp {}",
+            lock.txn_id.0, lock.start_timestamp.0
+        )));
     }
 
-    fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
-        validate_encoded_key_argument(key, "intent read key")?;
+    let mut resume_after = None;
+    loop {
+        let page = generation.write_page(
+            key,
+            Unbounded,
+            Included(read_ts),
+            resume_after,
+            MvccCursorDirection::Reverse,
+            MVCC_WRITE_CURSOR_PAGE_SIZE,
+        )?;
 
-        let Some(lock) = self.locks.get(key) else {
+        for (stored_write_ts, write) in &page.writes {
+            validate_write_record(*stored_write_ts, write)?;
+
+            match write.op {
+                WriteKind::Put => {
+                    let row = generation
+                        .get_default(key, write.start_timestamp)?
+                        .ok_or_else(|| {
+                            Error::CorruptData(format!(
+                                "Put at write timestamp {} references missing default \
+                                 value at start timestamp {}",
+                                stored_write_ts.0, write.start_timestamp.0
+                            ))
+                        })?;
+
+                    decode_row(&row)?;
+                    return Ok(Some(row));
+                }
+                WriteKind::Delete => return Ok(None),
+                WriteKind::Rollback => {}
+            }
+        }
+
+        if !page.has_more {
             return Ok(None);
+        }
+        resume_after = page.writes.last().map(|(timestamp, _)| *timestamp);
+    }
+}
+
+fn intent_for_read<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    key: &[u8],
+    read_ts: Timestamp,
+) -> Result<Option<LockRecord>> {
+    validate_encoded_key_argument(key, "intent read key")?;
+
+    let Some(lock) = generation.get_lock(key)? else {
+        return Ok(None);
+    };
+    if lock.start_timestamp > read_ts {
+        return Ok(None);
+    }
+
+    lock.validate().map_err(|error| {
+        Error::CorruptData(format!("intent lock cannot be used for a read: {error}"))
+    })?;
+    Ok(Some(lock))
+}
+
+fn scan_intent_page<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+    max_locks: usize,
+) -> Result<IntentScanPage> {
+    if max_locks == 0 {
+        return Err(Error::InvalidArgument(
+            "intent scan page max_locks must be greater than zero".to_string(),
+        ));
+    }
+
+    encoded_scan_bounds(start, end)?;
+    if let Some(resume_after) = resume_after {
+        validate_encoded_key_argument(resume_after, "intent scan resume key")?;
+        if end.is_some_and(|end| resume_after >= end) {
+            return Ok(IntentScanPage {
+                locks: Vec::new(),
+                has_more: false,
+            });
+        }
+    }
+
+    let page = generation.lock_page(start, end, resume_after, max_locks, usize::MAX)?;
+    for (key, lock) in &page.locks {
+        validate_encoded_key_argument(key, "intent scan key")?;
+        lock.validate().map_err(|error| {
+            Error::CorruptData(format!("intent scan found an invalid lock: {error}"))
+        })?;
+    }
+    Ok(page)
+}
+
+fn scan_conflicting_intents<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+    read_ts: Timestamp,
+    max_locks: usize,
+    max_bytes: usize,
+) -> Result<IntentScanPage> {
+    if max_locks == 0 {
+        return Err(Error::InvalidArgument(
+            "foreground scan intent max_locks must be greater than zero".to_string(),
+        ));
+    }
+    if max_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "foreground scan intent max_bytes must be greater than zero".to_string(),
+        ));
+    }
+
+    encoded_scan_bounds(start, end)?;
+    if let Some(resume_after) = resume_after {
+        validate_encoded_key_argument(resume_after, "foreground scan intent resume key")?;
+        if end.is_some_and(|end| resume_after >= end) {
+            return Ok(IntentScanPage {
+                locks: Vec::new(),
+                has_more: false,
+            });
+        }
+    }
+
+    let mut locks = Vec::new();
+    let mut encoded_bytes = 0usize;
+    let mut cursor = resume_after.map(ToOwned::to_owned);
+    loop {
+        // Filter by the snapshot timestamp before applying result limits. A
+        // later-starting intent is not a conflict and must not create a false
+        // continuation page after the final conflicting intent.
+        let page = generation.lock_page(start, end, cursor.as_deref(), 1, usize::MAX)?;
+        let Some((key, lock)) = page.locks.into_iter().next() else {
+            return Ok(IntentScanPage {
+                locks,
+                has_more: false,
+            });
         };
 
-        if lock.start_timestamp > read_ts {
-            return Ok(None);
-        }
-
+        validate_encoded_key_argument(&key, "foreground scan intent key")?;
         lock.validate().map_err(|error| {
-            Error::CorruptData(format!("intent lock cannot be used for a read: {error}"))
+            Error::CorruptData(format!("foreground scan found an invalid lock: {error}"))
         })?;
-
-        Ok(Some(lock.clone()))
-    }
-
-    fn scan_intent_page(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        resume_after: Option<&[u8]>,
-        max_locks: usize,
-    ) -> Result<IntentScanPage> {
-        if max_locks == 0 {
-            return Err(Error::InvalidArgument(
-                "intent scan page max_locks must be greater than zero".to_string(),
-            ));
-        }
-
-        let (_, upper) = encoded_scan_bounds(start, end)?;
-        if let Some(resume_after) = resume_after {
-            validate_encoded_key_argument(resume_after, "intent scan resume key")?;
-            if end.is_some_and(|end| resume_after >= end) {
+        cursor = Some(key.clone());
+        if lock.start_timestamp > read_ts {
+            if !page.has_more {
                 return Ok(IntentScanPage {
-                    locks: Vec::new(),
+                    locks,
                     has_more: false,
                 });
             }
+            continue;
         }
 
-        let lower = scan_lower_bound(start, resume_after);
-        let mut locks = Vec::new();
-        for (key, lock) in self.locks.range((lower, upper)) {
-            if locks.len() >= max_locks {
-                return Ok(IntentScanPage {
-                    locks,
-                    has_more: true,
-                });
+        if locks.len() >= max_locks {
+            return Ok(IntentScanPage {
+                locks,
+                has_more: true,
+            });
+        }
+
+        let encoded_lock = lock
+            .to_proto()
+            .map_err(|error| Error::CorruptData(error.to_string()))?
+            .encoded_len();
+        let entry_bytes = key.len().checked_add(encoded_lock).ok_or_else(|| {
+            Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+        })?;
+        let next_bytes = encoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+            Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
+        })?;
+        if next_bytes > max_bytes {
+            if locks.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "foreground scan intent byte budget is smaller than the first encoded lock"
+                        .to_string(),
+                ));
             }
-
-            validate_encoded_key_argument(key, "intent scan key")?;
-            lock.validate().map_err(|error| {
-                Error::CorruptData(format!("intent scan found an invalid lock: {error}"))
-            })?;
-            locks.push((key.clone(), lock.clone()));
+            return Ok(IntentScanPage {
+                locks,
+                has_more: true,
+            });
         }
 
-        Ok(IntentScanPage {
-            locks,
-            has_more: false,
-        })
+        encoded_bytes = next_bytes;
+        locks.push((key, lock));
+        if !page.has_more {
+            return Ok(IntentScanPage {
+                locks,
+                has_more: false,
+            });
+        }
+    }
+}
+
+fn scan_page_from<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    resume_after: Option<&[u8]>,
+    read_ts: Timestamp,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<MvccScanPage> {
+    validate_scan_page_limits(max_rows, max_bytes)?;
+    encoded_scan_bounds(start, end)?;
+
+    if let Some(resume_after) = resume_after {
+        validate_encoded_key_argument(resume_after, "scan resume key")?;
+        if end.is_some_and(|end| resume_after >= end) {
+            return Ok(MvccScanPage {
+                rows: Vec::new(),
+                has_more: false,
+            });
+        }
     }
 
-    fn scan_conflicting_intents(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        resume_after: Option<&[u8]>,
-        read_ts: Timestamp,
-        max_locks: usize,
-        max_bytes: usize,
-    ) -> Result<IntentScanPage> {
-        if max_locks == 0 {
-            return Err(Error::InvalidArgument(
-                "foreground scan intent max_locks must be greater than zero".to_string(),
-            ));
-        }
-        if max_bytes == 0 {
-            return Err(Error::InvalidArgument(
-                "foreground scan intent max_bytes must be greater than zero".to_string(),
-            ));
-        }
+    let mut rows = Vec::new();
+    let mut encoded_bytes = 0_usize;
+    let mut candidate_resume = resume_after.map(ToOwned::to_owned);
 
-        let (_, upper) = encoded_scan_bounds(start, end)?;
-        if let Some(resume_after) = resume_after {
-            validate_encoded_key_argument(resume_after, "foreground scan intent resume key")?;
-            if end.is_some_and(|end| resume_after >= end) {
-                return Ok(IntentScanPage {
-                    locks: Vec::new(),
-                    has_more: false,
-                });
-            }
+    loop {
+        let writes = generation.key_page(
+            MvccKeyFamily::Writes,
+            start,
+            end,
+            candidate_resume.as_deref(),
+            MVCC_ROW_CURSOR_PAGE_SIZE,
+        )?;
+        let locks = generation.key_page(
+            MvccKeyFamily::Locks,
+            start,
+            end,
+            candidate_resume.as_deref(),
+            MVCC_ROW_CURSOR_PAGE_SIZE,
+        )?;
+        let has_more_candidates = writes.has_more || locks.has_more;
+        let candidates = merge_key_pages(writes.keys, locks.keys);
+        if candidates.is_empty() {
+            return Ok(MvccScanPage {
+                rows,
+                has_more: has_more_candidates,
+            });
         }
 
-        let lower = scan_lower_bound(start, resume_after);
-        let mut locks = Vec::new();
-        let mut encoded_bytes = 0usize;
-        for (key, lock) in self.locks.range((lower, upper)) {
-            validate_encoded_key_argument(key, "foreground scan intent key")?;
-            lock.validate().map_err(|error| {
-                Error::CorruptData(format!("foreground scan found an invalid lock: {error}"))
-            })?;
-            if lock.start_timestamp > read_ts {
-                continue;
-            }
+        for key in candidates {
+            candidate_resume = Some(key.clone());
 
-            if locks.len() >= max_locks {
-                return Ok(IntentScanPage {
-                    locks,
-                    has_more: true,
-                });
-            }
-
-            let encoded_lock = lock
-                .to_proto()
-                .map_err(|error| Error::CorruptData(error.to_string()))?
-                .encoded_len();
-            let entry_bytes = key.len().checked_add(encoded_lock).ok_or_else(|| {
-                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
-            })?;
-            let next_bytes = encoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
-                Error::InvalidArgument("foreground scan intent byte count overflowed".to_string())
-            })?;
-            if next_bytes > max_bytes {
-                if locks.is_empty() {
-                    return Err(Error::InvalidArgument(
-                        "foreground scan intent byte budget is smaller than the first encoded lock"
-                            .to_string(),
-                    ));
-                }
-                return Ok(IntentScanPage {
-                    locks,
-                    has_more: true,
-                });
-            }
-
-            encoded_bytes = next_bytes;
-            locks.push((key.clone(), lock.clone()));
-        }
-
-        Ok(IntentScanPage {
-            locks,
-            has_more: false,
-        })
-    }
-
-    fn scan(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        read_ts: Timestamp,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        Ok(self
-            .scan_page(start, end, None, read_ts, usize::MAX, usize::MAX)?
-            .rows)
-    }
-
-    fn scan_page(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        resume_after: Option<&[u8]>,
-        read_ts: Timestamp,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Result<MvccScanPage> {
-        validate_scan_page_limits(max_rows, max_bytes)?;
-        let (_, upper) = encoded_scan_bounds(start, end)?;
-
-        if let Some(resume_after) = resume_after {
-            validate_encoded_key_argument(resume_after, "scan resume key")?;
-            if end.is_some_and(|end| resume_after >= end) {
-                return Ok(MvccScanPage {
-                    rows: Vec::new(),
-                    has_more: false,
-                });
-            }
-        }
-
-        let lower = scan_lower_bound(start, resume_after);
-        let mut writes = self.writes.range((lower.clone(), upper.clone())).peekable();
-        let mut locks = self.locks.range((lower, upper)).peekable();
-        let mut next_write = writes.next();
-        let mut next_lock = locks.next();
-        let mut rows = Vec::new();
-        let mut encoded_bytes = 0_usize;
-
-        loop {
-            let (key, take_write, take_lock) = match (&next_write, &next_lock) {
-                (None, None) => break,
-                (Some((write_key, _)), None) => ((*write_key).clone(), true, false),
-                (None, Some((lock_key, _))) => ((*lock_key).clone(), false, true),
-                (Some((write_key, _)), Some((lock_key, _))) => match write_key.cmp(lock_key) {
-                    std::cmp::Ordering::Less => ((*write_key).clone(), true, false),
-                    std::cmp::Ordering::Equal => ((*write_key).clone(), true, true),
-                    std::cmp::Ordering::Greater => ((*lock_key).clone(), false, true),
-                },
-            };
-
-            if take_write {
-                next_write = writes.next();
-            }
-            if take_lock {
-                next_lock = locks.next();
-            }
-
-            // Locks must participate even when they have no committed history;
-            // otherwise a scan could silently pass a locked insertion.
-            let Some(row) = self.read_visible_version(&key, read_ts)? else {
+            // Locks must participate even when they have no committed
+            // history; otherwise a scan could pass a locked insertion.
+            let Some(row) = read_visible_version(generation, &key, read_ts)? else {
                 continue;
             };
 
@@ -1579,10 +1944,76 @@ impl MvccStorage for InMemoryMvcc {
             rows.push((key, row));
         }
 
-        Ok(MvccScanPage {
-            rows,
-            has_more: false,
-        })
+        if !has_more_candidates {
+            return Ok(MvccScanPage {
+                rows,
+                has_more: false,
+            });
+        }
+    }
+}
+
+impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
+    fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        self.backend.read(key, read_ts)
+    }
+
+    fn intent_for_read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<LockRecord>> {
+        self.backend.intent_for_read(key, read_ts)
+    }
+
+    fn scan_intent_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+    ) -> Result<IntentScanPage> {
+        self.backend
+            .scan_intent_page(start, end, resume_after, max_locks)
+    }
+
+    fn scan_conflicting_intents(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        self.backend.scan_conflicting_intents(
+            start,
+            end,
+            resume_after,
+            read_ts,
+            max_locks,
+            max_bytes,
+        )
+    }
+
+    fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        read_ts: Timestamp,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .scan_page(start, end, None, read_ts, usize::MAX, usize::MAX)?
+            .rows)
+    }
+
+    fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        self.backend
+            .scan_page(start, end, resume_after, read_ts, max_rows, max_bytes)
     }
 
     fn validate_commit_batch(
@@ -1641,16 +2072,17 @@ impl MvccStorage for InMemoryMvcc {
             self.validate_commit_timestamp(key, commit_ts)?;
         }
 
-        // Every fallible validation step has completed. The following section
-        // performs the complete in-memory state transition without exposing a
-        // partially applied mutation batch.
+        // Prepare one sparse backend delta only after every logical validation
+        // has succeeded. The backend publishes the complete MVCC edit set once.
+        let mut delta = MvccDelta::default();
         for (key, mutation) in mutations {
             match mutation {
                 Mutation::Put(row) => {
-                    self.default
-                        .entry(key.clone())
-                        .or_default()
-                        .insert(start_ts, row.clone());
+                    delta.edits.push(MvccRecordEdit::PutDefault {
+                        key: key.clone(),
+                        start_ts,
+                        row: row.clone(),
+                    });
                 }
 
                 Mutation::Delete => {
@@ -1659,37 +2091,33 @@ impl MvccStorage for InMemoryMvcc {
                 }
             }
 
-            self.writes.entry(key.clone()).or_default().insert(
-                commit_ts,
-                WriteRecord {
+            delta.edits.push(MvccRecordEdit::PutWrite {
+                key: key.clone(),
+                write_ts: commit_ts,
+                write: WriteRecord {
                     start_timestamp: start_ts,
                     commit_timestamp: commit_ts,
                     op: mutation.write_kind(),
                 },
-            );
+            });
 
             if self
-                .locks
-                .get(key)
+                .backend
+                .get_lock(key)?
                 .is_some_and(|lock| lock.txn_id == txn_id && lock.start_timestamp == start_ts)
             {
-                self.locks.remove(key);
+                delta
+                    .edits
+                    .push(MvccRecordEdit::DeleteLock { key: key.clone() });
             }
         }
 
+        self.backend.publish_atomic(delta)?;
         Ok(mutations.len())
     }
 
     fn stats(&self) -> MvccStats {
-        MvccStats {
-            default_keys: self.default.len(),
-            default_versions: self.default.values().map(BTreeMap::len).sum(),
-            default_version_chains: version_chain_stats(self.default.values().map(BTreeMap::len)),
-            locks: self.locks.len(),
-            write_keys: self.writes.len(),
-            write_records: self.writes.values().map(BTreeMap::len).sum(),
-            write_record_chains: version_chain_stats(self.writes.values().map(BTreeMap::len)),
-        }
+        self.backend.stats()
     }
 
     fn prewrite(
@@ -1713,7 +2141,9 @@ impl MvccStorage for InMemoryMvcc {
         if let Some(prepared) =
             self.prepare_prewrite(txn_id, start_ts, key, mutation, primary_key, ttl_ms)?
         {
-            self.apply_prewrite(prepared);
+            let mut delta = MvccDelta::default();
+            Self::append_prewrite_edit(&mut delta, prepared);
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
@@ -1751,8 +2181,12 @@ impl MvccStorage for InMemoryMvcc {
             }
         }
 
-        for delta in prepared {
-            self.apply_prewrite(delta);
+        let mut delta = MvccDelta::default();
+        for prepared in prepared {
+            Self::append_prewrite_edit(&mut delta, prepared);
+        }
+        if !delta.edits.is_empty() {
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
@@ -1768,7 +2202,9 @@ impl MvccStorage for InMemoryMvcc {
         validate_commit_metadata(txn_id, start_ts, commit_ts)?;
 
         if let Some(prepared) = self.prepare_intent_commit(txn_id, start_ts, commit_ts, key)? {
-            self.apply_intent_commit(prepared);
+            let mut delta = MvccDelta::default();
+            Self::append_intent_commit_edit(&mut delta, prepared);
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
@@ -1796,8 +2232,12 @@ impl MvccStorage for InMemoryMvcc {
             }
         }
 
-        for delta in prepared {
-            self.apply_intent_commit(delta);
+        let mut delta = MvccDelta::default();
+        for prepared in prepared {
+            Self::append_intent_commit_edit(&mut delta, prepared);
+        }
+        if !delta.edits.is_empty() {
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
@@ -1807,7 +2247,9 @@ impl MvccStorage for InMemoryMvcc {
         validate_commit_preflight_metadata(txn_id, start_ts)?;
 
         if let Some(prepared) = self.prepare_intent_rollback(txn_id, start_ts, key)? {
-            self.apply_intent_rollback(prepared, start_ts);
+            let mut delta = MvccDelta::default();
+            Self::append_intent_rollback_edit(&mut delta, prepared, start_ts);
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
@@ -1834,11 +2276,414 @@ impl MvccStorage for InMemoryMvcc {
             }
         }
 
-        for delta in prepared {
-            self.apply_intent_rollback(delta, start_ts);
+        let mut delta = MvccDelta::default();
+        for prepared in prepared {
+            Self::append_intent_rollback_edit(&mut delta, prepared, start_ts);
+        }
+        if !delta.edits.is_empty() {
+            self.backend.publish_atomic(delta)?;
         }
 
         Ok(())
+    }
+}
+
+impl MvccReadGeneration for InMemoryMvccBackend {
+    fn get_default(&self, key: &[u8], start_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .default
+            .get(key)
+            .and_then(|versions| versions.get(&start_ts))
+            .cloned())
+    }
+
+    fn get_lock(&self, key: &[u8]) -> Result<Option<LockRecord>> {
+        Ok(self.locks.get(key).cloned())
+    }
+
+    fn get_write(&self, key: &[u8], write_ts: Timestamp) -> Result<Option<WriteRecord>> {
+        Ok(self
+            .writes
+            .get(key)
+            .and_then(|versions| versions.get(&write_ts))
+            .cloned())
+    }
+
+    fn write_page(
+        &self,
+        key: &[u8],
+        lower: Bound<Timestamp>,
+        upper: Bound<Timestamp>,
+        resume_after: Option<Timestamp>,
+        direction: MvccCursorDirection,
+        max_records: usize,
+    ) -> Result<MvccWritePage> {
+        if max_records == 0 {
+            return Err(Error::InvalidArgument(
+                "MVCC write cursor max_records must be greater than zero".to_string(),
+            ));
+        }
+
+        let Some(versions) = self.writes.get(key) else {
+            return Ok(MvccWritePage {
+                writes: Vec::new(),
+                has_more: false,
+            });
+        };
+
+        let (lower, upper) = match (direction, resume_after) {
+            (MvccCursorDirection::Forward, Some(timestamp)) => {
+                (max_lower_bound(lower, Excluded(timestamp)), upper)
+            }
+            (MvccCursorDirection::Reverse, Some(timestamp)) => {
+                (lower, min_upper_bound(upper, Excluded(timestamp)))
+            }
+            (_, None) => (lower, upper),
+        };
+
+        if timestamp_range_is_empty(&lower, &upper) {
+            return Ok(MvccWritePage {
+                writes: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        let mut writes = Vec::with_capacity(max_records.saturating_add(1));
+        match direction {
+            MvccCursorDirection::Forward => {
+                for (timestamp, write) in versions.range((lower, upper)).take(max_records + 1) {
+                    writes.push((*timestamp, write.clone()));
+                }
+            }
+            MvccCursorDirection::Reverse => {
+                for (timestamp, write) in versions.range((lower, upper)).rev().take(max_records + 1)
+                {
+                    writes.push((*timestamp, write.clone()));
+                }
+            }
+        }
+
+        let has_more = writes.len() > max_records;
+        writes.truncate(max_records);
+        Ok(MvccWritePage { writes, has_more })
+    }
+
+    fn key_page(
+        &self,
+        family: MvccKeyFamily,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_keys: usize,
+    ) -> Result<MvccKeyPage> {
+        if max_keys == 0 {
+            return Err(Error::InvalidArgument(
+                "MVCC key cursor max_keys must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "MVCC key cursor resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(MvccKeyPage {
+                    keys: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut keys = Vec::with_capacity(max_keys.saturating_add(1));
+        match family {
+            MvccKeyFamily::Writes => {
+                for key in self.writes.range((lower, upper)).map(|(key, _)| key) {
+                    validate_encoded_key_argument(key, "MVCC write cursor key")?;
+                    keys.push(key.clone());
+                    if keys.len() > max_keys {
+                        break;
+                    }
+                }
+            }
+            MvccKeyFamily::Locks => {
+                for key in self.locks.range((lower, upper)).map(|(key, _)| key) {
+                    validate_encoded_key_argument(key, "MVCC lock cursor key")?;
+                    keys.push(key.clone());
+                    if keys.len() > max_keys {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let has_more = keys.len() > max_keys;
+        keys.truncate(max_keys);
+        Ok(MvccKeyPage { keys, has_more })
+    }
+
+    fn lock_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        if max_locks == 0 || max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "MVCC lock cursor limits must be greater than zero".to_string(),
+            ));
+        }
+
+        let (_, upper) = encoded_scan_bounds(start, end)?;
+        if let Some(resume_after) = resume_after {
+            validate_encoded_key_argument(resume_after, "MVCC lock cursor resume key")?;
+            if end.is_some_and(|end| resume_after >= end) {
+                return Ok(IntentScanPage {
+                    locks: Vec::new(),
+                    has_more: false,
+                });
+            }
+        }
+
+        let lower = scan_lower_bound(start, resume_after);
+        let mut locks = Vec::new();
+        let mut encoded_bytes = 0usize;
+        for (key, lock) in self.locks.range((lower, upper)) {
+            if locks.len() >= max_locks {
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            let lock_bytes = lock
+                .to_proto()
+                .map_err(|error| Error::CorruptData(error.to_string()))?
+                .encoded_len();
+            let entry_bytes = key.len().checked_add(lock_bytes).ok_or_else(|| {
+                Error::InvalidArgument("MVCC lock cursor byte count overflowed".to_string())
+            })?;
+            let next_bytes = encoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+                Error::InvalidArgument("MVCC lock cursor byte count overflowed".to_string())
+            })?;
+            if next_bytes > max_bytes {
+                if locks.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "MVCC lock cursor byte budget is smaller than its first record".to_string(),
+                    ));
+                }
+                return Ok(IntentScanPage {
+                    locks,
+                    has_more: true,
+                });
+            }
+
+            encoded_bytes = next_bytes;
+            locks.push((key.clone(), lock.clone()));
+        }
+
+        Ok(IntentScanPage {
+            locks,
+            has_more: false,
+        })
+    }
+
+    fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
+        Ok(None)
+    }
+
+    fn export_snapshot(&self) -> Result<CapturedMvccState> {
+        let default_values = self
+            .default
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions.iter().map(move |(start_timestamp, row)| {
+                    snapshot_proto::DefaultValueEntry {
+                        key: key.clone(),
+                        start_timestamp: Some(start_timestamp.to_proto()),
+                        row: row.clone(),
+                    }
+                })
+            })
+            .collect();
+
+        let locks = self
+            .locks
+            .iter()
+            .map(|(key, record)| {
+                record.validate().map_err(|error| {
+                    Error::CorruptData(format!("in-memory lock cannot be exported: {error}"))
+                })?;
+                Ok(snapshot_proto::LockEntry {
+                    key: key.clone(),
+                    record: Some(record.to_proto().map_err(|error| {
+                        Error::CorruptData(format!("in-memory lock cannot be exported: {error}"))
+                    })?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let writes = self
+            .writes
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions.iter().map(move |(write_timestamp, record)| {
+                    validate_write_record(*write_timestamp, record)?;
+                    Ok(snapshot_proto::WriteEntry {
+                        key: key.clone(),
+                        write_timestamp: Some(write_timestamp.to_proto()),
+                        record: Some(record.to_proto().map_err(|error| {
+                            Error::CorruptData(format!(
+                                "in-memory write cannot be exported: {error}"
+                            ))
+                        })?),
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CapturedMvccState::new(default_values, locks, writes))
+    }
+}
+
+impl MvccBackend for InMemoryMvccBackend {
+    type PinnedGeneration = Self;
+
+    fn publish_atomic(&mut self, delta: MvccDelta) -> Result<()> {
+        let mut changed_records = BTreeSet::new();
+        for edit in &delta.edits {
+            let (family, key, timestamp) = match edit {
+                MvccRecordEdit::PutDefault { key, start_ts, row } => {
+                    validate_encoded_key_argument(key, "MVCC default edit key")?;
+                    decode_row(row).map_err(|error| {
+                        Error::InvalidArgument(format!(
+                            "default edit does not contain a canonical encoded row: {error}"
+                        ))
+                    })?;
+                    (0, key, start_ts.0)
+                }
+                MvccRecordEdit::DeleteDefault { key, start_ts } => {
+                    validate_encoded_key_argument(key, "MVCC default edit key")?;
+                    (0, key, start_ts.0)
+                }
+                MvccRecordEdit::PutLock { key, lock } => {
+                    validate_encoded_key_argument(key, "MVCC lock edit key")?;
+                    lock.validate().map_err(|error| {
+                        Error::CorruptData(format!("MVCC lock edit is invalid: {error}"))
+                    })?;
+                    (1, key, 0)
+                }
+                MvccRecordEdit::DeleteLock { key } => {
+                    validate_encoded_key_argument(key, "MVCC lock edit key")?;
+                    (1, key, 0)
+                }
+                MvccRecordEdit::PutWrite {
+                    key,
+                    write_ts,
+                    write,
+                } => {
+                    validate_encoded_key_argument(key, "MVCC write edit key")?;
+                    validate_write_record(*write_ts, write)?;
+                    (2, key, write_ts.0)
+                }
+            };
+
+            if !changed_records.insert((family, key.clone(), timestamp)) {
+                return Err(Error::InvalidArgument(
+                    "MVCC delta edits the same logical record more than once".to_string(),
+                ));
+            }
+        }
+
+        // All fallible checks precede the first map change. The remaining
+        // operations are deterministic edits to the single-owner reference map.
+        for edit in delta.edits {
+            match edit {
+                MvccRecordEdit::PutDefault { key, start_ts, row } => {
+                    self.default.entry(key).or_default().insert(start_ts, row);
+                }
+                MvccRecordEdit::DeleteDefault { key, start_ts } => {
+                    let remove_key = if let Some(versions) = self.default.get_mut(&key) {
+                        versions.remove(&start_ts);
+                        versions.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_key {
+                        self.default.remove(&key);
+                    }
+                }
+                MvccRecordEdit::PutLock { key, lock } => {
+                    self.locks.insert(key, lock);
+                }
+                MvccRecordEdit::DeleteLock { key } => {
+                    self.locks.remove(&key);
+                }
+                MvccRecordEdit::PutWrite {
+                    key,
+                    write_ts,
+                    write,
+                } => {
+                    self.writes.entry(key).or_default().insert(write_ts, write);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pin_generation(&self) -> Result<Self::PinnedGeneration> {
+        Ok(self.clone())
+    }
+
+    fn stats(&self) -> MvccStats {
+        self.compute_stats()
+    }
+
+    fn allocator_high_water_marks(&self) -> (TxnId, Timestamp) {
+        self.compute_allocator_high_water_marks()
+    }
+}
+
+impl InMemoryMvccBackend {
+    fn compute_stats(&self) -> MvccStats {
+        MvccStats {
+            default_keys: self.default.len(),
+            default_versions: self.default.values().map(BTreeMap::len).sum(),
+            default_version_chains: version_chain_stats(self.default.values().map(BTreeMap::len)),
+            locks: self.locks.len(),
+            write_keys: self.writes.len(),
+            write_records: self.writes.values().map(BTreeMap::len).sum(),
+            write_record_chains: version_chain_stats(self.writes.values().map(BTreeMap::len)),
+        }
+    }
+
+    fn compute_allocator_high_water_marks(&self) -> (TxnId, Timestamp) {
+        let mut max_transaction_id = TxnId(0);
+        let mut max_timestamp = Timestamp(0);
+
+        for versions in self.default.values() {
+            for start_timestamp in versions.keys() {
+                max_timestamp = Timestamp(max_timestamp.0.max(start_timestamp.0));
+            }
+        }
+        for lock in self.locks.values() {
+            max_transaction_id = TxnId(max_transaction_id.0.max(lock.txn_id.0));
+            max_timestamp = Timestamp(max_timestamp.0.max(lock.start_timestamp.0));
+        }
+        for versions in self.writes.values() {
+            for (commit_timestamp, record) in versions {
+                max_timestamp = Timestamp(
+                    max_timestamp
+                        .0
+                        .max(commit_timestamp.0)
+                        .max(record.start_timestamp.0),
+                );
+            }
+        }
+
+        (max_transaction_id, max_timestamp)
     }
 }
 
@@ -1995,60 +2840,6 @@ fn scan_lower_bound(start: Option<&[u8]>, resume_after: Option<&[u8]>) -> Bound<
     }
 }
 
-fn page_ordered_rows(
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    resume_after: Option<&[u8]>,
-    max_rows: usize,
-    max_bytes: usize,
-) -> Result<MvccScanPage> {
-    validate_scan_page_limits(max_rows, max_bytes)?;
-    encoded_scan_bounds(start, end)?;
-    if let Some(resume_after) = resume_after {
-        validate_encoded_key_argument(resume_after, "scan resume key")?;
-    }
-
-    let mut page = Vec::new();
-    let mut encoded_bytes = 0_usize;
-
-    for (key, row) in rows {
-        if start.is_some_and(|start| key.as_slice() < start)
-            || end.is_some_and(|end| key.as_slice() >= end)
-            || resume_after.is_some_and(|resume_after| key.as_slice() <= resume_after)
-        {
-            continue;
-        }
-
-        let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
-            Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
-        })?;
-        if page.len() >= max_rows
-            || encoded_bytes
-                .checked_add(row_bytes)
-                .is_none_or(|bytes| bytes > max_bytes)
-        {
-            if page.is_empty() {
-                return Err(Error::InvalidArgument(
-                    "scan page byte budget is smaller than the first encoded row".to_string(),
-                ));
-            }
-            return Ok(MvccScanPage {
-                rows: page,
-                has_more: true,
-            });
-        }
-
-        encoded_bytes += row_bytes;
-        page.push((key, row));
-    }
-
-    Ok(MvccScanPage {
-        rows: page,
-        has_more: false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2077,6 +2868,89 @@ mod tests {
 
     fn delete_batch(key: Vec<u8>) -> BTreeMap<Vec<u8>, Mutation> {
         BTreeMap::from([(key, Mutation::Delete)])
+    }
+
+    #[test]
+    fn write_cursor_resume_preserves_inclusive_range_edges() {
+        let key = encoded_key(1);
+        let mut backend = InMemoryMvccBackend::default();
+        backend.writes.insert(
+            key.clone(),
+            BTreeMap::from([
+                (
+                    Timestamp(7),
+                    WriteRecord {
+                        start_timestamp: Timestamp(5),
+                        commit_timestamp: Timestamp(7),
+                        op: WriteKind::Delete,
+                    },
+                ),
+                (
+                    Timestamp(9),
+                    WriteRecord {
+                        start_timestamp: Timestamp(8),
+                        commit_timestamp: Timestamp(9),
+                        op: WriteKind::Delete,
+                    },
+                ),
+            ]),
+        );
+
+        let forward = backend
+            .write_page(
+                &key,
+                Included(Timestamp(7)),
+                Unbounded,
+                Some(Timestamp(6)),
+                MvccCursorDirection::Forward,
+                1,
+            )
+            .unwrap();
+        assert_eq!(forward.writes[0].0, Timestamp(7));
+
+        let reverse = backend
+            .write_page(
+                &key,
+                Unbounded,
+                Included(Timestamp(7)),
+                Some(Timestamp(7)),
+                MvccCursorDirection::Reverse,
+                1,
+            )
+            .unwrap();
+        assert!(reverse.writes.is_empty());
+    }
+
+    /// This catches an in-flight tablet read that silently switches from its
+    /// pinned storage generation to records published after the read began.
+    #[test]
+    fn pinned_read_view_keeps_its_generation_after_live_commit() {
+        let key = encoded_key(1);
+        let before = encoded_row(1, "before");
+        let after = encoded_row(1, "after");
+        let mut engine = InMemoryMvcc::new();
+
+        engine
+            .commit_batch(
+                TxnId(1),
+                Timestamp(1),
+                Timestamp(2),
+                &put_batch(key.clone(), before.clone()),
+            )
+            .unwrap();
+        let pinned = engine.pin_read_view().unwrap();
+
+        engine
+            .commit_batch(
+                TxnId(2),
+                Timestamp(3),
+                Timestamp(4),
+                &put_batch(key.clone(), after.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(pinned.read(&key, Timestamp(5)).unwrap(), Some(before));
+        assert_eq!(engine.read(&key, Timestamp(5)).unwrap(), Some(after));
     }
 
     /// Install a valid single-key Put intent for batch atomicity tests.
@@ -2177,14 +3051,19 @@ mod tests {
             )
             .unwrap();
 
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(3),
-            WriteRecord {
-                start_timestamp: Timestamp(3),
-                commit_timestamp: Timestamp(3),
-                op: WriteKind::Rollback,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(3),
+                WriteRecord {
+                    start_timestamp: Timestamp(3),
+                    commit_timestamp: Timestamp(3),
+                    op: WriteKind::Rollback,
+                },
+            );
 
         assert_eq!(engine.read(&key, Timestamp(3)).unwrap(), Some(original));
 
@@ -2228,14 +3107,19 @@ mod tests {
                 &put_batch(key.clone(), encoded_row(1, "at-boundary")),
             )
             .unwrap();
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(9),
-            WriteRecord {
-                start_timestamp: Timestamp(9),
-                commit_timestamp: Timestamp(9),
-                op: WriteKind::Rollback,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(9),
+                WriteRecord {
+                    start_timestamp: Timestamp(9),
+                    commit_timestamp: Timestamp(9),
+                    op: WriteKind::Rollback,
+                },
+            );
 
         engine
             .validate_commit_batch(
@@ -2315,14 +3199,19 @@ mod tests {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(4),
-            WriteRecord {
-                start_timestamp: Timestamp(3),
-                commit_timestamp: Timestamp(4),
-                op: WriteKind::Rollback,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(4),
+                WriteRecord {
+                    start_timestamp: Timestamp(3),
+                    commit_timestamp: Timestamp(4),
+                    op: WriteKind::Rollback,
+                },
+            );
 
         let error = engine.read(&key, Timestamp(4)).unwrap_err();
 
@@ -2367,7 +3256,7 @@ mod tests {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
-        engine.locks.insert(
+        engine.backend.locks.insert(
             key.clone(),
             LockRecord {
                 txn_id: TxnId(9),
@@ -2390,7 +3279,7 @@ mod tests {
         let row = encoded_row(1, "value");
         let mut engine = InMemoryMvcc::new();
 
-        engine.locks.insert(
+        engine.backend.locks.insert(
             key.clone(),
             LockRecord {
                 txn_id: TxnId(1),
@@ -2440,7 +3329,7 @@ mod tests {
             ]
         );
 
-        engine.locks.insert(
+        engine.backend.locks.insert(
             second_key.clone(),
             LockRecord {
                 txn_id: TxnId(2),
@@ -2573,7 +3462,7 @@ mod tests {
         let keys = [encoded_key(1), encoded_key(2), encoded_key(3)];
         let mut engine = InMemoryMvcc::new();
         for (index, (key, start_timestamp)) in keys.iter().zip([3, 4, 9]).enumerate() {
-            engine.locks.insert(
+            engine.backend.locks.insert(
                 key.clone(),
                 LockRecord {
                     txn_id: TxnId(index as u64 + 1),
@@ -2590,7 +3479,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             first.locks,
-            vec![(keys[0].clone(), engine.locks[&keys[0]].clone())]
+            vec![(keys[0].clone(), engine.backend.locks[&keys[0]].clone())]
         );
         assert!(first.has_more);
 
@@ -2599,7 +3488,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             second.locks,
-            vec![(keys[1].clone(), engine.locks[&keys[1]].clone())]
+            vec![(keys[1].clone(), engine.backend.locks[&keys[1]].clone())]
         );
         assert!(!second.has_more);
 
@@ -2678,6 +3567,7 @@ mod tests {
             .unwrap();
 
         engine
+            .backend
             .writes
             .get_mut(&second_key)
             .unwrap()
@@ -2695,14 +3585,19 @@ mod tests {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(2),
-            WriteRecord {
-                start_timestamp: Timestamp(1),
-                commit_timestamp: Timestamp(2),
-                op: WriteKind::Put,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(2),
+                WriteRecord {
+                    start_timestamp: Timestamp(1),
+                    commit_timestamp: Timestamp(2),
+                    op: WriteKind::Put,
+                },
+            );
 
         let error = engine.read(&key, Timestamp(2)).unwrap_err();
 
@@ -2742,7 +3637,7 @@ mod tests {
         let row = encoded_row(1, "pending");
         let mut engine = InMemoryMvcc::new();
 
-        engine.locks.insert(
+        engine.backend.locks.insert(
             key.clone(),
             LockRecord {
                 txn_id: TxnId(9),
@@ -2776,14 +3671,19 @@ mod tests {
         let key = encoded_key(1);
         let mut engine = InMemoryMvcc::new();
 
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(1),
-            WriteRecord {
-                start_timestamp: Timestamp(1),
-                commit_timestamp: Timestamp(1),
-                op: WriteKind::Rollback,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(1),
+                WriteRecord {
+                    start_timestamp: Timestamp(1),
+                    commit_timestamp: Timestamp(1),
+                    op: WriteKind::Rollback,
+                },
+            );
 
         let mutations = put_batch(key, encoded_row(1, "delayed"));
         let stats_before = engine.stats();
@@ -2818,14 +3718,19 @@ mod tests {
             .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
             .unwrap();
 
-        engine.writes.entry(key.clone()).or_default().insert(
-            Timestamp(100),
-            WriteRecord {
-                start_timestamp: Timestamp(100),
-                commit_timestamp: Timestamp(100),
-                op: WriteKind::Rollback,
-            },
-        );
+        engine
+            .backend
+            .writes
+            .entry(key.clone())
+            .or_default()
+            .insert(
+                Timestamp(100),
+                WriteRecord {
+                    start_timestamp: Timestamp(100),
+                    commit_timestamp: Timestamp(100),
+                    op: WriteKind::Rollback,
+                },
+            );
 
         let error = engine
             .commit_intent(TxnId(44), Timestamp(100), Timestamp(110), &key)
@@ -2864,9 +3769,12 @@ mod tests {
         assert_eq!(engine.stats().default_versions, before.default_versions);
         assert_eq!(engine.stats().locks, before.locks);
         assert_eq!(engine.stats().write_records, before.write_records);
-        assert!(!engine.default.contains_key(&first_key));
-        assert!(!engine.locks.contains_key(&first_key));
-        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
+        assert!(!engine.backend.default.contains_key(&first_key));
+        assert!(!engine.backend.locks.contains_key(&first_key));
+        assert_eq!(
+            engine.backend.locks.get(&second_key).unwrap().txn_id,
+            TxnId(2)
+        );
     }
 
     #[test]
@@ -2888,8 +3796,14 @@ mod tests {
         assert_eq!(engine.stats().default_versions, 2);
         assert_eq!(engine.stats().locks, 2);
         assert_eq!(engine.stats().write_records, 0);
-        assert_eq!(engine.locks.get(&first_key).unwrap().txn_id, TxnId(1));
-        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
+        assert_eq!(
+            engine.backend.locks.get(&first_key).unwrap().txn_id,
+            TxnId(1)
+        );
+        assert_eq!(
+            engine.backend.locks.get(&second_key).unwrap().txn_id,
+            TxnId(2)
+        );
     }
 
     #[test]
@@ -2911,7 +3825,13 @@ mod tests {
         assert_eq!(engine.stats().default_versions, 2);
         assert_eq!(engine.stats().locks, 2);
         assert_eq!(engine.stats().write_records, 0);
-        assert_eq!(engine.locks.get(&first_key).unwrap().txn_id, TxnId(1));
-        assert_eq!(engine.locks.get(&second_key).unwrap().txn_id, TxnId(2));
+        assert_eq!(
+            engine.backend.locks.get(&first_key).unwrap().txn_id,
+            TxnId(1)
+        );
+        assert_eq!(
+            engine.backend.locks.get(&second_key).unwrap().txn_id,
+            TxnId(2)
+        );
     }
 }

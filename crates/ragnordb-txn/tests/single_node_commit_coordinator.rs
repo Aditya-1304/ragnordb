@@ -14,7 +14,7 @@ use ragnordb_common::{
 };
 use ragnordb_storage::{
     key::{encode_row_key, make_row_key},
-    mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
+    mvcc::{InMemoryMvcc, Mutation, MvccScanPage, MvccStats, MvccStorage},
     wal::{RagnorDbWalAdapter, RagnorDbWalRecordType, SingleNodeTxnCommit},
 };
 use ragnordb_txn::{LocalTransactionManager, SingleNodeCommitCoordinator, Transaction};
@@ -308,6 +308,19 @@ impl MvccStorage for FailApplyMvcc {
         read_ts: Timestamp,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan(start, end, read_ts)
+    }
+
+    fn scan_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        read_ts: Timestamp,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<MvccScanPage> {
+        self.inner
+            .scan_page(start, end, resume_after, read_ts, max_rows, max_bytes)
     }
 
     fn validate_commit_batch(
