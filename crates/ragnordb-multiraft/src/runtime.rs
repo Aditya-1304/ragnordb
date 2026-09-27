@@ -43,6 +43,7 @@ use raft::{
     },
     entry::EntryPayload,
     message::Envelope,
+    message::Message,
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{ConfChange, HardState, LogIndex, Snapshot, SnapshotMetadata, Term},
 };
@@ -530,6 +531,10 @@ where
     /// restarted nodes must initialize the persistence writer with
     /// `RaftWalStorage::from_recovered` before entering this runtime
     pub fn new(raft: RaftNode<Vec<u8>, Vec<u8>, LS, SS>, persistence: RaftWalStorage<W>) -> Self {
+        let mut raft = raft;
+        if crate::diagnostics::enabled() {
+            raft.enable_replication_timing();
+        }
         Self {
             raft,
             persistence,
@@ -550,6 +555,55 @@ where
 
     pub fn persistence(&self) -> &RaftWalStorage<W> {
         &self.persistence
+    }
+
+    fn record_pipeline_ready_generation(&self) {
+        if !crate::diagnostics::enabled() {
+            return;
+        }
+        let identity = self.persistence.log_view().identity();
+        metrics::counter!(
+            "ragnordb_raft_pipeline_ready_generations_total",
+            "raft_group_id" => identity.raft_group_id.0.to_string(),
+            "replica_id" => identity.replica_id.0.to_string()
+        )
+        .increment(1);
+    }
+
+    fn record_pipeline_wal_persist(
+        &self,
+        ready_created_at: Instant,
+        persist_started_at: Instant,
+        persist_elapsed: std::time::Duration,
+    ) {
+        if !crate::diagnostics::enabled() {
+            return;
+        }
+        let identity = self.persistence.log_view().identity();
+        let group_id = identity.raft_group_id.0.to_string();
+        let replica_id = identity.replica_id.0.to_string();
+        metrics::counter!(
+            "ragnordb_raft_pipeline_wal_syncs_total",
+            "raft_group_id" => group_id.clone(),
+            "replica_id" => replica_id.clone()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "ragnordb_raft_pipeline_ready_to_wal_sync_start_seconds",
+            "raft_group_id" => group_id.clone(),
+            "replica_id" => replica_id.clone()
+        )
+        .record(
+            persist_started_at
+                .saturating_duration_since(ready_created_at)
+                .as_secs_f64(),
+        );
+        metrics::histogram!(
+            "ragnordb_raft_pipeline_wal_sync_seconds",
+            "raft_group_id" => group_id,
+            "replica_id" => replica_id
+        )
+        .record(persist_elapsed.as_secs_f64());
     }
 
     /// returns the exact applied boundary observed by this ready loop
@@ -598,8 +652,11 @@ where
             }
 
             timing.persisted_at = Some(persisted_at);
-            metrics::histogram!("ragnordb_raft_proposal_to_persisted_seconds")
-                .record(persisted_at.duration_since(timing.proposed_at).as_secs_f64());
+            metrics::histogram!("ragnordb_raft_proposal_to_persisted_seconds").record(
+                persisted_at
+                    .duration_since(timing.proposed_at)
+                    .as_secs_f64(),
+            );
             if let Some(quorum_observed_at) = timing.quorum_observed_at {
                 metrics::histogram!("ragnordb_raft_persisted_to_quorum_seconds").record(
                     quorum_observed_at
@@ -692,12 +749,91 @@ where
     /// processes one inbound Raft message only after the previous Ready has
     /// been durably acknowledged
     pub fn step(&mut self, message: Envelope<Vec<u8>, Vec<u8>>) -> Result<(), ReadyLoopError> {
+        self.step_with_transport_receive_time(message, None)
+    }
+
+    /// Processes a transport message while preserving its local receive time
+    /// for the receive-to-Ready diagnostic interval.
+    pub fn step_with_transport_receive_time(
+        &mut self,
+        message: Envelope<Vec<u8>, Vec<u8>>,
+        transport_received_at: Option<Instant>,
+    ) -> Result<(), ReadyLoopError> {
         self.ensure_active()?;
         self.ensure_no_pending_ready()?;
 
-        self.raft
-            .step_checked(message)
-            .map_err(ReadyLoopError::Step)
+        let is_append_entries = matches!(&message.msg, Message::AppendEntries(_));
+        let observe_response = crate::diagnostics::enabled()
+            && matches!(&message.msg, Message::AppendEntriesResponse(_));
+        let response_step_started_at = observe_response.then(Instant::now);
+        let result = self.raft.step_checked(message);
+        if result.is_ok() && crate::diagnostics::enabled() {
+            let identity = self.persistence.log_view().identity();
+            let group_id = identity.raft_group_id.0.to_string();
+            if is_append_entries
+                && self.raft.ready().is_some()
+                && let Some(received_at) = transport_received_at
+            {
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_append_entries_receive_to_follower_ready_created_seconds",
+                    "raft_group_id" => group_id.clone(),
+                    "follower_replica_id" => identity.replica_id.0.to_string()
+                )
+                .record(received_at.elapsed().as_secs_f64());
+            }
+
+            if let Some(response_step_started_at) = response_step_started_at {
+                let response_elapsed = response_step_started_at.elapsed();
+                if let Some(timing) = self.raft.take_replication_response_timing() {
+                    let follower_id = timing.follower_id.get().to_string();
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_append_entries_response_raft_step_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_id.clone()
+                    )
+                    .record(response_elapsed.as_secs_f64());
+                    metrics::histogram!(
+                        "ragnordb_raft_pipeline_raft_step_to_match_advance_seconds",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_id.clone()
+                    )
+                    .record(timing.step_to_match_advance.as_secs_f64());
+                    metrics::counter!(
+                        "ragnordb_raft_pipeline_match_index_advances_total",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_id.clone()
+                    )
+                    .increment(1);
+                    metrics::gauge!(
+                        "ragnordb_raft_pipeline_follower_match_index",
+                        "raft_group_id" => group_id.clone(),
+                        "follower_replica_id" => follower_id.clone()
+                    )
+                    .set(timing.match_index as f64);
+                    if let Some(match_to_commit) = timing.match_advance_to_commit {
+                        metrics::histogram!(
+                            "ragnordb_raft_pipeline_match_advance_to_commit_advance_seconds",
+                            "raft_group_id" => group_id.clone(),
+                            "follower_replica_id" => follower_id.clone()
+                        )
+                        .record(match_to_commit.as_secs_f64());
+                        metrics::counter!(
+                            "ragnordb_raft_pipeline_commit_advances_after_follower_response_total",
+                            "raft_group_id" => group_id.clone(),
+                            "follower_replica_id" => follower_id.clone()
+                        )
+                        .increment(1);
+                        metrics::gauge!(
+                            "ragnordb_raft_pipeline_leader_commit_index",
+                            "raft_group_id" => group_id,
+                            "follower_replica_id" => follower_id
+                        )
+                        .set(timing.commit_index as f64);
+                    }
+                }
+            }
+        }
+        result.map_err(ReadyLoopError::Step)
     }
 
     /// admits one application proposal into the logical Raft overlay
@@ -819,7 +955,9 @@ where
 
             return Ok(None);
         };
+        let ready_created_at = Instant::now();
         metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
+        self.record_pipeline_ready_generation();
 
         match (ready.snapshot.as_ref(), snapshot_pointer.as_ref()) {
             (Some(snapshot), Some(pointer)) => {
@@ -840,7 +978,15 @@ where
             hard_state: ready.hard_state.clone(),
         };
 
-        match self.persistence.persist(batch) {
+        let persist_started_at = Instant::now();
+        let persistence_result = self.persistence.persist(batch);
+        self.record_pipeline_wal_persist(
+            ready_created_at,
+            persist_started_at,
+            persist_started_at.elapsed(),
+        );
+
+        match persistence_result {
             Ok(_) => {}
             Err(RaftPersistenceError::OutcomeUnknown { .. }) => {
                 let report_result = self.raft.report_persistence_outcome_unknown(ready.id);
@@ -877,9 +1023,7 @@ where
             }
         }
 
-        self.record_persisted_proposals(
-            ready.entries_to_persist.iter().map(|entry| entry.index),
-        );
+        self.record_persisted_proposals(ready.entries_to_persist.iter().map(|entry| entry.index));
 
         if let Err(error) = self.raft.advance_persisted(ready.id) {
             self.state = RuntimeState::RecoveryRequired;
@@ -923,6 +1067,7 @@ where
             return Ok(ReadyPersistenceProgress::default());
         };
         metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
+        self.record_pipeline_ready_generation();
 
         let ready_entries = ready.committed_entries.len();
         let ready_bytes = ready_apply_bytes(&ready);
@@ -1254,7 +1399,9 @@ where
         let Some(ready) = self.raft.ready() else {
             return Ok(None);
         };
+        let ready_created_at = Instant::now();
         metrics::counter!("ragnordb_raft_ready_generations_total").increment(1);
+        self.record_pipeline_ready_generation();
 
         let Some(snapshot) = ready.snapshot.as_ref() else {
             return Err(ReadyLoopError::UnexpectedSnapshotPointer);
@@ -1272,7 +1419,15 @@ where
             hard_state: ready.hard_state.clone(),
         };
 
-        match self.persistence.persist(batch) {
+        let persist_started_at = Instant::now();
+        let persistence_result = self.persistence.persist(batch);
+        self.record_pipeline_wal_persist(
+            ready_created_at,
+            persist_started_at,
+            persist_started_at.elapsed(),
+        );
+
+        match persistence_result {
             Ok(_) => {}
             Err(RaftPersistenceError::OutcomeUnknown { .. }) => {
                 let report_result = self.raft.report_persistence_outcome_unknown(ready.id);
@@ -1307,9 +1462,7 @@ where
             }
         }
 
-        self.record_persisted_proposals(
-            ready.entries_to_persist.iter().map(|entry| entry.index),
-        );
+        self.record_persisted_proposals(ready.entries_to_persist.iter().map(|entry| entry.index));
 
         self.raft.advance_persisted(ready.id).map_err(|error| {
             self.state = RuntimeState::RecoveryRequired;

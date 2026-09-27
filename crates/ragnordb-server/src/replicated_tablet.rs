@@ -13,7 +13,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use raft::{
@@ -188,6 +188,13 @@ pub struct ReplicatedTabletStatus {
     pub snapshot_term: u64,
     pub uncommitted_bytes: usize,
     pub replication_inflight_bytes: usize,
+    /// Per-replica replication-window occupancy, sampled with the Raft frontier.
+    pub replica_inflight_bytes: Vec<(u64, usize)>,
+    /// Sampled retained tablet state, populated only when Stage 3.5 diagnostics
+    /// are enabled for a short profiling run.
+    pub tablet_state_diagnostics: Option<ragnordb_tablet::command::TabletStateDiagnostics>,
+    /// Wall-clock timestamp for the latest state-growth sample.
+    pub state_diagnostics_sample_unix_nanos: Option<u64>,
     /// Locally admitted client proposals that still await a terminal outcome.
     pub pending_proposals: usize,
     pub apply_backlog_entries: usize,
@@ -353,6 +360,7 @@ enum RaftHostControl {
 
     Step {
         message: RaftMessageEnvelope,
+        transport_received_at: Option<Instant>,
         reply: mpsc::SyncSender<std::result::Result<RaftHostControlResult, HostedGroupError>>,
     },
 
@@ -1301,7 +1309,15 @@ impl ReplicatedTabletGroupProxy {
         let (reply, response) = mpsc::sync_channel(1);
         let control = match control {
             RaftHostControl::Tick { ticks, .. } => RaftHostControl::Tick { ticks, reply },
-            RaftHostControl::Step { message, .. } => RaftHostControl::Step { message, reply },
+            RaftHostControl::Step {
+                message,
+                transport_received_at,
+                ..
+            } => RaftHostControl::Step {
+                message,
+                transport_received_at,
+                reply,
+            },
             RaftHostControl::Propose {
                 command,
                 encoded_len,
@@ -1379,6 +1395,13 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
                 .into_iter()
                 .map(|(replica_id, index)| (ReplicaId(replica_id), index))
                 .collect(),
+            replica_inflight_bytes: status
+                .replica_inflight_bytes
+                .into_iter()
+                .map(|(replica_id, bytes)| (ReplicaId(replica_id), bytes))
+                .collect(),
+            tablet_state_diagnostics: status.tablet_state_diagnostics,
+            state_diagnostics_sample_unix_nanos: status.state_diagnostics_sample_unix_nanos,
             pending_conf_change_index: status.pending_conf_change_index,
             last_conf_change: status.last_conf_change,
             last_removed_replica: status.last_removed_replica.map(
@@ -1425,6 +1448,7 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
         }
         self.submit_direct(RaftHostControl::Step {
             message,
+            transport_received_at: None,
             reply: mpsc::sync_channel(1).0,
         })?;
 
@@ -1520,9 +1544,22 @@ impl HostedRaftGroup for ReplicatedTabletGroupProxy {
     fn step_and_prepare_budgeted(
         &mut self,
         message: RaftMessageEnvelope,
-        _budget: MultiRaftTurnBudget,
+        budget: MultiRaftTurnBudget,
     ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
-        self.submit_budgeted(|reply| RaftHostControl::Step { message, reply })
+        self.step_and_prepare_budgeted_with_receive_time(message, budget, None)
+    }
+
+    fn step_and_prepare_budgeted_with_receive_time(
+        &mut self,
+        message: RaftMessageEnvelope,
+        _budget: MultiRaftTurnBudget,
+        transport_received_at: Option<Instant>,
+    ) -> std::result::Result<HostedGroupTurn, HostedGroupError> {
+        self.submit_budgeted(|reply| RaftHostControl::Step {
+            message,
+            transport_received_at,
+            reply,
+        })
     }
 }
 
@@ -1871,21 +1908,18 @@ impl ReplicatedTabletHandle {
             .ok_or_else(|| Error::InvalidArgument("tablet request deadline overflowed".into()))?;
         let (reply, response) = mpsc::sync_channel(1);
         let queue_admission_started = Instant::now();
-        let admission = self
-            .requests
-            .send(HostRequest::Command {
-                request,
-                reply,
-                deadline,
-            });
+        let admission = self.requests.send(HostRequest::Command {
+            request,
+            reply,
+            deadline,
+        });
         crate::metrics::histogram_record(
             "ragnordb_tablet_command_queue_admission_seconds",
             queue_admission_started.elapsed().as_secs_f64(),
         );
-        admission
-            .map_err(|_| Error::ProposalUnavailable {
-                reason: "replicated tablet runtime has stopped".to_string(),
-            })?;
+        admission.map_err(|_| Error::ProposalUnavailable {
+            reason: "replicated tablet runtime has stopped".to_string(),
+        })?;
         let result = response
             .recv_timeout(timeout)
             .map_err(|_| Error::ProposalUnavailable {
@@ -2799,6 +2833,7 @@ where
     latest_snapshot: Option<TabletSnapshotImage>,
     last_snapshot_index: u64,
     last_snapshot_at: Instant,
+    last_state_diagnostics_sample_at: Instant,
     expected_snapshot_install: Option<SnapshotMetadata>,
     pending_snapshot_install: Option<PendingIncomingSnapshotInstall>,
     pending_local_snapshot: Option<PendingLocalSnapshotPublication>,
@@ -2875,6 +2910,7 @@ where
             latest_snapshot,
             last_snapshot_index,
             last_snapshot_at: Instant::now(),
+            last_state_diagnostics_sample_at: Instant::now(),
             expected_snapshot_install: None,
             pending_snapshot_install: None,
             pending_local_snapshot: None,
@@ -2982,6 +3018,7 @@ where
             latest_snapshot,
             last_snapshot_index,
             last_snapshot_at,
+            last_state_diagnostics_sample_at,
             expected_snapshot_install,
             pending_snapshot_install,
             pending_local_snapshot,
@@ -3141,7 +3178,11 @@ where
                         }
                     }
 
-                    RaftHostControl::Step { message, reply } => {
+                    RaftHostControl::Step {
+                        message,
+                        transport_received_at,
+                        reply,
+                    } => {
                         let result: std::result::Result<(), HostedGroupError> = (|| {
                             let had_pending_ready = ready_loop.has_pending_work();
                             if let Some(metadata) = drain_ready(
@@ -3166,7 +3207,9 @@ where
                                         .to_string(),
                                 ));
                             }
-                            ready_loop.step(message).map_err(classify_ready_error)?;
+                            ready_loop
+                                .step_with_transport_receive_time(message, transport_received_at)
+                                .map_err(classify_ready_error)?;
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
                                 &mut tablet,
@@ -4229,6 +4272,8 @@ where
                 .unwrap_or((0, 0)),
             pending_snapshot_install.is_some() || pending_local_snapshot.is_some(),
             registry.pending_count(),
+            tablet,
+            last_state_diagnostics_sample_at,
             *ownership,
             &status,
         );
@@ -6845,7 +6890,7 @@ fn send_messages(
         let carries_snapshot = matches!(message.msg, Message::InstallSnapshot(_));
         let target_node = transport.target_node_for_replica(target_replica);
 
-        if let Err(source) = transport.try_send(message) {
+        if let Err(source) = transport.try_send_after_persistence(message) {
             warn!(
                 node_id = transport.local_node_id().0,
                 group_id = transport.raft_group_id().0,
@@ -7165,6 +7210,8 @@ fn publish_status<W, LS, SS>(
     snapshot: (u64, u64),
     snapshot_install_pending: bool,
     pending_proposals: usize,
+    tablet: &TabletCommandApplier,
+    last_state_diagnostics_sample_at: &mut Instant,
     ownership: ReactorOwnership,
     status: &RwLock<ReplicatedTabletStatus>,
 ) where
@@ -7172,6 +7219,21 @@ fn publish_status<W, LS, SS>(
     LS: LogStore<Vec<u8>>,
     SS: StableStore,
 {
+    let sampled_state_diagnostics = if crate::metrics::stage35_diagnostics_enabled()
+        && last_state_diagnostics_sample_at.elapsed() >= Duration::from_secs(5)
+    {
+        *last_state_diagnostics_sample_at = Instant::now();
+        Some((
+            tablet.state_machine().state_diagnostics(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        ))
+    } else {
+        None
+    };
     let mut published = status
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7195,13 +7257,22 @@ fn publish_status<W, LS, SS>(
         published.applied_term = 0;
     }
     published.uncommitted_bytes = ready_loop.raft().uncommitted_bytes();
-    published.replication_inflight_bytes = ready_loop
+    published.replica_inflight_bytes = ready_loop
         .raft()
         .conf_state()
         .replication_targets()
         .into_iter()
-        .filter_map(|replica_id| ready_loop.raft().progress(replica_id))
-        .map(|progress| progress.inflight_bytes)
+        .filter_map(|replica_id| {
+            ready_loop
+                .raft()
+                .progress(replica_id)
+                .map(|progress| (replica_id.get(), progress.inflight_bytes))
+        })
+        .collect();
+    published.replication_inflight_bytes = published
+        .replica_inflight_bytes
+        .iter()
+        .map(|(_, bytes)| *bytes)
         .sum();
     published.pending_proposals = pending_proposals;
     let apply_backlog = ready_loop.apply_backlog_status();
@@ -7233,6 +7304,15 @@ fn publish_status<W, LS, SS>(
         .into_iter()
         .map(|(replica_id, index)| (replica_id.get(), index))
         .collect();
+    if let Some((diagnostics, sampled_at_unix_nanos)) = sampled_state_diagnostics {
+        record_tablet_state_diagnostics_metrics(
+            ready_loop.persistence().log_view().identity(),
+            &diagnostics,
+            sampled_at_unix_nanos,
+        );
+        published.tablet_state_diagnostics = Some(diagnostics);
+        published.state_diagnostics_sample_unix_nanos = Some(sampled_at_unix_nanos);
+    }
     published.pending_conf_change_index = ready_loop.raft().pending_conf_change_index();
     published.last_conf_change = ready_loop.raft().last_applied_conf_change();
     published.last_removed_replica = ready_loop
@@ -7247,6 +7327,97 @@ fn publish_status<W, LS, SS>(
         .raft()
         .durable_conf_state()
         .map(|conf_state| conf_state.contains(local_replica));
+}
+
+fn record_tablet_state_diagnostics_metrics(
+    identity: RaftReplicaIdentity,
+    diagnostics: &ragnordb_tablet::command::TabletStateDiagnostics,
+    sampled_at_unix_nanos: u64,
+) {
+    let group_id = identity.raft_group_id.0.to_string();
+    let replica_id = identity.replica_id.0.to_string();
+    let mvcc = diagnostics.mvcc;
+    macro_rules! set_state_gauge {
+        ($name:literal, $value:expr) => {
+            metrics::gauge!(
+                $name,
+                "raft_group_id" => group_id.clone(),
+                "replica_id" => replica_id.clone()
+            )
+            .set($value as f64)
+        };
+    }
+
+    set_state_gauge!("ragnordb_tablet_mvcc_default_keys", mvcc.default_keys);
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_versions",
+        mvcc.default_versions
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_chain_max",
+        mvcc.default_version_chains.max_per_key
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_chain_one_key_count",
+        mvcc.default_version_chains.one
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_chain_two_to_four_key_count",
+        mvcc.default_version_chains.two_to_four
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_chain_five_to_sixteen_key_count",
+        mvcc.default_version_chains.five_to_sixteen
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_default_chain_more_than_sixteen_key_count",
+        mvcc.default_version_chains.more_than_sixteen
+    );
+    set_state_gauge!("ragnordb_tablet_mvcc_write_keys", mvcc.write_keys);
+    set_state_gauge!("ragnordb_tablet_mvcc_write_records", mvcc.write_records);
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_write_chain_max",
+        mvcc.write_record_chains.max_per_key
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_write_chain_one_key_count",
+        mvcc.write_record_chains.one
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_write_chain_two_to_four_key_count",
+        mvcc.write_record_chains.two_to_four
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_write_chain_five_to_sixteen_key_count",
+        mvcc.write_record_chains.five_to_sixteen
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_mvcc_write_chain_more_than_sixteen_key_count",
+        mvcc.write_record_chains.more_than_sixteen
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_cached_legacy_outcomes",
+        diagnostics.legacy_cached_outcomes
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_cached_logical_outcomes",
+        diagnostics.logical_cached_outcomes
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_retry_floor_entries",
+        diagnostics.retry_floor_entries
+    );
+    set_state_gauge!(
+        "ragnordb_tablet_transaction_status_records",
+        diagnostics.transaction_status_records
+    );
+    set_state_gauge!("ragnordb_tablet_mvcc_locks", mvcc.locks);
+    metrics::gauge!(
+        "ragnordb_tablet_state_diagnostics_sample_unix_seconds",
+        "raft_group_id" => group_id,
+        "replica_id" => replica_id
+    )
+    .set(sampled_at_unix_nanos as f64 / 1_000_000_000.0);
 }
 
 #[cfg(test)]
@@ -8307,6 +8478,7 @@ mod tests {
         control_tx
             .send(RaftHostControl::Step {
                 message,
+                transport_received_at: None,
                 reply: step_reply_tx,
             })
             .unwrap();

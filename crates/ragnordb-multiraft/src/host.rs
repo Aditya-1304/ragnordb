@@ -23,7 +23,7 @@ use raft::{
         read_index::{ReadIndexError, ReadState},
         ready::AdvanceError,
     },
-    message::Envelope,
+    message::{Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{ConfChange, ConfState, LogIndex, Role, Term},
 };
@@ -56,6 +56,22 @@ pub type RaftMessageEnvelope = Envelope<Vec<u8>, Vec<u8>>;
 pub struct RoutedRaftMessage {
     pub raft_group_id: RaftGroupId,
     pub envelope: RaftMessageEnvelope,
+    /// Process-local and wire-carried timestamps used only by opt-in
+    /// Stage 3.5.2b diagnostics. These fields never affect Raft decisions.
+    pub diagnostics: RoutedRaftMessageDiagnostics,
+}
+
+/// Diagnostic timestamps attached to one routed message while it crosses the
+/// persistence, transport, and host scheduling boundaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutedRaftMessageDiagnostics {
+    /// Local monotonic completion of the Ready persistence that released this
+    /// message, when the message depends on a persisted Ready.
+    pub persistence_completed_at: Option<Instant>,
+    /// Sender wall-clock enqueue time carried across the physical connection.
+    pub transport_enqueued_unix_nanos: u64,
+    /// Local monotonic time at which the transport decoded the complete frame.
+    pub transport_received_at: Option<Instant>,
 }
 
 /// Result of admitting one client command to a particular hosted group.
@@ -239,6 +255,13 @@ pub struct MultiRaftGroupStatus {
     /// Latest per-replica replication match frontier, including the local
     /// replica. This is diagnostic state and never drives host placement.
     pub replica_match_indices: Vec<(ReplicaId, u64)>,
+    /// Latest per-follower replication window occupancy in encoded bytes.
+    pub replica_inflight_bytes: Vec<(ReplicaId, usize)>,
+    /// State-growth snapshot sampled by the tablet owner only in diagnostic
+    /// mode; absent for lightweight and non-tablet group adapters.
+    pub tablet_state_diagnostics: Option<ragnordb_tablet::command::TabletStateDiagnostics>,
+    /// Wall-clock time of the last state-growth snapshot, in Unix nanoseconds.
+    pub state_diagnostics_sample_unix_nanos: Option<u64>,
     /// First unapplied configuration entry, if one is outstanding.
     pub pending_conf_change_index: Option<u64>,
     /// Exact latest committed configuration entry `(index, term)`, when the
@@ -422,6 +445,7 @@ pub struct MultiRaftPersistenceStatus {
 pub(crate) struct HostedPersistenceBatch {
     records: Box<[HostedPersistenceRecord]>,
     encoded_bytes: usize,
+    ready_created_at: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -447,6 +471,7 @@ impl HostedPersistenceBatch {
         Self {
             records,
             encoded_bytes,
+            ready_created_at: Instant::now(),
         }
     }
 
@@ -633,6 +658,7 @@ struct PendingMessage {
 #[derive(Debug)]
 struct PendingPersistenceGroup {
     raft_group_id: RaftGroupId,
+    replica_id: u64,
     timer_due: bool,
     batch: HostedPersistenceBatch,
     /// Monotonic admission time used to measure bounded-queue residence.
@@ -947,18 +973,55 @@ fn append_prepared_batch<W: RaftWal>(
         })
     } else {
         let sync_started_at = Instant::now();
+        if crate::diagnostics::enabled() {
+            for pending in groups {
+                if pending.record_count() == 0 {
+                    continue;
+                }
+                let group_id = pending.raft_group_id.0.to_string();
+                let replica_id = pending.replica_id.to_string();
+                metrics::counter!(
+                    "ragnordb_raft_pipeline_wal_syncs_total",
+                    "raft_group_id" => group_id.clone(),
+                    "replica_id" => replica_id.clone()
+                )
+                .increment(1);
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_ready_to_wal_sync_start_seconds",
+                    "raft_group_id" => group_id,
+                    "replica_id" => replica_id
+                )
+                .record(
+                    sync_started_at
+                        .saturating_duration_since(pending.batch.ready_created_at)
+                        .as_secs_f64(),
+                );
+            }
+        }
         metrics::counter!("ragnordb_awal_sync_calls_total").increment(1);
-        metrics::counter!("ragnordb_awal_sync_records_total")
-            .increment(total_records as u64);
+        metrics::counter!("ragnordb_awal_sync_records_total").increment(total_records as u64);
         metrics::counter!("ragnordb_awal_sync_bytes_total").increment(total_bytes as u64);
         metrics::counter!("ragnordb_awal_sync_groups_total").increment(groups.len() as u64);
-        metrics::histogram!("ragnordb_awal_records_per_sync")
-            .record(total_records as f64);
+        metrics::histogram!("ragnordb_awal_records_per_sync").record(total_records as f64);
         metrics::histogram!("ragnordb_awal_bytes_per_sync").record(total_bytes as f64);
         metrics::histogram!("ragnordb_awal_groups_per_sync").record(groups.len() as f64);
         let result = node_wal.append_batch_and_sync(&records);
+        let sync_elapsed = sync_started_at.elapsed();
         metrics::histogram!("ragnordb_awal_sync_latency_seconds")
-            .record(sync_started_at.elapsed().as_secs_f64());
+            .record(sync_elapsed.as_secs_f64());
+        if crate::diagnostics::enabled() {
+            for pending in groups {
+                if pending.record_count() == 0 {
+                    continue;
+                }
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_wal_sync_seconds",
+                    "raft_group_id" => pending.raft_group_id.0.to_string(),
+                    "replica_id" => pending.replica_id.to_string()
+                )
+                .record(sync_elapsed.as_secs_f64());
+            }
+        }
         result
     };
 
@@ -1098,6 +1161,9 @@ pub trait HostedRaftGroup: Send {
             learners: Vec::new(),
             outgoing_voters: Vec::new(),
             replica_match_indices: Vec::new(),
+            replica_inflight_bytes: Vec::new(),
+            tablet_state_diagnostics: None,
+            state_diagnostics_sample_unix_nanos: None,
             pending_conf_change_index: None,
             last_conf_change: None,
             last_removed_replica: None,
@@ -1230,6 +1296,17 @@ pub trait HostedRaftGroup: Send {
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
         self.step_and_drain_budgeted(message, budget)
+    }
+
+    /// Process a routed transport message while retaining its local receive
+    /// timestamp through Ready creation when the adapter supports that trace.
+    fn step_and_prepare_budgeted_with_receive_time(
+        &mut self,
+        message: RaftMessageEnvelope,
+        budget: MultiRaftTurnBudget,
+        _transport_received_at: Option<Instant>,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.step_and_prepare_budgeted(message, budget)
     }
 
     /// Complete a group whose records were included in the shared WAL batch.
@@ -1490,6 +1567,15 @@ where
             .filter_map(|replica_id| raft.progress(replica_id))
             .map(|progress| progress.inflight_bytes)
             .sum();
+        let replica_inflight_bytes = raft
+            .conf_state()
+            .replication_targets()
+            .into_iter()
+            .filter_map(|replica_id| {
+                raft.progress(replica_id)
+                    .map(|progress| (ReplicaId::from_raft(replica_id), progress.inflight_bytes))
+            })
+            .collect();
         let apply_backlog = self.ready_loop.apply_backlog_status();
 
         MultiRaftGroupStatus {
@@ -1540,6 +1626,9 @@ where
                 .into_iter()
                 .map(|(replica_id, index)| (ReplicaId::from_raft(replica_id), index))
                 .collect(),
+            replica_inflight_bytes,
+            tablet_state_diagnostics: None,
+            state_diagnostics_sample_unix_nanos: None,
             pending_conf_change_index: raft.pending_conf_change_index(),
             last_conf_change: raft.last_applied_conf_change(),
             last_removed_replica: raft.last_removed_replica().map(
@@ -1786,6 +1875,15 @@ where
         message: RaftMessageEnvelope,
         budget: MultiRaftTurnBudget,
     ) -> Result<HostedGroupTurn, HostedGroupError> {
+        self.step_and_prepare_budgeted_with_receive_time(message, budget, None)
+    }
+
+    fn step_and_prepare_budgeted_with_receive_time(
+        &mut self,
+        message: RaftMessageEnvelope,
+        budget: MultiRaftTurnBudget,
+        transport_received_at: Option<Instant>,
+    ) -> Result<HostedGroupTurn, HostedGroupError> {
         // A direct compatibility operation may have completed a ReadIndex and
         // retained its state for publication by the next bounded host turn.
         // Process the queued Raft message before exposing that state: a higher
@@ -1793,7 +1891,7 @@ where
         // would make a same-turn stale-read result observable.
         if !self.ready_loop.has_pending_work() && !self.deferred_read_states.is_empty() {
             self.ready_loop
-                .step(message)
+                .step_with_transport_receive_time(message, transport_received_at)
                 .map_err(classify_ready_error)?;
             return self.prepare_ready_budgeted(budget);
         }
@@ -1808,7 +1906,7 @@ where
         }
 
         self.ready_loop
-            .step(message)
+            .step_with_transport_receive_time(message, transport_received_at)
             .map_err(classify_ready_error)?;
         let after_step = self.prepare_ready_budgeted(budget)?;
         turn.outbound.extend(after_step.outbound);
@@ -2689,6 +2787,28 @@ where
                     .expect("a processed message must be present")
                     .clone()
             });
+            let pipeline_message_timing = pending_message.as_ref().map(|pending| {
+                let envelope = &pending.message.envelope;
+                (
+                    matches!(&envelope.msg, Message::AppendEntriesResponse(_)),
+                    envelope.from.get(),
+                    envelope.to.get(),
+                    pending.message.diagnostics.transport_received_at,
+                )
+            });
+
+            if process_message
+                && crate::diagnostics::enabled()
+                && let Some((true, source_replica_id, _, Some(received_at))) =
+                    pipeline_message_timing
+            {
+                metrics::histogram!(
+                    "ragnordb_raft_pipeline_append_entries_response_receive_to_step_seconds",
+                    "raft_group_id" => raft_group_id.0.to_string(),
+                    "follower_replica_id" => source_replica_id.to_string()
+                )
+                .record(received_at.elapsed().as_secs_f64());
+            }
 
             if had_message && !process_message {
                 let message = pending_message.take().expect("message was checked above");
@@ -2722,9 +2842,11 @@ where
                     .expect("runnable group came from the active registry");
 
                 match (process_message, pending_message.take()) {
-                    (true, Some(message)) => {
-                        group.step_and_prepare_budgeted(message.message.envelope, group_budget)
-                    }
+                    (true, Some(message)) => group.step_and_prepare_budgeted_with_receive_time(
+                        message.message.envelope,
+                        group_budget,
+                        message.message.diagnostics.transport_received_at,
+                    ),
                     (false, None) | (false, Some(_)) => {
                         group.tick_and_prepare_budgeted(group_timer_ticks, group_budget)
                     }
@@ -2744,8 +2866,16 @@ where
                     result.snapshot_bytes += turn.snapshot_bytes;
 
                     if let Some(batch) = turn.persistence {
+                        let replica_id = self
+                            .groups
+                            .get(&raft_group_id)
+                            .expect("persistence output belongs to a registered group")
+                            .identity()
+                            .replica_id
+                            .0;
                         let pending = PendingPersistenceGroup {
                             raft_group_id,
+                            replica_id,
                             timer_due: rearm_timer,
                             batch,
                             admitted_at: Instant::now(),
@@ -2799,6 +2929,7 @@ where
                             .extend(turn.outbound.into_iter().map(|envelope| RoutedRaftMessage {
                                 raft_group_id,
                                 envelope,
+                                diagnostics: RoutedRaftMessageDiagnostics::default(),
                             }));
 
                         self.ensure_shared_wal_healthy_for_turn()?;
@@ -2892,6 +3023,7 @@ where
 
                 match completion {
                     Ok(turn) => {
+                        let persistence_completed_at = Instant::now();
                         result.apply_entries += turn.apply_entries;
                         result.snapshot_bytes += turn.snapshot_bytes;
                         result.read_states.extend(
@@ -2909,6 +3041,10 @@ where
                                 .map(|envelope| RoutedRaftMessage {
                                     raft_group_id,
                                     envelope,
+                                    diagnostics: RoutedRaftMessageDiagnostics {
+                                        persistence_completed_at: Some(persistence_completed_at),
+                                        ..RoutedRaftMessageDiagnostics::default()
+                                    },
                                 }),
                         );
 
@@ -3333,6 +3469,7 @@ where
                 .map(|envelope| RoutedRaftMessage {
                     raft_group_id,
                     envelope,
+                    diagnostics: RoutedRaftMessageDiagnostics::default(),
                 })
                 .collect(),
         })
@@ -3477,6 +3614,7 @@ where
                 .map(|envelope| RoutedRaftMessage {
                     raft_group_id,
                     envelope,
+                    diagnostics: RoutedRaftMessageDiagnostics::default(),
                 })
                 .collect(),
         })
@@ -4060,12 +4198,14 @@ mod tests {
         assert_eq!(
             host.route(RoutedRaftMessage {
                 raft_group_id: RaftGroupId(11),
-                envelope: inbound
+                envelope: inbound,
+                diagnostics: RoutedRaftMessageDiagnostics::default(),
             })
             .unwrap(),
             vec![RoutedRaftMessage {
                 raft_group_id: RaftGroupId(11),
-                envelope: outbound
+                envelope: outbound,
+                diagnostics: RoutedRaftMessageDiagnostics::default(),
             }]
         );
     }
@@ -4615,6 +4755,7 @@ mod tests {
         service
             .try_submit(PendingPersistenceGroup {
                 raft_group_id: first_identity.raft_group_id,
+                replica_id: first_identity.replica_id.0,
                 timer_due: false,
                 batch: HostedPersistenceBatch::new(vec![
                     (RecordType::new(101), b"first-entry".to_vec()),
@@ -4637,6 +4778,7 @@ mod tests {
         assert!(matches!(
             service.try_submit(PendingPersistenceGroup {
                 raft_group_id: second_identity.raft_group_id,
+                replica_id: second_identity.replica_id.0,
                 timer_due: false,
                 batch: HostedPersistenceBatch::new(vec![(
                     RecordType::new(201),
@@ -4862,6 +5004,7 @@ mod tests {
                         vote_granted: true,
                     }),
                 },
+                diagnostics: RoutedRaftMessageDiagnostics::default(),
             })
             .unwrap();
         }
@@ -4909,6 +5052,7 @@ mod tests {
                     vote_granted: true,
                 }),
             },
+            diagnostics: RoutedRaftMessageDiagnostics::default(),
         };
 
         host.enqueue_message(message()).unwrap();
@@ -4966,6 +5110,7 @@ mod tests {
                     leader_commit: 0,
                 }),
             },
+            diagnostics: RoutedRaftMessageDiagnostics::default(),
         })
         .unwrap();
         host.enqueue_message(RoutedRaftMessage {
@@ -4978,6 +5123,7 @@ mod tests {
                     vote_granted: true,
                 }),
             },
+            diagnostics: RoutedRaftMessageDiagnostics::default(),
         })
         .unwrap();
 
@@ -5105,6 +5251,9 @@ mod tests {
                 learners: Vec::new(),
                 outgoing_voters: Vec::new(),
                 replica_match_indices: Vec::new(),
+                replica_inflight_bytes: Vec::new(),
+                tablet_state_diagnostics: None,
+                state_diagnostics_sample_unix_nanos: None,
                 pending_conf_change_index: None,
                 last_conf_change: None,
                 last_removed_replica: None,
@@ -5157,6 +5306,7 @@ mod tests {
                     vote_granted: true,
                 }),
             },
+            diagnostics: RoutedRaftMessageDiagnostics::default(),
         };
         assert_eq!(
             host.enqueue_message(message),
@@ -5189,6 +5339,7 @@ mod tests {
                     vote_granted: true,
                 }),
             },
+            diagnostics: RoutedRaftMessageDiagnostics::default(),
         };
         assert!(matches!(
             host.enqueue_message(message),

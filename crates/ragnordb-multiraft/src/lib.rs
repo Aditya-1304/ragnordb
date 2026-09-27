@@ -1,6 +1,7 @@
 use ragnordb_common::ids::NodeId;
 
 pub mod bootstrap;
+pub(crate) mod diagnostics;
 pub mod host;
 pub mod membership;
 pub mod meta;

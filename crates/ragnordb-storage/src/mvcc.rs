@@ -75,10 +75,40 @@ impl Mutation {
     }
 }
 
-/// diagnostic counters for the in memory MVCC engine
+/// Distribution of retained versions or write records across keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VersionChainStats {
+    /// Number of keys that currently retain exactly one version or record.
+    pub one: usize,
+    /// Number of keys with two through four versions or records.
+    pub two_to_four: usize,
+    /// Number of keys with five through sixteen versions or records.
+    pub five_to_sixteen: usize,
+    /// Number of keys with more than sixteen versions or records.
+    pub more_than_sixteen: usize,
+    /// Largest version or record chain retained for any one key.
+    pub max_per_key: usize,
+}
+
+fn version_chain_stats(lengths: impl Iterator<Item = usize>) -> VersionChainStats {
+    lengths.fold(VersionChainStats::default(), |mut stats, length| {
+        stats.max_per_key = stats.max_per_key.max(length);
+        match length {
+            0 => {}
+            1 => stats.one += 1,
+            2..=4 => stats.two_to_four += 1,
+            5..=16 => stats.five_to_sixteen += 1,
+            _ => stats.more_than_sixteen += 1,
+        }
+        stats
+    })
+}
+
+/// Diagnostic counters for the in-memory MVCC engine.
 ///
-/// these counters describe logical in memory state they are not durability
-/// or replication metrics
+/// These values describe logical retained state. Computing the totals and
+/// chain distributions walks the version maps, so callers should sample them
+/// for diagnostics rather than on every transaction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MvccStats {
     /// number of distinct row keys with at least one default value
@@ -86,6 +116,9 @@ pub struct MvccStats {
 
     /// total number of default value version
     pub default_versions: usize,
+
+    /// Distribution of retained default-value versions across keys.
+    pub default_version_chains: VersionChainStats,
 
     /// number of unresolved locks
     pub locks: usize,
@@ -95,6 +128,9 @@ pub struct MvccStats {
 
     /// total number of Put, Delete and Rollback write records.
     pub write_records: usize,
+
+    /// Distribution of retained write records across keys.
+    pub write_record_chains: VersionChainStats,
 }
 
 /// One bounded, ordered MVCC scan response.
@@ -756,9 +792,12 @@ impl InMemoryMvcc {
             return Ok(());
         };
 
-        for (stored_write_ts, write) in write_versions {
-            validate_write_record(*stored_write_ts, write)?;
-
+        // Write records are validated when they are published or restored. A
+        // conflict check only needs this transaction's rollback witness and
+        // writes newer than its snapshot; scanning older history on every
+        // prewrite made steady-state writes slower as chains grew.
+        if let Some(write) = write_versions.get(&start_ts) {
+            validate_write_record(start_ts, write)?;
             if write.op == WriteKind::Rollback && write.start_timestamp == start_ts {
                 return Err(Error::WriteConflict(format!(
                     "transaction starting at timestamp {} was already rolled back",
@@ -767,11 +806,12 @@ impl InMemoryMvcc {
             }
         }
 
-        if let Some((conflicting_write_ts, _)) = write_versions
+        if let Some((conflicting_write_ts, conflicting_write)) = write_versions
             .range((Excluded(start_ts), Unbounded))
             .rev()
             .find(|(_, write)| write.op != WriteKind::Rollback)
         {
+            validate_write_record(*conflicting_write_ts, conflicting_write)?;
             return Err(Error::WriteConflict(format!(
                 "row was modified at timestamp {} after transaction start \
              timestamp {}",
@@ -1644,9 +1684,11 @@ impl MvccStorage for InMemoryMvcc {
         MvccStats {
             default_keys: self.default.len(),
             default_versions: self.default.values().map(BTreeMap::len).sum(),
+            default_version_chains: version_chain_stats(self.default.values().map(BTreeMap::len)),
             locks: self.locks.len(),
             write_keys: self.writes.len(),
             write_records: self.writes.values().map(BTreeMap::len).sum(),
+            write_record_chains: version_chain_stats(self.writes.values().map(BTreeMap::len)),
         }
     }
 

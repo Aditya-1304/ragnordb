@@ -4,6 +4,12 @@ use std::{sync::OnceLock, time::Instant};
 use tracing::warn;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static STAGE35_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+/// Enable sampled state-growth snapshots for a short Stage 3.5.2b run.
+pub(crate) fn stage35_diagnostics_enabled() -> bool {
+    *STAGE35_DIAGNOSTICS.get_or_init(|| std::env::var_os("RAGNORDB_STAGE35_DIAGNOSTICS").is_some())
+}
 
 pub fn init_metrics() {
     if PROMETHEUS_HANDLE.get().is_some() {

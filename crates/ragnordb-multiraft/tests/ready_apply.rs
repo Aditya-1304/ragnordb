@@ -522,6 +522,7 @@ fn host_turn_discards_deferred_read_state_after_same_turn_higher_term_message() 
                 context: b"stale-after-demotion".to_vec(),
             }),
         },
+        diagnostics: ragnordb_multiraft::host::RoutedRaftMessageDiagnostics::default(),
     })
     .unwrap();
 

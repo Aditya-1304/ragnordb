@@ -22,7 +22,7 @@ use ragnordb_common::{
 };
 use ragnordb_storage::{
     key::decode_row_key,
-    mvcc::{InMemoryMvcc, Mutation, MvccStorage},
+    mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
 
 use crate::Tablet;
@@ -57,6 +57,20 @@ pub struct TabletStateMachine<S = InMemoryMvcc> {
     transaction_statuses: BTreeMap<ragnordb_common::ids::TxnId, TxnStatusRecord>,
 }
 
+/// On-demand counts for investigating retained state growth in one tablet.
+///
+/// The MVCC portion walks the current in-memory version maps. Callers should
+/// sample this snapshot at diagnostic checkpoints, not on the transaction
+/// apply path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabletStateDiagnostics {
+    pub mvcc: MvccStats,
+    pub legacy_cached_outcomes: usize,
+    pub logical_cached_outcomes: usize,
+    pub retry_floor_entries: usize,
+    pub transaction_status_records: usize,
+}
+
 impl<S: MvccStorage> TabletStateMachine<S> {
     /// bind a tablet to the non-zero descriptor epoch represented by this
     /// state-machine instance
@@ -81,6 +95,17 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             logical_client_retry_horizons: BTreeMap::new(),
             transaction_statuses: BTreeMap::new(),
         })
+    }
+
+    /// Capture a state-growth snapshot for an explicit diagnostics sample.
+    pub fn state_diagnostics(&self) -> TabletStateDiagnostics {
+        TabletStateDiagnostics {
+            mvcc: self.tablet.stats(),
+            legacy_cached_outcomes: self.client_deduplication.len(),
+            logical_cached_outcomes: self.logical_command_deduplication.len(),
+            retry_floor_entries: self.logical_client_retry_horizons.len(),
+            transaction_status_records: self.transaction_statuses.len(),
+        }
     }
 
     /// Borrow the tablet state owned by this replicated state machine.
