@@ -36,7 +36,7 @@
 //! into raft
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Bound::{self, Excluded, Included, Unbounded},
 };
 
@@ -102,33 +102,6 @@ fn timestamp_range_is_empty(lower: &Bound<Timestamp>, upper: &Bound<Timestamp>) 
         | (Bound::Excluded(lower), Bound::Included(upper))
         | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
     }
-}
-
-fn merge_key_pages(left: Vec<Vec<u8>>, right: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut merged = Vec::with_capacity(left.len().saturating_add(right.len()));
-    let (mut left_index, mut right_index) = (0, 0);
-
-    while left_index < left.len() && right_index < right.len() {
-        match left[left_index].cmp(&right[right_index]) {
-            std::cmp::Ordering::Less => {
-                merged.push(left[left_index].clone());
-                left_index += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                merged.push(right[right_index].clone());
-                right_index += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                merged.push(left[left_index].clone());
-                left_index += 1;
-                right_index += 1;
-            }
-        }
-    }
-
-    merged.extend(left[left_index..].iter().cloned());
-    merged.extend(right[right_index..].iter().cloned());
-    merged
 }
 
 /// A transaction local mutation waiting to be committed
@@ -256,6 +229,107 @@ pub struct MvccKeyPage {
     pub keys: Vec<Vec<u8>>,
     /// Whether the backend has another matching key after this page.
     pub has_more: bool,
+}
+
+/// Maintains an independent bounded cursor for one logical key family while
+/// scans merge keys from writes and locks in canonical row-key order.
+struct MvccFamilyKeyCursor {
+    family: MvccKeyFamily,
+    resume_after: Option<Vec<u8>>,
+    buffered: VecDeque<Vec<u8>>,
+    exhausted: bool,
+}
+
+impl MvccFamilyKeyCursor {
+    fn new(family: MvccKeyFamily, resume_after: Option<&[u8]>) -> Self {
+        Self {
+            family,
+            resume_after: resume_after.map(ToOwned::to_owned),
+            buffered: VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    /// Refill only after the current bounded page has been consumed. Advancing
+    /// one family's physical cursor never changes the other family's position.
+    fn fill<R: MvccReadGeneration + ?Sized>(
+        &mut self,
+        generation: &R,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<()> {
+        if self.exhausted || !self.buffered.is_empty() {
+            return Ok(());
+        }
+
+        let page = generation.key_page(
+            self.family,
+            start,
+            end,
+            self.resume_after.as_deref(),
+            MVCC_ROW_CURSOR_PAGE_SIZE,
+        )?;
+
+        if page.keys.is_empty() {
+            if page.has_more {
+                return Err(Error::CorruptData(
+                    "MVCC key cursor returned an empty page with has_more=true".to_string(),
+                ));
+            }
+
+            self.exhausted = true;
+            return Ok(());
+        }
+
+        self.resume_after = page.keys.last().cloned();
+        self.exhausted = !page.has_more;
+        self.buffered.extend(page.keys);
+
+        Ok(())
+    }
+}
+
+/// Return the next distinct key in the ordered union of the write and lock
+/// families while retaining separate physical continuation positions.
+fn next_candidate_key<R: MvccReadGeneration + ?Sized>(
+    generation: &R,
+    writes: &mut MvccFamilyKeyCursor,
+    locks: &mut MvccFamilyKeyCursor,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    writes.fill(generation, start, end)?;
+    locks.fill(generation, start, end)?;
+
+    let write_key = writes.buffered.front().cloned();
+    let lock_key = locks.buffered.front().cloned();
+
+    match (write_key, lock_key) {
+        (None, None) => Ok(None),
+        (Some(key), None) => {
+            writes.buffered.pop_front();
+            Ok(Some(key))
+        }
+        (None, Some(key)) => {
+            locks.buffered.pop_front();
+            Ok(Some(key))
+        }
+        (Some(write_key), Some(lock_key)) => match write_key.cmp(&lock_key) {
+            std::cmp::Ordering::Less => {
+                writes.buffered.pop_front();
+                Ok(Some(write_key))
+            }
+            std::cmp::Ordering::Greater => {
+                locks.buffered.pop_front();
+                Ok(Some(lock_key))
+            }
+            std::cmp::Ordering::Equal => {
+                writes.buffered.pop_front();
+                locks.buffered.pop_front();
+                Ok(Some(write_key))
+            }
+        },
+    }
 }
 
 /// A bounded page from one row's committed write history.
@@ -459,7 +533,7 @@ pub trait MvccReadGeneration {
 /// another read generation that stays stable while newer deltas are published.
 pub trait MvccBackend: MvccReadGeneration {
     /// Immutable generation handle returned by [`Self::pin_generation`].
-    type PinnedGeneration: MvccReadGeneration;
+    type PinnedGeneration: MvccReadGeneration + Send + Sync + 'static;
 
     /// Publish all edits in one MVCC delta or leave the generation unchanged.
     fn publish_atomic(&mut self, delta: MvccDelta) -> Result<()>;
@@ -859,9 +933,10 @@ impl<B: MvccBackend> MvccEngine<B> {
         self.pin_read_view()?.capture_snapshot_state()
     }
 
-    /// Return the recovery boundary belonging to one newly pinned generation.
+    /// Return the backend's current recovery boundary without pinning a read
+    /// generation or materializing a snapshot of its records.
     pub fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
-        self.pin_read_view()?.recovery_frontier()
+        self.backend.recovery_frontier()
     }
 }
 
@@ -1880,76 +1955,50 @@ fn scan_page_from<R: MvccReadGeneration + ?Sized>(
 
     let mut rows = Vec::new();
     let mut encoded_bytes = 0_usize;
-    let mut candidate_resume = resume_after.map(ToOwned::to_owned);
+    let mut writes = MvccFamilyKeyCursor::new(MvccKeyFamily::Writes, resume_after);
+    let mut locks = MvccFamilyKeyCursor::new(MvccKeyFamily::Locks, resume_after);
 
     loop {
-        let writes = generation.key_page(
-            MvccKeyFamily::Writes,
-            start,
-            end,
-            candidate_resume.as_deref(),
-            MVCC_ROW_CURSOR_PAGE_SIZE,
-        )?;
-        let locks = generation.key_page(
-            MvccKeyFamily::Locks,
-            start,
-            end,
-            candidate_resume.as_deref(),
-            MVCC_ROW_CURSOR_PAGE_SIZE,
-        )?;
-        let has_more_candidates = writes.has_more || locks.has_more;
-        let candidates = merge_key_pages(writes.keys, locks.keys);
-        if candidates.is_empty() {
-            return Ok(MvccScanPage {
-                rows,
-                has_more: has_more_candidates,
-            });
-        }
-
-        for key in candidates {
-            candidate_resume = Some(key.clone());
-
-            // Locks must participate even when they have no committed
-            // history; otherwise a scan could pass a locked insertion.
-            let Some(row) = read_visible_version(generation, &key, read_ts)? else {
-                continue;
-            };
-
-            if rows.len() >= max_rows {
-                return Ok(MvccScanPage {
-                    rows,
-                    has_more: true,
-                });
-            }
-
-            let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
-                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
-            })?;
-            let next_bytes = encoded_bytes.checked_add(row_bytes).ok_or_else(|| {
-                Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
-            })?;
-            if next_bytes > max_bytes {
-                if rows.is_empty() {
-                    return Err(Error::InvalidArgument(
-                        "scan page byte budget is smaller than the first encoded row".to_string(),
-                    ));
-                }
-                return Ok(MvccScanPage {
-                    rows,
-                    has_more: true,
-                });
-            }
-
-            encoded_bytes = next_bytes;
-            rows.push((key, row));
-        }
-
-        if !has_more_candidates {
+        let Some(key) = next_candidate_key(generation, &mut writes, &mut locks, start, end)? else {
             return Ok(MvccScanPage {
                 rows,
                 has_more: false,
             });
+        };
+
+        // Locks must participate even when they have no committed history;
+        // otherwise a scan could pass a locked insertion.
+        let Some(row) = read_visible_version(generation, &key, read_ts)? else {
+            continue;
+        };
+
+        if rows.len() >= max_rows {
+            return Ok(MvccScanPage {
+                rows,
+                has_more: true,
+            });
         }
+
+        let row_bytes = key.len().checked_add(row.len()).ok_or_else(|| {
+            Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+        })?;
+        let next_bytes = encoded_bytes.checked_add(row_bytes).ok_or_else(|| {
+            Error::InvalidArgument("scan page encoded byte count overflowed".to_string())
+        })?;
+        if next_bytes > max_bytes {
+            if rows.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "scan page byte budget is smaller than the first encoded row".to_string(),
+                ));
+            }
+            return Ok(MvccScanPage {
+                rows,
+                has_more: true,
+            });
+        }
+
+        encoded_bytes = next_bytes;
+        rows.push((key, row));
     }
 }
 
@@ -2871,6 +2920,63 @@ mod tests {
     }
 
     #[test]
+    fn backend_atomic_publish_rejects_invalid_late_edit_without_partial_publication() {
+        let first_key = encoded_key(1);
+        let second_key = encoded_key(2);
+
+        let mut backend = InMemoryMvccBackend::default();
+
+        let delta = MvccDelta {
+            edits: vec![
+                MvccRecordEdit::PutDefault {
+                    key: first_key.clone(),
+                    start_ts: Timestamp(1),
+                    row: encoded_row(1, "valid"),
+                },
+                MvccRecordEdit::PutDefault {
+                    key: second_key,
+                    start_ts: Timestamp(2),
+                    row: vec![0xff],
+                },
+            ],
+        };
+
+        let error = backend.publish_atomic(delta).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(backend.default.is_empty());
+        assert!(backend.locks.is_empty());
+        assert!(backend.writes.is_empty());
+    }
+
+    #[test]
+    fn backend_atomic_publish_rejects_duplicate_record_edits_without_mutation() {
+        let key = encoded_key(1);
+
+        let mut backend = InMemoryMvccBackend::default();
+
+        let delta = MvccDelta {
+            edits: vec![
+                MvccRecordEdit::PutDefault {
+                    key: key.clone(),
+                    start_ts: Timestamp(1),
+                    row: encoded_row(1, "first"),
+                },
+                MvccRecordEdit::PutDefault {
+                    key,
+                    start_ts: Timestamp(1),
+                    row: encoded_row(1, "second"),
+                },
+            ],
+        };
+
+        let error = backend.publish_atomic(delta).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(backend.default.is_empty());
+    }
+
+    #[test]
     fn write_cursor_resume_preserves_inclusive_range_edges() {
         let key = encoded_key(1);
         let mut backend = InMemoryMvccBackend::default();
@@ -3452,6 +3558,40 @@ mod tests {
             byte_budget
         );
         assert!(byte_page.has_more);
+    }
+
+    #[test]
+    fn scan_does_not_skip_write_keys_when_lock_cursor_runs_ahead() {
+        let mut engine = InMemoryMvcc::new();
+
+        let mutations = (1_i64..=200)
+            .map(|id| (encoded_key(id), Mutation::Put(encoded_row(id, "committed"))))
+            .collect::<BTreeMap<_, _>>();
+
+        engine
+            .commit_batch(TxnId(1), Timestamp(1), Timestamp(2), &mutations)
+            .unwrap();
+
+        // Keep this future lock beyond the first bounded write-key page. It
+        // must remain invisible to this read timestamp without moving the
+        // independent write-family cursor past committed rows.
+        let future_lock_key = encoded_key(10_000);
+        engine.backend.locks.insert(
+            future_lock_key.clone(),
+            LockRecord {
+                txn_id: TxnId(999),
+                primary_key: future_lock_key,
+                start_timestamp: Timestamp(100),
+                ttl_ms: 30_000,
+                op: WriteKind::Put,
+            },
+        );
+
+        let rows = engine.scan(None, None, Timestamp(2)).unwrap();
+
+        assert_eq!(rows.len(), 200);
+        assert_eq!(rows.first().unwrap().0, encoded_key(1));
+        assert_eq!(rows.last().unwrap().0, encoded_key(200));
     }
 
     #[test]
