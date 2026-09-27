@@ -15,10 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ragnordb_bench::lsm_layout::{
     BENCHMARK_LOCK_VALUE_BYTES, BENCHMARK_WRITE_VALUE_BYTES, EXPERIMENTAL_ENCODING_VERSION, Engine,
-    KeyScratch, Layout, Namespace, RecordEdit, WriteKind, WriteRecord,
+    KeyScratch, Layout, Namespace, RecordEdit, WriteKind, WriteRecord, encode_candidate_b_key_into,
 };
 use ragnordb_common::{codec::Value, ids::TableId};
 use ragnordb_storage::key::{encode_row_key, make_row_key};
@@ -237,6 +237,29 @@ fn commit_edits(profile: Profile) -> Vec<RecordEdit> {
     edits
 }
 
+/// Restores each commit fixture to a genuine prewrite state outside timing.
+fn commit_reset_edits(profile: Profile) -> Vec<RecordEdit> {
+    let mut edits = Vec::with_capacity(96);
+    for index in 0..32 {
+        let key = encoded_key(i64::MAX - index as i64 - 100);
+        let start_ts = profile.latest_ts() + 100 + (index as u64 * 2);
+        edits.push(RecordEdit {
+            key: key.clone(),
+            namespace: Namespace::Default,
+            timestamp: Some(start_ts),
+            value: None,
+        });
+        edits.push(RecordEdit {
+            key: key.clone(),
+            namespace: Namespace::Write,
+            timestamp: Some(start_ts + 1),
+            value: None,
+        });
+        edits.push(RecordEdit::put_lock(key));
+    }
+    edits
+}
+
 fn rollback_edit(profile: Profile, key: &[u8]) -> Vec<RecordEdit> {
     vec![RecordEdit::put_write(
         key.to_vec(),
@@ -270,6 +293,7 @@ fn bench_engine_profile(
     let rollback_key = &keys[rollback_index];
     let miss_key = encoded_key(i64::MAX - 7);
     let batch = commit_edits(profile);
+    let batch_reset = commit_reset_edits(profile);
     let rollback = rollback_edit(profile, &miss_key);
     let mut group =
         criterion.benchmark_group(format!("stage4_2/{}/{}", profile.name, layout_name(layout)));
@@ -323,10 +347,20 @@ fn bench_engine_profile(
         });
     });
     group.bench_function("intent_commit_batch_32", |bencher| {
-        bencher.iter(|| {
-            engine.publish_atomic(black_box(&batch)).unwrap();
-            black_box(())
-        });
+        bencher.iter_batched(
+            || {
+                engine
+                    .publish_atomic(&batch_reset)
+                    .expect("commit benchmark setup must restore intents");
+            },
+            |_| {
+                engine
+                    .publish_atomic(black_box(&batch))
+                    .expect("commit benchmark batch must publish");
+                black_box(())
+            },
+            BatchSize::SmallInput,
+        );
     });
     group.bench_function("rollback_publish", |bencher| {
         bencher.iter(|| {
@@ -714,11 +748,10 @@ fn encode_physical_key(
                 _ => namespace as u8,
             });
         }
-        Layout::SeparateFamilies => match namespace {
-            Namespace::Lock => encoded.extend_from_slice(key),
-            Namespace::Default | Namespace::Write => encode_prefix(key, encoded),
-            _ => unreachable!(),
-        },
+        Layout::SeparateFamilies => {
+            encode_candidate_b_key_into(namespace, key, timestamp, encoded);
+            return;
+        }
         Layout::UnifiedFamilyFirst => {
             encoded.push(namespace as u8);
             encode_prefix(key, encoded);

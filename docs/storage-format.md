@@ -86,6 +86,17 @@ bytes. The V1 decoder accepts only `0x00 0xff` as an escaped zero and
 namespace IDs, malformed escapes, truncated components, invalid identity
 shapes, and timestamp suffixes on unversioned namespaces are corruption.
 
+### Format-version coexistence
+
+One mutable generation, immutable run, SST comparator domain, and MANIFEST
+generation uses exactly one internal-key format and comparator identity. V1
+keys and keys from a future format version must not coexist in one ordered
+family and be interpreted as one logical MVCC keyspace. A format migration
+must either rewrite the complete affected generation into the new format
+before publication, or retain distinct versioned readers and segment sets
+until the old generation is retired. The leading format byte identifies
+compatibility; it does not make mixed comparators safe in one tree.
+
 Versioned namespaces append `(!timestamp).to_be_bytes()`. For a fixed logical
 identity, newer timestamps therefore compare before older timestamps. The
 timestamp coordinate is Default `start_ts`, committed Write `commit_ts`,
@@ -105,6 +116,28 @@ The namespace mapping in `lsm/internal_key.rs` is explicit in both directions.
 No Rust enum discriminant is serialized. Golden tests in that module freeze
 exact bytes for every namespace, including the intentional Write-key identity
 shared by committed writes and rollback witnesses.
+
+### Range-tombstone physical invariant
+
+`RangeTombstone` belongs to the Write physical family for atomic publication,
+resource ownership, recovery, and compaction scheduling, but its namespace is
+comparator-disjoint from ordinary Write point records. Because namespace bytes
+precede the logical identity, ordinary `InternalKeyV1` point-key minimum and
+maximum bounds alone cannot prove semantic overlap with range tombstones.
+
+V1 SSTables represent range tombstones in a dedicated checked range-deletion
+section or meta-block, or an equivalent separately indexed structure, inside
+the Write-family segment. Tombstone metadata retains logical row coverage
+independently of point-key bounds. Reads consult every relevant tombstone
+covering the requested row, and range scans merge point records with deletion
+state. Flush and compaction fragment or normalize overlapping tombstones so
+coverage can be searched without a linear scan. The compaction picker accounts
+for tombstone logical spans even when ordinary InternalKeyV1 namespace ranges
+do not overlap. Compaction output clips or propagates tombstones without
+exposing covered data at any protected MVCC timestamp. Tombstones remain until
+GC and snapshot protection prove that no supported read can observe the
+covered older versions. Stage 4.5 must satisfy these invariants before range
+deletion is enabled in the production LSM.
 
 ## Value and record-kind boundary
 
@@ -140,9 +173,9 @@ version change.
 | Large atomic apply | Compute a checked upper bound including key/value and in-memory index overhead. If a delta does not fit the remaining arena, freeze the current generation and apply to a fresh one. Reject a single delta whose upper bound exceeds 64 MiB before Raft proposal. | Avoids an unbounded large-batch allocation and does not split one command across visibility boundaries. Stage 4.3 must make this admission decision before proposal; apply may not discover the limit after committing the command. |
 | Immutable queue | Up to 4 immutable generations per tablet; throttle new user proposals at 2 | Gives flush work a small bounded queue while retaining headroom to schedule storage workers. Before proposal, reserve memory for the complete delta and a future immutable slot; already accepted proposals retain that reservation through apply. |
 | L0 organization | Overlap is allowed across L0 sublevels; files in one sublevel/family are non-overlapping; each flush generation forms one sublevel in every non-empty family | Preserves flush ordering without requiring a global merge at each flush. A large flush may emit adjacent non-overlapping files in that sublevel. |
-| L0 compaction trigger | Schedule urgent L0 compaction at 4 sublevels; stop admitting new user writes at 12 sublevels | Four is the conventional baseline exercised by the model; 12 is a safety ceiling selected to bound read amplification. Both require real workload validation. |
-| Level count and ratio | 7 total levels: L0 plus L1–L6; target size ratio 10:1 | Conventional leveled baseline with room for tablet data growth; not copied from the prototype's 4-level model. |
-| L1 base target | 640 MiB; multiply each later level target by 10 | Equals ten 64 MiB target files at L1 and keeps the stated ratio interpretable. These are compaction targets, not hard file-size limits. |
+| L0 compaction trigger | Per active physical family, schedule urgent L0 compaction at 4 sublevels; stop admitting new user writes at 12 sublevels | Four is the conventional baseline exercised by the model; 12 is a safety ceiling selected to bound read amplification. Both require real workload validation. |
+| Level count and ratio | Per active physical family, 7 levels: L0 plus L1–L6; target size ratio 10:1 | Conventional leveled baseline with room for family data growth; not copied from the prototype's 4-level model. |
+| L1 base target | 640 MiB per active physical family; multiply each later level target by 10 per family | Equals ten 64 MiB target files at L1 within each family and keeps the stated ratio interpretable. This is not a tablet-wide aggregate; the node resource governor accounts for family and tablet totals. These are compaction targets, not hard file-size limits. |
 | SST target | 64 MiB | Limits per-file index/filter metadata while keeping flush/compaction output large enough to amortize file operations. Split at key boundaries; never split one atomic record. |
 | SST hard maximum | 256 MiB per segment | Four times the target permits bounded oversized output while giving readers a strict allocation/validation ceiling. |
 | Data block target and maximum | 16 KiB target; 64 KiB hard maximum, uncompressed | A point-read/cache tradeoff starting point with a finite decode bound. The prototype's 4 KiB block was an experimental model parameter and is not promoted to V1. |

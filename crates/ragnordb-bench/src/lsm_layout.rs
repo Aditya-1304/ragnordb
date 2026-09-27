@@ -562,31 +562,12 @@ fn physical_key_into(layout: Layout, edit: &RecordEdit, scratch: &mut KeyScratch
                     .extend_from_slice(&(!timestamp).to_be_bytes());
             }
         }
-        Layout::SeparateFamilies => match edit.namespace {
-            Namespace::Default | Namespace::Write => {
-                encode_logical_prefix_into(&edit.key, &mut scratch.encoded);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-                if let Some(timestamp) = edit.timestamp {
-                    scratch
-                        .encoded
-                        .extend_from_slice(&(!timestamp).to_be_bytes());
-                }
-            }
-            Namespace::Lock => {
-                scratch.encoded.extend_from_slice(&edit.key);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-            }
-            _ => {
-                scratch.encoded.push(edit.namespace.id());
-                encode_logical_prefix_into(&edit.key, &mut scratch.encoded);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-                if let Some(timestamp) = edit.timestamp {
-                    scratch
-                        .encoded
-                        .extend_from_slice(&(!timestamp).to_be_bytes());
-                }
-            }
-        },
+        Layout::SeparateFamilies => encode_candidate_b_key_into(
+            edit.namespace,
+            &edit.key,
+            edit.timestamp,
+            &mut scratch.encoded,
+        ),
         Layout::UnifiedFamilyFirst => {
             scratch.encoded.push(edit.namespace.id());
             encode_logical_prefix_into(&edit.key, &mut scratch.encoded);
@@ -618,6 +599,26 @@ fn encode_logical_prefix_into(logical_key: &[u8], output: &mut Vec<u8>) {
         }
     }
     output.extend_from_slice(&[0, 0]);
+}
+
+/// Encode Candidate B keys using the frozen InternalKeyV1 structure.
+///
+/// This helper is shared by the logical map benchmark and the modeled block
+/// path so that both exercise the same version, namespace, framing, and
+/// descending-timestamp bytes as the production codec.
+pub fn encode_candidate_b_key_into(
+    namespace: Namespace,
+    logical_key: &[u8],
+    timestamp: Option<u64>,
+    output: &mut Vec<u8>,
+) {
+    output.clear();
+    output.push(KEY_FORMAT_VERSION);
+    output.push(namespace.id());
+    encode_logical_prefix_into(logical_key, output);
+    if let Some(timestamp) = timestamp {
+        output.extend_from_slice(&(!timestamp).to_be_bytes());
+    }
 }
 
 fn decode_logical_prefix(encoded: &[u8], offset: usize, output: &mut Vec<u8>) -> Option<usize> {
@@ -665,27 +666,12 @@ fn lookup_key_into(
                     .extend_from_slice(&(!timestamp).to_be_bytes());
             }
         }
-        Layout::SeparateFamilies => match namespace {
-            Namespace::Default | Namespace::Write => {
-                encode_logical_prefix_into(key, &mut scratch.encoded);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-                scratch
-                    .encoded
-                    .extend_from_slice(&(!timestamp).to_be_bytes());
-            }
-            Namespace::Lock => {
-                scratch.encoded.extend_from_slice(key);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-            }
-            _ => {
-                scratch.encoded.push(namespace.id());
-                encode_logical_prefix_into(key, &mut scratch.encoded);
-                scratch.encoded.push(KEY_FORMAT_VERSION);
-                scratch
-                    .encoded
-                    .extend_from_slice(&(!timestamp).to_be_bytes());
-            }
-        },
+        Layout::SeparateFamilies => encode_candidate_b_key_into(
+            namespace,
+            key,
+            (namespace != Namespace::Lock).then_some(timestamp),
+            &mut scratch.encoded,
+        ),
         Layout::UnifiedFamilyFirst => {
             scratch.encoded.push(namespace.id());
             encode_logical_prefix_into(key, &mut scratch.encoded);
@@ -778,7 +764,11 @@ fn write_prefix_into(layout: Layout, key: &[u8], scratch: &mut KeyScratch) {
             encode_logical_prefix_into(key, &mut scratch.prefix);
             scratch.prefix.push(0x01);
         }
-        Layout::SeparateFamilies => encode_logical_prefix_into(key, &mut scratch.prefix),
+        Layout::SeparateFamilies => {
+            scratch.prefix.push(KEY_FORMAT_VERSION);
+            scratch.prefix.push(Namespace::Write.id());
+            encode_logical_prefix_into(key, &mut scratch.prefix);
+        }
         Layout::UnifiedFamilyFirst => {
             scratch.prefix.push(Namespace::Write.id());
             encode_logical_prefix_into(key, &mut scratch.prefix);
@@ -799,9 +789,10 @@ fn next_row_cursor(layout: Layout, row: &[u8], cursor: &mut Vec<u8>) {
             cursor.extend_from_slice(&[0xff; 16]);
         }
         Layout::SeparateFamilies => {
-            encode_logical_prefix_into(row, cursor);
             cursor.push(KEY_FORMAT_VERSION);
-            cursor.extend_from_slice(&[0xff; 16]);
+            cursor.push(Namespace::Write.id());
+            encode_logical_prefix_into(row, cursor);
+            cursor.extend_from_slice(&[0xff; 9]);
         }
         Layout::UnifiedFamilyFirst => {
             cursor.push(Namespace::Write.id());
@@ -886,18 +877,31 @@ fn next_tree_candidate(
     let mut next_cursor = cursor.to_vec();
     loop {
         let (first_key, _) = writes.range(next_cursor.clone()..).next()?;
-        decode_logical_prefix(first_key, 0, &mut scratch.logical)?;
+        if first_key.first().copied()? != KEY_FORMAT_VERSION
+            || first_key.get(1).copied()? != Namespace::Write.id()
+        {
+            return None;
+        }
+        let identity_end = decode_logical_prefix(first_key, 2, &mut scratch.logical)?;
+        if first_key.len() != identity_end + 8 {
+            return None;
+        }
         let row = scratch.logical.clone();
         scratch.prefix.clear();
+        scratch.prefix.push(KEY_FORMAT_VERSION);
+        scratch.prefix.push(Namespace::Write.id());
         encode_logical_prefix_into(&row, &mut scratch.prefix);
         scratch.encoded.clear();
         scratch.encoded.extend_from_slice(&scratch.prefix);
-        scratch.encoded.push(KEY_FORMAT_VERSION);
         scratch.encoded.extend_from_slice(&(!read_ts).to_be_bytes());
 
         for (physical, value) in writes.range(scratch.encoded.clone()..) {
             if !physical.starts_with(&scratch.prefix) {
                 break;
+            }
+            let write_ts = decode_timestamp(physical, scratch.prefix.len())?;
+            if write_ts > read_ts {
+                continue;
             }
             if let Some(write) = decode_write_value(value)
                 && write.commit_ts <= read_ts
@@ -1009,22 +1013,81 @@ mod tests {
             Layout::UnifiedFamilyFirst,
         ] {
             physical_key_into(layout, &write, &mut scratch);
-            assert!(scratch.encoded.ends_with(&write_suffix));
+            if layout == Layout::SeparateFamilies {
+                assert!(scratch.encoded.ends_with(&(!8_u64).to_be_bytes()));
+            } else {
+                assert!(scratch.encoded.ends_with(&write_suffix));
+            }
             assert_eq!(
                 write.value.as_ref().unwrap()[..2],
                 [VALUE_FORMAT_VERSION, WRITE_VALUE_KIND]
             );
 
             physical_key_into(layout, &default, &mut scratch);
-            assert!(scratch.encoded.ends_with(&default_suffix));
+            if layout == Layout::SeparateFamilies {
+                assert!(scratch.encoded.ends_with(&(!7_u64).to_be_bytes()));
+            } else {
+                assert!(scratch.encoded.ends_with(&default_suffix));
+            }
             assert_eq!(
                 default.value.as_ref().unwrap()[..2],
                 [VALUE_FORMAT_VERSION, DEFAULT_VALUE_KIND]
             );
 
             physical_key_into(layout, &lock, &mut scratch);
-            assert!(scratch.encoded.ends_with(&[KEY_FORMAT_VERSION]));
+            if layout == Layout::SeparateFamilies {
+                assert!(scratch.encoded.ends_with(&[0, 0]));
+            } else {
+                assert!(scratch.encoded.ends_with(&[KEY_FORMAT_VERSION]));
+            }
             assert_eq!(lock.value.as_ref().unwrap().len(), LOCK_VALUE_BYTES);
+        }
+    }
+
+    #[test]
+    fn candidate_b_row_keys_match_frozen_internal_key_v1() {
+        use ragnordb_common::{
+            codec::Value,
+            ids::{TableId, Timestamp},
+        };
+        use ragnordb_storage::{
+            key::{encode_row_key, make_row_key},
+            lsm::internal_key::InternalKeyV1,
+        };
+
+        let row = encode_row_key(&make_row_key(TableId(44), &[Value::Int(123)]).unwrap()).unwrap();
+        let cases = [
+            (
+                RecordEdit::put_default(row.clone(), 7, b"value"),
+                InternalKeyV1::for_default(&row, Timestamp(7))
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            ),
+            (
+                RecordEdit::put_write(
+                    row.clone(),
+                    WriteRecord {
+                        start_ts: 7,
+                        commit_ts: 8,
+                        kind: WriteKind::Put,
+                    },
+                ),
+                InternalKeyV1::for_write(&row, Timestamp(8))
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            ),
+            (
+                RecordEdit::put_lock(row.clone()),
+                InternalKeyV1::for_lock(&row).unwrap().encode().unwrap(),
+            ),
+        ];
+
+        let mut scratch = KeyScratch::default();
+        for (edit, expected) in cases {
+            physical_key_into(Layout::SeparateFamilies, &edit, &mut scratch);
+            assert_eq!(scratch.encoded, expected);
         }
     }
 
