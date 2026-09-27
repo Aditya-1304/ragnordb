@@ -5,5 +5,6 @@
 //! different types and cannot be ordered against one another.
 
 pub mod frontier;
+pub mod internal_key;
 
 pub use frontier::{RecoveryFrontier, RecoveryFrontierError, ReplicatedWalMapping};
