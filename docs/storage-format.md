@@ -1,19 +1,17 @@
 # Tablet-local LSM storage format
 
-Status: the V1 logical key codec and initial physical-design defaults are
-specified, but Stage 4.2's layout decision remains open after the corrected
-A/B/C benchmark. This document does not claim that SSTables, MANIFEST
-publication, memtables, or durable `CommandDelta` are implemented. Those arrive
-in the ordered later stages, with real-file crash/reopen validation before the
-engine is enabled.
+Status: **Stage 4.2 is closed with Candidate B selected for V1.** The corrected
+full-matrix benchmark, format contract, and design rationale are recorded in
+[stage4_2_lsm_layout_decision.md](design/stage4_2_lsm_layout_decision.md). This
+document does not claim that SSTables, MANIFEST publication, memtables, or
+durable `CommandDelta` are implemented. Those arrive in the ordered later
+stages, with real-file crash/reopen validation before the engine is enabled.
 
 ## Ownership and physical layout
 
-The current V1 key codec represents Candidate B: separate logical Default,
-Write, and Lock trees inside one tablet-replica storage lifetime. The corrected
-benchmark reopened the Candidate A/B layout decision; this physical-family
-choice is not formally closed for Stage 4.2. A lifetime is identified by
-`(tablet_id, raft_group_id, replica_id)`; it has one MANIFEST lineage, one
+Candidate B is the selected V1 layout: separate logical Default, Write, and
+Lock trees inside one tablet-replica storage lifetime. A lifetime is identified
+by `(tablet_id, raft_group_id, replica_id)`; it has one MANIFEST lineage, one
 recovery frontier, one atomic publication boundary, and one selected serving
 generation. A node-local registry may locate these lifetimes but does not merge
 their recovery positions.

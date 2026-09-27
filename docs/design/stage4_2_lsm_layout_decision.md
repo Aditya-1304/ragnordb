@@ -1,41 +1,36 @@
 # Stage 4.2: LSM layout decision
 
-Status: **benchmark corrected; layout decision gate reopened**. Candidate B
-was selected from the earlier exploratory run, but that run used non-V1 B keys
-and did not repeatedly commit existing intents. The clean corrected run below
-does not confirm B as the broad OLTP winner. Keep Stage 4.2 open until the
-Candidate A/B trade-off is reconciled; Stage 4.3 must not start yet.
+Status: **Stage 4.2 closed; Candidate B selected for V1**. The corrected
+benchmark invalidated the earlier single-profile rationale, so this decision
+uses the full five-profile A/B matrix, scan matrix, physical-family ownership
+requirements, and explicit trade-offs. Stage 4.3 is the next ordered stage.
 
-## Prior selection and current status
+## Decision
 
-The previously selected format remains Candidate B: separate logical Default,
-Write, and Lock trees inside one tablet-replica storage lineage. The physical
-identity is `(tablet_id, raft_group_id, replica_id)`. All families share one
-recovery frontier, MANIFEST lineage, coherent generation, and future atomic
-`CommandDelta` publication boundary. Node-level memory, block cache, I/O,
-compaction scheduling, and background workers remain shared. The corrected
-results below reopen the layout decision: A leads most measured OLTP
-operations, while B leads lock lookup and modeled compaction amplification.
-This closure patch records the evidence and does not silently change the
-already frozen production codec.
+Select **Candidate B: separate logical Default, Write, and Lock trees inside
+one tablet-replica storage lifetime**. The physical identity is
+`(tablet_id, raft_group_id, replica_id)`. All families share one recovery
+frontier, MANIFEST lineage, coherent generation, and atomic `CommandDelta`
+publication boundary. Node-level memory, block cache, I/O, compaction
+scheduling, and background workers remain shared. Candidate B is frozen for
+V1; this decision does not mean three independent database instances.
 
-The selected V1 comparator, namespace IDs, key bytes, operating defaults, and
-recovery direction are specified in [storage-format.md](../storage-format.md).
-The production codec is `crates/ragnordb-storage/src/lsm/internal_key.rs`.
+The V1 comparator, namespace IDs, key bytes, operating defaults, and recovery
+direction are specified in [storage-format.md](../storage-format.md). The
+production codec is `crates/ragnordb-storage/src/lsm/internal_key.rs`.
 
 ## Candidates compared
 
 | Candidate | Ordered storage arrangement | Expected strength | Main cost |
 |---|---|---|---|
-| A — unified row-first | One ordered tree, sorted by logical row, record namespace, then version | Rows and their histories are adjacent; strongest point, prewrite, and batch-commit timings in this corrected model | Lock checks traverse/interrogate the mixed row history; one merged run carries every record kind |
-| B — separate families | Distinct Default, Write, and Lock trees under one tablet storage generation; benchmark metadata used a shared metadata map | Direct lock lookup and write-history traversal; independently compactable record families; the same publication boundary can cover all trees | More tree/run coordination and cross-family publication work; corrected point, prewrite, and commit timings trail A |
-| C — unified family-first | One ordered tree sorted by family, then row, then version | Family locality improves long scans and cache/block selectivity | A point operation may cross more key ranges; lock and latest-point costs are worse in this model |
+| A — unified row-first | One ordered tree, sorted by logical row, record namespace, then version | Strong result in the normal sequential profile; one tree makes publication simpler | Its relative result degrades on retained deep random history, large rows, lock-heavy, and write-churn profiles; families cannot be tuned independently |
+| B — separate families | Distinct Default, Write, and Lock trees under one tablet storage generation; benchmark metadata used a shared metadata map | Wins most full-matrix core comparisons and isolates payload, history, and intent access patterns for later family-specific tuning | More tree/run coordination; cross-family publication must stay atomic |
+| C — unified family-first | One ordered tree sorted by family, then row, then version | Family locality improves long scans and cache/block selectivity | One shared tree does not provide independent family roots; normal-profile latest, lock, and commit estimates trail B |
 
-Candidate B does **not** mean three database instances. The selected namespace
-map also reserves Metadata and Index logical families beneath the same
-tablet-replica lifetime. Rollback witnesses remain in Write; range tombstones
-are colocated in Write. No namespace owns an independent MANIFEST or recovery
-authority.
+Candidate B does **not** mean three database instances. The namespace map also
+reserves Metadata and Index logical families beneath the same tablet-replica
+lifetime. Rollback witnesses remain in Write; range tombstones are colocated
+in Write. No namespace owns an independent MANIFEST or recovery authority.
 
 ## Workload matrix and operations
 
@@ -64,10 +59,56 @@ value encodings remain experimental.
 
 ## Measured evidence
 
-Criterion point estimates are from the normal sequential OLTP profile. The
-sample count was 10; these are short in-memory-model timings, not production
-latency SLOs. The corrected B path uses exact `InternalKeyV1` bytes, and the
-batch commit setup restores 32 existing locks before each timed operation.
+Criterion point estimates use 10 samples per operation. They are short
+in-memory-model timings, not production latency SLOs. Candidate B uses exact
+`InternalKeyV1` bytes, and the batch commit setup restores 32 existing locks
+before each timed operation.
+
+### Core operations across all five 100k-row profiles
+
+The core set is latest/middle/old point reads, point miss, lock hit/miss,
+rollback-witness lookup, prewrite validation, and batch-32 intent commit. This
+gives 40 A/B point-estimate comparisons: B wins 25 and A wins 15. Taking an
+equal-weight geometric mean of `B latency / A latency` gives `0.8833`, or
+about 11.7% lower latency for B across this comparison set. This is a
+descriptive sanity check; it assigns equal weight to every operation and
+profile and is not a workload-frequency model.
+
+| 100k-row profile | A wins | B wins | Geometric mean B/A | Readout |
+|---|---:|---:|---:|---|
+| Normal sequential, 4 versions | 7 | 1 | 1.198 | B latency is about 19.8% higher than A |
+| History-heavy random, 16 versions | 0 | 8 | 0.660 | B is about 34% faster |
+| Large rows, 1 KiB payload | 1 | 7 | 0.749 | B is about 25% faster |
+| Lock-heavy, 10% locks | 3 | 5 | 0.972 | Near tie; B is about 3% faster |
+| Write churn, 8 versions | 4 | 4 | 0.933 | B is about 7% faster |
+| **All five profiles** | **15** | **25** | **0.883** | **B is about 11.7% faster overall** |
+
+Against Candidate C on the same 40 core comparisons, B wins 37 and C wins 3;
+the equal-weight geometric mean of `C latency / B latency` is `1.662`. This
+puts C about 66% slower than B across that comparison set.
+
+The normal sequential profile is a real trade-off: A wins seven of eight
+operations there. That profile alone does not represent the complete matrix.
+The 16-version history profile is especially relevant when retained MVCC
+history is deep;
+B wins all eight core comparisons:
+
+| History-heavy operation | A | B |
+|---|---:|---:|
+| Latest read | 0.583 µs | 0.491 µs |
+| Middle read | 0.708 µs | 0.544 µs |
+| Old read | 0.747 µs | 0.400 µs |
+| Point miss | 0.729 µs | 0.544 µs |
+| Lock hit/miss pair | 0.747 µs | 0.360 µs |
+| Rollback-witness lookup | 0.170 µs | 0.133 µs |
+| Prewrite validation | 0.190 µs | 0.127 µs |
+| Intent commit, batch 32 | 173.430 µs | 96.287 µs |
+
+In the large-row profile, B wins latest, old, miss, lock, rollback, prewrite,
+and commit; A wins middle-history lookup. Across lock-heavy and write-churn
+profiles B remains near parity or ahead on this equal-weight comparison.
+
+### Normal sequential profile (reference, not the selection basis)
 
 | Operation | A | B | C | Readout |
 |---|---:|---:|---:|---|
@@ -80,55 +121,103 @@ batch commit setup restores 32 existing locks before each timed operation.
 | Prewrite validation | 0.554 µs | 0.616 µs | 1.258 µs | A leads B by about 10.0% |
 | Intent commit, batch 32 | 96.7 µs | 125.3 µs | 149.5 µs | A leads B by about 22.8%; setup restores real intents |
 
+### Scan operations across all five 100k-row profiles
+
+The scan set is 10/100/1,000-row latest and old scans, for 30 A/B comparisons.
+B wins 16 and A wins 14. The equal-weight geometric mean of `B latency / A
+latency` is `0.9275`, about 7.3% lower latency for B. Per-profile, history-heavy
+scans favor B strongly, large-row and lock-heavy scans favor A, normal scans
+are effectively tied, and write-churn scans slightly favor B. This matrix
+shows no broad scan advantage for A.
+
+Against C on those same 30 scans, B wins 18 and C wins 12; the equal-weight
+geometric mean of `C latency / B latency` is `1.093`, about 9.3% higher latency
+for C. C's million-row modeled cold-byte result remains a scan-specific
+advantage, not a matrix-wide scan-latency win.
+
+| 100k-row profile | A wins | B wins | Geometric mean B/A | Readout |
+|---|---:|---:|---:|---|
+| Normal sequential | 3 | 3 | 1.002 | Effectively tied |
+| History-heavy random | 0 | 6 | 0.588 | B is about 41% faster |
+| Large rows | 5 | 1 | 1.122 | A is faster |
+| Lock-heavy | 5 | 1 | 1.060 | A is faster |
+| Write churn | 1 | 5 | 0.980 | B is slightly faster |
+| **All five profiles** | **14** | **16** | **0.927** | **B is about 7.3% faster overall** |
+
 Modeled physical evidence uses 4 KiB blocks, a 16 MiB shared cache, 4 MiB
-flush accounting, four L0 runs before compaction, 10:1 level ratio, and four
-modeled levels. These are benchmark parameters; only the four-run trigger and
-10:1 ratio are also selected as separate V1 operating defaults, for the
-rationales in `storage-format.md`. The four-level model is **not** the V1 level
-count.
+flush accounting, four L0 runs before compaction, a 10:1 level ratio, and four
+modeled levels. The four-level model is **not** the V1 level count. Compaction
+write amplification is secondary evidence, not the primary reason for
+selecting B: the model compacts families independently, so which family crosses
+its level-capacity threshold changes the modeled result. This reflects the
+per-family target policy being considered, but real SST overlap and compaction
+have not been implemented or measured.
 
-| Modeled result | A | B | C |
-|---|---:|---:|---:|
-| 10k-row cold scan bytes, 1m-row profile | 9.24 MB | 9.25 MB | 6.81 MB |
-| Cold block misses for that scan | 2,308 | 2,330 | 1,668 |
-| Compaction write amplification, 1m-row profile | 2.488x | 2.176x | 2.217x |
-| Compaction write amplification, 16-version history profile | 2.241x | 1.293x | 2.250x |
+| Profile | A WA | B WA | Readout |
+|---|---:|---:|---|
+| Normal sequential | 1.310x | 1.310x | Equal |
+| History-heavy random | 2.241x | 1.293x | B lower in this modeled state |
+| Large rows | 1.894x | 1.849x | B slightly lower |
+| Lock-heavy | 1.096x | 1.096x | Equal |
+| Write churn | 1.870x | 1.855x | B slightly lower |
+| Million-row scan profile | 2.488x | 2.176x | B lower in this modeled state |
 
-C has the strongest long-scan byte result: about 26% fewer cold bytes than B in
-the million-row model. B has the lowest modeled compaction amplification in
-both reported write-heavy comparisons, but A leads seven of the eight listed
-OLTP operations; B's only lead is the lock hit/miss pair, by about 10%. B's
-modeled 10k scan reads slightly more than A and has slightly more cold block
-misses. The corrected evidence therefore does not establish B as the broad
-OLTP winner. These model trade-offs need to be resolved before Stage 4.2 can
-close; the prior B selection remains recorded but is no longer supported by
-the earlier timing rationale.
+For the million-row profile, modeled 10k-row cold scan bytes are 9.24 MB for A,
+9.25 MB for B, and 6.81 MB for C; cold block misses are 2,308, 2,330, and
+1,668. A and B are effectively equal on these modeled cold bytes, while C has
+a scan-locality advantage that does not decide the broader layout choice.
 
-## Corrected decision readout
+### Why Candidate B is selected
 
-### Candidate A versus B
+B wins most core comparisons across the full workload matrix and is materially
+better as MVCC history deepens and row payloads grow. The five-profile totals
+and history-heavy results are the primary performance evidence. The families
+also have distinct roles and access patterns:
 
-The corrected run changes the comparison materially. A is faster for latest,
-middle, and old reads; point misses; rollback lookup; prewrite validation; and
-the real-intent batch commit. B is about 10% faster on the lock hit/miss pair
-and has lower modeled write amplification, particularly on version-heavy
-history. This may still justify B, but the previous claim that its transaction
-path was broadly stronger is withdrawn. Candidate selection needs to weigh
-the actual transaction mix against the modeled compaction benefit.
+- Default holds row payloads and can eventually use value-oriented block,
+  compression, and cache policies.
+- Write holds compact commit metadata and rollback witnesses, with history
+  traversal and filtering needs.
+- Lock holds the live intent set and is latency-sensitive.
 
-The separation remains useful only while publication is one coherent tablet
-generation. Whichever layout wins, Stage 4.3 must preflight and publish every
-applicable Default, Write, Lock, rollback, primary-status, retry outcome/floor,
-and processed Raft index/term edit together. It must never expose new data
-without its retry outcome, advance the frontier past partial data, or publish
-a lock removal without the corresponding committed Write/Default state.
+The separate ordered family roots preserve those future tuning choices. For
+example, later measurements may justify larger value-oriented Default blocks,
+smaller metadata-oriented Write blocks with stronger point filters, and
+higher-priority cache admission for the live Lock set. These are future tuning
+hypotheses, not V1 settings frozen by this benchmark. The normal-profile A
+advantage is acknowledged and accepted against B's full-matrix result and the
+retained-history/large-row profiles. The single-tree publication simplicity of
+A is an implementation advantage; B's extra coordination is contained by one
+coherent generation and the all-family publication contract in Stage 4.3.
+
+B can require a Write lookup followed by a Default lookup for large values. A
+future, separately benchmarked short-value-in-Write optimization may avoid the
+second lookup for small payloads. This is not part of Stage 4.2 and must have a
+versioned value envelope, defined delete/rollback and recovery semantics, and
+the same atomic publication boundary before implementation.
+
+### Atomic publication and resource ownership
+
+Stage 4.3 must validate and publish every applicable Default, Write, Lock,
+rollback, primary-status, retry outcome/floor, and processed Raft index/term
+edit as one visibility boundary. It must never expose data without its retry
+outcome, advance the frontier past partial data, or publish a lock removal
+without the matching committed Write/Default state.
+
+The tablet owns one storage lifetime, one generation, one frontier, and one
+MANIFEST lineage. Its Default/Write/Lock roots are allocated lazily under one
+bounded tablet memory budget. The node shares memory governance, block cache,
+I/O scheduling, compaction scheduling, and background workers. Three eager
+per-tablet database instances are out of contract.
 
 ### Candidate C
 
-C remains unattractive for the selected OLTP profile: it is slower than A and B
-for lock checking and slower than A for every listed point/transaction
-operation, though it gives the best long-scan bytes. Its modeled compaction
-amplification is also slightly higher than B in the million-row profile.
+C remains unselected. It offers the best modeled million-row scan bytes, but
+does not provide B's independent Default/Write/Lock roots and family-specific
+tuning boundary. Across the 40 core comparisons, B wins 37 against C; across
+the scan comparisons, B wins 18 of 30 and has the lower equal-weight geometric
+mean latency. The scan-locality byte result is not enough to select C for this
+transaction and MVCC-history workload matrix.
 
 ## Model boundaries
 
@@ -156,11 +245,10 @@ cargo bench -p ragnordb-bench --bench lsm_mvcc_layout -- --noplot
 
 The existing production key remains `InternalKeyV1` with bytewise
 `ComparatorV1`, namespace-prefixed prefix-free identity framing, and
-descending big-endian timestamps while Stage 4.2's layout decision is open.
-The full namespace table and initial LSM runtime defaults are in
-[storage-format.md](../storage-format.md). Changing the selected physical
-layout now would require an explicit format/design decision before any durable
-SST writer is built.
+descending big-endian timestamps. Candidate B and its full namespace table
+are frozen in [storage-format.md](../storage-format.md). Stage 4.3 is next;
+changing the selected physical layout would require an explicit storage-format
+migration design before any durable SST writer is built.
 
 Candidate B adds atomic work at Stage 4.3: every family and metadata edit in a
 single tablet command shares one validation and publication result. It does
