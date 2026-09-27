@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "mvcc_write_history"
 harness = false
+
+[[bench]]
+name = "lsm_mvcc_layout"
+harness = false
