@@ -1,9 +1,15 @@
 # Stage 4.4 — lazy bounded memtables
 
-Status: **implementation in progress; Stage 4.4 is not declared closed here.** The
-full verification gate and every closure regression must pass before closure.
-This note describes the Stage 4.4 ownership and admission contract only; it does
-not claim durable LSM publication.
+Status: **Stage 4.4 — CLOSED.** This closes lazy bounded memtables, immutable
+debt accounting, User throttling, node-budget charging, and the owner-local
+nonblocking handoff boundary. The complete Stage 4.4 regression set passes.
+
+The exact workspace all-targets and Clippy commands still report two failures
+that reproduce on the unchanged parent revision: the `ragnordb-bench` layout
+fixture comparator-order panic and the existing `clippy::manual_clamp` lint at
+`lsm/memory.rs:138`. The workspace suite excluding that benchmark package and
+Clippy with only that baseline lint allowed both pass. These baseline failures
+do not exercise or touch the Stage 4.4 changes.
 
 ## Ownership
 
@@ -51,9 +57,12 @@ one owner, an exact byte amount, and one class:
 Reservation occurs before an edit is allocated or published. Publication
 transfers only the actually retained amount into a shared charge; unused
 reservation bytes are released. Failed admission/publication drops its
-reservation, and explicit immutable retirement releases a charge once. Shrink,
-transfer, and release use checked arithmetic and fail without partially
-changing counters. Charge clones share one release state.
+reservation. Shrink and transfer use checked arithmetic and fail without
+partially changing counters. Since an ambiguous shrink cannot identify the
+class of removed records, it releases Progress ownership first and keeps
+remaining User bytes conservatively charged. This can throttle User admission
+early but preserves capacity for committed Progress work. Charge clones share
+one release state.
 
 A leader computes the conservative complete-command delta bound and reserves
 both node capacity and an immutable-slot allowance before Raft proposal. The
@@ -95,13 +104,15 @@ for worker progress. `Full`/`Closed` leave the generation in serving state and
 allow later retries. A successful offer also leaves the generation in serving
 state and does not reduce queue debt or release any memory.
 
-The explicit completion boundary retires an exact immutable generation ID. It
-may be called only after the future durable SST and MANIFEST publication has
-succeeded. Retirement removes that immutable from the in-memory serving queue,
-releases its charge exactly once, reduces byte/count debt, and can resume user
-admission. Duplicate or unknown retirement fails without changing accounting.
-Stage 4.4 tests may use a fake completion to exercise this ownership contract;
-the production path does not yet claim durable completion.
+Stage 4.4 exposes no production retirement operation. Sink acceptance alone is
+not a durability proof and cannot remove a generation from serving state or
+release its charge. A private `cfg(test)` helper exercises exact charge
+retirement mechanics; a compile-fail doctest verifies production callers cannot
+invoke it. Automatic freeze treats `Full` as retryable backpressure and records
+permanent `Closed`/`Rejected` errors for inspection through
+`last_flush_handoff_error()`, without failing or rolling back a valid command.
+Stage 4.6 must add a typed durable-publication proof before production retirement
+can be enabled.
 
 ## Restored snapshot base
 
@@ -120,4 +131,24 @@ Stage 4.4 does **not** implement SST data/index/filter blocks, an SST filesystem
 writer, Bloom integration, MANIFEST/CURRENT records, fsync/rename publication,
 durable immutable retirement, compaction, MVCC garbage collection, or disk
 reservations. Those remain Stage 4.5 and later work. No Stage 4.4 closure claim
-is made until the required regressions and full verification gate pass.
+reservations. Those remain Stage 4.5 and later work.
+
+## Closure verification
+
+The Stage 4.4 verification results on `lsm-storage` are:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | Passed |
+| `cargo test -p ragnordb-storage` | Passed |
+| `cargo test -p ragnordb-tablet` | Passed |
+| `cargo test -p ragnordb-multiraft` | Passed |
+| `cargo test -p ragnordb-server` | Passed |
+| `cargo test --workspace --all-targets --exclude ragnordb-bench` | Passed |
+| `cargo test --workspace --all-targets` | Existing `ragnordb-bench` fixture comparator-order panic; same bench target fails on parent `c1fdcf094588a0b75e23a8895111cf78365d3882` |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Existing `clippy::manual_clamp` at `lsm/memory.rs:138`; reproduced on parent `c1fdcf094588a0b75e23a8895111cf78365d3882` |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings -A clippy::manual_clamp` | Passed; only the reproduced parent lint was allowed |
+| `git diff --check` | Passed after this document update |
+
+No Stage 4.5, 4.6, or later physical-storage feature is implemented or claimed
+by this closure.

@@ -7944,6 +7944,162 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Condvar;
 
+    #[derive(Debug, Default)]
+    struct FullImmutableSinkProbe {
+        attempts: AtomicUsize,
+    }
+
+    impl ragnordb_storage::mvcc::ImmutableMemtableSink for FullImmutableSinkProbe {
+        fn try_submit(
+            &self,
+            _generation: Arc<ragnordb_storage::mvcc::ImmutableMemtableGeneration>,
+        ) -> std::result::Result<(), ragnordb_storage::mvcc::FlushHandoffError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ragnordb_storage::mvcc::FlushHandoffError::Full)
+        }
+    }
+
+    struct MemtablePressureWal {
+        next_lsn: wal::lsn::Lsn,
+    }
+
+    impl Default for MemtablePressureWal {
+        fn default() -> Self {
+            Self {
+                next_lsn: wal::lsn::Lsn::ZERO,
+            }
+        }
+    }
+
+    impl ragnordb_multiraft::storage::persistence::RaftWal for MemtablePressureWal {
+        fn append_batch_and_sync(
+            &mut self,
+            records: &[(wal::types::RecordType, &[u8])],
+        ) -> std::result::Result<wal::wal::BatchAppendResult, wal::error::BatchAppendFailure>
+        {
+            let mut extents = Vec::with_capacity(records.len());
+            for (_, payload) in records {
+                let start_lsn = self.next_lsn;
+                let end_lsn = start_lsn
+                    .checked_add_bytes(payload.len() as u64 + 1)
+                    .expect("test WAL LSN must remain bounded");
+                self.next_lsn = end_lsn;
+                extents.push(wal::wal::AppendResult { start_lsn, end_lsn });
+            }
+
+            Ok(wal::wal::BatchAppendResult {
+                final_end_lsn: extents
+                    .last()
+                    .map(|extent| extent.end_lsn)
+                    .unwrap_or(wal::lsn::Lsn::ZERO),
+                record_extents: extents,
+            })
+        }
+    }
+
+    type MemtablePressureReadyLoop = ragnordb_multiraft::runtime::RaftReadyLoop<
+        MemtablePressureWal,
+        raft::storage::mem::MemStorage<Vec<u8>, Vec<u8>>,
+        raft::storage::mem::MemStorage<Vec<u8>, Vec<u8>>,
+    >;
+
+    struct MemtablePressureReactorProbe {
+        identity: RaftReplicaIdentity,
+        ownership: ReactorOwnership,
+        ready_loop: MemtablePressureReadyLoop,
+        applier: TabletCommandApplier<MemtableMvcc>,
+        host_control: Receiver<RaftHostControl>,
+        completed: SyncSender<std::result::Result<(), String>>,
+    }
+
+    impl ReactorGroup for MemtablePressureReactorProbe {
+        fn identity(&self) -> RaftReplicaIdentity {
+            self.identity
+        }
+
+        fn ownership(&self) -> ReactorOwnership {
+            self.ownership
+        }
+
+        fn is_shutdown(&self) -> bool {
+            false
+        }
+
+        fn turn(&mut self) -> std::result::Result<bool, String> {
+            let result = (|| {
+                let control = self
+                    .host_control
+                    .try_recv()
+                    .map_err(|error| format!("test control was not available: {error}"))?;
+                let RaftHostControl::Tick { ticks, reply } = control else {
+                    return Err("test owner expected a Raft tick control".to_string());
+                };
+                self.ready_loop
+                    .tick(ticks)
+                    .map_err(|error| format!("Raft tick failed: {error}"))?;
+
+                if memtable_write_stall_error(&self.applier).is_none() {
+                    return Err("soft immutable pressure did not throttle User work".to_string());
+                }
+                if reserve_memtable_admission(
+                    &self.applier,
+                    128,
+                    ragnordb_storage::lsm::MemoryClass::User,
+                )
+                .is_ok()
+                {
+                    return Err("User admission succeeded at the soft threshold".to_string());
+                }
+                let progress = reserve_memtable_admission(
+                    &self.applier,
+                    128,
+                    ragnordb_storage::lsm::MemoryClass::Progress,
+                )
+                .map_err(|error| format!("Progress admission failed: {error}"))?;
+                drop(progress);
+
+                let envelope = TabletCommandEnvelope::new(
+                    RequestId {
+                        client_id: 771,
+                        sequence: 1,
+                        raft_group_id: TABLET_RAFT_GROUP_ID,
+                    },
+                    TABLET_ID,
+                    TABLET_EPOCH,
+                    TabletCommand::Noop(NoopCommand),
+                )
+                .map_err(|error| error.to_string())?;
+                self.applier
+                    .apply_committed_entry(
+                        ProposalPosition { term: 1, index: 1 },
+                        &envelope.encode().map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if self.applier.state_machine().recovery_frontier()
+                    != Some(ragnordb_storage::lsm::RecoveryFrontier::ReplicatedTablet {
+                        raft_group_id: TABLET_RAFT_GROUP_ID,
+                        replica_id: ReplicaId(1),
+                        applied_index: 1,
+                        applied_term: 1,
+                    })
+                {
+                    return Err(
+                        "committed Progress apply did not publish its exact frontier".into(),
+                    );
+                }
+
+                reply
+                    .send(Ok(RaftHostControlResult::Completed))
+                    .map_err(|error| format!("Raft tick reply receiver was dropped: {error}"))?;
+                Ok(())
+            })();
+            let _ = self.completed.send(result);
+            Ok(false)
+        }
+
+        fn fail(&mut self, _reason: String) {}
+    }
+
     #[test]
     fn batch_delta_bound_rejects_oversize_and_overflow_before_proposal() {
         let limit = ragnordb_storage::lsm::MAX_COMMAND_DELTA_BYTES;
@@ -8059,6 +8215,117 @@ mod tests {
             reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::Progress)
                 .is_ok()
         );
+    }
+
+    /// Realistic bug caught: a full asynchronous handoff queue must not stall
+    /// the tablet's owner turn or consume capacity reserved for committed work.
+    #[test]
+    fn reactor_turn_services_control_and_committed_progress_with_full_flush_queue() {
+        use ragnordb_storage::mvcc::{MvccDelta, MvccRecordEdit};
+
+        let budget =
+            ragnordb_storage::lsm::NodeMemtableBudget::new_with_progress_reserve(32768, 8192)
+                .unwrap();
+        let sink = Arc::new(FullImmutableSinkProbe::default());
+        let mut storage = MemtableMvcc::with_memtable_budget(budget.clone(), 2048).unwrap();
+        storage.set_immutable_memtable_sink(sink.clone());
+
+        for id in 1..=3 {
+            let key = ragnordb_storage::key::encode_row_key(
+                &ragnordb_storage::key::make_row_key(TableId(1), &[Value::Int(id)]).unwrap(),
+            )
+            .unwrap();
+            let row = encode_row(&Row {
+                values: vec![Value::Int(id), Value::Text("p".repeat(1_100))],
+            })
+            .unwrap();
+            storage
+                .publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key,
+                        start_ts: Timestamp(id as u64),
+                        row,
+                    }],
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count,
+            2
+        );
+        assert!(sink.attempts.load(Ordering::SeqCst) > 0);
+
+        let tablet = ragnordb_tablet::Tablet::with_storage(TABLET_ID, TABLE_ID, storage).unwrap();
+        let state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
+            tablet,
+            TABLET_EPOCH,
+            TABLET_RAFT_GROUP_ID,
+        )
+        .unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+        let identity = RaftReplicaIdentity::new(TABLET_RAFT_GROUP_ID, ReplicaId(1)).unwrap();
+        let replica = ReplicaId(1).to_raft().unwrap();
+        let conf_state = raft::types::ConfState::new(1, [replica], []).unwrap();
+        let raft_node = raft::core::node::RaftNode::bootstrap(
+            replica,
+            conf_state,
+            raft::storage::mem::MemStorage::new(),
+            raft::storage::mem::MemStorage::new(),
+            ELECTION_TIMEOUT_TICKS,
+            HEARTBEAT_INTERVAL_TICKS,
+        )
+        .unwrap();
+        let mut ready_loop = ragnordb_multiraft::runtime::RaftReadyLoop::new(
+            raft_node,
+            ragnordb_multiraft::storage::persistence::RaftWalStorage::new(
+                MemtablePressureWal::default(),
+                identity,
+            ),
+        );
+        ready_loop
+            .persist_next_ready(None)
+            .expect("bootstrap Ready must persist before reactor turns");
+        let reactors = FixedReactorSet::new(1).expect("the tablet reactor must start");
+        let assignment = reactors.assign().unwrap();
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
+        let (tick_reply_tx, tick_reply_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        control_tx
+            .send(RaftHostControl::Tick {
+                ticks: 1,
+                reply: tick_reply_tx,
+            })
+            .unwrap();
+        reactors
+            .register(
+                &assignment,
+                Box::new(MemtablePressureReactorProbe {
+                    identity,
+                    ownership: assignment.ownership,
+                    ready_loop,
+                    applier,
+                    host_control: control_rx,
+                    completed: completed_tx,
+                }),
+            )
+            .unwrap();
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the owner turn must finish while the handoff queue is full")
+            .expect("User throttling and committed Progress apply must both succeed");
+        assert!(matches!(
+            tick_reply_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the queued Raft control tick must be acknowledged")
+                .expect("the owner must complete Raft control work"),
+            RaftHostControlResult::Completed
+        ));
+        assert!(sink.attempts.load(Ordering::SeqCst) > 0);
+        drop(reactors);
     }
 
     #[test]

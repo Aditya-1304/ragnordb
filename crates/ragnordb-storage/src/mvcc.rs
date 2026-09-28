@@ -1138,6 +1138,19 @@ pub trait MvccStorage {
 ///
 /// The shared [`MvccEngine`] owns transaction semantics; this backend owns the
 /// tablet-local generation queue, tombstones, and node-budget reservations.
+///
+/// Production retirement is intentionally unavailable until durable generation
+/// publication exists. A nonblocking sink handoff alone does not authorize data
+/// removal from serving state.
+///
+/// ```compile_fail
+/// use ragnordb_storage::lsm::NodeMemtableBudget;
+/// use ragnordb_storage::mvcc::MemtableMvcc;
+///
+/// let budget = NodeMemtableBudget::new_with_progress_reserve(4096, 1024).unwrap();
+/// let mut storage = MemtableMvcc::with_memtable_budget(budget, 300).unwrap();
+/// storage.retire_immutable_generation(1).unwrap();
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct MemtableMvccBackend {
     /// `row_key -> start_ts -> encoded row`.
@@ -1166,6 +1179,8 @@ pub struct MemtableMvccBackend {
     handed_off_immutables: BTreeSet<u64>,
     /// Optional nonblocking Stage-4.5 handoff endpoint.
     immutable_sink: Option<Arc<dyn ImmutableMemtableSink>>,
+    /// Most recent permanent sink failure; queue-full backpressure is not retained.
+    last_flush_handoff_error: Option<FlushHandoffError>,
     /// Monotonic identity assigned before each successful immutable freeze.
     next_immutable_generation_id: u64,
     /// Ordered command metadata belonging to the active MVCC generation.
@@ -1483,14 +1498,24 @@ impl MemtableMvcc {
         self.backend.try_handoff_pending_immutables()
     }
 
+    /// Return the most recent permanent immutable-handoff failure, if any.
+    pub fn last_flush_handoff_error(&self) -> Option<FlushHandoffError> {
+        self.backend.last_flush_handoff_error.clone()
+    }
+
     /// Return immutable generations still retained for serving reads.
     pub fn immutable_memtable_generations(&self) -> Vec<Arc<ImmutableMemtableGeneration>> {
         self.backend.immutable_generations()
     }
 
-    /// Complete durable publication for exactly one immutable generation.
-    pub fn retire_immutable_generation(&mut self, generation_id: u64) -> Result<()> {
-        self.backend.retire_immutable_generation(generation_id)
+    /// Test-only hook for exercising immutable charge retirement.
+    ///
+    /// A fake sink handoff is not a durable publication proof. Production
+    /// retirement will be introduced with the Stage 4.6 publication boundary.
+    #[cfg(test)]
+    fn retire_immutable_generation_for_test(&mut self, generation_id: u64) -> Result<()> {
+        self.backend
+            .retire_immutable_generation_for_test(generation_id)
     }
 
     /// Bytes held by the restored read-only base, outside the active cap.
@@ -3627,16 +3652,26 @@ impl MemtableMvccBackend {
             .collect::<Vec<_>>();
         let mut submitted = 0usize;
         for generation in pending {
-            sink.try_submit(Arc::clone(&generation))?;
+            if let Err(error) = sink.try_submit(Arc::clone(&generation)) {
+                match error {
+                    FlushHandoffError::Full => return Err(FlushHandoffError::Full),
+                    permanent @ (FlushHandoffError::Closed | FlushHandoffError::Rejected(_)) => {
+                        self.last_flush_handoff_error = Some(permanent.clone());
+                        return Err(permanent);
+                    }
+                }
+            }
             self.handed_off_immutables.insert(generation.id);
             submitted = submitted.checked_add(1).ok_or_else(|| {
                 FlushHandoffError::Rejected("handoff submission count overflowed".to_string())
             })?;
         }
+        self.last_flush_handoff_error = None;
         Ok(submitted)
     }
 
-    fn retire_immutable_generation(&mut self, generation_id: u64) -> Result<()> {
+    #[cfg(test)]
+    fn retire_immutable_generation_for_test(&mut self, generation_id: u64) -> Result<()> {
         let index = self
             .immutable_memtables
             .iter()
@@ -4405,7 +4440,14 @@ impl MvccBackend for MemtableMvccBackend {
 
         if freeze_active {
             self.freeze_active_memtable()?;
-            let _ = self.try_handoff_pending_immutables();
+            match self.try_handoff_pending_immutables() {
+                Ok(_) | Err(FlushHandoffError::Full) => {}
+                Err(FlushHandoffError::Closed | FlushHandoffError::Rejected(_)) => {
+                    // The command publication is valid even if background
+                    // handoff is unavailable. The backend retains this failure
+                    // for diagnostics and later retry without rolling back data.
+                }
+            }
         }
 
         if self.memtable_budget.is_some() {
@@ -4575,6 +4617,7 @@ impl MvccBackend for MemtableMvccBackend {
                 .collect(),
             handed_off_immutables: BTreeSet::new(),
             immutable_sink: None,
+            last_flush_handoff_error: None,
             next_immutable_generation_id: self.next_immutable_generation_id,
             immutable_memtable_bytes: 0,
             immutable_memtable_soft_limit_bytes: 0,
@@ -5792,7 +5835,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FakeImmutableSink {
-        full: std::sync::atomic::AtomicBool,
+        failure: std::sync::Mutex<Option<FlushHandoffError>>,
         accepted: std::sync::Mutex<Vec<Arc<ImmutableMemtableGeneration>>>,
     }
 
@@ -5801,8 +5844,13 @@ mod tests {
             &self,
             generation: Arc<ImmutableMemtableGeneration>,
         ) -> std::result::Result<(), FlushHandoffError> {
-            if self.full.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(FlushHandoffError::Full);
+            if let Some(error) = self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(error);
             }
             self.accepted
                 .lock()
@@ -5813,11 +5861,11 @@ mod tests {
     }
 
     #[test]
-    fn immutable_handoff_is_nonblocking_and_retirement_releases_exact_generation_once() {
+    fn immutable_handoff_does_not_authorize_production_retirement() {
         let budget = crate::lsm::NodeMemtableBudget::new_with_progress_reserve(4096, 1024).unwrap();
         let mut storage = MemtableMvcc::with_memtable_budget(budget.clone(), 300).unwrap();
         let sink = Arc::new(FakeImmutableSink {
-            full: std::sync::atomic::AtomicBool::new(true),
+            failure: std::sync::Mutex::new(Some(FlushHandoffError::Full)),
             accepted: std::sync::Mutex::new(Vec::new()),
         });
         storage.set_immutable_memtable_sink(sink.clone());
@@ -5844,7 +5892,11 @@ mod tests {
         assert_eq!(immutable.len(), 2);
         let retired_id = immutable[1].id();
         let retired_bytes = immutable[1].charged_bytes();
-        assert!(storage.retire_immutable_generation(retired_id).is_err());
+        assert!(
+            storage
+                .retire_immutable_generation_for_test(retired_id)
+                .is_err()
+        );
         assert_eq!(budget.used_bytes(), held_bytes);
         assert_eq!(
             storage
@@ -5854,7 +5906,10 @@ mod tests {
             2
         );
 
-        sink.full.store(false, std::sync::atomic::Ordering::SeqCst);
+        *sink
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         assert_eq!(storage.try_handoff_pending_immutables().unwrap(), 2);
         assert_eq!(budget.used_bytes(), held_bytes);
         assert_eq!(
@@ -5874,7 +5929,21 @@ mod tests {
             );
         }
 
-        storage.retire_immutable_generation(retired_id).unwrap();
+        // Queue acceptance leaves the generation readable and charged. The
+        // test-only hook exercises retirement mechanics without claiming that
+        // this fake handoff is durable.
+        for id in 41..=43 {
+            assert!(
+                storage
+                    .get_default_record(&encoded_key(id), Timestamp(id as u64))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(budget.used_bytes(), held_bytes);
+        storage
+            .retire_immutable_generation_for_test(retired_id)
+            .unwrap();
         assert_eq!(budget.used_bytes(), held_bytes - retired_bytes);
         assert_eq!(
             storage
@@ -5890,7 +5959,11 @@ mod tests {
                 .user_admission_throttled()
         );
         let after_retirement = budget.used_bytes();
-        assert!(storage.retire_immutable_generation(retired_id).is_err());
+        assert!(
+            storage
+                .retire_immutable_generation_for_test(retired_id)
+                .is_err()
+        );
         assert_eq!(budget.used_bytes(), after_retirement);
         assert_eq!(
             storage
@@ -5900,7 +5973,7 @@ mod tests {
             1
         );
         storage
-            .retire_immutable_generation(immutable[0].id())
+            .retire_immutable_generation_for_test(immutable[0].id())
             .unwrap();
         assert_eq!(
             storage
@@ -5909,6 +5982,52 @@ mod tests {
                 .immutable_memtable_count,
             0
         );
+    }
+
+    #[test]
+    fn automatic_freeze_retains_permanent_handoff_failure_for_diagnostics() {
+        let budget = crate::lsm::NodeMemtableBudget::new_with_progress_reserve(4096, 1024).unwrap();
+        let mut storage = MemtableMvcc::with_memtable_budget(budget, 300).unwrap();
+        let sink = Arc::new(FakeImmutableSink {
+            failure: std::sync::Mutex::new(Some(FlushHandoffError::Rejected(
+                "flush worker rejected generation".to_string(),
+            ))),
+            accepted: std::sync::Mutex::new(Vec::new()),
+        });
+        storage.set_immutable_memtable_sink(sink.clone());
+        let value = "v".repeat(64);
+
+        for id in 51..=53 {
+            storage
+                .publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key: encoded_key(id),
+                        start_ts: Timestamp(id as u64),
+                        row: encoded_row(id, &value),
+                    }],
+                })
+                .expect("asynchronous handoff failure must not reject a valid publication");
+        }
+
+        assert_eq!(
+            storage.last_flush_handoff_error(),
+            Some(FlushHandoffError::Rejected(
+                "flush worker rejected generation".to_string()
+            ))
+        );
+        assert!(
+            storage
+                .get_default_record(&encoded_key(53), Timestamp(53))
+                .unwrap()
+                .is_some()
+        );
+
+        *sink
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        assert_eq!(storage.try_handoff_pending_immutables().unwrap(), 2);
+        assert_eq!(storage.last_flush_handoff_error(), None);
     }
 
     #[test]

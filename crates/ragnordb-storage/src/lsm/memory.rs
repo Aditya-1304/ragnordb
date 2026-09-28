@@ -564,6 +564,7 @@ impl MemtableCharge {
     }
 
     /// Release this charge's remaining User and Progress ownership exactly once.
+    #[cfg(test)]
     pub(crate) fn release(&self) -> Result<()> {
         let mut charged = lock_unpoisoned(&self.inner.bytes);
         if charged.total_bytes == 0 {
@@ -606,8 +607,9 @@ impl MemtableCharge {
         Ok(())
     }
 
-    /// Try to release bytes from this charge. User-class ownership is released
-    /// first, then progress-class ownership, and invalid shrinks leave all
+    /// Try to release bytes from this charge. Because a shrink does not identify
+    /// which class owned the removed records, progress ownership is released
+    /// first to keep User admission conservative. Invalid shrinks leave all
     /// accounting unchanged.
     pub(crate) fn try_shrink(&self, bytes: usize) -> Result<()> {
         if bytes == 0 {
@@ -618,9 +620,9 @@ impl MemtableCharge {
             .total_bytes
             .checked_sub(bytes)
             .ok_or_else(|| accounting_error("memtable charge shrink exceeds its retained bytes"))?;
-        let user_released = charged.user_bytes.min(bytes);
-        let progress_released = bytes
-            .checked_sub(user_released)
+        let progress_released = charged.progress_bytes.min(bytes);
+        let user_released = bytes
+            .checked_sub(progress_released)
             .ok_or_else(accounting_overflow)?;
         let next_user = charged
             .user_bytes
@@ -766,7 +768,9 @@ mod tests {
         charge.try_shrink(25).unwrap();
         assert_eq!(charge.bytes(), 5);
         assert_eq!(budget.used_bytes(), 5);
-        assert_eq!(budget.user_used_bytes(), 0);
+        // The class of removed records is unknown, so the remaining charge is
+        // conservatively attributed to User until exact ownership is available.
+        assert_eq!(budget.user_used_bytes(), 5);
 
         assert!(charge.try_shrink(6).is_err());
         assert_eq!(charge.bytes(), 5);
@@ -776,6 +780,38 @@ mod tests {
         drop(charge);
         assert_eq!(budget.used_bytes(), 5);
         drop(clone);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn mixed_class_shrink_never_releases_user_capacity_before_progress_capacity() {
+        let budget = NodeMemtableBudget::new_with_progress_reserve(100, 30).unwrap();
+        let charge = budget
+            .reserve(MemoryClass::User, 60)
+            .unwrap()
+            .commit()
+            .unwrap();
+        budget
+            .reserve(MemoryClass::Progress, 30)
+            .unwrap()
+            .commit_into_amount(&charge, 30)
+            .unwrap();
+
+        assert_eq!(budget.used_bytes(), 90);
+        assert_eq!(budget.user_used_bytes(), 60);
+
+        charge.try_shrink(20).unwrap();
+
+        assert_eq!(budget.used_bytes(), 70);
+        assert_eq!(budget.user_used_bytes(), 60);
+        assert!(budget.reserve(MemoryClass::User, 11).is_err());
+
+        let user = budget.reserve(MemoryClass::User, 10).unwrap();
+        let progress = budget.reserve(MemoryClass::Progress, 20).unwrap();
+
+        drop(user);
+        drop(progress);
+        drop(charge);
         assert_eq!(budget.used_bytes(), 0);
     }
 
