@@ -142,6 +142,7 @@ fn target() -> TabletSnapshotInstallTarget {
     TabletSnapshotInstallTarget {
         cluster_id: CLUSTER_ID.to_string(),
         raft_group_id: RAFT_GROUP_ID,
+        replica_id: ReplicaId(1),
         tablet_id: TABLET_ID,
         table_id: TABLE_ID,
         tablet_epoch: TABLET_EPOCH,
@@ -251,7 +252,7 @@ fn restart_restores_snapshot_then_replays_committed_suffix() {
     let mut state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
     let (first_command, first_key, first_row) = command(41, 1, 1, 11, 30);
     state_machine
-        .apply(TabletCommandEnvelope::decode(&first_command).unwrap())
+        .apply_committed_at(TabletCommandEnvelope::decode(&first_command).unwrap(), 1, 1)
         .unwrap();
 
     persistence

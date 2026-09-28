@@ -626,6 +626,7 @@ impl TabletLifecycleManager {
             let target = TabletSnapshotInstallTarget {
                 cluster_id: self.config.cluster_id.clone().unwrap_or_default(),
                 raft_group_id: descriptor.raft_group_id,
+                replica_id: local_replica_id,
                 tablet_id: descriptor.tablet_id,
                 table_id: descriptor.table_id,
                 tablet_epoch: descriptor.tablet_epoch,
@@ -1697,6 +1698,7 @@ impl TabletLifecycleManager {
         let target = TabletSnapshotInstallTarget {
             cluster_id: self.config.cluster_id.clone().unwrap_or_default(),
             raft_group_id: group_id,
+            replica_id,
             tablet_id,
             table_id: descriptor.table_id,
             tablet_epoch: descriptor.tablet_epoch,

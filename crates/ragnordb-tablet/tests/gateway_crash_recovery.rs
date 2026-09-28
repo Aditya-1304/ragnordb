@@ -160,16 +160,18 @@ struct DurableCluster {
 
 impl DurableCluster {
     fn new() -> Self {
-        let primary = TabletStateMachine::new(
+        let primary = TabletStateMachine::new_with_replica(
             Tablet::new(PRIMARY_TABLET, TABLE_ID).unwrap(),
             TABLET_EPOCH,
             primary_route().raft_group_id,
+            primary_route().leader_replica_id,
         )
         .unwrap();
-        let secondary = TabletStateMachine::new(
+        let secondary = TabletStateMachine::new_with_replica(
             Tablet::new(SECONDARY_TABLET, TABLE_ID).unwrap(),
             TABLET_EPOCH,
             secondary_route().raft_group_id,
+            secondary_route().leader_replica_id,
         )
         .unwrap();
 
@@ -214,12 +216,13 @@ impl DurableCluster {
     fn restart_participants(&mut self) {
         let tablet_ids = self.tablets.keys().copied().collect::<Vec<_>>();
         for (offset, tablet_id) in tablet_ids.into_iter().enumerate() {
-            let previous = self
+            let mut previous = self
                 .tablets
                 .remove(&tablet_id)
                 .expect("tablet listed by the durable cluster must exist");
             let snapshot_id = 800 + offset as u64;
             let tablet_epoch = previous.epoch();
+            previous.restore_recovery_frontier(snapshot_id, 1).unwrap();
             let image = generate_local_snapshot(
                 &previous,
                 "ragnordb-phase-6-9-gateway",
@@ -232,6 +235,7 @@ impl DurableCluster {
             let target = TabletSnapshotInstallTarget {
                 cluster_id: "ragnordb-phase-6-9-gateway".to_string(),
                 raft_group_id: previous.raft_group_id(),
+                replica_id: previous.replica_id(),
                 tablet_id,
                 table_id: TABLE_ID,
                 tablet_epoch,
@@ -742,10 +746,11 @@ fn committed_intent_recovery_follows_a_child_created_after_primary_commit() {
         sequence: participant.request_id.sequence,
         raft_group_id: child_route.raft_group_id,
     };
-    let mut child = TabletStateMachine::new(
+    let mut child = TabletStateMachine::new_with_replica(
         Tablet::new(child_route.tablet_id, TABLE_ID).unwrap(),
         child_route.tablet_epoch,
         child_route.raft_group_id,
+        child_route.leader_replica_id,
     )
     .unwrap();
     let child_prewrite = TabletCommandEnvelope::new_with_logical_command_id(

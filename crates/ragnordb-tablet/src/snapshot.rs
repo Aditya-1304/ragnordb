@@ -5,9 +5,15 @@
 //! snapshot image to the exact cluster, tablet generation, configuration,
 //! applied boundary, and payload checksum that produced it
 
-use crate::{Tablet, command::TabletStateMachine};
+use crate::{
+    Tablet,
+    command::{TabletReadGeneration, TabletStateMachine},
+};
 
-use ragnordb_storage::mvcc::InMemoryMvcc;
+use ragnordb_storage::{
+    lsm::{RecoveryFrontier, TabletStorageIdentity},
+    mvcc::{InMemoryMvcc, MvccReadGeneration},
+};
 
 use std::{
     collections::BTreeSet,
@@ -120,14 +126,47 @@ pub fn generate_local_snapshot_with_removal_proof(
         return Err(TabletSnapshotGenerationError::ZeroAppliedTerm);
     }
 
-    let tablet_state_machine = state_machine
-        .encode_snapshot_state()
+    let generation = state_machine
+        .pin_generation()
+        .map_err(|error| TabletSnapshotGenerationError::StateMachineSnapshot(error.to_string()))?;
+    let expected_identity = TabletStorageIdentity {
+        tablet_id: state_machine.tablet().id(),
+        table_id: state_machine.tablet().table_id(),
+        raft_group_id: state_machine.raft_group_id(),
+        replica_id,
+    };
+    let actual_identity = generation.storage_identity();
+    if actual_identity != expected_identity {
+        return Err(TabletSnapshotGenerationError::PinnedIdentityMismatch {
+            expected: expected_identity,
+            actual: actual_identity,
+        });
+    }
+
+    let expected_frontier = RecoveryFrontier::ReplicatedTablet {
+        raft_group_id: expected_identity.raft_group_id,
+        replica_id: expected_identity.replica_id,
+        applied_index: applied_frontier.index,
+        applied_term: applied_frontier.term,
+    };
+    let actual_frontier = generation.processed_frontier();
+    if actual_frontier != Some(expected_frontier) {
+        return Err(TabletSnapshotGenerationError::PinnedFrontierMismatch {
+            expected: expected_frontier,
+            actual: actual_frontier,
+        });
+    }
+
+    let tablet_state_machine = generation
+        .encode_snapshot_state(
+            state_machine.tablet().id(),
+            state_machine.epoch(),
+            state_machine.raft_group_id(),
+        )
         .map_err(|error| TabletSnapshotGenerationError::StateMachineSnapshot(error.to_string()))?;
 
-    let (default_values, locks, writes) = state_machine
-        .tablet()
-        .storage()
-        .capture_snapshot_state()
+    let (default_values, locks, writes) = generation
+        .export_snapshot()
         .map_err(|error| TabletSnapshotGenerationError::StateMachineSnapshot(error.to_string()))?
         .into_snapshot_entries();
 
@@ -195,6 +234,22 @@ pub enum TabletSnapshotGenerationError {
 
     #[error("local tablet snapshot has no applied term")]
     ZeroAppliedTerm,
+
+    #[error(
+        "pinned tablet generation identity {actual:?} does not match snapshot identity {expected:?}"
+    )]
+    PinnedIdentityMismatch {
+        expected: TabletStorageIdentity,
+        actual: TabletStorageIdentity,
+    },
+
+    #[error(
+        "pinned tablet generation frontier {actual:?} does not match snapshot boundary {expected:?}"
+    )]
+    PinnedFrontierMismatch {
+        expected: RecoveryFrontier,
+        actual: Option<RecoveryFrontier>,
+    },
 
     #[error("tablet state-machine snapshot encoding failed: {0}")]
     StateMachineSnapshot(String),
@@ -1342,6 +1397,9 @@ impl Drop for IncomingTabletSnapshotReceiver {
 pub struct TabletSnapshotInstallTarget {
     pub cluster_id: String,
     pub raft_group_id: RaftGroupId,
+    /// Local receiving replica lifetime; it may differ from the snapshot's
+    /// source replica when installing a replacement replica.
+    pub replica_id: ReplicaId,
     pub tablet_id: TabletId,
     pub table_id: TableId,
     pub tablet_epoch: u64,
@@ -1411,6 +1469,17 @@ pub fn restore_verified_snapshot(
     image: &TabletSnapshotImage,
     target: &TabletSnapshotInstallTarget,
 ) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    restore_verified_snapshot_for_replica(image, target, target.replica_id)
+}
+
+/// Restore a verified snapshot for the receiving replica lifetime. The
+/// snapshot's source replica is recorded in its metadata, while applied
+/// storage state must be rebound to the receiver's new local replica ID.
+pub fn restore_verified_snapshot_for_replica(
+    image: &TabletSnapshotImage,
+    target: &TabletSnapshotInstallTarget,
+    local_replica_id: ReplicaId,
+) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
     validate_install_target(&image.metadata, target)?;
 
     let payload = snapshot_proto::TabletSnapshotPayload::decode(image.data.as_slice())
@@ -1457,9 +1526,18 @@ pub fn restore_verified_snapshot(
     let tablet = Tablet::with_storage(target.tablet_id, target.table_id, storage)
         .map_err(|error| TabletSnapshotInstallError::TabletRestore(error.to_string()))?;
 
-    let state_machine =
-        TabletStateMachine::restore_from_snapshot(tablet, &payload.tablet_state_machine)
-            .map_err(|error| TabletSnapshotInstallError::StateMachineRestore(error.to_string()))?;
+    let mut state_machine = TabletStateMachine::restore_from_snapshot_with_replica(
+        tablet,
+        &payload.tablet_state_machine,
+        local_replica_id,
+    )
+    .map_err(|error| TabletSnapshotInstallError::StateMachineRestore(error.to_string()))?;
+    state_machine
+        .restore_recovery_frontier(
+            image.metadata.last_included_index,
+            image.metadata.last_included_term,
+        )
+        .map_err(|error| TabletSnapshotInstallError::StateMachineRestore(error.to_string()))?;
 
     Ok(RestoredTabletSnapshot {
         state_machine,
@@ -1505,6 +1583,12 @@ fn validate_install_target(
     if target.cluster_id.trim().is_empty() {
         return Err(TabletSnapshotInstallError::InvalidTarget(
             "cluster ID must not be empty",
+        ));
+    }
+
+    if target.replica_id.0 == 0 {
+        return Err(TabletSnapshotInstallError::InvalidTarget(
+            "replica ID must be non-zero",
         ));
     }
 

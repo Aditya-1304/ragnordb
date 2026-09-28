@@ -75,7 +75,9 @@ fn image() -> TabletSnapshotImage {
 
 fn installable_image() -> TabletSnapshotImage {
     let tablet = Tablet::new(TabletId(31), ragnordb_common::ids::TableId(9)).unwrap();
-    let state_machine = TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
+    let mut state_machine =
+        TabletStateMachine::new_with_replica(tablet, 4, RaftGroupId(17), ReplicaId(2)).unwrap();
+    state_machine.restore_recovery_frontier(12, 5).unwrap();
 
     generate_local_snapshot(
         &state_machine,
@@ -351,6 +353,7 @@ fn durable_install_requires_the_bounded_receive_session() {
         &TabletSnapshotInstallTarget {
             cluster_id: "ragnordb-test".to_string(),
             raft_group_id: RaftGroupId(17),
+            replica_id: ReplicaId(2),
             tablet_id: TabletId(31),
             table_id: ragnordb_common::ids::TableId(9),
             tablet_epoch: 4,
@@ -416,6 +419,7 @@ fn uncertain_snapshot_boundary_persistence_fences_the_ready_loop() {
             &TabletSnapshotInstallTarget {
                 cluster_id: "ragnordb-test".to_string(),
                 raft_group_id: RaftGroupId(17),
+                replica_id: ReplicaId(2),
                 tablet_id: TabletId(31),
                 table_id: ragnordb_common::ids::TableId(9),
                 tablet_epoch: 4,
@@ -501,8 +505,13 @@ fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
 
     let tablet =
         ragnordb_tablet::Tablet::new(TabletId(31), ragnordb_common::ids::TableId(9)).unwrap();
-    let state_machine =
-        ragnordb_tablet::command::TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
+    let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new_with_replica(
+        tablet,
+        4,
+        RaftGroupId(17),
+        ReplicaId(2),
+    )
+    .unwrap();
 
     let conf_state =
         TabletSnapshotConfState::new(7, [ReplicaId(1), ReplicaId(2), ReplicaId(3)], [], [])
@@ -530,6 +539,11 @@ fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
         .persist_and_apply_next_ready(&mut snapshot_store, &mut applied_state_machine)
         .unwrap();
 
+    let frontier = loop_.applied_frontier().unwrap();
+    state_machine
+        .apply_frontier_only_at(frontier.index, frontier.term)
+        .unwrap();
+
     let image = generate_tablet_snapshot_from_ready_loop(
         &work,
         &loop_,
@@ -541,7 +555,6 @@ fn local_tablet_snapshot_requires_the_ready_loop_applied_frontier() {
     )
     .unwrap();
 
-    let frontier = loop_.applied_frontier().unwrap();
     assert_eq!(image.metadata.last_included_index, frontier.index);
     assert_eq!(image.metadata.last_included_term, frontier.term);
 }

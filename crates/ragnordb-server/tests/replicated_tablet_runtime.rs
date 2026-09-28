@@ -595,6 +595,10 @@ async fn start_failover_test_nodes() -> Vec<TestNode> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_single_shard_commits_do_not_exhaust_lifecycle_registry() {
     const TRANSACTIONS: u64 = 2_048;
+    // This regression checks lifecycle capacity after many durable commits,
+    // not a per-statement latency target. Each loop iteration is a separate
+    // SQL statement, so install a fresh request deadline before executing it.
+    const STRESS_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
     let nodes = start_failover_test_nodes().await;
     let leader = tokio::time::timeout(Duration::from_secs(8), async {
@@ -693,19 +697,38 @@ async fn repeated_single_shard_commits_do_not_exhaust_lifecycle_registry() {
     };
 
     let stress_services = services.clone();
+    let stress_host_statuses = nodes
+        .iter()
+        .map(|node| node.runtime.host_status_handle())
+        .collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut session = SqlSession::with_client_id(0x7A11);
         for id in 1..=TRANSACTIONS {
             let statement = format!("INSERT INTO lifecycle_stress (id, value) VALUES ({id}, 'v')");
-            stress_services.execute_sql(
+            session.set_tablet_request_timeout(STRESS_STATEMENT_TIMEOUT);
+            if let Err(error) = stress_services.execute_sql(
                 &mut session,
                 &statement,
                 None,
                 None,
                 Duration::from_secs(5),
-            )?;
+            ) {
+                let statuses = stress_host_statuses
+                    .iter()
+                    .map(|status| {
+                        status
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                return Err(Error::Configuration(format!(
+                    "lifecycle stress insert {id} failed: {error}; host statuses: {statuses:?}"
+                )));
+            }
         }
 
+        session.set_tablet_request_timeout(STRESS_STATEMENT_TIMEOUT);
         stress_services.execute_sql(
             &mut session,
             &format!(
@@ -1107,8 +1130,18 @@ async fn three_node_runtime_admits_concurrent_barriers_and_replicates_sql_commit
     })
     .await
     .unwrap();
-    let (cross_table_commit, cross_table_user) =
-        cross_table_result.expect("production SQL must commit writes across two tablet groups");
+    let (cross_table_commit, cross_table_user) = match cross_table_result {
+        Ok(result) => result,
+        Err(error) => {
+            let statuses = nodes
+                .iter()
+                .map(|node| node.runtime.host_status())
+                .collect::<Vec<_>>();
+            panic!(
+                "production SQL must commit writes across two tablet groups: {error}; host statuses: {statuses:?}"
+            );
+        }
+    };
     let ExecutionResult::TransactionCommitted {
         commit_ts: Some(cross_table_commit_ts),
         committed_writes: 2,

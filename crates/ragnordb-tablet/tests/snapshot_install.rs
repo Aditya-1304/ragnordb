@@ -42,6 +42,7 @@ fn target() -> TabletSnapshotInstallTarget {
     TabletSnapshotInstallTarget {
         cluster_id: "ragnordb-test".to_string(),
         raft_group_id: RaftGroupId(17),
+        replica_id: ReplicaId(1),
         tablet_id: TabletId(31),
         table_id: TableId(9),
         tablet_epoch: 4,
@@ -52,12 +53,17 @@ fn snapshot_image() -> TabletSnapshotImage {
     let tablet = Tablet::new(TabletId(31), TableId(9)).unwrap();
     let mut state_machine = TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
 
-    state_machine.apply(request()).unwrap();
+    state_machine.apply_committed_at(request(), 1, 1).unwrap();
+    for index in 2..=12 {
+        state_machine
+            .apply_frontier_only_at(index, if index == 12 { 5 } else { 1 })
+            .unwrap();
+    }
 
     generate_local_snapshot(
         &state_machine,
         "ragnordb-test",
-        ReplicaId(2),
+        ReplicaId(1),
         9,
         conf_state(),
         AppliedTabletFrontier::new(12, 5),

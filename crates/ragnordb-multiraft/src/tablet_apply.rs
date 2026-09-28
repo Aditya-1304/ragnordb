@@ -204,11 +204,39 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
                         });
                     }
                 }
+                self.state_machine
+                    .command_batch_delta_upper_bound(&batch.commands)
+                    .map_err(TabletApplyError::FatalApply)?;
 
-                let dispositions = batch
-                    .commands
+                let envelopes = batch.commands;
+                let request_ids = envelopes
+                    .iter()
+                    .map(|envelope| envelope.request_id.clone())
+                    .collect::<Vec<_>>();
+                let outcomes = self
+                    .state_machine
+                    .apply_committed_batch_at(envelopes, position.index, position.term)
+                    .map_err(TabletApplyError::FatalApply)?;
+                let dispositions = request_ids
                     .into_iter()
-                    .map(|envelope| self.apply_envelope(position, envelope))
+                    .zip(outcomes)
+                    .map(|(request_id, outcome)| match outcome {
+                        Ok(outcome) => Ok(CommittedTabletCommandDisposition::Applied(
+                            AppliedTabletCommand {
+                                request_id,
+                                position,
+                                outcome,
+                            },
+                        )),
+                        Err(rejection) if is_deterministic_rejection(&rejection) => Ok(
+                            CommittedTabletCommandDisposition::Rejected(RejectedTabletCommand {
+                                request_id,
+                                position,
+                                rejection,
+                            }),
+                        ),
+                        Err(source) => Err(TabletApplyError::FatalApply(source)),
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 Ok(CommittedTabletCommandEntry::Batch(dispositions))
@@ -222,7 +250,13 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         envelope: TabletCommandEnvelope,
     ) -> Result<CommittedTabletCommandDisposition, TabletApplyError> {
         let request_id = envelope.request_id.clone();
-        match self.state_machine.apply(envelope) {
+        self.state_machine
+            .command_delta_upper_bound(&envelope)
+            .map_err(TabletApplyError::FatalApply)?;
+        match self
+            .state_machine
+            .apply_committed_at(envelope, position.index, position.term)
+        {
             Ok(outcome) => Ok(CommittedTabletCommandDisposition::Applied(
                 AppliedTabletCommand {
                     request_id,

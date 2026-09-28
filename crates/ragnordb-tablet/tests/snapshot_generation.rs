@@ -45,12 +45,17 @@ fn local_snapshot_records_the_applied_boundary() {
     )
     .unwrap();
 
-    state_machine.apply(request).unwrap();
+    state_machine.apply_committed_at(request, 1, 1).unwrap();
+    for index in 2..=12 {
+        state_machine
+            .apply_frontier_only_at(index, if index == 12 { 5 } else { 1 })
+            .unwrap();
+    }
 
     let image = generate_local_snapshot(
         &state_machine,
         "ragnordb-test",
-        ReplicaId(2),
+        ReplicaId(1),
         9,
         conf_state(),
         AppliedTabletFrontier::new(12, 5),
@@ -70,6 +75,52 @@ fn local_snapshot_records_the_applied_boundary() {
 
     assert_eq!(restored_state.tablet_id.0, 31);
     assert_eq!(restored_state.clients.len(), 1);
+}
+
+/// A snapshot boundary must describe the same replica generation that was
+/// pinned; otherwise restore could skip or replay commands against mismatched
+/// state.
+#[test]
+fn local_snapshot_rejects_boundary_or_replica_mismatch_with_pinned_generation() {
+    let mut state_machine = state_machine();
+    let request = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 42,
+            sequence: 1,
+            raft_group_id: RaftGroupId(17),
+        },
+        TabletId(31),
+        4,
+        TabletCommand::Noop(NoopCommand),
+    )
+    .unwrap();
+    state_machine.apply_committed_at(request, 1, 1).unwrap();
+
+    let mismatched_frontier = generate_local_snapshot(
+        &state_machine,
+        "ragnordb-test",
+        ReplicaId(1),
+        10,
+        conf_state(),
+        AppliedTabletFrontier::new(2, 1),
+    );
+    assert!(matches!(
+        mismatched_frontier,
+        Err(TabletSnapshotGenerationError::PinnedFrontierMismatch { .. })
+    ));
+
+    let mismatched_replica = generate_local_snapshot(
+        &state_machine,
+        "ragnordb-test",
+        ReplicaId(2),
+        11,
+        conf_state(),
+        AppliedTabletFrontier::new(1, 1),
+    );
+    assert!(matches!(
+        mismatched_replica,
+        Err(TabletSnapshotGenerationError::PinnedIdentityMismatch { .. })
+    ));
 }
 
 /// Catches generating or publishing a snapshot before a valid applied

@@ -533,7 +533,11 @@ fn bench_raft_simulated(c: &mut Criterion) {
 fn snapshot_fixture(row_count: u64) -> TabletStateMachine<InMemoryMvcc> {
     let storage = build_distinct_mvcc(row_count);
     let tablet = Tablet::with_storage(TABLET_ID, TABLE_ID, storage).unwrap();
-    TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap()
+    let mut state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    state_machine
+        .restore_recovery_frontier(100, 5)
+        .expect("snapshot benchmark fixture uses its synthetic applied boundary");
+    state_machine
 }
 
 fn snapshot_conf_state() -> TabletSnapshotConfState {

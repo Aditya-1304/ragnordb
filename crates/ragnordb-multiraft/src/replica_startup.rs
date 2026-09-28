@@ -136,7 +136,12 @@ where
 
     let tablet = Tablet::new(target.tablet_id, target.table_id)
         .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
-    let tablet = TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+    let tablet = TabletStateMachine::new_with_replica(
+        tablet,
+        target.tablet_epoch,
+        target.raft_group_id,
+        local_replica_id,
+    )?;
     let mut ready_loop = RaftReadyLoop::new(raft, RaftWalStorage::new(wal, identity));
     let initial_ready = ready_loop.persist_next_ready(None)?;
 
@@ -184,7 +189,12 @@ where
     .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
     let tablet = Tablet::new(target.tablet_id, target.table_id)
         .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
-    let state_machine = TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+    let state_machine = TabletStateMachine::new_with_replica(
+        tablet,
+        target.tablet_epoch,
+        target.raft_group_id,
+        local_replica_id,
+    )?;
     let mut ready_loop = RaftReadyLoop::new(
         raft,
         RaftWalStorage::new(
@@ -250,8 +260,12 @@ pub fn recover_tablet_replica<W: RaftWal>(
             }
             let tablet = Tablet::new(target.tablet_id, target.table_id)
                 .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
-            let state_machine =
-                TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+            let state_machine = TabletStateMachine::new_with_replica(
+                tablet,
+                target.tablet_epoch,
+                target.raft_group_id,
+                local_replica_id,
+            )?;
             (TabletCommandApplier::new(state_machine), None)
         }
     };
@@ -395,8 +409,12 @@ pub fn recover_joining_tablet_replica<W: RaftWal>(
             }
             let tablet = Tablet::new(target.tablet_id, target.table_id)
                 .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
-            let state_machine =
-                TabletStateMachine::new(tablet, target.tablet_epoch, target.raft_group_id)?;
+            let state_machine = TabletStateMachine::new_with_replica(
+                tablet,
+                target.tablet_epoch,
+                target.raft_group_id,
+                local_replica_id,
+            )?;
             (TabletCommandApplier::new(state_machine), None)
         }
     };

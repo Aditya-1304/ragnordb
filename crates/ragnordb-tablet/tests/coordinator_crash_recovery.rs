@@ -49,14 +49,23 @@ fn conf_state() -> TabletSnapshotConfState {
 
 fn state_machine(tablet_id: TabletId, raft_group_id: RaftGroupId) -> TabletStateMachine {
     let tablet = Tablet::new(tablet_id, TABLE_ID).unwrap();
-    TabletStateMachine::new(tablet, TABLET_EPOCH, raft_group_id).unwrap()
+    TabletStateMachine::new_with_replica(
+        tablet,
+        TABLET_EPOCH,
+        raft_group_id,
+        ReplicaId(tablet_id.0),
+    )
+    .unwrap()
 }
 
 fn restart_from_durable_snapshot(
-    state_machine: &TabletStateMachine,
+    state_machine: &mut TabletStateMachine,
     replica_id: ReplicaId,
     snapshot_id: u64,
 ) -> TabletStateMachine {
+    state_machine
+        .restore_recovery_frontier(snapshot_id + 10, 3)
+        .unwrap();
     let image = generate_local_snapshot(
         state_machine,
         CLUSTER_ID,
@@ -70,6 +79,7 @@ fn restart_from_durable_snapshot(
     let target = TabletSnapshotInstallTarget {
         cluster_id: CLUSTER_ID.to_string(),
         raft_group_id: state_machine.raft_group_id(),
+        replica_id: state_machine.replica_id(),
         tablet_id: state_machine.tablet().id(),
         table_id: TABLE_ID,
         tablet_epoch: TABLET_EPOCH,
@@ -225,8 +235,8 @@ fn crash_after_prewrite_recovers_and_rolls_back_all_visible_intents() {
         ))
         .unwrap();
 
-    let mut primary = restart_from_durable_snapshot(&primary, ReplicaId(1), 601);
-    let mut secondary = restart_from_durable_snapshot(&secondary, ReplicaId(2), 602);
+    let mut primary = restart_from_durable_snapshot(&mut primary, ReplicaId(1), 601);
+    let mut secondary = restart_from_durable_snapshot(&mut secondary, ReplicaId(2), 602);
 
     let pending = status(
         txn_id,
@@ -360,7 +370,7 @@ fn crash_after_primary_commit_rolls_secondary_forward_from_status() {
 
     // The secondary snapshot is taken before its cleanup command, which is
     // the crash point being modeled.
-    let mut secondary = restart_from_durable_snapshot(&secondary, ReplicaId(2), 603);
+    let mut secondary = restart_from_durable_snapshot(&mut secondary, ReplicaId(2), 603);
     let committed = status(
         txn_id,
         primary_key,
@@ -471,7 +481,7 @@ fn participant_crash_before_and_after_apply_has_one_deterministic_outcome() {
     )
     .unwrap();
     after_apply.apply(applied).unwrap();
-    let mut after_apply = restart_from_durable_snapshot(&after_apply, ReplicaId(3), 605);
+    let mut after_apply = restart_from_durable_snapshot(&mut after_apply, ReplicaId(3), 605);
     let replay = TabletCommandEnvelope::new_with_logical_command_id(
         request_id(0x502, 77, group),
         logical_id,

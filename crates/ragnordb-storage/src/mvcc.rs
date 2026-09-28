@@ -646,6 +646,37 @@ impl<G: MvccReadGeneration> MvccReadView<G> {
 /// All keys passed to this trait must be complete canonical row-key encodings
 /// produced by `ragnordb_storage::key::encode_row_key`.
 pub trait MvccStorage {
+    /// Pin the complete current MVCC generation for a coherent tablet-level
+    /// read or snapshot. Reference backends may materialize an owned copy;
+    /// persistent backends should return a lightweight immutable generation
+    /// handle.
+    fn pin_read_generation(&self) -> Result<Box<dyn MvccReadGeneration + Send + Sync>> {
+        Err(Error::NotImplemented(
+            "pinning a complete MVCC generation is not supported by this backend",
+        ))
+    }
+
+    /// Read one physical Default record for complete command-delta validation.
+    fn get_default_record(&self, _key: &[u8], _start_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        Err(Error::NotImplemented(
+            "physical default-record lookup is not supported by this backend",
+        ))
+    }
+
+    /// Read one physical Lock record for complete command-delta validation.
+    fn get_lock_record(&self, _key: &[u8]) -> Result<Option<LockRecord>> {
+        Err(Error::NotImplemented(
+            "physical lock-record lookup is not supported by this backend",
+        ))
+    }
+
+    /// Read one physical Write record for complete command-delta validation.
+    fn get_write_record(&self, _key: &[u8], _write_ts: Timestamp) -> Result<Option<WriteRecord>> {
+        Err(Error::NotImplemented(
+            "physical write-record lookup is not supported by this backend",
+        ))
+    }
+
     /// Read the row version visible at `read_ts`.
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>>;
 
@@ -759,6 +790,144 @@ pub trait MvccStorage {
         ))
     }
 
+    /// Prepare a distributed prewrite without publishing any MVCC record.
+    /// Replicated apply combines this with status, retry, and Raft metadata.
+    fn prepare_prewrite_batch(
+        &self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _mutations: &BTreeMap<Vec<u8>, Mutation>,
+        _primary_key: &[u8],
+        _ttl_ms: u64,
+    ) -> Result<MvccDelta> {
+        Err(Error::NotImplemented(
+            "side-effect-free distributed prewrite preparation is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Prepare an atomic single-shard commit without publishing its records.
+    fn prepare_commit_batch(
+        &self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _commit_ts: Timestamp,
+        _mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<MvccDelta> {
+        Err(Error::NotImplemented(
+            "side-effect-free commit preparation is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Prepare an atomic intent commit without removing any live intent.
+    fn prepare_commit_intents_batch(
+        &self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _commit_ts: Timestamp,
+        _keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        Err(Error::NotImplemented(
+            "side-effect-free intent commit preparation is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Prepare rollback witnesses and intent cleanup without publishing them.
+    fn prepare_rollback_intents_batch(
+        &self,
+        _txn_id: TxnId,
+        _start_ts: Timestamp,
+        _keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        Err(Error::NotImplemented(
+            "side-effect-free intent rollback preparation is not supported by this MVCC backend",
+        ))
+    }
+
+    /// Prepare against the base generation plus earlier edits staged by the
+    /// same Raft entry. Implementations that cannot provide a sparse overlay
+    /// must fail explicitly instead of validating against stale base state.
+    fn prepare_prewrite_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+        primary_key: &[u8],
+        ttl_ms: u64,
+    ) -> Result<MvccDelta> {
+        if staged.edits.is_empty() {
+            self.prepare_prewrite_batch(txn_id, start_ts, mutations, primary_key, ttl_ms)
+        } else {
+            Err(Error::NotImplemented(
+                "MVCC backend does not support sparse command-batch overlays",
+            ))
+        }
+    }
+
+    /// Prepare a single-shard commit against the private effects of earlier
+    /// subcommands in the same committed Raft entry.
+    fn prepare_commit_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<MvccDelta> {
+        if staged.edits.is_empty() {
+            self.prepare_commit_batch(txn_id, start_ts, commit_ts, mutations)
+        } else {
+            Err(Error::NotImplemented(
+                "MVCC backend does not support sparse command-batch overlays",
+            ))
+        }
+    }
+
+    /// Prepare intent commit using locks, defaults, and writes staged by prior
+    /// commands in this Raft entry.
+    fn prepare_commit_intents_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        if staged.edits.is_empty() {
+            self.prepare_commit_intents_batch(txn_id, start_ts, commit_ts, keys)
+        } else {
+            Err(Error::NotImplemented(
+                "MVCC backend does not support sparse command-batch overlays",
+            ))
+        }
+    }
+
+    /// Prepare rollback against the staged view, preserving sequential batch
+    /// semantics without exposing intermediate edits.
+    fn prepare_rollback_intents_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        if staged.edits.is_empty() {
+            self.prepare_rollback_intents_batch(txn_id, start_ts, keys)
+        } else {
+            Err(Error::NotImplemented(
+                "MVCC backend does not support sparse command-batch overlays",
+            ))
+        }
+    }
+
+    /// Publish one already prepared MVCC delta. Tablet command application
+    /// uses this only after complete-delta validation succeeds.
+    fn publish_mvcc_delta(&mut self, _delta: MvccDelta) -> Result<()> {
+        Err(Error::NotImplemented(
+            "prepared MVCC delta publication is not supported by this backend",
+        ))
+    }
+
     /// commit one previously installed distributed transaction intent
     ///
     /// an exact replay succeeds without creating a second write version. A
@@ -869,6 +1038,14 @@ pub struct MvccEngine<B = InMemoryMvccBackend> {
     backend: B,
 }
 
+/// Read-only sparse overlay used while preparing subcommands in one Raft
+/// batch. It keeps only the batch's edited records and delegates untouched
+/// reads to the immutable base backend.
+struct DeltaOverlayBackend<'a, B> {
+    base: &'a B,
+    staged: &'a MvccDelta,
+}
+
 /// Memory-backed MVCC reference engine retained for shadow comparisons.
 pub type InMemoryMvcc = MvccEngine<InMemoryMvccBackend>;
 
@@ -937,6 +1114,16 @@ impl<B: MvccBackend> MvccEngine<B> {
     /// generation or materializing a snapshot of its records.
     pub fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
         self.backend.recovery_frontier()
+    }
+
+    fn overlay_engine<'a>(
+        &'a self,
+        staged: &'a MvccDelta,
+    ) -> MvccEngine<DeltaOverlayBackend<'a, B>> {
+        MvccEngine::with_backend(DeltaOverlayBackend {
+            base: &self.backend,
+            staged,
+        })
     }
 }
 
@@ -2003,6 +2190,22 @@ fn scan_page_from<R: MvccReadGeneration + ?Sized>(
 }
 
 impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
+    fn pin_read_generation(&self) -> Result<Box<dyn MvccReadGeneration + Send + Sync>> {
+        Ok(Box::new(self.backend.pin_generation()?))
+    }
+
+    fn get_default_record(&self, key: &[u8], start_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        self.backend.get_default(key, start_ts)
+    }
+
+    fn get_lock_record(&self, key: &[u8]) -> Result<Option<LockRecord>> {
+        self.backend.get_lock(key)
+    }
+
+    fn get_write_record(&self, key: &[u8], write_ts: Timestamp) -> Result<Option<WriteRecord>> {
+        self.backend.get_write(key, write_ts)
+    }
+
     fn read(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Vec<u8>>> {
         self.backend.read(key, read_ts)
     }
@@ -2093,6 +2296,19 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         commit_ts: Timestamp,
         mutations: &BTreeMap<Vec<u8>, Mutation>,
     ) -> Result<usize> {
+        let applied_writes = mutations.len();
+        let delta = self.prepare_commit_batch(txn_id, start_ts, commit_ts, mutations)?;
+        self.publish_mvcc_delta(delta)?;
+        Ok(applied_writes)
+    }
+
+    fn prepare_commit_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<MvccDelta> {
         validate_commit_metadata(txn_id, start_ts, commit_ts)?;
 
         // validate persisted representations before considering an idempotent
@@ -2103,14 +2319,14 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         }
 
         if mutations.is_empty() {
-            return Ok(0);
+            return Ok(MvccDelta::default());
         }
 
         // identical batch is a safe deterministic replay A
         // partially present batch is impossible after atomic application and
         // therefore represents corrupted state
         if self.validate_batch_replay(mutations, start_ts, commit_ts)? {
-            return Ok(mutations.len());
+            return Ok(MvccDelta::default());
         }
 
         self.validate_commit_batch(txn_id, start_ts, mutations)?;
@@ -2122,7 +2338,8 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         }
 
         // Prepare one sparse backend delta only after every logical validation
-        // has succeeded. The backend publishes the complete MVCC edit set once.
+        // has succeeded. The caller can combine it with tablet metadata before
+        // invoking the single command publication boundary.
         let mut delta = MvccDelta::default();
         for (key, mutation) in mutations {
             match mutation {
@@ -2161,8 +2378,7 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
             }
         }
 
-        self.backend.publish_atomic(delta)?;
-        Ok(mutations.len())
+        Ok(delta)
     }
 
     fn stats(&self) -> MvccStats {
@@ -2206,6 +2422,19 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         primary_key: &[u8],
         ttl_ms: u64,
     ) -> Result<()> {
+        let delta =
+            self.prepare_prewrite_batch(txn_id, start_ts, mutations, primary_key, ttl_ms)?;
+        self.publish_mvcc_delta(delta)
+    }
+
+    fn prepare_prewrite_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+        primary_key: &[u8],
+        ttl_ms: u64,
+    ) -> Result<MvccDelta> {
         if mutations.is_empty() {
             return Err(Error::InvalidArgument(
                 "distributed prewrite batch must contain at least one mutation".to_string(),
@@ -2223,10 +2452,10 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
 
         let mut prepared = Vec::with_capacity(mutations.len());
         for (key, mutation) in mutations {
-            if let Some(delta) =
+            if let Some(edit) =
                 self.prepare_prewrite(txn_id, start_ts, key, mutation, primary_key, ttl_ms)?
             {
-                prepared.push(delta);
+                prepared.push(edit);
             }
         }
 
@@ -2234,11 +2463,11 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         for prepared in prepared {
             Self::append_prewrite_edit(&mut delta, prepared);
         }
-        if !delta.edits.is_empty() {
-            self.backend.publish_atomic(delta)?;
-        }
+        Ok(delta)
+    }
 
-        Ok(())
+    fn publish_mvcc_delta(&mut self, delta: MvccDelta) -> Result<()> {
+        self.backend.publish_atomic(delta)
     }
 
     fn commit_intent(
@@ -2266,6 +2495,17 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         commit_ts: Timestamp,
         keys: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
+        let delta = self.prepare_commit_intents_batch(txn_id, start_ts, commit_ts, keys)?;
+        self.publish_mvcc_delta(delta)
+    }
+
+    fn prepare_commit_intents_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
         if keys.is_empty() {
             return Err(Error::InvalidArgument(
                 "distributed commit batch must contain at least one key".to_string(),
@@ -2285,11 +2525,7 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         for prepared in prepared {
             Self::append_intent_commit_edit(&mut delta, prepared);
         }
-        if !delta.edits.is_empty() {
-            self.backend.publish_atomic(delta)?;
-        }
-
-        Ok(())
+        Ok(delta)
     }
 
     fn rollback_intent(&mut self, txn_id: TxnId, start_ts: Timestamp, key: &[u8]) -> Result<()> {
@@ -2310,6 +2546,16 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         start_ts: Timestamp,
         keys: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
+        let delta = self.prepare_rollback_intents_batch(txn_id, start_ts, keys)?;
+        self.publish_mvcc_delta(delta)
+    }
+
+    fn prepare_rollback_intents_batch(
+        &self,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
         if keys.is_empty() {
             return Err(Error::InvalidArgument(
                 "distributed rollback batch must contain at least one key".to_string(),
@@ -2329,11 +2575,60 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         for prepared in prepared {
             Self::append_intent_rollback_edit(&mut delta, prepared, start_ts);
         }
-        if !delta.edits.is_empty() {
-            self.backend.publish_atomic(delta)?;
-        }
+        Ok(delta)
+    }
 
-        Ok(())
+    fn prepare_prewrite_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+        primary_key: &[u8],
+        ttl_ms: u64,
+    ) -> Result<MvccDelta> {
+        self.overlay_engine(staged).prepare_prewrite_batch(
+            txn_id,
+            start_ts,
+            mutations,
+            primary_key,
+            ttl_ms,
+        )
+    }
+
+    fn prepare_commit_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        mutations: &BTreeMap<Vec<u8>, Mutation>,
+    ) -> Result<MvccDelta> {
+        self.overlay_engine(staged)
+            .prepare_commit_batch(txn_id, start_ts, commit_ts, mutations)
+    }
+
+    fn prepare_commit_intents_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        commit_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        self.overlay_engine(staged)
+            .prepare_commit_intents_batch(txn_id, start_ts, commit_ts, keys)
+    }
+
+    fn prepare_rollback_intents_batch_with_overlay(
+        &self,
+        staged: &MvccDelta,
+        txn_id: TxnId,
+        start_ts: Timestamp,
+        keys: &BTreeSet<Vec<u8>>,
+    ) -> Result<MvccDelta> {
+        self.overlay_engine(staged)
+            .prepare_rollback_intents_batch(txn_id, start_ts, keys)
     }
 }
 
@@ -2594,6 +2889,197 @@ impl MvccReadGeneration for InMemoryMvccBackend {
 
         Ok(CapturedMvccState::new(default_values, locks, writes))
     }
+}
+
+impl<B: MvccBackend> MvccReadGeneration for DeltaOverlayBackend<'_, B> {
+    fn get_default(&self, key: &[u8], start_ts: Timestamp) -> Result<Option<Vec<u8>>> {
+        for edit in self.staged.edits.iter().rev() {
+            match edit {
+                MvccRecordEdit::PutDefault {
+                    key: edit_key,
+                    start_ts: edit_ts,
+                    row,
+                } if edit_key == key && *edit_ts == start_ts => return Ok(Some(row.clone())),
+                MvccRecordEdit::DeleteDefault {
+                    key: edit_key,
+                    start_ts: edit_ts,
+                } if edit_key == key && *edit_ts == start_ts => return Ok(None),
+                _ => {}
+            }
+        }
+        self.base.get_default(key, start_ts)
+    }
+
+    fn get_lock(&self, key: &[u8]) -> Result<Option<LockRecord>> {
+        for edit in self.staged.edits.iter().rev() {
+            match edit {
+                MvccRecordEdit::PutLock {
+                    key: edit_key,
+                    lock,
+                } if edit_key == key => return Ok(Some(lock.clone())),
+                MvccRecordEdit::DeleteLock { key: edit_key } if edit_key == key => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        self.base.get_lock(key)
+    }
+
+    fn get_write(&self, key: &[u8], write_ts: Timestamp) -> Result<Option<WriteRecord>> {
+        if let Some(write) = self.staged.edits.iter().rev().find_map(|edit| match edit {
+            MvccRecordEdit::PutWrite {
+                key: edit_key,
+                write_ts: edit_ts,
+                write,
+            } if edit_key == key && *edit_ts == write_ts => Some(write.clone()),
+            _ => None,
+        }) {
+            return Ok(Some(write));
+        }
+        self.base.get_write(key, write_ts)
+    }
+
+    fn write_page(
+        &self,
+        key: &[u8],
+        lower: Bound<Timestamp>,
+        upper: Bound<Timestamp>,
+        resume_after: Option<Timestamp>,
+        direction: MvccCursorDirection,
+        max_records: usize,
+    ) -> Result<MvccWritePage> {
+        if max_records == 0 {
+            return Err(Error::InvalidArgument(
+                "MVCC write cursor max_records must be greater than zero".to_string(),
+            ));
+        }
+
+        let staged_writes = self
+            .staged
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                MvccRecordEdit::PutWrite {
+                    key: edit_key,
+                    write_ts,
+                    write,
+                } if edit_key == key && timestamp_in_bounds(*write_ts, &lower, &upper) => {
+                    let after_resume = match (direction, resume_after) {
+                        (MvccCursorDirection::Forward, Some(resume)) => *write_ts > resume,
+                        (MvccCursorDirection::Reverse, Some(resume)) => *write_ts < resume,
+                        (_, None) => true,
+                    };
+                    after_resume.then_some((*write_ts, write.clone()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let base_limit = max_records
+            .checked_add(staged_writes.len())
+            .ok_or_else(|| {
+                Error::InvalidArgument("MVCC overlay page size overflowed".to_string())
+            })?;
+        let base_page =
+            self.base
+                .write_page(key, lower, upper, resume_after, direction, base_limit)?;
+
+        let mut merged = base_page.writes.into_iter().collect::<BTreeMap<_, _>>();
+        merged.extend(staged_writes);
+        let mut writes = merged
+            .into_iter()
+            .filter(|(timestamp, _)| {
+                timestamp_in_bounds(*timestamp, &lower, &upper)
+                    && match (direction, resume_after) {
+                        (MvccCursorDirection::Forward, Some(resume)) => *timestamp > resume,
+                        (MvccCursorDirection::Reverse, Some(resume)) => *timestamp < resume,
+                        (_, None) => true,
+                    }
+            })
+            .collect::<Vec<_>>();
+        if direction == MvccCursorDirection::Reverse {
+            writes.reverse();
+        }
+        let has_more = base_page.has_more || writes.len() > max_records;
+        writes.truncate(max_records);
+        Ok(MvccWritePage { writes, has_more })
+    }
+
+    fn key_page(
+        &self,
+        family: MvccKeyFamily,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_keys: usize,
+    ) -> Result<MvccKeyPage> {
+        self.base
+            .key_page(family, start, end, resume_after, max_keys)
+    }
+
+    fn lock_page(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        resume_after: Option<&[u8]>,
+        max_locks: usize,
+        max_bytes: usize,
+    ) -> Result<IntentScanPage> {
+        self.base
+            .lock_page(start, end, resume_after, max_locks, max_bytes)
+    }
+
+    fn recovery_frontier(&self) -> Result<Option<RecoveryFrontier>> {
+        self.base.recovery_frontier()
+    }
+
+    fn export_snapshot(&self) -> Result<CapturedMvccState> {
+        self.base.export_snapshot()
+    }
+}
+
+impl<B: MvccBackend> MvccBackend for DeltaOverlayBackend<'_, B> {
+    // This private preparation view is never pinned or published. Keeping the
+    // associated type valid lets it reuse the shared MVCC preparation rules.
+    type PinnedGeneration = B::PinnedGeneration;
+
+    fn publish_atomic(&mut self, _delta: MvccDelta) -> Result<()> {
+        Err(Error::NotImplemented(
+            "a private MVCC command overlay cannot publish independently",
+        ))
+    }
+
+    fn pin_generation(&self) -> Result<Self::PinnedGeneration> {
+        Err(Error::NotImplemented(
+            "a private MVCC command overlay cannot be pinned",
+        ))
+    }
+
+    fn stats(&self) -> MvccStats {
+        self.base.stats()
+    }
+
+    fn allocator_high_water_marks(&self) -> (TxnId, Timestamp) {
+        self.base.allocator_high_water_marks()
+    }
+}
+
+fn timestamp_in_bounds(
+    timestamp: Timestamp,
+    lower: &Bound<Timestamp>,
+    upper: &Bound<Timestamp>,
+) -> bool {
+    let above_lower = match lower {
+        Bound::Included(bound) => timestamp >= *bound,
+        Bound::Excluded(bound) => timestamp > *bound,
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(bound) => timestamp <= *bound,
+        Bound::Excluded(bound) => timestamp < *bound,
+        Bound::Unbounded => true,
+    };
+    above_lower && below_upper
 }
 
 impl MvccBackend for InMemoryMvccBackend {
@@ -3914,6 +4400,65 @@ mod tests {
         assert_eq!(
             engine.backend.locks.get(&second_key).unwrap().txn_id,
             TxnId(2)
+        );
+    }
+
+    #[test]
+    fn prewrite_preparation_does_not_publish_before_the_command_boundary() {
+        let key = encoded_key(91);
+        let mutations = put_batch(key.clone(), encoded_row(91, "prepared"));
+        let mut engine = InMemoryMvcc::new();
+
+        let delta = engine
+            .prepare_prewrite_batch(TxnId(7), Timestamp(11), &mutations, &key, 30_000)
+            .unwrap();
+
+        assert!(!engine.backend.default.contains_key(&key));
+        assert!(!engine.backend.locks.contains_key(&key));
+
+        engine.publish_mvcc_delta(delta).unwrap();
+
+        assert!(engine.backend.default.contains_key(&key));
+        assert_eq!(engine.backend.locks.get(&key).unwrap().txn_id, TxnId(7));
+    }
+
+    #[test]
+    fn rollback_preparation_keeps_intent_and_witness_unmodified_until_publish() {
+        let key = encoded_key(92);
+        let mut engine = InMemoryMvcc::new();
+        let mutations = put_batch(key.clone(), encoded_row(92, "rollback"));
+        let prewrite = engine
+            .prepare_prewrite_batch(TxnId(8), Timestamp(12), &mutations, &key, 30_000)
+            .unwrap();
+        engine.publish_mvcc_delta(prewrite).unwrap();
+        let keys = BTreeSet::from([key.clone()]);
+
+        let rollback = engine
+            .prepare_rollback_intents_batch(TxnId(8), Timestamp(12), &keys)
+            .unwrap();
+
+        assert!(engine.backend.default.contains_key(&key));
+        assert!(engine.backend.locks.contains_key(&key));
+        assert!(
+            engine
+                .backend
+                .get_write(&key, Timestamp(12))
+                .unwrap()
+                .is_none()
+        );
+
+        engine.publish_mvcc_delta(rollback).unwrap();
+
+        assert!(!engine.backend.default.contains_key(&key));
+        assert!(!engine.backend.locks.contains_key(&key));
+        assert_eq!(
+            engine
+                .backend
+                .get_write(&key, Timestamp(12))
+                .unwrap()
+                .unwrap()
+                .op,
+            WriteKind::Rollback
         );
     }
 

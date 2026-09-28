@@ -249,8 +249,13 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
                 let tablet = Tablet::new(tablet_id, table_id)
                     .map_err(|error| TabletClusterError::Configuration(error.to_string()))?;
 
-                let state_machine = TabletStateMachine::new(tablet, tablet_epoch, raft_group_id)
-                    .map_err(|error| TabletClusterError::Configuration(error.to_string()))?;
+                let state_machine = TabletStateMachine::new_with_replica(
+                    tablet,
+                    tablet_epoch,
+                    raft_group_id,
+                    ReplicaId(node_id),
+                )
+                .map_err(|error| TabletClusterError::Configuration(error.to_string()))?;
 
                 Ok(TabletReplica {
                     node_id,
@@ -556,6 +561,7 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
         let target = TabletSnapshotInstallTarget {
             cluster_id: target_image.metadata.cluster_id.clone(),
             raft_group_id: self.raft_group_id,
+            replica_id: ReplicaId(self.replicas[follower_index].raft.raft().id().get()),
             tablet_id: self.tablet_id,
             table_id: self.replicas[follower_index]
                 .tablet
@@ -809,6 +815,14 @@ impl<W: RaftWal> InMemoryTabletCluster<W> {
             .tablet
             .state_machine()
             .validate_proposal(&envelope)
+            .map_err(|source| TabletClusterError::ProposalValidation {
+                node_id: leader_id,
+                source,
+            })?;
+        self.replicas[leader_index]
+            .tablet
+            .state_machine()
+            .command_delta_upper_bound(&envelope)
             .map_err(|source| TabletClusterError::ProposalValidation {
                 node_id: leader_id,
                 source,

@@ -1,10 +1,9 @@
 # Tablet-local LSM storage format
 
-Status: **Stage 4.2 is closed with Candidate B selected for V1.** The corrected
-full-matrix benchmark, format contract, and design rationale are recorded in
-[stage4_2_lsm_layout_decision.md](design/stage4_2_lsm_layout_decision.md). This
-document does not claim that SSTables, MANIFEST publication, memtables, or
-durable `CommandDelta` are implemented. Those arrive in the ordered later
+Status: **Stage 4.2 is closed with Candidate B selected for V1.** Stage 4.3
+adds an in-memory atomic `CommandDelta` boundary and versioned value codecs.
+This document does not claim that SSTables, MANIFEST publication, memtables,
+or durable `CommandDelta` recovery are implemented. Those arrive in later
 stages, with real-file crash/reopen validation before the engine is enabled.
 
 ## Ownership and physical layout
@@ -36,6 +35,10 @@ key uses the transaction `start_ts`; the Write value tag identifies
 existing MVCC rollback model while making rollback lookup part of the Write
 family. Range tombstones share that family; their value stores a canonical
 exclusive end key and their logical range is `[start, end)`.
+
+A Lock key belongs to the tablet's table. Its value's `primary_key` is a
+canonical row-key reference and may belong to another table, because a
+cross-table participant lock points to the transaction's primary row.
 
 Metadata and Index are logical families under the same tablet-local LSM
 lineage. They do not create independent database instances, WALs, MANIFESTs,
@@ -143,21 +146,26 @@ deletion is enabled in the production LSM.
 
 ## Value and record-kind boundary
 
-InternalKeyV1 freezes key identities and ordering. Stage 4.2 does not freeze
-value payload bytes. Those will use explicitly assigned
-`[value-format-version][record-tag][payload]` envelopes and must not be inferred
-from Rust struct layout or serde. The Write value's operation tag will
-distinguish Put, Delete, and Rollback. Lock values will include the owning
-transaction and intent metadata; range-tombstone values will include the
-exclusive end row key. Each value tag and payload must receive exact
-golden-byte tests before Stage 4.3 can publish it.
+`InternalKeyV1` freezes key identities and ordering. `ValueRecordV1` now
+defines explicit `[value-format-version][record-tag][payload]` encodings for
+Default rows, Put/Delete/Rollback Write records, Locks, transaction status,
+logical and legacy retry outcomes, and retry floors. Integer byte order,
+record tags, length framing, bounds, and golden bytes are explicit in
+`crates/ragnordb-storage/src/lsm/value.rs`; Rust struct layout and serde are
+not storage formats. Range-tombstone, Index, and unique-claim payloads remain
+reserved for later implementation.
 
-`CommandDelta` publication is one all-family visibility boundary. It must
-atomically publish applicable Default, Write, Lock, RangeTombstone, Metadata,
-Index, retry-floor, and processed Raft index/term changes. A state where only
-some families or the applied frontier are visible is invalid. Recovery selects
-one complete MANIFEST generation and its typed `RecoveryFrontier`; it never
-combines independently published family generations.
+Stage 4.3 implements an **in-memory** `CommandDelta` publication boundary for
+MVCC Default/Write/Lock records (rollback witnesses use Write), transaction
+status, logical and legacy retry outcomes, retry floors, and the exact
+processed Raft index/term. It validates the whole delta before publication;
+fatal validation or apply errors leave that entry unpublished, while
+deterministic command rejections publish their result and consumed frontier
+together. RangeTombstone and Index namespaces are reserved only and are not
+current edits; when enabled, their changes must join this same boundary. This
+in-memory contract is not a claim of atomic durable persistence. A future
+backend must publish one complete durable generation and recover its typed
+`RecoveryFrontier`, never combine independently published family generations.
 
 ## V1 LSM operating defaults
 

@@ -4,17 +4,24 @@ use prost::Message;
 use ragnordb_common::{
     codec::{Row, Value, WriteKind},
     command_codec::{
-        NoopCommand, SingleShardCommitCommand, TabletCommand, TabletCommandBatchEnvelope,
-        TabletCommandEnvelope, WriteEntry,
+        CommitCommand, NoopCommand, PrewriteCommand, SingleShardCommitCommand, TabletCommand,
+        TabletCommandBatchEnvelope, TabletCommandEnvelope, WriteEntry,
     },
-    ids::{RaftGroupId, RequestId, TableId, TabletId},
+    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
     proto::command,
 };
 use ragnordb_multiraft::{
     proposal::{ProposalCompletion, ProposalPosition, ProposalRegistry},
-    tablet_apply::{CommittedTabletCommandDisposition, TabletApplyError, TabletCommandApplier},
+    tablet_apply::{
+        CommittedTabletCommandDisposition, CommittedTabletCommandEntry, RejectedTabletCommand,
+        TabletApplyError, TabletCommandApplier,
+    },
 };
-use ragnordb_storage::key::{encode_row_key, make_row_key};
+use ragnordb_storage::{
+    key::{encode_row_key, make_row_key},
+    lsm::RecoveryFrontier,
+    mvcc::MvccStorage,
+};
 use ragnordb_tablet::{
     Tablet,
     command::{
@@ -43,6 +50,15 @@ fn applier() -> TabletCommandApplier {
     TabletCommandApplier::new(state_machine)
 }
 
+fn applier_with_frontier(index: u64, term: u64) -> TabletCommandApplier {
+    let mut applier = applier();
+    applier
+        .state_machine_mut()
+        .restore_recovery_frontier(index, term)
+        .unwrap();
+    applier
+}
+
 fn noop_bytes(request_id: RequestId, tablet_id: TabletId) -> Vec<u8> {
     TabletCommandEnvelope::new(
         request_id,
@@ -61,7 +77,7 @@ fn noop_bytes(request_id: RequestId, tablet_id: TabletId) -> Vec<u8> {
 /// position so the proposal waiter can be resolved only by the matching apply.
 #[test]
 fn committed_entry_resolves_proposal_from_tablet_apply_result() {
-    let mut applier = applier();
+    let mut applier = applier_with_frontier(6, 2);
     let request_id = request_id();
     let position = ProposalPosition { term: 3, index: 7 };
     let command = noop_bytes(request_id.clone(), TABLET_ID);
@@ -85,6 +101,15 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
     assert_eq!(applied.request_id, request_id);
     assert_eq!(applied.position, position);
     assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: position.index,
+            applied_term: position.term,
+        })
+    );
+    assert_eq!(
         applied.outcome,
         TabletCommandApplyOutcome {
             result: TabletCommandApplyResult::Noop,
@@ -107,6 +132,112 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
     );
 }
 
+#[test]
+fn committed_write_rejection_caches_result_and_advances_complete_frontier() {
+    let mut applier = applier();
+    let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(7)]).unwrap()).unwrap();
+    let first_request = request_id();
+    let first = TabletCommandEnvelope::new(
+        first_request.clone(),
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: ragnordb_common::ids::TxnId(1),
+            start_timestamp: ragnordb_common::ids::Timestamp(10),
+            commit_timestamp: ragnordb_common::ids::Timestamp(100),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(7)],
+                }),
+                op: WriteKind::Put,
+            }],
+        }),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    let rejected_request = RequestId {
+        client_id: first_request.client_id,
+        sequence: 2,
+        raft_group_id: RAFT_GROUP_ID,
+    };
+    let rejected = TabletCommandEnvelope::new(
+        rejected_request.clone(),
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: ragnordb_common::ids::TxnId(2),
+            start_timestamp: ragnordb_common::ids::Timestamp(20),
+            commit_timestamp: ragnordb_common::ids::Timestamp(50),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(8)],
+                }),
+                op: WriteKind::Put,
+            }],
+        }),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    applier
+        .apply_committed(ProposalPosition { term: 2, index: 1 }, &first)
+        .unwrap();
+    let first_rejection = applier
+        .apply_committed(ProposalPosition { term: 2, index: 2 }, &rejected)
+        .unwrap();
+    assert!(matches!(
+        first_rejection,
+        CommittedTabletCommandDisposition::Rejected(_)
+    ));
+    assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 2,
+            applied_term: 2,
+        })
+    );
+
+    let retry = applier
+        .apply_committed(ProposalPosition { term: 3, index: 3 }, &rejected)
+        .unwrap();
+    assert!(matches!(
+        retry,
+        CommittedTabletCommandDisposition::Rejected(RejectedTabletCommand {
+            rejection: TabletCommandApplyError::WriteConflict { .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 3,
+            applied_term: 3,
+        })
+    );
+    assert_eq!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .read(&key, ragnordb_common::ids::Timestamp(100))
+            .unwrap(),
+        Some(
+            ragnordb_common::encoding::encode_row(&Row {
+                values: vec![Value::Int(7)],
+            })
+            .unwrap()
+        )
+    );
+}
+
 /// Realistic bug caught:
 ///
 /// Corrupt committed bytes must fail before reaching the tablet state machine.
@@ -114,7 +245,7 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
 /// malformed entry did not consume replicated request state.
 #[test]
 fn malformed_committed_entry_does_not_consume_request_sequence() {
-    let mut applier = applier();
+    let mut applier = applier_with_frontier(6, 2);
     let position = ProposalPosition { term: 3, index: 7 };
 
     assert!(matches!(
@@ -138,7 +269,7 @@ fn malformed_committed_entry_does_not_consume_request_sequence() {
 /// rejection, but must never be reported as a successful proposal.
 #[test]
 fn committed_entry_for_another_tablet_is_rejected() {
-    let mut applier = applier();
+    let mut applier = applier_with_frontier(6, 2);
     let position = ProposalPosition { term: 3, index: 7 };
     let command = noop_bytes(request_id(), TabletId(TABLET_ID.0 + 1));
 
@@ -161,7 +292,7 @@ fn committed_entry_for_another_tablet_is_rejected() {
 /// batch as if it had one client identity.
 #[test]
 fn committed_batch_applies_each_subcommand_at_the_shared_position() {
-    let mut applier = applier();
+    let mut applier = applier_with_frontier(7, 2);
     let first_key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(1)]).unwrap()).unwrap();
     let second_key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(2)]).unwrap()).unwrap();
 
@@ -238,12 +369,359 @@ fn committed_batch_applies_each_subcommand_at_the_shared_position() {
 
 /// Realistic bug caught:
 ///
+/// Commands inside one committed batch execute in order against the staged
+/// effects of earlier commands, while the complete batch publishes once at
+/// its single Raft position. A prewrite followed by its commit must therefore
+/// produce a committed row without exposing an intermediate lock generation.
+#[test]
+fn committed_batch_prewrite_then_commit_uses_one_staged_generation() {
+    let mut applier = applier_with_frontier(11, 3);
+    let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(55)]).unwrap()).unwrap();
+    let prewrite = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 501,
+            sequence: 1,
+            raft_group_id: RAFT_GROUP_ID,
+        },
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: ragnordb_common::ids::TxnId(501),
+            start_timestamp: ragnordb_common::ids::Timestamp(10),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(55)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: key.clone(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        }),
+    )
+    .unwrap();
+    let commit = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 502,
+            sequence: 1,
+            raft_group_id: RAFT_GROUP_ID,
+        },
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Commit(CommitCommand {
+            txn_id: ragnordb_common::ids::TxnId(501),
+            start_timestamp: ragnordb_common::ids::Timestamp(10),
+            commit_timestamp: ragnordb_common::ids::Timestamp(20),
+            keys: vec![key.clone()],
+            committed_status: None,
+        }),
+    )
+    .unwrap();
+    let entry = TabletCommandBatchEnvelope::new(vec![prewrite, commit])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let position = ProposalPosition { term: 4, index: 12 };
+
+    let CommittedTabletCommandEntry::Batch(dispositions) =
+        applier.apply_committed_entry(position, &entry).unwrap()
+    else {
+        panic!("batch entry was not reported as a batch");
+    };
+
+    assert!(
+        dispositions.iter().all(|disposition| matches!(
+            disposition,
+            CommittedTabletCommandDisposition::Applied(_)
+        ))
+    );
+    assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: position.index,
+            applied_term: position.term,
+        })
+    );
+    assert!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .scan_intent_page(None, None, None, 10)
+            .unwrap()
+            .locks
+            .is_empty()
+    );
+    assert_eq!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .read(&key, ragnordb_common::ids::Timestamp(20))
+            .unwrap(),
+        Some(
+            ragnordb_common::encoding::encode_row(&Row {
+                values: vec![Value::Int(55)],
+            })
+            .unwrap()
+        )
+    );
+}
+
+/// Realistic bug caught: a deterministic conflict between two successful
+/// subcommands must be cached inside the same entry publication, and the entry
+/// advances one shared frontier only after all three outcomes are prepared.
+#[test]
+fn mixed_batch_publishes_success_rejection_success_at_one_frontier() {
+    let mut applier = applier();
+    let locked_key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(70)]).unwrap()).unwrap();
+    let first_key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(71)]).unwrap()).unwrap();
+    let last_key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(72)]).unwrap()).unwrap();
+    let initial_prewrite = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 700,
+            sequence: 1,
+            raft_group_id: RAFT_GROUP_ID,
+        },
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: ragnordb_common::ids::TxnId(700),
+            start_timestamp: ragnordb_common::ids::Timestamp(10),
+            writes: vec![WriteEntry {
+                key: locked_key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(70)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: locked_key.clone(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        }),
+    )
+    .unwrap();
+    applier
+        .apply_committed_entry(
+            ProposalPosition { term: 4, index: 1 },
+            &initial_prewrite.encode().unwrap(),
+        )
+        .unwrap();
+
+    let commit = |client_id, txn_id, key: Vec<u8>, value| {
+        TabletCommandEnvelope::new(
+            RequestId {
+                client_id,
+                sequence: 1,
+                raft_group_id: RAFT_GROUP_ID,
+            },
+            TABLET_ID,
+            TABLET_EPOCH,
+            TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+                txn_id: ragnordb_common::ids::TxnId(txn_id),
+                start_timestamp: ragnordb_common::ids::Timestamp(txn_id),
+                commit_timestamp: ragnordb_common::ids::Timestamp(txn_id + 1),
+                writes: vec![WriteEntry {
+                    key,
+                    row: Some(Row {
+                        values: vec![Value::Int(value)],
+                    }),
+                    op: WriteKind::Put,
+                }],
+            }),
+        )
+        .unwrap()
+    };
+    let first = commit(710, 20, first_key.clone(), 71);
+    let conflict = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 711,
+            sequence: 1,
+            raft_group_id: RAFT_GROUP_ID,
+        },
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::Prewrite(PrewriteCommand {
+            txn_id: ragnordb_common::ids::TxnId(711),
+            start_timestamp: ragnordb_common::ids::Timestamp(30),
+            writes: vec![WriteEntry {
+                key: locked_key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(700)],
+                }),
+                op: WriteKind::Put,
+            }],
+            primary_key: locked_key.clone(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        }),
+    )
+    .unwrap();
+    let last = commit(712, 40, last_key.clone(), 72);
+    let batch = TabletCommandBatchEnvelope::new(vec![first, conflict.clone(), last])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let position = ProposalPosition { term: 4, index: 2 };
+
+    let CommittedTabletCommandEntry::Batch(dispositions) =
+        applier.apply_committed_entry(position, &batch).unwrap()
+    else {
+        panic!("mixed committed entry was not reported as a batch");
+    };
+    assert!(matches!(
+        &dispositions[0],
+        CommittedTabletCommandDisposition::Applied(_)
+    ));
+    let conflict_error = match &dispositions[1] {
+        CommittedTabletCommandDisposition::Rejected(rejected) => {
+            assert_eq!(rejected.request_id, conflict.request_id);
+            rejected.rejection.clone()
+        }
+        CommittedTabletCommandDisposition::Applied(_) => {
+            panic!("the second subcommand must deterministically conflict")
+        }
+    };
+    assert!(matches!(
+        conflict_error,
+        TabletCommandApplyError::WriteConflict { .. }
+    ));
+    assert!(matches!(
+        &dispositions[2],
+        CommittedTabletCommandDisposition::Applied(_)
+    ));
+    assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 2,
+            applied_term: 4,
+        })
+    );
+
+    let CommittedTabletCommandDisposition::Rejected(replayed) = applier
+        .apply_committed(
+            ProposalPosition { term: 4, index: 3 },
+            &conflict.encode().unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("replayed conflict must return its cached rejection");
+    };
+    assert_eq!(replayed.rejection, conflict_error);
+    assert_eq!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .read(&first_key, ragnordb_common::ids::Timestamp(21))
+            .unwrap(),
+        Some(
+            ragnordb_common::encoding::encode_row(&Row {
+                values: vec![Value::Int(71)],
+            })
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .read(&last_key, ragnordb_common::ids::Timestamp(41))
+            .unwrap(),
+        Some(
+            ragnordb_common::encoding::encode_row(&Row {
+                values: vec![Value::Int(72)],
+            })
+            .unwrap()
+        )
+    );
+}
+
+/// Realistic bug caught:
+///
+/// The old bridge published each subcommand before preparing the next one.
+/// A later fatal state-integrity error could therefore leave an earlier
+/// subcommand visible while the Raft entry had no complete processed
+/// frontier. A failed batch must discard all sparse staged edits.
+#[test]
+fn fatal_later_batch_subcommand_discards_earlier_prewrite_and_frontier() {
+    let mut applier = applier_with_frontier(12, 3);
+    let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(56)]).unwrap()).unwrap();
+    let make_prewrite = |client_id, ttl_ms| {
+        TabletCommandEnvelope::new(
+            RequestId {
+                client_id,
+                sequence: 1,
+                raft_group_id: RAFT_GROUP_ID,
+            },
+            TABLET_ID,
+            TABLET_EPOCH,
+            TabletCommand::Prewrite(PrewriteCommand {
+                txn_id: ragnordb_common::ids::TxnId(506),
+                start_timestamp: ragnordb_common::ids::Timestamp(10),
+                writes: vec![WriteEntry {
+                    key: key.clone(),
+                    row: Some(Row {
+                        values: vec![Value::Int(56)],
+                    }),
+                    op: WriteKind::Put,
+                }],
+                primary_key: key.clone(),
+                ttl_ms,
+                pending_status: None,
+            }),
+        )
+        .unwrap()
+    };
+    let entry = TabletCommandBatchEnvelope::new(vec![
+        make_prewrite(506, 30_000),
+        make_prewrite(507, 60_000),
+    ])
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    assert!(matches!(
+        applier.apply_committed_entry(ProposalPosition { term: 4, index: 13 }, &entry),
+        Err(TabletApplyError::FatalApply(
+            TabletCommandApplyError::CorruptState { .. }
+        ))
+    ));
+    assert!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .scan_intent_page(None, None, None, 10)
+            .unwrap()
+            .locks
+            .is_empty()
+    );
+    assert_eq!(
+        applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 12,
+            applied_term: 3,
+        })
+    );
+}
+
+/// Realistic bug caught:
+///
 /// A malformed later subcommand must not allow an earlier valid mutation to
 /// execute before the batch is rejected. Reapplying that valid command as a
 /// standalone committed entry must therefore still be a fresh apply.
 #[test]
 fn malformed_committed_batch_is_rejected_before_any_subcommand_applies() {
-    let mut applier = applier();
+    let mut applier = applier_with_frontier(8, 2);
     let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(3)]).unwrap()).unwrap();
     let request_id = request_id();
     let first = TabletCommandEnvelope::new(
@@ -294,7 +772,7 @@ fn malformed_committed_batch_is_rejected_before_any_subcommand_applies() {
     let standalone = first.encode().unwrap();
     assert!(matches!(
         applier
-            .apply_committed(ProposalPosition { term: 3, index: 10 }, &standalone)
+            .apply_committed(ProposalPosition { term: 3, index: 9 }, &standalone)
             .unwrap(),
         CommittedTabletCommandDisposition::Applied(applied) if !applied.outcome.deduplicated
     ));

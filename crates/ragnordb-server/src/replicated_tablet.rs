@@ -778,6 +778,8 @@ struct PendingClient {
 /// position without conflating per-request deadlines or RPC correlation.
 struct PreparedCommandRequest {
     envelope: TabletCommandEnvelope,
+    /// Conservative storage-generation bound checked before Raft admission.
+    delta_upper_bound: usize,
     deadline: Instant,
     reply: ClientReply,
 }
@@ -2273,6 +2275,7 @@ impl ReplicatedTabletRuntime {
         let target = TabletSnapshotInstallTarget {
             cluster_id,
             raft_group_id: TABLET_RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
             tablet_id: TABLET_ID,
             table_id: TABLE_ID,
             tablet_epoch: TABLET_EPOCH,
@@ -3269,6 +3272,7 @@ where
                                         .to_string(),
                                 ));
                             }
+                            validate_raw_command_delta_admission(&tablet, &command)?;
                             let index = ready_loop
                                 .propose(command, encoded_len)
                                 .map_err(classify_ready_error)?;
@@ -3487,6 +3491,7 @@ where
             let target = TabletSnapshotInstallTarget {
                 cluster_id: identity.target.cluster_id.clone(),
                 raft_group_id: identity.target.raft_group_id,
+                replica_id: identity.target.replica_id,
                 tablet_id: identity.target.tablet_id,
                 table_id: identity.target.table_id,
                 tablet_epoch: identity.target.tablet_epoch,
@@ -3672,9 +3677,14 @@ where
                         image.metadata.last_included_index,
                         image.metadata.last_included_term,
                     );
+                    let mut committed_outcomes = Vec::with_capacity(ready.committed_entries.len());
                     for entry in &ready.committed_entries {
                         frontier = AppliedRaftFrontier::new(entry.index, entry.term);
                         let EntryPayload::Normal(bytes) = &entry.payload else {
+                            tablet
+                                .state_machine_mut()
+                                .apply_frontier_only_at(entry.index, entry.term)
+                                .map_err(|error| error.to_string())?;
                             continue;
                         };
                         let dispositions = tablet
@@ -3689,18 +3699,28 @@ where
                         snapshot_policy.note_applied(bytes.len());
                         publish_committed_entry(
                             bytes,
-                            dispositions,
+                            dispositions.clone(),
                             &mut registry,
                             &database,
                             catalog_cache.as_ref(),
                             &identity,
                         )
                         .map_err(|e| e.to_string())?;
+                        committed_outcomes.push(dispositions);
                     }
                     registry.advance_applied_frontier(frontier.index);
                     ready_loop
                         .advance_applied_frontier(frontier)
                         .map_err(|e| e.to_string())?;
+                    for outcomes in committed_outcomes {
+                        resolve_committed_entry_outcomes(
+                            outcomes,
+                            ready_loop.applied_frontier(),
+                            tablet.state_machine().recovery_frontier(),
+                            &mut registry,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
                     *latest_snapshot = Some(image.clone());
                     snapshot_policy.reset();
                     send_messages(
@@ -4576,12 +4596,50 @@ fn prepare_mutation_envelope(
         send_client_error(reply, map_tablet_rejection(source));
         return None;
     }
+    let delta_upper_bound = match tablet.state_machine().command_delta_upper_bound(&envelope) {
+        Ok(size) => size,
+        Err(source) => {
+            send_client_error(reply, map_tablet_rejection(source));
+            return None;
+        }
+    };
 
     Some(PreparedCommandRequest {
         envelope,
+        delta_upper_bound,
         deadline,
         reply,
     })
+}
+
+/// Validate opaque host proposals at the final tablet-specific admission
+/// boundary so an alternate internal caller cannot bypass the delta cap.
+fn validate_raw_command_delta_admission(
+    tablet: &TabletCommandApplier,
+    bytes: &[u8],
+) -> std::result::Result<(), HostedGroupError> {
+    let state_machine = tablet.state_machine();
+    if let Ok(envelope) = TabletCommandEnvelope::decode(bytes) {
+        state_machine
+            .validate_proposal(&envelope)
+            .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+        state_machine
+            .command_delta_upper_bound(&envelope)
+            .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+        return Ok(());
+    }
+
+    let batch = TabletCommandBatchEnvelope::decode(bytes)
+        .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+    for envelope in &batch.commands {
+        state_machine
+            .validate_proposal(envelope)
+            .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+    }
+    state_machine
+        .command_batch_delta_upper_bound(&batch.commands)
+        .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+    Ok(())
 }
 
 fn envelope_from_tablet_command_request(
@@ -4615,6 +4673,15 @@ fn envelope_from_tablet_command_request(
 
 /// Publishes one semantic-batch sample using the exact bytes that are about to
 /// enter Raft, avoiding any additional command serialization for diagnostics.
+/// Sum per-command sparse-generation estimates without allowing arithmetic
+/// wraparound to turn an oversized Raft batch into an admissible one.
+fn command_delta_batch_fits(bounds: impl IntoIterator<Item = usize>) -> bool {
+    bounds
+        .into_iter()
+        .try_fold(0usize, |total, bound| total.checked_add(bound))
+        .is_some_and(|total| total <= ragnordb_storage::lsm::MAX_COMMAND_DELTA_BYTES)
+}
+
 fn record_semantic_batch(command_count: usize, encoded_bytes: usize, started_at: Instant) {
     crate::metrics::counter_inc("ragnordb_semantic_batches_total");
     crate::metrics::counter_add(
@@ -4646,6 +4713,7 @@ fn admit_prepared_command<W, LS, SS>(
         envelope,
         deadline,
         reply,
+        ..
     } = prepared;
     let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
     if !serving_leader || ready_loop.raft().leader_id() != Some(ready_loop.raft().id()) {
@@ -4748,6 +4816,18 @@ fn admit_prepared_batch<W, LS, SS>(
             true,
             batch_started_at,
         );
+        return;
+    }
+
+    if !command_delta_batch_fits(prepared.iter().map(|request| request.delta_upper_bound)) {
+        for request in prepared {
+            send_client_error(
+                request.reply,
+                Error::InvalidArgument(
+                    "tablet command batch exceeds the bounded storage delta limit".to_string(),
+                ),
+            );
+        }
         return;
     }
 
@@ -5030,6 +5110,10 @@ fn admit_request<W, LS, SS>(
         // and before deduplication. Preserve their typed meaning so a gateway
         // can refresh metadata instead of treating a stale route as malformed
         // SQL or replaying a mutation against the wrong tablet.
+        send_client_error(reply, map_tablet_rejection(source));
+        return;
+    }
+    if let Err(source) = tablet.state_machine().command_delta_upper_bound(&envelope) {
         send_client_error(reply, map_tablet_rejection(source));
         return;
     }
@@ -6473,6 +6557,7 @@ where
     let target = TabletSnapshotInstallTarget {
         cluster_id: cluster_id.to_string(),
         raft_group_id: identity.target.raft_group_id,
+        replica_id: local_replica_id,
         tablet_id: identity.target.tablet_id,
         table_id: identity.target.table_id,
         tablet_epoch: identity.target.tablet_epoch,
@@ -6527,9 +6612,14 @@ where
         image.metadata.last_included_index,
         image.metadata.last_included_term,
     );
+    let mut committed_outcomes = Vec::with_capacity(ready.committed_entries.len());
     for entry in &ready.committed_entries {
         frontier = AppliedRaftFrontier::new(entry.index, entry.term);
         let EntryPayload::Normal(bytes) = &entry.payload else {
+            tablet
+                .state_machine_mut()
+                .apply_frontier_only_at(entry.index, entry.term)
+                .map_err(|error| error.to_string())?;
             continue;
         };
         let dispositions = tablet
@@ -6544,17 +6634,26 @@ where
         snapshot_policy.note_applied(bytes.len());
         publish_committed_entry(
             bytes,
-            dispositions,
+            dispositions.clone(),
             registry,
             database,
             catalog_cache,
             identity,
         )?;
+        committed_outcomes.push(dispositions);
     }
     registry.advance_applied_frontier(frontier.index);
     ready_loop
         .advance_applied_frontier(frontier)
         .map_err(|error| error.to_string())?;
+    for outcomes in committed_outcomes {
+        resolve_committed_entry_outcomes(
+            outcomes,
+            ready_loop.applied_frontier(),
+            tablet.state_machine().recovery_frontier(),
+            registry,
+        )?;
+    }
     *latest_snapshot = Some(image);
     snapshot_policy.reset();
     send_messages(
@@ -6663,6 +6762,7 @@ fn envelope_from_catalog(
     let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
         cluster_id: String::new(),
         raft_group_id: TABLET_RAFT_GROUP_ID,
+        replica_id: ReplicaId(1),
         tablet_id: TABLET_ID,
         table_id: TABLE_ID,
         tablet_epoch: TABLET_EPOCH,
@@ -6714,7 +6814,6 @@ fn publish_committed_entry(
                 &envelope,
                 locally_proposed,
                 disposition,
-                registry,
                 database,
                 catalog_cache,
                 identity,
@@ -6736,7 +6835,6 @@ fn publish_committed_entry(
                     envelope,
                     locally_proposed,
                     disposition,
-                    registry,
                     database,
                     catalog_cache,
                     identity,
@@ -6751,7 +6849,6 @@ fn publish_committed_command(
     envelope: &TabletCommandEnvelope,
     locally_proposed: bool,
     disposition: CommittedTabletCommandDisposition,
-    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     catalog_cache: &dyn CatalogCacheWriter,
     identity: &TabletRuntimeIdentity,
@@ -6797,10 +6894,74 @@ fn publish_committed_command(
         }
     }
 
-    if locally_proposed {
-        disposition
-            .resolve(registry)
-            .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Resolve proposal waiters only after the complete Ready prefix has been
+/// published and both the storage and Raft applied frontiers have advanced.
+fn resolve_committed_entry_outcomes(
+    entry: CommittedTabletCommandEntry,
+    raft_frontier: Option<AppliedRaftFrontier>,
+    tablet_frontier: Option<ragnordb_storage::lsm::RecoveryFrontier>,
+    registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
+) -> std::result::Result<(), String> {
+    let applied_frontier = raft_frontier.ok_or_else(|| {
+        "cannot resolve command outcomes before the Raft applied frontier is established"
+            .to_string()
+    })?;
+    match tablet_frontier {
+        Some(ragnordb_storage::lsm::RecoveryFrontier::ReplicatedTablet {
+            applied_index,
+            applied_term,
+            ..
+        }) if applied_index == applied_frontier.index && applied_term == applied_frontier.term => {}
+        _ => {
+            return Err(
+                "cannot resolve command outcomes before the tablet storage frontier matches Raft"
+                    .to_string(),
+            );
+        }
+    }
+
+    let dispositions = match entry {
+        CommittedTabletCommandEntry::Single(disposition) => vec![disposition],
+        CommittedTabletCommandEntry::Batch(dispositions) => dispositions,
+    };
+
+    if let Some(position) = dispositions
+        .iter()
+        .map(|disposition| match disposition {
+            CommittedTabletCommandDisposition::Applied(applied) => applied.position,
+            CommittedTabletCommandDisposition::Rejected(rejected) => rejected.position,
+        })
+        .find(|position| {
+            position.index > applied_frontier.index
+                || (position.index == applied_frontier.index
+                    && position.term != applied_frontier.term)
+        })
+    {
+        return Err(format!(
+            "cannot resolve command at applied index {} before frontier {}",
+            position.index, applied_frontier.index
+        ));
+    }
+
+    let mut resolve =
+        |disposition: CommittedTabletCommandDisposition| -> std::result::Result<(), String> {
+            let request_id = match &disposition {
+                CommittedTabletCommandDisposition::Applied(applied) => &applied.request_id,
+                CommittedTabletCommandDisposition::Rejected(rejected) => &rejected.request_id,
+            };
+            if registry.is_pending(request_id) {
+                disposition
+                    .resolve(registry)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+
+    for disposition in dispositions {
+        resolve(disposition)?;
     }
     Ok(())
 }
@@ -6840,9 +7001,14 @@ where
     );
 
     let mut frontier = None;
+    let mut committed_outcomes = Vec::with_capacity(ready.committed_entries.len());
     for entry in &ready.committed_entries {
         frontier = Some(AppliedRaftFrontier::new(entry.index, entry.term));
         let EntryPayload::Normal(bytes) = &entry.payload else {
+            tablet
+                .state_machine_mut()
+                .apply_frontier_only_at(entry.index, entry.term)
+                .map_err(|error| HostedGroupError::Group(error.to_string()))?;
             continue;
         };
         let dispositions = tablet
@@ -6857,19 +7023,29 @@ where
         snapshot_policy.note_applied(bytes.len());
         publish_committed_entry(
             bytes,
-            dispositions,
+            dispositions.clone(),
             registry,
             database,
             catalog_cache,
             identity,
         )
         .map_err(HostedGroupError::Group)?;
+        committed_outcomes.push(dispositions);
     }
     if let Some(frontier) = frontier {
         registry.advance_applied_frontier(frontier.index);
         ready_loop
             .advance_applied_frontier(frontier)
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+    }
+    for outcomes in committed_outcomes {
+        resolve_committed_entry_outcomes(
+            outcomes,
+            ready_loop.applied_frontier(),
+            tablet.state_machine().recovery_frontier(),
+            registry,
+        )
+        .map_err(HostedGroupError::Group)?;
     }
     // Read states are emitted only after the Ready's committed entries have
     // applied and the applied frontier has advanced. They authorize a read
@@ -7461,6 +7637,16 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Condvar;
 
+    #[test]
+    fn batch_delta_bound_rejects_oversize_and_overflow_before_proposal() {
+        let limit = ragnordb_storage::lsm::MAX_COMMAND_DELTA_BYTES;
+
+        assert!(command_delta_batch_fits([limit]));
+        assert!(command_delta_batch_fits([limit - 1, 1]));
+        assert!(!command_delta_batch_fits([limit, 1]));
+        assert!(!command_delta_batch_fits([usize::MAX, 1]));
+    }
+
     type OwnershipObservations = Arc<(
         Mutex<HashMap<RaftReplicaIdentity, (thread::ThreadId, bool)>>,
         Condvar,
@@ -7674,6 +7860,7 @@ mod tests {
         let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
             cluster_id: "cluster".to_string(),
             raft_group_id: RaftGroupId(9),
+            replica_id: ReplicaId(1),
             tablet_id: TabletId(3),
             table_id: TableId(3),
             tablet_epoch: 7,
@@ -7727,6 +7914,7 @@ mod tests {
         let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
             cluster_id: "cluster".to_string(),
             raft_group_id: RaftGroupId(9),
+            replica_id: ReplicaId(1),
             tablet_id: TabletId(3),
             table_id: TableId(3),
             tablet_epoch: 7,
@@ -7852,6 +8040,7 @@ mod tests {
         let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
             cluster_id: "cluster".to_string(),
             raft_group_id: RaftGroupId(9),
+            replica_id: ReplicaId(1),
             tablet_id: TabletId(3),
             table_id: TableId(3),
             tablet_epoch: 7,
@@ -8252,7 +8441,8 @@ mod tests {
         };
         let envelope = envelope_from_catalog(1, &record).expect("catalog envelope must encode");
         let position = ProposalPosition { term: 2, index: 9 };
-        let mut registry = ProposalRegistry::new();
+        let mut registry =
+            ProposalRegistry::<TabletCommandApplyOutcome, TabletCommandApplyError>::new();
         let ticket = registry
             .register(
                 envelope.request_id.clone(),
@@ -8273,12 +8463,12 @@ mod tests {
             &envelope,
             true,
             disposition,
-            &mut registry,
             &crate::database::LocalDatabase::shared(),
             &OutcomeUnknownCatalogCache,
             &TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
                 cluster_id: String::new(),
                 raft_group_id: TABLET_RAFT_GROUP_ID,
+                replica_id: ReplicaId(1),
                 tablet_id: TABLET_ID,
                 table_id: TABLE_ID,
                 tablet_epoch: TABLET_EPOCH,
@@ -8291,6 +8481,105 @@ mod tests {
         assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
+    /// Realistic bug caught: publishing a command result must not wake its
+    /// proposal waiter before the Ready loop commits the matching applied
+    /// frontier.
+    #[test]
+    fn command_result_waiter_resolves_only_after_frontier_gate() {
+        let envelope = TabletCommandEnvelope::new(
+            RequestId {
+                client_id: 17,
+                sequence: 1,
+                raft_group_id: TABLET_RAFT_GROUP_ID,
+            },
+            TABLET_ID,
+            TABLET_EPOCH,
+            TabletCommand::Noop(NoopCommand),
+        )
+        .unwrap();
+        let position = ProposalPosition { term: 2, index: 9 };
+        let disposition = CommittedTabletCommandDisposition::Applied(AppliedTabletCommand {
+            request_id: envelope.request_id.clone(),
+            position,
+            outcome: TabletCommandApplyOutcome {
+                result: TabletCommandApplyResult::Noop,
+                deduplicated: false,
+            },
+        });
+        let mut registry = ProposalRegistry::new();
+        let ticket = registry
+            .register(
+                envelope.request_id.clone(),
+                position,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("proposal registration must succeed");
+        let database = crate::database::LocalDatabase::shared();
+        let catalog = OutcomeUnknownCatalogCache;
+        let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
+            cluster_id: String::new(),
+            raft_group_id: TABLET_RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            tablet_id: TABLET_ID,
+            table_id: TABLE_ID,
+            tablet_epoch: TABLET_EPOCH,
+        });
+
+        publish_committed_command(
+            &envelope,
+            true,
+            disposition.clone(),
+            &database,
+            &catalog,
+            &identity,
+        )
+        .expect("pre-frontier side effects must succeed");
+        assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let tablet_frontier = |index, term| {
+            Some(ragnordb_storage::lsm::RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: TABLET_RAFT_GROUP_ID,
+                replica_id: ReplicaId(1),
+                applied_index: index,
+                applied_term: term,
+            })
+        };
+
+        let error = resolve_committed_entry_outcomes(
+            CommittedTabletCommandEntry::Single(disposition.clone()),
+            Some(AppliedRaftFrontier::new(position.index - 1, position.term)),
+            tablet_frontier(position.index - 1, position.term),
+            &mut registry,
+        )
+        .expect_err("the waiter must stay pending before its entry is in the applied prefix");
+        assert!(error.contains("before frontier"));
+        assert_eq!(registry.pending_count(), 1);
+        assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let error = resolve_committed_entry_outcomes(
+            CommittedTabletCommandEntry::Single(disposition.clone()),
+            Some(AppliedRaftFrontier::new(position.index, position.term)),
+            tablet_frontier(position.index - 1, position.term),
+            &mut registry,
+        )
+        .expect_err("Raft and tablet storage frontiers must agree before resolving");
+        assert!(error.contains("tablet storage frontier"));
+        assert_eq!(registry.pending_count(), 1);
+        assert!(matches!(ticket.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        resolve_committed_entry_outcomes(
+            CommittedTabletCommandEntry::Single(disposition),
+            Some(AppliedRaftFrontier::new(position.index, position.term)),
+            tablet_frontier(position.index, position.term),
+            &mut registry,
+        )
+        .expect("published entry outcome must resolve after its frontier gate");
+        assert!(matches!(
+            ticket.try_recv().expect("waiter must receive its result"),
+            ragnordb_multiraft::proposal::ProposalCompletion::Applied { .. }
+        ));
+    }
+
     /// Realistic bug caught: a metadata-created tablet could still emit a
     /// legacy group/tablet identity in a catalog proposal, causing followers
     /// to reject an otherwise valid command as belonging to another tablet.
@@ -8299,6 +8588,7 @@ mod tests {
         let identity = TabletRuntimeIdentity::new(TabletSnapshotInstallTarget {
             cluster_id: "cluster-5-5".to_string(),
             raft_group_id: RaftGroupId(42),
+            replica_id: ReplicaId(1),
             tablet_id: TabletId(9),
             table_id: TableId(77),
             tablet_epoch: 3,
