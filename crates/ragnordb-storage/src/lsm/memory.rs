@@ -20,10 +20,44 @@ pub const DEFAULT_NODE_MEMTABLE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// admitted atomically, so this leaves headroom above the encoded delta limit.
 pub const DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Maximum number of immutable generations retained by one tablet before
+/// user writes are stalled pending a future storage-generation flush.
+pub const DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT: usize = 2;
+
 /// A node-owned limit shared by all tablet memtables constructed from it.
 #[derive(Debug, Clone)]
 pub struct NodeMemtableBudget {
     inner: Arc<NodeMemtableBudgetInner>,
+}
+
+/// Point-in-time managed-memory pressure for one budgeted tablet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemtablePressure {
+    /// Bytes retained by the current mutable generation.
+    pub active_bytes: usize,
+    /// Maximum managed bytes allowed in the mutable generation.
+    pub active_limit_bytes: usize,
+    /// Bytes retained by immutable generations awaiting storage publication.
+    pub immutable_memtable_bytes: usize,
+    /// Maximum managed bytes retained by this tablet's immutable queue.
+    pub immutable_memtable_limit_bytes: usize,
+    /// Number of immutable generations awaiting storage publication.
+    pub immutable_memtable_count: usize,
+    /// Maximum immutable generations retained by this tablet.
+    pub immutable_memtable_count_limit: usize,
+    /// Current node-wide managed memtable charge.
+    pub node_used_bytes: usize,
+    /// Maximum node-wide managed memtable charge.
+    pub node_limit_bytes: usize,
+}
+
+impl MemtablePressure {
+    /// Return whether another user write must wait for immutable-memory relief.
+    pub fn user_writes_stalled(self) -> bool {
+        self.immutable_memtable_bytes >= self.immutable_memtable_limit_bytes
+            || self.immutable_memtable_count >= self.immutable_memtable_count_limit
+            || self.node_used_bytes >= self.node_limit_bytes
+    }
 }
 
 #[derive(Debug)]

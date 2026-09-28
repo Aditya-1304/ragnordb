@@ -3997,6 +3997,7 @@ where
                     if batch.len() == 1 {
                         admit_prepared_command(
                             batch.pop().expect("single batch item exists"),
+                            &tablet,
                             &mut ready_loop,
                             &mut registry,
                             &mut clients,
@@ -4006,6 +4007,7 @@ where
                     } else {
                         admit_prepared_batch(
                             batch,
+                            &tablet,
                             &mut ready_loop,
                             &mut registry,
                             &mut clients,
@@ -4645,6 +4647,11 @@ fn validate_raw_command_delta_admission(
 ) -> std::result::Result<(), HostedGroupError> {
     let state_machine = tablet.state_machine();
     if let Ok(envelope) = TabletCommandEnvelope::decode(bytes) {
+        if !matches!(&envelope.command, TabletCommand::Noop(_))
+            && let Some(error) = memtable_write_stall_error(tablet)
+        {
+            return Err(HostedGroupError::Retryable(error.to_string()));
+        }
         state_machine
             .validate_proposal(&envelope)
             .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
@@ -4656,6 +4663,14 @@ fn validate_raw_command_delta_admission(
 
     let batch = TabletCommandBatchEnvelope::decode(bytes)
         .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
+    if batch
+        .commands
+        .iter()
+        .any(|envelope| !matches!(&envelope.command, TabletCommand::Noop(_)))
+        && let Some(error) = memtable_write_stall_error(tablet)
+    {
+        return Err(HostedGroupError::Retryable(error.to_string()));
+    }
     for envelope in &batch.commands {
         state_machine
             .validate_proposal(envelope)
@@ -4721,9 +4736,26 @@ fn record_semantic_batch(command_count: usize, encoded_bytes: usize, started_at:
     );
 }
 
+fn memtable_write_stall_error(tablet: &TabletCommandApplier) -> Option<Error> {
+    let pressure = tablet
+        .state_machine()
+        .tablet()
+        .storage()
+        .memtable_pressure()?;
+    pressure
+        .user_writes_stalled()
+        .then(|| Error::ProposalUnavailable {
+            reason: format!(
+                "tablet memtable debt is at its limit ({} immutable bytes across {} generations)",
+                pressure.immutable_memtable_bytes, pressure.immutable_memtable_count
+            ),
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_command<W, LS, SS>(
     prepared: PreparedCommandRequest,
+    tablet: &TabletCommandApplier,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
@@ -4743,6 +4775,10 @@ fn admit_prepared_command<W, LS, SS>(
     let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
     if !serving_leader || ready_loop.raft().leader_id() != Some(ready_loop.raft().id()) {
         send_client_error(reply, Error::NotLeader { leader_id });
+        return;
+    }
+    if let Some(error) = memtable_write_stall_error(tablet) {
+        send_client_error(reply, error);
         return;
     }
 
@@ -4794,6 +4830,7 @@ fn admit_prepared_command<W, LS, SS>(
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_batch<W, LS, SS>(
     prepared: Vec<PreparedCommandRequest>,
+    tablet: &TabletCommandApplier,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
@@ -4832,9 +4869,18 @@ fn admit_prepared_batch<W, LS, SS>(
     if prepared.is_empty() {
         return;
     }
+    if memtable_write_stall_error(tablet).is_some() {
+        for request in prepared {
+            let error = memtable_write_stall_error(tablet)
+                .expect("a stalled tablet remains stalled for this owner turn");
+            send_client_error(request.reply, error);
+        }
+        return;
+    }
     if prepared.len() == 1 {
         admit_prepared_command(
             prepared.pop().expect("single prepared request exists"),
+            tablet,
             ready_loop,
             registry,
             clients,
@@ -5129,6 +5175,13 @@ fn admit_request<W, LS, SS>(
             unreachable!("RPC read requests use their dedicated admission paths")
         }
     };
+
+    if internal_barrier_sequence.is_none()
+        && let Some(error) = memtable_write_stall_error(tablet)
+    {
+        send_client_error(reply, error);
+        return;
+    }
 
     if let Err(source) = tablet.state_machine().validate_proposal(&envelope) {
         // Routing/generation failures are checked before proposal admission

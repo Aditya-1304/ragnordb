@@ -43,7 +43,8 @@ use std::{
 use crate::{
     key::decode_row_key,
     lsm::{
-        NodeMemtableBudget, RecoveryFrontier,
+        DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT, MemtablePressure, NodeMemtableBudget,
+        RecoveryFrontier,
         memory::{MemoryReservation, MemtableCharge},
     },
 };
@@ -1034,6 +1035,18 @@ pub struct InMemoryMvccBackend {
     /// `row_key -> write_ts -> write record`.
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
 
+    /// Active-generation tombstones prevent deleted immutable records from
+    /// becoming visible again when reads traverse older generations.
+    default_tombstones: BTreeSet<(Vec<u8>, Timestamp)>,
+    lock_tombstones: BTreeSet<Vec<u8>>,
+
+    /// Frozen generations remain owned by this tablet until a later storage
+    /// stage can publish their records into a durable serving generation.
+    immutable_memtables: VecDeque<ImmutableMemtable>,
+    immutable_memtable_bytes: usize,
+    immutable_memtable_limit_bytes: usize,
+    immutable_memtable_count_limit: usize,
+
     /// Shared node budget used by this tablet's mutable MVCC generation.
     memtable_budget: Option<NodeMemtableBudget>,
 
@@ -1042,6 +1055,31 @@ pub struct InMemoryMvccBackend {
 
     /// RAII charge acquired before the first active record is inserted.
     memtable_charge: Option<MemtableCharge>,
+}
+
+/// One frozen MVCC edit generation and the reservation that keeps its bytes
+/// charged while it remains available to readers.
+#[derive(Debug, Clone, Default)]
+struct ImmutableMemtable {
+    default: BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>>,
+    locks: BTreeMap<Vec<u8>, LockRecord>,
+    writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
+    default_tombstones: BTreeSet<(Vec<u8>, Timestamp)>,
+    lock_tombstones: BTreeSet<Vec<u8>>,
+    _charge: Option<MemtableCharge>,
+}
+
+impl ImmutableMemtable {
+    fn read_copy(&self) -> Self {
+        Self {
+            default: self.default.clone(),
+            locks: self.locks.clone(),
+            writes: self.writes.clone(),
+            default_tombstones: self.default_tombstones.clone(),
+            lock_tombstones: self.lock_tombstones.clone(),
+            _charge: None,
+        }
+    }
 }
 
 /// Fixed managed-byte allowance for each ordered memtable record and index
@@ -1183,6 +1221,12 @@ impl InMemoryMvcc {
             .memtable_budget
             .as_ref()
             .map(|_| self.backend.memtable_limit_bytes)
+    }
+
+    /// Return the current active and immutable generation pressure, when this
+    /// storage instance participates in a shared node budget.
+    pub fn memtable_pressure(&self) -> Option<MemtablePressure> {
+        self.backend.memtable_pressure()
     }
 
     /// Return the shared node budget used by this storage instance, when set.
@@ -2696,23 +2740,15 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
 
 impl MvccReadGeneration for InMemoryMvccBackend {
     fn get_default(&self, key: &[u8], start_ts: Timestamp) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .default
-            .get(key)
-            .and_then(|versions| versions.get(&start_ts))
-            .cloned())
+        Ok(self.visible_default(key, start_ts).cloned())
     }
 
     fn get_lock(&self, key: &[u8]) -> Result<Option<LockRecord>> {
-        Ok(self.locks.get(key).cloned())
+        Ok(self.visible_lock(key).cloned())
     }
 
     fn get_write(&self, key: &[u8], write_ts: Timestamp) -> Result<Option<WriteRecord>> {
-        Ok(self
-            .writes
-            .get(key)
-            .and_then(|versions| versions.get(&write_ts))
-            .cloned())
+        Ok(self.visible_write(key, write_ts).cloned())
     }
 
     fn write_page(
@@ -2730,7 +2766,8 @@ impl MvccReadGeneration for InMemoryMvccBackend {
             ));
         }
 
-        let Some(versions) = self.writes.get(key) else {
+        let all_writes = self.materialize_writes();
+        let Some(versions) = all_writes.get(key) else {
             return Ok(MvccWritePage {
                 writes: Vec::new(),
                 has_more: false,
@@ -2803,7 +2840,8 @@ impl MvccReadGeneration for InMemoryMvccBackend {
         let mut keys = Vec::with_capacity(max_keys.saturating_add(1));
         match family {
             MvccKeyFamily::Writes => {
-                for key in self.writes.range((lower, upper)).map(|(key, _)| key) {
+                let records = self.materialize_writes();
+                for key in records.range((lower, upper)).map(|(key, _)| key) {
                     validate_encoded_key_argument(key, "MVCC write cursor key")?;
                     keys.push(key.clone());
                     if keys.len() > max_keys {
@@ -2812,7 +2850,8 @@ impl MvccReadGeneration for InMemoryMvccBackend {
                 }
             }
             MvccKeyFamily::Locks => {
-                for key in self.locks.range((lower, upper)).map(|(key, _)| key) {
+                let records = self.materialize_locks();
+                for key in records.range((lower, upper)).map(|(key, _)| key) {
                     validate_encoded_key_argument(key, "MVCC lock cursor key")?;
                     keys.push(key.clone());
                     if keys.len() > max_keys {
@@ -2855,7 +2894,8 @@ impl MvccReadGeneration for InMemoryMvccBackend {
         let lower = scan_lower_bound(start, resume_after);
         let mut locks = Vec::new();
         let mut encoded_bytes = 0usize;
-        for (key, lock) in self.locks.range((lower, upper)) {
+        let current_locks = self.materialize_locks();
+        for (key, lock) in current_locks.range((lower, upper)) {
             if locks.len() >= max_locks {
                 return Ok(IntentScanPage {
                     locks,
@@ -3155,6 +3195,9 @@ impl InMemoryMvccBackend {
         Ok(Self {
             memtable_budget: Some(budget),
             memtable_limit_bytes: max_active_bytes,
+            immutable_memtable_limit_bytes: max_active_bytes
+                .saturating_mul(DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT),
+            immutable_memtable_count_limit: DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT,
             ..Self::default()
         })
     }
@@ -3191,8 +3234,232 @@ impl InMemoryMvccBackend {
         };
         self.memtable_budget = Some(budget);
         self.memtable_limit_bytes = max_active_bytes;
+        self.immutable_memtable_limit_bytes =
+            max_active_bytes.saturating_mul(DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT);
+        self.immutable_memtable_count_limit = DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT;
         self.memtable_charge = charge;
         Ok(())
+    }
+
+    fn memtable_pressure(&self) -> Option<MemtablePressure> {
+        let budget = self.memtable_budget.as_ref()?;
+        Some(MemtablePressure {
+            active_bytes: self
+                .memtable_charge
+                .as_ref()
+                .map_or(0, MemtableCharge::bytes),
+            active_limit_bytes: self.memtable_limit_bytes,
+            immutable_memtable_bytes: self.immutable_memtable_bytes,
+            immutable_memtable_limit_bytes: self.immutable_memtable_limit_bytes,
+            immutable_memtable_count: self.immutable_memtables.len(),
+            immutable_memtable_count_limit: self.immutable_memtable_count_limit,
+            node_used_bytes: budget.used_bytes(),
+            node_limit_bytes: budget.limit_bytes(),
+        })
+    }
+
+    fn immutable_has_default(&self, key: &[u8], start_ts: Timestamp) -> bool {
+        for memtable in self.immutable_memtables.iter().rev() {
+            let identity = (key.to_vec(), start_ts);
+            if memtable.default_tombstones.contains(&identity) {
+                return false;
+            }
+            if memtable
+                .default
+                .get(key)
+                .is_some_and(|versions| versions.contains_key(&start_ts))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn immutable_has_lock(&self, key: &[u8]) -> bool {
+        for memtable in self.immutable_memtables.iter().rev() {
+            if memtable.lock_tombstones.contains(key) {
+                return false;
+            }
+            if memtable.locks.contains_key(key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn visible_default(&self, key: &[u8], start_ts: Timestamp) -> Option<&Vec<u8>> {
+        if self.default_tombstones.contains(&(key.to_vec(), start_ts)) {
+            return None;
+        }
+        if let Some(row) = self
+            .default
+            .get(key)
+            .and_then(|versions| versions.get(&start_ts))
+        {
+            return Some(row);
+        }
+        for memtable in self.immutable_memtables.iter().rev() {
+            if memtable
+                .default_tombstones
+                .contains(&(key.to_vec(), start_ts))
+            {
+                return None;
+            }
+            if let Some(row) = memtable
+                .default
+                .get(key)
+                .and_then(|versions| versions.get(&start_ts))
+            {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    fn visible_lock(&self, key: &[u8]) -> Option<&LockRecord> {
+        if self.lock_tombstones.contains(key) {
+            return None;
+        }
+        if let Some(lock) = self.locks.get(key) {
+            return Some(lock);
+        }
+        for memtable in self.immutable_memtables.iter().rev() {
+            if memtable.lock_tombstones.contains(key) {
+                return None;
+            }
+            if let Some(lock) = memtable.locks.get(key) {
+                return Some(lock);
+            }
+        }
+        None
+    }
+
+    fn visible_write(&self, key: &[u8], write_ts: Timestamp) -> Option<&WriteRecord> {
+        if let Some(write) = self
+            .writes
+            .get(key)
+            .and_then(|versions| versions.get(&write_ts))
+        {
+            return Some(write);
+        }
+        self.immutable_memtables.iter().rev().find_map(|memtable| {
+            memtable
+                .writes
+                .get(key)
+                .and_then(|versions| versions.get(&write_ts))
+        })
+    }
+
+    fn projected_after_freeze(&self, delta: &MvccDelta) -> Result<usize> {
+        let mut projected = 0usize;
+        for edit in &delta.edits {
+            match edit {
+                MvccRecordEdit::PutDefault { key, row, .. } => {
+                    add_memtable_record_charge(&mut projected, key.len(), row.len())?;
+                }
+                MvccRecordEdit::DeleteDefault { key, start_ts } => {
+                    if self.visible_default(key, *start_ts).is_some() {
+                        add_memtable_record_charge(&mut projected, key.len(), 0)?;
+                    }
+                }
+                MvccRecordEdit::PutLock { key, lock } => {
+                    add_memtable_record_charge(
+                        &mut projected,
+                        key.len(),
+                        memtable_lock_payload_size(lock)?,
+                    )?;
+                }
+                MvccRecordEdit::DeleteLock { key } => {
+                    if self.visible_lock(key).is_some() {
+                        add_memtable_record_charge(&mut projected, key.len(), 0)?;
+                    }
+                }
+                MvccRecordEdit::PutWrite { key, write, .. } => {
+                    add_memtable_record_charge(
+                        &mut projected,
+                        key.len(),
+                        memtable_write_payload_size(write)?,
+                    )?;
+                }
+            }
+        }
+        Ok(projected)
+    }
+
+    fn validate_freeze_capacity(&self, bytes: usize) -> Result<()> {
+        let next_bytes = self
+            .immutable_memtable_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::TabletUnavailable {
+                reason: "immutable memtable byte accounting overflowed".to_string(),
+            })?;
+        if self.immutable_memtables.len() >= self.immutable_memtable_count_limit
+            || next_bytes > self.immutable_memtable_limit_bytes
+        {
+            return Err(Error::TabletUnavailable {
+                reason: "immutable memtable queue is full; user writes are stalled".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn freeze_active_memtable(&mut self) -> Result<()> {
+        let bytes = self
+            .memtable_charge
+            .as_ref()
+            .map_or(0, MemtableCharge::bytes);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.validate_freeze_capacity(bytes)?;
+        let frozen = ImmutableMemtable {
+            default: std::mem::take(&mut self.default),
+            locks: std::mem::take(&mut self.locks),
+            writes: std::mem::take(&mut self.writes),
+            default_tombstones: std::mem::take(&mut self.default_tombstones),
+            lock_tombstones: std::mem::take(&mut self.lock_tombstones),
+            _charge: self.memtable_charge.take(),
+        };
+        self.immutable_memtable_bytes += bytes;
+        self.immutable_memtables.push_back(frozen);
+        Ok(())
+    }
+
+    fn materialize_default(&self) -> BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>> {
+        let mut records = BTreeMap::new();
+        for memtable in &self.immutable_memtables {
+            apply_default_generation(
+                &mut records,
+                &memtable.default,
+                &memtable.default_tombstones,
+            );
+        }
+        apply_default_generation(&mut records, &self.default, &self.default_tombstones);
+        records
+    }
+
+    fn materialize_locks(&self) -> BTreeMap<Vec<u8>, LockRecord> {
+        let mut records = BTreeMap::new();
+        for memtable in &self.immutable_memtables {
+            for key in &memtable.lock_tombstones {
+                records.remove(key);
+            }
+            records.extend(memtable.locks.clone());
+        }
+        for key in &self.lock_tombstones {
+            records.remove(key);
+        }
+        records.extend(self.locks.clone());
+        records
+    }
+
+    fn materialize_writes(&self) -> BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>> {
+        let mut records = BTreeMap::new();
+        for memtable in &self.immutable_memtables {
+            merge_write_generation(&mut records, &memtable.writes);
+        }
+        merge_write_generation(&mut records, &self.writes);
+        records
     }
 
     fn projected_memtable_bytes(&self, delta: &MvccDelta) -> Result<usize> {
@@ -3215,6 +3482,9 @@ impl InMemoryMvccBackend {
                         previous,
                         Some(row.len()),
                     )?;
+                    if self.default_tombstones.contains(&(key.clone(), *start_ts)) {
+                        replace_memtable_record_charge(&mut projected, key.len(), Some(0), None)?;
+                    }
                 }
                 MvccRecordEdit::DeleteDefault { key, start_ts } => {
                     let previous = self
@@ -3223,6 +3493,11 @@ impl InMemoryMvccBackend {
                         .and_then(|versions| versions.get(start_ts))
                         .map(Vec::len);
                     replace_memtable_record_charge(&mut projected, key.len(), previous, None)?;
+                    if self.immutable_has_default(key, *start_ts)
+                        && !self.default_tombstones.contains(&(key.clone(), *start_ts))
+                    {
+                        add_memtable_record_charge(&mut projected, key.len(), 0)?;
+                    }
                 }
                 MvccRecordEdit::PutLock { key, lock } => {
                     let previous = self
@@ -3236,6 +3511,9 @@ impl InMemoryMvccBackend {
                         previous,
                         Some(memtable_lock_payload_size(lock)?),
                     )?;
+                    if self.lock_tombstones.contains(key) {
+                        replace_memtable_record_charge(&mut projected, key.len(), Some(0), None)?;
+                    }
                 }
                 MvccRecordEdit::DeleteLock { key } => {
                     let previous = self
@@ -3244,6 +3522,9 @@ impl InMemoryMvccBackend {
                         .map(memtable_lock_payload_size)
                         .transpose()?;
                     replace_memtable_record_charge(&mut projected, key.len(), previous, None)?;
+                    if self.immutable_has_lock(key) && !self.lock_tombstones.contains(key) {
+                        add_memtable_record_charge(&mut projected, key.len(), 0)?;
+                    }
                 }
                 MvccRecordEdit::PutWrite {
                     key,
@@ -3287,6 +3568,12 @@ impl InMemoryMvccBackend {
                     memtable_write_payload_size(write)?,
                 )?;
             }
+        }
+        for (key, _) in &self.default_tombstones {
+            add_memtable_record_charge(&mut bytes, key.len(), 0)?;
+        }
+        for key in &self.lock_tombstones {
+            add_memtable_record_charge(&mut bytes, key.len(), 0)?;
         }
         Ok(bytes)
     }
@@ -3410,30 +3697,52 @@ impl MvccBackend for InMemoryMvccBackend {
             }
         }
 
-        let (next_memtable_bytes, growth_reservation) = if let Some(budget) = &self.memtable_budget
+        let (next_memtable_bytes, growth_reservation, freeze_active) = if let Some(budget) =
+            &self.memtable_budget
         {
             let next_bytes = self.projected_memtable_bytes(&delta)?;
             if next_bytes > self.memtable_limit_bytes {
-                return Err(Error::TabletUnavailable {
-                    reason: format!(
-                        "tablet active memtable limit exceeded: {next_bytes} bytes requested with a {}-byte limit",
-                        self.memtable_limit_bytes
-                    ),
-                });
-            }
-            let current_bytes = self
-                .memtable_charge
-                .as_ref()
-                .map_or(0, MemtableCharge::bytes);
-            let reservation = if next_bytes > current_bytes {
-                Some(budget.reserve(next_bytes - current_bytes)?)
+                let fresh_bytes = self.projected_after_freeze(&delta)?;
+                if fresh_bytes > self.memtable_limit_bytes {
+                    return Err(Error::TabletUnavailable {
+                        reason: format!(
+                            "tablet command needs {fresh_bytes} active memtable bytes with a {}-byte limit",
+                            self.memtable_limit_bytes
+                        ),
+                    });
+                }
+                let current_bytes = self
+                    .memtable_charge
+                    .as_ref()
+                    .map_or(0, MemtableCharge::bytes);
+                if current_bytes > 0 {
+                    self.validate_freeze_capacity(current_bytes)?;
+                }
+                let reservation = if fresh_bytes > 0 {
+                    Some(budget.reserve(fresh_bytes)?)
+                } else {
+                    None
+                };
+                (fresh_bytes, reservation, current_bytes > 0)
             } else {
-                None
-            };
-            (next_bytes, reservation)
+                let current_bytes = self
+                    .memtable_charge
+                    .as_ref()
+                    .map_or(0, MemtableCharge::bytes);
+                let reservation = if next_bytes > current_bytes {
+                    Some(budget.reserve(next_bytes - current_bytes)?)
+                } else {
+                    None
+                };
+                (next_bytes, reservation, false)
+            }
         } else {
-            (0, None)
+            (0, None, false)
         };
+
+        if freeze_active {
+            self.freeze_active_memtable()?;
+        }
 
         // All fallible checks precede the first map change. The remaining
         // operations are deterministic edits to the single-owner reference map.
@@ -3442,6 +3751,7 @@ impl MvccBackend for InMemoryMvccBackend {
         for edit in delta.edits {
             match edit {
                 MvccRecordEdit::PutDefault { key, start_ts, row } => {
+                    self.default_tombstones.remove(&(key.clone(), start_ts));
                     self.default.entry(key).or_default().insert(start_ts, row);
                 }
                 MvccRecordEdit::DeleteDefault { key, start_ts } => {
@@ -3454,12 +3764,23 @@ impl MvccBackend for InMemoryMvccBackend {
                     if remove_key {
                         self.default.remove(&key);
                     }
+                    if self.immutable_has_default(&key, start_ts) {
+                        self.default_tombstones.insert((key, start_ts));
+                    } else {
+                        self.default_tombstones.remove(&(key, start_ts));
+                    }
                 }
                 MvccRecordEdit::PutLock { key, lock } => {
+                    self.lock_tombstones.remove(&key);
                     self.locks.insert(key, lock);
                 }
                 MvccRecordEdit::DeleteLock { key } => {
                     self.locks.remove(&key);
+                    if self.immutable_has_lock(&key) {
+                        self.lock_tombstones.insert(key);
+                    } else {
+                        self.lock_tombstones.remove(&key);
+                    }
                 }
                 MvccRecordEdit::PutWrite {
                     key,
@@ -3486,6 +3807,16 @@ impl MvccBackend for InMemoryMvccBackend {
             default: self.default.clone(),
             locks: self.locks.clone(),
             writes: self.writes.clone(),
+            default_tombstones: self.default_tombstones.clone(),
+            lock_tombstones: self.lock_tombstones.clone(),
+            immutable_memtables: self
+                .immutable_memtables
+                .iter()
+                .map(ImmutableMemtable::read_copy)
+                .collect(),
+            immutable_memtable_bytes: 0,
+            immutable_memtable_limit_bytes: 0,
+            immutable_memtable_count_limit: 0,
             memtable_budget: None,
             memtable_limit_bytes: 0,
             memtable_charge: None,
@@ -3503,14 +3834,17 @@ impl MvccBackend for InMemoryMvccBackend {
 
 impl InMemoryMvccBackend {
     fn compute_stats(&self) -> MvccStats {
+        let default = self.materialize_default();
+        let locks = self.materialize_locks();
+        let writes = self.materialize_writes();
         MvccStats {
-            default_keys: self.default.len(),
-            default_versions: self.default.values().map(BTreeMap::len).sum(),
-            default_version_chains: version_chain_stats(self.default.values().map(BTreeMap::len)),
-            locks: self.locks.len(),
-            write_keys: self.writes.len(),
-            write_records: self.writes.values().map(BTreeMap::len).sum(),
-            write_record_chains: version_chain_stats(self.writes.values().map(BTreeMap::len)),
+            default_keys: default.len(),
+            default_versions: default.values().map(BTreeMap::len).sum(),
+            default_version_chains: version_chain_stats(default.values().map(BTreeMap::len)),
+            locks: locks.len(),
+            write_keys: writes.len(),
+            write_records: writes.values().map(BTreeMap::len).sum(),
+            write_record_chains: version_chain_stats(writes.values().map(BTreeMap::len)),
         }
     }
 
@@ -3518,16 +3852,16 @@ impl InMemoryMvccBackend {
         let mut max_transaction_id = TxnId(0);
         let mut max_timestamp = Timestamp(0);
 
-        for versions in self.default.values() {
+        for versions in self.materialize_default().values() {
             for start_timestamp in versions.keys() {
                 max_timestamp = Timestamp(max_timestamp.0.max(start_timestamp.0));
             }
         }
-        for lock in self.locks.values() {
+        for lock in self.materialize_locks().values() {
             max_transaction_id = TxnId(max_transaction_id.0.max(lock.txn_id.0));
             max_timestamp = Timestamp(max_timestamp.0.max(lock.start_timestamp.0));
         }
-        for versions in self.writes.values() {
+        for versions in self.materialize_writes().values() {
             for (commit_timestamp, record) in versions {
                 max_timestamp = Timestamp(
                     max_timestamp
@@ -3646,6 +3980,42 @@ fn validate_encoded_key_argument(key: &[u8], context: &str) -> Result<()> {
             "{context} is not a canonical encoded row key: {error}"
         ))
     })
+}
+
+fn apply_default_generation(
+    target: &mut BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>>,
+    source: &BTreeMap<Vec<u8>, BTreeMap<Timestamp, Vec<u8>>>,
+    tombstones: &BTreeSet<(Vec<u8>, Timestamp)>,
+) {
+    for (key, timestamp) in tombstones {
+        let remove_key = if let Some(versions) = target.get_mut(key) {
+            versions.remove(timestamp);
+            versions.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            target.remove(key);
+        }
+    }
+    for (key, versions) in source {
+        let target_versions = target.entry(key.clone()).or_default();
+        for (timestamp, row) in versions {
+            target_versions.insert(*timestamp, row.clone());
+        }
+    }
+}
+
+fn merge_write_generation(
+    target: &mut BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
+    source: &BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
+) {
+    for (key, versions) in source {
+        let target_versions = target.entry(key.clone()).or_default();
+        for (timestamp, write) in versions {
+            target_versions.insert(*timestamp, write.clone());
+        }
+    }
 }
 
 fn memtable_lock_payload_size(lock: &LockRecord) -> Result<usize> {
@@ -3912,6 +4282,98 @@ mod tests {
         assert_eq!(
             storage.get_default_record(&key, Timestamp(3)).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn immutable_memtable_rollover_retains_records_and_stalls_at_queue_capacity() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 300).unwrap();
+        let value = "v".repeat(64);
+
+        for id in 1..=3 {
+            storage
+                .publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key: encoded_key(id),
+                        start_ts: Timestamp(id as u64),
+                        row: encoded_row(id, &value),
+                    }],
+                })
+                .unwrap();
+        }
+
+        let pressure = storage.memtable_pressure().unwrap();
+        assert_eq!(pressure.immutable_memtable_count, 2);
+        assert!(pressure.user_writes_stalled());
+        for id in 1..=3 {
+            assert!(
+                storage
+                    .get_default_record(&encoded_key(id), Timestamp(id as u64))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let rejected_key = encoded_key(4);
+        let rejected = storage.publish_mvcc_delta(MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: rejected_key.clone(),
+                start_ts: Timestamp(4),
+                row: encoded_row(4, &value),
+            }],
+        });
+
+        assert!(rejected.is_err());
+        assert_eq!(node_budget.used_bytes(), pressure.node_used_bytes);
+        assert_eq!(
+            storage
+                .get_default_record(&rejected_key, Timestamp(4))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn deleting_a_frozen_record_does_not_resurface_from_immutable_queue() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget, 300).unwrap();
+        let value = "v".repeat(64);
+        let first_key = encoded_key(11);
+
+        for id in 11..=12 {
+            storage
+                .publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key: encoded_key(id),
+                        start_ts: Timestamp(id as u64),
+                        row: encoded_row(id, &value),
+                    }],
+                })
+                .unwrap();
+        }
+
+        storage
+            .publish_mvcc_delta(MvccDelta {
+                edits: vec![MvccRecordEdit::DeleteDefault {
+                    key: first_key.clone(),
+                    start_ts: Timestamp(11),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_default_record(&first_key, Timestamp(11))
+                .unwrap(),
+            None
+        );
+        assert!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count
+                >= 1
         );
     }
 

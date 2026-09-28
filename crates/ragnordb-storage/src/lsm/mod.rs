@@ -16,5 +16,6 @@ pub use command_delta::{
 };
 pub use frontier::{RecoveryFrontier, RecoveryFrontierError, ReplicatedWalMapping};
 pub use memory::{
-    DEFAULT_NODE_MEMTABLE_BUDGET_BYTES, DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, NodeMemtableBudget,
+    DEFAULT_NODE_MEMTABLE_BUDGET_BYTES, DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+    DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT, MemtablePressure, NodeMemtableBudget,
 };
