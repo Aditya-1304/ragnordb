@@ -13,7 +13,10 @@ use ragnordb_common::{
     ids::ReplicaId,
     raft_bootstrap::{RaftGroupBootstrap, RaftGroupBootstrapError},
 };
-use ragnordb_storage::lsm::{DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, NodeMemtableBudget};
+use ragnordb_storage::{
+    lsm::{DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, NodeMemtableBudget},
+    mvcc::MemtableMvcc,
+};
 use ragnordb_tablet::{
     Tablet,
     command::{TabletCommandApplyError, TabletStateMachine},
@@ -53,7 +56,7 @@ pub type RecoveredTabletReadyLoop<W> =
 pub struct BootstrappedTabletReplica<W: RaftWal> {
     pub bootstrap: RaftGroupBootstrap,
     pub ready_loop: BootstrappedTabletReadyLoop<W>,
-    pub tablet: TabletCommandApplier,
+    pub tablet: TabletCommandApplier<MemtableMvcc>,
     /// Host may release these messages only after receiving this value. A
     /// durable bootstrap can legitimately produce no Ready records when a
     /// process restarts before Raft has emitted any persistent state.
@@ -65,7 +68,7 @@ pub struct BootstrappedTabletReplica<W: RaftWal> {
 /// applied by Raft.
 pub struct BootstrappedJoiningTabletReplica<W: RaftWal> {
     pub ready_loop: BootstrappedTabletReadyLoop<W>,
-    pub tablet: TabletCommandApplier,
+    pub tablet: TabletCommandApplier<MemtableMvcc>,
     pub initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
 }
 
@@ -73,7 +76,7 @@ pub struct BootstrappedJoiningTabletReplica<W: RaftWal> {
 pub struct RecoveredTabletReplica<W: RaftWal> {
     pub bootstrap: RaftGroupBootstrap,
     pub ready_loop: RecoveredTabletReadyLoop<W>,
-    pub tablet: TabletCommandApplier,
+    pub tablet: TabletCommandApplier<MemtableMvcc>,
 }
 
 /// Existing dynamic replica reconstructed from its joining witness and shared
@@ -81,7 +84,7 @@ pub struct RecoveredTabletReplica<W: RaftWal> {
 /// mutable or synthetic bootstrap authority.
 pub struct RecoveredJoiningTabletReplica<W: RaftWal> {
     pub ready_loop: RecoveredTabletReadyLoop<W>,
-    pub tablet: TabletCommandApplier,
+    pub tablet: TabletCommandApplier<MemtableMvcc>,
 }
 
 /// return the identity and initial configuration used while the shared WAL is

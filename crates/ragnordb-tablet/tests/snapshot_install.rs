@@ -8,8 +8,15 @@ use std::{
 };
 
 use ragnordb_common::{
-    command_codec::{NoopCommand, TabletCommand, TabletCommandEnvelope},
-    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    codec::{Row, Value, WriteKind},
+    command_codec::{
+        NoopCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
+    },
+    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, Timestamp, TxnId},
+};
+use ragnordb_storage::{
+    key::{encode_row_key, make_row_key},
+    lsm::NodeMemtableBudget,
 };
 use ragnordb_tablet::{
     Tablet,
@@ -18,7 +25,7 @@ use ragnordb_tablet::{
         AppliedTabletFrontier, FileTabletSnapshotStore, IncomingTabletSnapshotReceiver,
         TabletSnapshotConfState, TabletSnapshotImage, TabletSnapshotInstallError,
         TabletSnapshotInstallTarget, TabletSnapshotReceiveError, generate_local_snapshot,
-        install_incoming_snapshot,
+        install_incoming_snapshot, restore_verified_snapshot_with_memtable_budget,
     },
 };
 
@@ -91,6 +98,119 @@ fn store(snapshot_id: u64) -> (FileTabletSnapshotStore, std::path::PathBuf) {
         FileTabletSnapshotStore::new(root.clone(), 4096).unwrap(),
         root,
     )
+}
+
+/// A restored image larger than the mutable limit is kept as a Progress-charged
+/// base, not rejected as an oversized active generation.
+#[test]
+fn restored_snapshot_larger_than_active_limit_uses_accounted_base() {
+    let mut source = TabletStateMachine::new_local_reference(
+        Tablet::new(TabletId(31), TableId(9)).unwrap(),
+        4,
+        RaftGroupId(17),
+    )
+    .unwrap();
+    for id in 1..=20 {
+        let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(id)]).unwrap()).unwrap();
+        let row = Row {
+            values: vec![Value::Int(id), Value::Text("x".repeat(1024))],
+        };
+        let request = TabletCommandEnvelope::new(
+            RequestId {
+                client_id: 100 + id as u128,
+                sequence: 1,
+                raft_group_id: RaftGroupId(17),
+            },
+            TabletId(31),
+            4,
+            TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+                txn_id: TxnId(id as u64),
+                start_timestamp: Timestamp(id as u64),
+                commit_timestamp: Timestamp(id as u64 + 100),
+                writes: vec![WriteEntry {
+                    key,
+                    row: Some(row),
+                    op: WriteKind::Put,
+                }],
+            }),
+        )
+        .unwrap();
+        source.apply_committed_at(request, id as u64, 1).unwrap();
+    }
+    let image = generate_local_snapshot(
+        &source,
+        "ragnordb-test",
+        ReplicaId(1),
+        90,
+        conf_state(),
+        AppliedTabletFrontier::new(20, 1),
+    )
+    .unwrap();
+
+    let active_limit = 16 * 1024;
+    let budget = NodeMemtableBudget::new_with_progress_reserve(128 * 1024, 128 * 1024).unwrap();
+    let mut restored = restore_verified_snapshot_with_memtable_budget(
+        &image,
+        &target(),
+        budget.clone(),
+        active_limit,
+    )
+    .unwrap();
+
+    let restored_base_bytes = restored
+        .state_machine
+        .tablet()
+        .storage()
+        .restored_base_bytes();
+    assert!(restored_base_bytes > active_limit);
+    assert_eq!(
+        restored
+            .state_machine
+            .tablet()
+            .storage()
+            .active_memtable_bytes(),
+        0
+    );
+    assert_eq!(budget.used_bytes(), restored_base_bytes);
+    assert_eq!(restored.state_machine.tablet().stats().default_versions, 20);
+
+    let next = TabletCommandEnvelope::new(
+        RequestId {
+            client_id: 200,
+            sequence: 1,
+            raft_group_id: RaftGroupId(17),
+        },
+        TabletId(31),
+        4,
+        TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: TxnId(21),
+            start_timestamp: Timestamp(21),
+            commit_timestamp: Timestamp(121),
+            writes: vec![WriteEntry {
+                key: encode_row_key(&make_row_key(TableId(9), &[Value::Int(21)]).unwrap()).unwrap(),
+                row: Some(Row {
+                    values: vec![Value::Int(21), Value::Text("new active".to_string())],
+                }),
+                op: WriteKind::Put,
+            }],
+        }),
+    )
+    .unwrap();
+    restored
+        .state_machine
+        .apply_committed_at(next, 21, 1)
+        .unwrap();
+    assert!(
+        restored
+            .state_machine
+            .tablet()
+            .storage()
+            .active_memtable_bytes()
+            > 0
+    );
+
+    drop(restored);
+    assert_eq!(budget.used_bytes(), 0);
 }
 
 /// Catches accepting a complete snapshot without restoring replicated

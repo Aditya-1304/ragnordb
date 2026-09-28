@@ -63,7 +63,7 @@ use ragnordb_multiraft::{
         PreparedIncomingTabletSnapshotInstall, SnapshotWorkController, SnapshotWorkError,
         SnapshotWorkKind, TabletSnapshotIntegrationError, TabletSnapshotTransfer,
         generate_tablet_snapshot_from_ready_loop, install_incoming_tablet_snapshot,
-        persist_tablet_snapshot_boundary_via_ready_loop, prepare_incoming_tablet_snapshot,
+        persist_tablet_snapshot_boundary_via_ready_loop,
         prepare_incoming_tablet_snapshot_with_memtable_budget, raft_metadata_for_tablet,
         raft_pointer_for_tablet,
     },
@@ -84,7 +84,7 @@ use ragnordb_storage::wal::{
 };
 use ragnordb_storage::{
     key::{decode_row_key, encode_row_key},
-    mvcc::MvccStorage,
+    mvcc::{InMemoryMvcc, MemtableMvcc, MvccStorage},
 };
 use ragnordb_tablet::{
     command::{TabletCommandApplyError, TabletCommandApplyOutcome},
@@ -810,11 +810,11 @@ enum PendingIncomingSnapshotInstall {
     },
     BoundaryPending {
         expected: SnapshotMetadata,
-        prepared: PreparedIncomingTabletSnapshotInstall,
+        prepared: PreparedIncomingTabletSnapshotInstall<MemtableMvcc>,
     },
     ReadyPending {
         expected: SnapshotMetadata,
-        prepared: PreparedIncomingTabletSnapshotInstall,
+        prepared: PreparedIncomingTabletSnapshotInstall<MemtableMvcc>,
         image: TabletSnapshotImage,
         raft_pointer: RaftSnapshotPointerRecord,
     },
@@ -2749,9 +2749,9 @@ fn requested_bootstrap(config: &NodeConfig) -> Result<RaftGroupBootstrap> {
 fn install_recovered_sql_mirror(
     database: &SharedLocalDatabase,
     table_id: TableId,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
 ) -> Result<()> {
-    let storage = tablet.state_machine().tablet().storage().clone();
+    let storage = reference_storage_mirror(tablet.state_machine().tablet().storage(), table_id)?;
     let mut database = database.try_lock().map_err(|_| {
         Error::Configuration(
             "database owner is busy while replicated startup installs its recovered tablet"
@@ -2760,6 +2760,12 @@ fn install_recovered_sql_mirror(
     })?;
     database.install_replicated_storage(table_id, storage)?;
     Ok(())
+}
+
+fn reference_storage_mirror(storage: &impl MvccStorage, table_id: TableId) -> Result<InMemoryMvcc> {
+    let snapshot = storage.pin_read_generation()?.export_snapshot()?;
+    let (default_values, locks, writes) = snapshot.into_snapshot_entries();
+    InMemoryMvcc::restore_from_snapshot_entries(table_id, default_values, locks, writes)
 }
 
 fn install_recovered_catalog(
@@ -2822,7 +2828,7 @@ where
     SS: StableStore,
 {
     ready_loop: RaftReadyLoop<W, LS, SS>,
-    tablet: TabletCommandApplier,
+    tablet: TabletCommandApplier<MemtableMvcc>,
     initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
     transport: GroupRaftTransport,
     host_control: ByteBoundedReceiver<RaftHostControl>,
@@ -2866,7 +2872,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn new(
         ready_loop: RaftReadyLoop<W, LS, SS>,
-        tablet: TabletCommandApplier,
+        tablet: TabletCommandApplier<MemtableMvcc>,
         initial_ready: Option<Ready<Vec<u8>, Vec<u8>>>,
         transport: GroupRaftTransport,
         host_control: ByteBoundedReceiver<RaftHostControl>,
@@ -3523,27 +3529,22 @@ where
                 table_id: identity.target.table_id,
                 tablet_epoch: identity.target.tablet_epoch,
             };
-            let prepared_install = match tablet
+            let budget = tablet
                 .state_machine()
                 .tablet()
                 .storage()
                 .node_memtable_budget()
-            {
-                Some(budget) => prepare_incoming_tablet_snapshot_with_memtable_budget(
-                    snapshot_store.as_ref(),
-                    received.session,
-                    &target,
-                    install_permit,
-                    budget,
-                    ragnordb_storage::lsm::DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
-                ),
-                None => prepare_incoming_tablet_snapshot(
-                    snapshot_store.as_ref(),
-                    received.session,
-                    &target,
-                    install_permit,
-                ),
-            };
+                .ok_or_else(|| {
+                    "production tablet is missing its node memtable budget".to_string()
+                })?;
+            let prepared_install = prepare_incoming_tablet_snapshot_with_memtable_budget(
+                snapshot_store.as_ref(),
+                received.session,
+                &target,
+                install_permit,
+                budget,
+                ragnordb_storage::lsm::DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+            );
             match prepared_install {
                 Ok(prepared) => {
                     *pending_snapshot_install =
@@ -3703,12 +3704,14 @@ where
                     replacement.inherit_memtable_admissions(tablet);
                     *tablet = replacement;
                     if identity.sql_mirror_enabled {
+                        let storage = reference_storage_mirror(
+                            tablet.state_machine().tablet().storage(),
+                            identity.target.table_id,
+                        )
+                        .map_err(|error| error.to_string())?;
                         database
                             .blocking_lock()
-                            .install_replicated_storage(
-                                identity.target.table_id,
-                                tablet.state_machine().tablet().storage().clone(),
-                            )
+                            .install_replicated_storage(identity.target.table_id, storage)
                             .map_err(|e| e.to_string())?;
                     }
                     let classified_messages = classify_ready_messages(ready.messages);
@@ -4372,7 +4375,7 @@ impl InternalBarrierAllocator {
     fn candidate(
         &mut self,
         term: u64,
-        tablet: &TabletCommandApplier,
+        tablet: &TabletCommandApplier<impl MvccStorage>,
         raft_group_id: RaftGroupId,
     ) -> std::result::Result<RequestId, TabletCommandApplyError> {
         if self.term != Some(term) {
@@ -4433,7 +4436,7 @@ const fn internal_barrier_client_id(term: u64) -> u128 {
 
 fn admit_outcome_query(
     request: TabletOutcomeQueryRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
     reply: mpsc::SyncSender<Result<Option<CachedTabletCommandOutcome>>>,
@@ -4462,7 +4465,7 @@ fn admit_outcome_query(
 
 fn evaluate_rpc_outcome_query(
     request: TabletOutcomeQueryRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -4502,7 +4505,7 @@ fn evaluate_rpc_outcome_query(
 #[allow(clippy::too_many_arguments)]
 fn admit_rpc_outcome_query(
     request: TabletOutcomeQueryRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -4529,7 +4532,7 @@ fn admit_rpc_outcome_query(
 /// admission paths.
 fn prepare_pending_request(
     request: PendingTabletRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
     local_id: u64,
@@ -4602,7 +4605,7 @@ fn prepare_mutation_request(
     request: TabletCommandRequest,
     reply: ClientReply,
     deadline: Instant,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
 ) -> Option<PreparedCommandRequest> {
@@ -4615,7 +4618,7 @@ fn prepare_mutation_envelope(
     envelope: Result<TabletCommandEnvelope>,
     reply: ClientReply,
     deadline: Instant,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_id: Option<u64>,
 ) -> Option<PreparedCommandRequest> {
@@ -4683,7 +4686,7 @@ fn command_memory_class(command: &TabletCommand) -> Option<ragnordb_storage::lsm
 /// Validate opaque host proposals at the final tablet-specific admission
 /// boundary so an alternate internal caller cannot bypass the delta cap.
 fn validate_raw_command_delta_admission(
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     bytes: &[u8],
 ) -> std::result::Result<Option<(ragnordb_storage::lsm::MemoryClass, usize)>, HostedGroupError> {
     let state_machine = tablet.state_machine();
@@ -4786,14 +4789,14 @@ fn record_semantic_batch(command_count: usize, encoded_bytes: usize, started_at:
     );
 }
 
-fn memtable_write_stall_error(tablet: &TabletCommandApplier) -> Option<Error> {
+fn memtable_write_stall_error(tablet: &TabletCommandApplier<impl MvccStorage>) -> Option<Error> {
     let pressure = tablet
         .state_machine()
         .tablet()
         .storage()
         .memtable_pressure()?;
     pressure
-        .user_writes_stalled()
+        .user_admission_throttled()
         .then(|| Error::ProposalUnavailable {
             reason: format!(
                 "tablet memtable debt is at its limit ({} immutable bytes across {} generations)",
@@ -4806,7 +4809,7 @@ fn memtable_write_stall_error(tablet: &TabletCommandApplier) -> Option<Error> {
 /// Raft admission. The applier retains the lease until that position applies
 /// or the applied frontier proves that the entry was superseded.
 fn reserve_memtable_admission(
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     bytes: usize,
     class: ragnordb_storage::lsm::MemoryClass,
 ) -> Result<Option<ragnordb_storage::lsm::MemoryReservation>> {
@@ -4832,15 +4835,13 @@ fn reserve_memtable_admission(
             .and_then(|reserved| pressure.immutable_memtable_bytes.checked_add(reserved));
         let (count_limit, byte_limit, node_stalled) = match class {
             ragnordb_storage::lsm::MemoryClass::User => (
-                ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT,
-                pressure.immutable_memtable_limit_bytes,
-                pressure.user_writes_stalled(),
+                pressure.immutable_memtable_hard_count_limit,
+                pressure.immutable_memtable_hard_limit_bytes,
+                pressure.user_admission_throttled(),
             ),
             ragnordb_storage::lsm::MemoryClass::Progress => (
-                ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_HARD_COUNT,
-                pressure
-                    .active_limit_bytes
-                    .saturating_mul(ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_HARD_COUNT),
+                pressure.immutable_memtable_hard_count_limit,
+                pressure.immutable_memtable_hard_limit_bytes,
                 false,
             ),
         };
@@ -4877,7 +4878,7 @@ fn reserve_memtable_admission(
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_command<W, LS, SS>(
     prepared: PreparedCommandRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
@@ -4971,7 +4972,7 @@ fn admit_prepared_command<W, LS, SS>(
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_batch<W, LS, SS>(
     prepared: Vec<PreparedCommandRequest>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
@@ -5180,7 +5181,7 @@ fn admit_prepared_batch<W, LS, SS>(
 fn admit_request<W, LS, SS>(
     request: HostRequest,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
@@ -5483,7 +5484,7 @@ fn admit_read_barrier<W, LS, SS>(
     reply: ClientReply,
     deadline: Instant,
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
@@ -5618,7 +5619,7 @@ fn pending_read_barrier_waiter_count(pending_read_barriers: &[PendingReadBarrier
 fn complete_read_barrier_reply(
     reply: ClientReply,
     barrier_result: Result<()>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -5712,7 +5713,7 @@ fn complete_read_barrier_reply(
 
 fn process_pending_read_states<W, LS, SS>(
     ready_loop: &RaftReadyLoop<W, LS, SS>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     identity: &TabletRuntimeIdentity,
     read_states: &mut Vec<ReadState>,
@@ -5806,7 +5807,7 @@ fn reject_pending_read_barriers(
 #[allow(clippy::too_many_arguments)]
 fn fallback_pending_read_barriers<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     clients: &mut Vec<PendingClient>,
     serving_leader: bool,
@@ -5885,7 +5886,7 @@ fn fallback_pending_read_barriers<W, LS, SS>(
 
 fn evaluate_point_read(
     request: TabletReadRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -6204,7 +6205,7 @@ fn scan_conflicting_intent_batch<S: MvccStorage>(
 
 fn evaluate_scan_request(
     request: TabletScanRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -6328,7 +6329,7 @@ fn evaluate_scan_request(
 /// that was already pending at the start of the host turn.
 fn admit_read_request(
     request: TabletReadRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -6445,7 +6446,7 @@ fn admit_point_inspection_request<S: MvccStorage>(
 /// identity, tablet epoch, or the caller's fixed MVCC timestamp.
 fn admit_scan_request(
     request: TabletScanRequest,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
     identity: &TabletRuntimeIdentity,
@@ -6579,7 +6580,7 @@ fn admit_scan_request(
 #[allow(clippy::too_many_arguments)]
 fn refresh_leader_activation<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &mut TabletCommandApplier,
+    tablet: &mut TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
@@ -6682,7 +6683,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn maybe_publish_snapshot<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &mut TabletCommandApplier,
+    tablet: &mut TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
@@ -7274,7 +7275,7 @@ fn resolve_committed_entry_outcomes(
 #[allow(clippy::too_many_arguments)]
 fn drain_ready<W, LS, SS>(
     ready_loop: &mut RaftReadyLoop<W, LS, SS>,
-    tablet: &mut TabletCommandApplier,
+    tablet: &mut TabletCommandApplier<impl MvccStorage>,
     registry: &mut ProposalRegistry<TabletCommandApplyOutcome, TabletCommandApplyError>,
     database: &SharedLocalDatabase,
     transport: &GroupRaftTransport,
@@ -7419,7 +7420,7 @@ fn send_messages(
 
 fn forward_completions(
     clients: &mut Vec<PendingClient>,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     database: &SharedLocalDatabase,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
@@ -7459,7 +7460,7 @@ fn forward_completions(
 fn forward_completion(
     reply: ClientReply,
     completion: Completion,
-    tablet: &TabletCommandApplier,
+    tablet: &TabletCommandApplier<impl MvccStorage>,
     database: &SharedLocalDatabase,
     serving_leader: bool,
     leader_replica_id: Option<u64>,
@@ -7696,20 +7697,20 @@ fn send_client_error(reply: ClientReply, error: Error) {
 ///
 /// Keeping owner references in one context makes the status boundary explicit
 /// without copying tablet state or splitting its sampling cadence.
-struct ReactorStatusContext<'a> {
+struct ReactorStatusContext<'a, S = InMemoryMvcc> {
     serving_leader: bool,
     snapshot: (u64, u64),
     snapshot_install_pending: bool,
     pending_proposals: usize,
-    tablet: &'a TabletCommandApplier,
+    tablet: &'a TabletCommandApplier<S>,
     last_state_diagnostics_sample_at: &'a mut Instant,
     ownership: ReactorOwnership,
     status: &'a RwLock<ReplicatedTabletStatus>,
 }
 
-fn publish_status<W, LS, SS>(
+fn publish_status<W, LS, SS, S: MvccStorage>(
     ready_loop: &RaftReadyLoop<W, LS, SS>,
-    context: ReactorStatusContext<'_>,
+    context: ReactorStatusContext<'_, S>,
 ) where
     W: RaftWal,
     LS: LogStore<Vec<u8>>,
@@ -7951,6 +7952,113 @@ mod tests {
         assert!(command_delta_batch_fits([limit - 1, 1]));
         assert!(!command_delta_batch_fits([limit, 1]));
         assert!(!command_delta_batch_fits([usize::MAX, 1]));
+    }
+
+    #[test]
+    fn outstanding_user_admissions_reserve_hard_immutable_slots_before_raft() {
+        let budget =
+            ragnordb_storage::lsm::NodeMemtableBudget::new_with_progress_reserve(8192, 2048)
+                .unwrap();
+        let tablet = ragnordb_tablet::Tablet::new_with_memtable_budget(
+            TabletId(1),
+            TableId(1),
+            budget.clone(),
+            300,
+        )
+        .unwrap();
+        let state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
+            tablet,
+            1,
+            RaftGroupId(1),
+        )
+        .unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+
+        for index in 1..=4 {
+            let lease =
+                reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User)
+                    .unwrap()
+                    .unwrap();
+            applier.retain_memtable_admission(ProposalPosition { term: 1, index }, Some(lease));
+        }
+        assert_eq!(applier.pending_memtable_admission_count(), 4);
+        assert!(
+            reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User,)
+                .is_err()
+        );
+        assert_eq!(budget.user_used_bytes(), 512);
+
+        applier.release_memtable_admissions_through(2);
+        assert_eq!(applier.pending_memtable_admission_count(), 2);
+        for index in 5..=6 {
+            let lease =
+                reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User)
+                    .unwrap()
+                    .unwrap();
+            applier.retain_memtable_admission(ProposalPosition { term: 2, index }, Some(lease));
+        }
+        assert_eq!(applier.pending_memtable_admission_count(), 4);
+        assert!(
+            reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn soft_immutable_threshold_throttles_users_but_allows_progress_admission() {
+        use ragnordb_common::codec::Value;
+        use ragnordb_storage::mvcc::{MvccDelta, MvccRecordEdit};
+
+        let budget =
+            ragnordb_storage::lsm::NodeMemtableBudget::new_with_progress_reserve(8192, 2048)
+                .unwrap();
+        let mut storage = MemtableMvcc::with_memtable_budget(budget.clone(), 300).unwrap();
+        for id in 1..=3 {
+            let key = ragnordb_storage::key::encode_row_key(
+                &ragnordb_storage::key::make_row_key(TableId(1), &[Value::Int(id)]).unwrap(),
+            )
+            .unwrap();
+            let row = encode_row(&ragnordb_common::codec::Row {
+                values: vec![Value::Int(id), Value::Text("soft threshold".to_string())],
+            })
+            .unwrap();
+            storage
+                .publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key,
+                        start_ts: Timestamp(id as u64),
+                        row,
+                    }],
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count,
+            2
+        );
+
+        let tablet =
+            ragnordb_tablet::Tablet::with_storage(TabletId(1), TableId(1), storage).unwrap();
+        let state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
+            tablet,
+            1,
+            RaftGroupId(1),
+        )
+        .unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+
+        assert!(memtable_write_stall_error(&applier).is_some());
+        assert!(
+            reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User)
+                .is_err()
+        );
+        assert!(
+            reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::Progress)
+                .is_ok()
+        );
     }
 
     #[test]

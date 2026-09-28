@@ -216,7 +216,6 @@ dependencies = [
 name = "bloom-bloom"
 version = "0.1.0"
 dependencies = [
- "rayon",
  "xxhash-rust",
 ]
 

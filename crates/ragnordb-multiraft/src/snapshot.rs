@@ -5,7 +5,10 @@
 //! shape and provides the concrete A-WAL boundary used by incoming installs
 
 use raft::types::{ConfState, HardState, Snapshot, SnapshotMetadata};
-use ragnordb_storage::{lsm::NodeMemtableBudget, mvcc::InMemoryMvcc};
+use ragnordb_storage::{
+    lsm::NodeMemtableBudget,
+    mvcc::{InMemoryMvcc, MemtableMvcc, MvccStorage},
+};
 use ragnordb_tablet::{
     command::TabletStateMachine,
     snapshot::{
@@ -542,10 +545,10 @@ pub fn raft_pointer_for_tablet(
 /// function is borrowing the runtime and state machine. The frontier itself
 /// comes only from successful Ready application or explicit recovery seeding;
 /// a commit index or current term is never substituted
-pub fn generate_tablet_snapshot_from_ready_loop<W, LS, SS>(
+pub fn generate_tablet_snapshot_from_ready_loop<W, LS, SS, S: MvccStorage>(
     work: &SnapshotWorkController,
     ready_loop: &RaftReadyLoop<W, LS, SS>,
-    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    state_machine: &TabletStateMachine<S>,
     cluster_id: impl Into<String>,
     replica_id: ragnordb_common::ids::ReplicaId,
     snapshot_id: u64,
@@ -731,13 +734,13 @@ pub struct DurableTabletSnapshotInstall {
 /// Dropping this value cleanly abandons the candidate without modifying the
 /// currently live tablet state.
 #[derive(Debug)]
-pub struct PreparedIncomingTabletSnapshotInstall {
-    installed: PreparedTabletSnapshotInstall,
+pub struct PreparedIncomingTabletSnapshotInstall<S = InMemoryMvcc> {
+    installed: PreparedTabletSnapshotInstall<S>,
     _receive_permit: SnapshotWorkPermit,
     install_permit: SnapshotWorkPermit,
 }
 
-impl PreparedIncomingTabletSnapshotInstall {
+impl<S: MvccStorage> PreparedIncomingTabletSnapshotInstall<S> {
     pub fn pointer(&self) -> &TabletSnapshotPointer {
         &self.installed.pointer
     }
@@ -746,7 +749,7 @@ impl PreparedIncomingTabletSnapshotInstall {
         self.installed.frontier
     }
 
-    pub fn into_installed(self) -> PreparedTabletSnapshotInstall {
+    pub fn into_installed(self) -> PreparedTabletSnapshotInstall<S> {
         self.install_permit
             .note_bytes(self.installed.pointer.metadata.total_length);
 
@@ -759,8 +762,14 @@ pub fn prepare_incoming_tablet_snapshot(
     receiver: TabletSnapshotReceiveSession,
     target: &TabletSnapshotInstallTarget,
     install_permit: SnapshotWorkPermit,
-) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
-    prepare_incoming_tablet_snapshot_inner(store, receiver, target, install_permit, None)
+) -> Result<PreparedIncomingTabletSnapshotInstall<InMemoryMvcc>, TabletSnapshotIntegrationError> {
+    prepare_incoming_tablet_snapshot_inner(
+        store,
+        receiver,
+        target,
+        install_permit,
+        prepare_incoming_snapshot,
+    )
 }
 
 /// Prepare an incoming image with the receiver's active memtable reservation
@@ -772,36 +781,46 @@ pub fn prepare_incoming_tablet_snapshot_with_memtable_budget(
     install_permit: SnapshotWorkPermit,
     budget: NodeMemtableBudget,
     max_active_bytes: usize,
-) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+) -> Result<PreparedIncomingTabletSnapshotInstall<MemtableMvcc>, TabletSnapshotIntegrationError> {
     prepare_incoming_tablet_snapshot_inner(
         store,
         receiver,
         target,
         install_permit,
-        Some((budget, max_active_bytes)),
+        move |store, receiver, target| {
+            prepare_incoming_snapshot_with_memtable_budget(
+                store,
+                receiver,
+                target,
+                budget,
+                max_active_bytes,
+            )
+        },
     )
 }
 
-fn prepare_incoming_tablet_snapshot_inner(
+fn prepare_incoming_tablet_snapshot_inner<S, F>(
     store: &FileTabletSnapshotStore,
     receiver: TabletSnapshotReceiveSession,
     target: &TabletSnapshotInstallTarget,
     install_permit: SnapshotWorkPermit,
-    memtable_budget: Option<(NodeMemtableBudget, usize)>,
-) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    prepare: F,
+) -> Result<PreparedIncomingTabletSnapshotInstall<S>, TabletSnapshotIntegrationError>
+where
+    S: MvccStorage,
+    F: FnOnce(
+        &FileTabletSnapshotStore,
+        ragnordb_tablet::snapshot::IncomingTabletSnapshotReceiver,
+        &TabletSnapshotInstallTarget,
+    ) -> Result<
+        PreparedTabletSnapshotInstall<S>,
+        ragnordb_tablet::snapshot::TabletSnapshotInstallError,
+    >,
+{
     let (receiver, receive_permit) = receiver.into_parts();
 
-    let installed = match memtable_budget {
-        Some((budget, max_active_bytes)) => prepare_incoming_snapshot_with_memtable_budget(
-            store,
-            receiver,
-            target,
-            budget,
-            max_active_bytes,
-        ),
-        None => prepare_incoming_snapshot(store, receiver, target),
-    }
-    .map_err(TabletSnapshotIntegrationError::Install)?;
+    let installed =
+        prepare(store, receiver, target).map_err(TabletSnapshotIntegrationError::Install)?;
 
     install_permit.set_total_bytes(installed.pointer.metadata.total_length);
 

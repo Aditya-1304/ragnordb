@@ -312,19 +312,11 @@ impl<S: MvccStorage> InMemoryTabletStateBackend<S> {
             retry_floor_edits: retry_floor_edits.clone(),
             frontier,
         };
-        let freeze_active = self
-            .tablet
-            .storage
-            .command_generation_requires_freeze(&mvcc)
-            .map_err(map_publication_error)?;
-
-        // The tablet owner decides when the current generation rolls over.
-        // MVCC receives that decision together with the command metadata, so
-        // a frozen segment contains the rows and retry/status/frontier edits
-        // represented by exactly the same command interval.
+        // One complete command publication owns both rollover planning and
+        // publication, so MVCC records cannot freeze apart from metadata/frontier.
         self.tablet
             .storage
-            .publish_command_generation_with_reservation(mvcc, metadata, freeze_active, reservation)
+            .publish_command_generation_with_reservation(mvcc, metadata, reservation)
             .map_err(map_publication_error)?;
 
         for edit in transaction_status_edits {
@@ -1119,6 +1111,51 @@ impl<S: MvccStorage> TabletStateMachine<S> {
                     .to_string(),
             });
         }
+        let metadata = CommandGenerationMetadata {
+            storage_identity: self.storage_identity,
+            transaction_status_edits: self
+                .transaction_statuses
+                .iter()
+                .map(|(txn_id, status)| TxnStatusEdit::Put {
+                    txn_id: *txn_id,
+                    status: status.clone(),
+                })
+                .collect(),
+            logical_outcome_edits: self
+                .logical_command_deduplication
+                .iter()
+                .map(|(id, state)| LogicalOutcomeEdit::Put {
+                    id: *id,
+                    outcome: state.cached_outcome.clone(),
+                })
+                .collect(),
+            legacy_outcome_edits: self
+                .client_deduplication
+                .iter()
+                .filter(|(key, _)| key.raft_group_id == self.storage_identity.raft_group_id)
+                .map(|(key, state)| LegacyOutcomeEdit::Put {
+                    client_id: key.client_id,
+                    last_sequence_applied: state.last_sequence_applied,
+                    outcome: state.cached_outcome.clone(),
+                })
+                .collect(),
+            retry_floor_edits: self
+                .logical_client_retry_horizons
+                .iter()
+                .map(
+                    |((client_id, session_epoch), acknowledged_through)| RetryFloorEdit::Advance {
+                        client_id: *client_id,
+                        session_epoch: *session_epoch,
+                        acknowledged_through: *acknowledged_through,
+                    },
+                )
+                .collect(),
+            frontier,
+        };
+        self.tablet
+            .storage
+            .install_restored_command_metadata(metadata)
+            .map_err(map_publication_error)?;
         self.recovery_frontier = Some(frontier);
         Ok(())
     }
@@ -3683,6 +3720,105 @@ mod tests {
         );
         assert_eq!(state_machine.recovery_frontier(), None);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn memtable_deterministic_rejection_charges_outcome_and_advances_frontier_only() {
+        let budget = NodeMemtableBudget::new(2 * 1024 * 1024).unwrap();
+        let tablet = Tablet::new_with_memtable_budget(
+            LOCAL_TABLET_ID,
+            TableId(9),
+            budget.clone(),
+            64 * 1024,
+        )
+        .unwrap();
+        let mut state_machine = TabletStateMachine::new_local_reference(
+            tablet,
+            LOCAL_TABLET_EPOCH,
+            LOCAL_RAFT_GROUP_ID,
+        )
+        .unwrap();
+        let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(72)]).unwrap()).unwrap();
+        let first = PrewriteCommand {
+            txn_id: TxnId(121),
+            start_timestamp: Timestamp(420),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(test_row(72, "owner")),
+                op: WriteKind::Put,
+            }],
+            primary_key: key.clone(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        };
+        state_machine
+            .apply_committed_at(command_envelope(1, TabletCommand::Prewrite(first)), 1, 1)
+            .unwrap();
+
+        let before_default = state_machine
+            .tablet()
+            .storage()
+            .get_default_record(&key, Timestamp(420))
+            .unwrap();
+        let before_lock = state_machine
+            .tablet()
+            .storage()
+            .get_lock_record(&key)
+            .unwrap();
+        let before_bytes = state_machine.tablet().storage().active_memtable_bytes();
+        let rejection = PrewriteCommand {
+            txn_id: TxnId(122),
+            start_timestamp: Timestamp(430),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(test_row(72, "contender")),
+                op: WriteKind::Put,
+            }],
+            primary_key: key.clone(),
+            ttl_ms: 30_000,
+            pending_status: None,
+        };
+
+        assert!(matches!(
+            state_machine.apply_committed_at(
+                command_envelope(2, TabletCommand::Prewrite(rejection)),
+                2,
+                1,
+            ),
+            Err(TabletCommandApplyError::WriteConflict { .. })
+        ));
+        assert_eq!(
+            state_machine
+                .tablet()
+                .storage()
+                .get_default_record(&key, Timestamp(420))
+                .unwrap(),
+            before_default
+        );
+        assert_eq!(
+            state_machine
+                .tablet()
+                .storage()
+                .get_lock_record(&key)
+                .unwrap(),
+            before_lock
+        );
+        assert!(state_machine.tablet().storage().active_memtable_bytes() > before_bytes);
+        assert_eq!(
+            state_machine.recovery_frontier(),
+            Some(RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+                replica_id: ReplicaId(1),
+                applied_index: 2,
+                applied_term: 1,
+            })
+        );
+        let generation = state_machine.pin_generation().unwrap();
+        assert!(matches!(
+            generation.legacy_outcome(0xf5b4_81ab_9b67_4418_ba82_b49c_e371_007d),
+            Some((2, CachedTabletCommandOutcome::Rejected(_)))
+        ));
+        assert!(budget.used_bytes() >= before_bytes);
     }
 
     #[test]

@@ -147,7 +147,7 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
 fn retained_proposal_capacity_survives_until_exact_committed_apply() {
     let budget = NodeMemtableBudget::new_with_progress_reserve(65_536, 16_384).unwrap();
     let tablet =
-        Tablet::new_with_memtable_budget(TABLET_ID, TABLE_ID, budget.clone(), 512).unwrap();
+        Tablet::new_with_memtable_budget(TABLET_ID, TABLE_ID, budget.clone(), 1024).unwrap();
     let state_machine =
         TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
     let mut applier = TabletCommandApplier::new(state_machine);

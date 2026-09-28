@@ -12,7 +12,7 @@ use crate::{
 
 use ragnordb_storage::{
     lsm::{NodeMemtableBudget, RecoveryFrontier, TabletStorageIdentity},
-    mvcc::{InMemoryMvcc, MvccReadGeneration},
+    mvcc::{InMemoryMvcc, MemtableMvcc, MvccReadGeneration, MvccStorage},
 };
 
 use std::{
@@ -86,8 +86,8 @@ pub struct TabletSnapshotMetadataInput {
 /// entries have been successfully applied. This function captures the
 /// replicated deduplication state and detached MVCC records into one
 /// deterministic protobuf payload before metadata computes its checksum
-pub fn generate_local_snapshot(
-    state_machine: &TabletStateMachine<InMemoryMvcc>,
+pub fn generate_local_snapshot<S: MvccStorage>(
+    state_machine: &TabletStateMachine<S>,
     cluster_id: impl Into<String>,
     replica_id: ReplicaId,
     snapshot_id: u64,
@@ -109,8 +109,8 @@ pub fn generate_local_snapshot(
 /// replica-removal proof needed after the corresponding log entry is
 /// compacted. The proof is metadata, not tablet payload, so it is transferred
 /// and checksummed with the immutable snapshot envelope.
-pub fn generate_local_snapshot_with_removal_proof(
-    state_machine: &TabletStateMachine<InMemoryMvcc>,
+pub fn generate_local_snapshot_with_removal_proof<S: MvccStorage>(
+    state_machine: &TabletStateMachine<S>,
     cluster_id: impl Into<String>,
     replica_id: ReplicaId,
     snapshot_id: u64,
@@ -204,9 +204,9 @@ pub fn generate_local_snapshot_with_removal_proof(
 /// the file store performs the synchronized temporary-file write and atomic
 /// publication already established by Slice 1. Raft pointer persistence is
 /// intentionally left to the next integration step
-pub fn generate_and_publish_local_snapshot(
+pub fn generate_and_publish_local_snapshot<S: MvccStorage>(
     store: &FileTabletSnapshotStore,
-    state_machine: &TabletStateMachine<InMemoryMvcc>,
+    state_machine: &TabletStateMachine<S>,
     cluster_id: impl Into<String>,
     replica_id: ReplicaId,
     snapshot_id: u64,
@@ -1407,9 +1407,9 @@ pub struct TabletSnapshotInstallTarget {
 
 /// Successfully restored tablet state after durable boundary persistence.
 #[derive(Debug)]
-pub struct InstalledTabletSnapshot {
+pub struct InstalledTabletSnapshot<S = InMemoryMvcc> {
     pub pointer: TabletSnapshotPointer,
-    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub state_machine: TabletStateMachine<S>,
     pub frontier: AppliedTabletFrontier,
 }
 
@@ -1420,9 +1420,9 @@ pub struct InstalledTabletSnapshot {
 /// persist the matching Raft snapshot boundary before publishing this state as
 /// the live tablet image.
 #[derive(Debug)]
-pub struct PreparedTabletSnapshotInstall {
+pub struct PreparedTabletSnapshotInstall<S = InMemoryMvcc> {
     pub pointer: TabletSnapshotPointer,
-    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+    pub state_machine: TabletStateMachine<S>,
     pub frontier: AppliedTabletFrontier,
 }
 
@@ -1430,8 +1430,10 @@ pub fn prepare_incoming_snapshot(
     store: &FileTabletSnapshotStore,
     receiver: IncomingTabletSnapshotReceiver,
     target: &TabletSnapshotInstallTarget,
-) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
-    prepare_incoming_snapshot_inner(store, receiver, target, None)
+) -> Result<PreparedTabletSnapshotInstall<InMemoryMvcc>, TabletSnapshotInstallError> {
+    prepare_incoming_snapshot_inner(store, receiver, target, |image, target| {
+        restore_verified_snapshot(image, target)
+    })
 }
 
 /// Prepare an incoming image while charging the restored active generation to
@@ -1442,16 +1444,25 @@ pub fn prepare_incoming_snapshot_with_memtable_budget(
     target: &TabletSnapshotInstallTarget,
     budget: NodeMemtableBudget,
     max_active_bytes: usize,
-) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
-    prepare_incoming_snapshot_inner(store, receiver, target, Some((budget, max_active_bytes)))
+) -> Result<PreparedTabletSnapshotInstall<MemtableMvcc>, TabletSnapshotInstallError> {
+    prepare_incoming_snapshot_inner(store, receiver, target, move |image, target| {
+        restore_verified_snapshot_with_memtable_budget(image, target, budget, max_active_bytes)
+    })
 }
 
-fn prepare_incoming_snapshot_inner(
+fn prepare_incoming_snapshot_inner<S, F>(
     store: &FileTabletSnapshotStore,
     receiver: IncomingTabletSnapshotReceiver,
     target: &TabletSnapshotInstallTarget,
-    memtable_budget: Option<(NodeMemtableBudget, usize)>,
-) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
+    restore: F,
+) -> Result<PreparedTabletSnapshotInstall<S>, TabletSnapshotInstallError>
+where
+    S: MvccStorage,
+    F: FnOnce(
+        &TabletSnapshotImage,
+        &TabletSnapshotInstallTarget,
+    ) -> Result<RestoredTabletSnapshot<S>, TabletSnapshotInstallError>,
+{
     validate_install_target(&receiver.metadata, target)?;
 
     let image = receiver
@@ -1464,18 +1475,7 @@ fn prepare_incoming_snapshot_inner(
         .publish(&image)
         .map_err(TabletSnapshotInstallError::Store)?;
 
-    let restored = match memtable_budget {
-        Some((budget, max_active_bytes)) => {
-            restore_verified_snapshot_for_replica_with_memtable_budget(
-                &image,
-                target,
-                target.replica_id,
-                budget,
-                max_active_bytes,
-            )?
-        }
-        None => restore_verified_snapshot(&image, target)?,
-    };
+    let restored = restore(&image, target)?;
 
     Ok(PreparedTabletSnapshotInstall {
         pointer,
@@ -1490,8 +1490,8 @@ fn prepare_incoming_snapshot_inner(
 /// constructor has also validated the Raft pointer, rebuilt the Raft core, and
 /// replayed every committed entry after this frontier.
 #[derive(Debug)]
-pub struct RestoredTabletSnapshot {
-    pub state_machine: TabletStateMachine<InMemoryMvcc>,
+pub struct RestoredTabletSnapshot<S = InMemoryMvcc> {
+    pub state_machine: TabletStateMachine<S>,
     pub frontier: AppliedTabletFrontier,
 }
 
@@ -1500,7 +1500,7 @@ pub struct RestoredTabletSnapshot {
 pub fn restore_verified_snapshot(
     image: &TabletSnapshotImage,
     target: &TabletSnapshotInstallTarget,
-) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+) -> Result<RestoredTabletSnapshot<InMemoryMvcc>, TabletSnapshotInstallError> {
     restore_verified_snapshot_for_replica(image, target, target.replica_id)
 }
 
@@ -1511,7 +1511,7 @@ pub fn restore_verified_snapshot_with_memtable_budget(
     target: &TabletSnapshotInstallTarget,
     budget: NodeMemtableBudget,
     max_active_bytes: usize,
-) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+) -> Result<RestoredTabletSnapshot<MemtableMvcc>, TabletSnapshotInstallError> {
     restore_verified_snapshot_for_replica_with_memtable_budget(
         image,
         target,
@@ -1528,8 +1528,21 @@ pub fn restore_verified_snapshot_for_replica(
     image: &TabletSnapshotImage,
     target: &TabletSnapshotInstallTarget,
     local_replica_id: ReplicaId,
-) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
-    restore_verified_snapshot_for_replica_inner(image, target, local_replica_id, None)
+) -> Result<RestoredTabletSnapshot<InMemoryMvcc>, TabletSnapshotInstallError> {
+    restore_verified_snapshot_for_replica_inner(
+        image,
+        target,
+        local_replica_id,
+        |table_id, payload| {
+            InMemoryMvcc::restore_from_snapshot_entries(
+                table_id,
+                std::mem::take(&mut payload.default_values),
+                std::mem::take(&mut payload.locks),
+                std::mem::take(&mut payload.writes),
+            )
+            .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))
+        },
+    )
 }
 
 /// Restore a verified snapshot and charge its mutable reference generation to
@@ -1540,24 +1553,41 @@ pub fn restore_verified_snapshot_for_replica_with_memtable_budget(
     local_replica_id: ReplicaId,
     budget: NodeMemtableBudget,
     max_active_bytes: usize,
-) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+) -> Result<RestoredTabletSnapshot<MemtableMvcc>, TabletSnapshotInstallError> {
     restore_verified_snapshot_for_replica_inner(
         image,
         target,
         local_replica_id,
-        Some((budget, max_active_bytes)),
+        move |table_id, payload| {
+            let restored = InMemoryMvcc::restore_from_snapshot_entries(
+                table_id,
+                std::mem::take(&mut payload.default_values),
+                std::mem::take(&mut payload.locks),
+                std::mem::take(&mut payload.writes),
+            )
+            .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
+            MemtableMvcc::from_restored(restored, budget, max_active_bytes)
+                .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))
+        },
     )
 }
 
-fn restore_verified_snapshot_for_replica_inner(
+fn restore_verified_snapshot_for_replica_inner<S, F>(
     image: &TabletSnapshotImage,
     target: &TabletSnapshotInstallTarget,
     local_replica_id: ReplicaId,
-    memtable_budget: Option<(NodeMemtableBudget, usize)>,
-) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    build_storage: F,
+) -> Result<RestoredTabletSnapshot<S>, TabletSnapshotInstallError>
+where
+    S: MvccStorage,
+    F: FnOnce(
+        TableId,
+        &mut snapshot_proto::TabletSnapshotPayload,
+    ) -> Result<S, TabletSnapshotInstallError>,
+{
     validate_install_target(&image.metadata, target)?;
 
-    let payload = snapshot_proto::TabletSnapshotPayload::decode(image.data.as_slice())
+    let mut payload = snapshot_proto::TabletSnapshotPayload::decode(image.data.as_slice())
         .map_err(|error| TabletSnapshotInstallError::PayloadDecode(error.to_string()))?;
 
     if payload.format_version != TABLET_SNAPSHOT_PAYLOAD_VERSION {
@@ -1590,18 +1620,7 @@ fn restore_verified_snapshot_for_replica_inner(
         return Err(TabletSnapshotInstallError::StateMachineIdentityMismatch);
     }
 
-    let mut storage = InMemoryMvcc::restore_from_snapshot_entries(
-        target.table_id,
-        payload.default_values,
-        payload.locks,
-        payload.writes,
-    )
-    .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
-    if let Some((budget, max_active_bytes)) = memtable_budget {
-        storage
-            .bind_memtable_budget(budget, max_active_bytes)
-            .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
-    }
+    let storage = build_storage(target.table_id, &mut payload)?;
 
     let tablet = Tablet::with_storage(target.tablet_id, target.table_id, storage)
         .map_err(|error| TabletSnapshotInstallError::TabletRestore(error.to_string()))?;
@@ -1639,7 +1658,7 @@ pub fn install_incoming_snapshot<F, E>(
     receiver: IncomingTabletSnapshotReceiver,
     target: &TabletSnapshotInstallTarget,
     persist_boundary: F,
-) -> Result<InstalledTabletSnapshot, TabletSnapshotInstallError>
+) -> Result<InstalledTabletSnapshot<InMemoryMvcc>, TabletSnapshotInstallError>
 where
     F: FnOnce(&TabletSnapshotPointer, AppliedTabletFrontier) -> Result<(), E>,
     E: std::fmt::Display,
