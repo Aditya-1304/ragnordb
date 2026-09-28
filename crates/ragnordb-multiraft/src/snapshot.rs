@@ -5,7 +5,7 @@
 //! shape and provides the concrete A-WAL boundary used by incoming installs
 
 use raft::types::{ConfState, HardState, Snapshot, SnapshotMetadata};
-use ragnordb_storage::mvcc::InMemoryMvcc;
+use ragnordb_storage::{lsm::NodeMemtableBudget, mvcc::InMemoryMvcc};
 use ragnordb_tablet::{
     command::TabletStateMachine,
     snapshot::{
@@ -15,6 +15,7 @@ use ragnordb_tablet::{
         TabletSnapshotInstallTarget, TabletSnapshotMetadata, TabletSnapshotPointer,
         TabletSnapshotReceiveError, generate_local_snapshot_with_removal_proof,
         install_incoming_snapshot, prepare_incoming_snapshot,
+        prepare_incoming_snapshot_with_memtable_budget,
     },
 };
 
@@ -759,10 +760,48 @@ pub fn prepare_incoming_tablet_snapshot(
     target: &TabletSnapshotInstallTarget,
     install_permit: SnapshotWorkPermit,
 ) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    prepare_incoming_tablet_snapshot_inner(store, receiver, target, install_permit, None)
+}
+
+/// Prepare an incoming image with the receiver's active memtable reservation
+/// policy applied before it can cross the Raft snapshot boundary.
+pub fn prepare_incoming_tablet_snapshot_with_memtable_budget(
+    store: &FileTabletSnapshotStore,
+    receiver: TabletSnapshotReceiveSession,
+    target: &TabletSnapshotInstallTarget,
+    install_permit: SnapshotWorkPermit,
+    budget: NodeMemtableBudget,
+    max_active_bytes: usize,
+) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
+    prepare_incoming_tablet_snapshot_inner(
+        store,
+        receiver,
+        target,
+        install_permit,
+        Some((budget, max_active_bytes)),
+    )
+}
+
+fn prepare_incoming_tablet_snapshot_inner(
+    store: &FileTabletSnapshotStore,
+    receiver: TabletSnapshotReceiveSession,
+    target: &TabletSnapshotInstallTarget,
+    install_permit: SnapshotWorkPermit,
+    memtable_budget: Option<(NodeMemtableBudget, usize)>,
+) -> Result<PreparedIncomingTabletSnapshotInstall, TabletSnapshotIntegrationError> {
     let (receiver, receive_permit) = receiver.into_parts();
 
-    let installed = prepare_incoming_snapshot(store, receiver, target)
-        .map_err(TabletSnapshotIntegrationError::Install)?;
+    let installed = match memtable_budget {
+        Some((budget, max_active_bytes)) => prepare_incoming_snapshot_with_memtable_budget(
+            store,
+            receiver,
+            target,
+            budget,
+            max_active_bytes,
+        ),
+        None => prepare_incoming_snapshot(store, receiver, target),
+    }
+    .map_err(TabletSnapshotIntegrationError::Install)?;
 
     install_permit.set_total_bytes(installed.pointer.metadata.total_length);
 

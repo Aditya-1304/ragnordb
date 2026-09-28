@@ -36,6 +36,7 @@ use ragnordb_common::{
 };
 use ragnordb_storage::{
     key::{decode_row_key, encode_row_key},
+    lsm::NodeMemtableBudget,
     mvcc::{InMemoryMvcc, Mutation, MvccStats, MvccStorage},
 };
 use ragnordb_txn::{
@@ -112,6 +113,18 @@ impl Tablet<InMemoryMvcc> {
     /// Construct an empty in-memory tablet for one table.
     pub fn new(id: TabletId, table_id: TableId) -> Result<Self> {
         Self::with_storage(id, table_id, InMemoryMvcc::new())
+    }
+
+    /// Construct an empty tablet whose active MVCC generation reserves from a
+    /// shared node budget before publishing new records.
+    pub fn new_with_memtable_budget(
+        id: TabletId,
+        table_id: TableId,
+        budget: NodeMemtableBudget,
+        max_active_bytes: usize,
+    ) -> Result<Self> {
+        let storage = InMemoryMvcc::with_memtable_budget(budget, max_active_bytes)?;
+        Self::with_storage(id, table_id, storage)
     }
 }
 

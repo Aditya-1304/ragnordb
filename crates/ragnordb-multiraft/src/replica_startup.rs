@@ -13,12 +13,14 @@ use ragnordb_common::{
     ids::ReplicaId,
     raft_bootstrap::{RaftGroupBootstrap, RaftGroupBootstrapError},
 };
+use ragnordb_storage::lsm::{DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, NodeMemtableBudget};
 use ragnordb_tablet::{
     Tablet,
     command::{TabletCommandApplyError, TabletStateMachine},
     snapshot::{
         FileTabletSnapshotStore, TabletSnapshotInstallError, TabletSnapshotInstallTarget,
-        TabletSnapshotPointer, TabletSnapshotStoreError, restore_verified_snapshot,
+        TabletSnapshotPointer, TabletSnapshotStoreError,
+        restore_verified_snapshot_for_replica_with_memtable_budget,
     },
 };
 use wal::lsn::Lsn;
@@ -103,6 +105,7 @@ pub fn initial_recovery_configuration(
 
 /// create a new group through the exactly-once bootstrap authority and persist
 /// its initial Ready before returning it to transport or proposal routing
+#[allow(clippy::too_many_arguments)]
 pub fn bootstrap_tablet_replica<W, S>(
     bootstrap_store: &mut S,
     requested: &RaftGroupBootstrap,
@@ -111,6 +114,7 @@ pub fn bootstrap_tablet_replica<W, S>(
     target: &TabletSnapshotInstallTarget,
     election_timeout: u64,
     heartbeat_interval: u64,
+    memtable_budget: NodeMemtableBudget,
 ) -> Result<BootstrappedTabletReplica<W>, TabletReplicaStartupError>
 where
     W: RaftWal,
@@ -134,8 +138,13 @@ where
     )
     .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
 
-    let tablet = Tablet::new(target.tablet_id, target.table_id)
-        .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+    let tablet = Tablet::new_with_memtable_budget(
+        target.tablet_id,
+        target.table_id,
+        memtable_budget,
+        DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+    )
+    .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
     let tablet = TabletStateMachine::new_with_replica(
         tablet,
         target.tablet_epoch,
@@ -163,6 +172,7 @@ pub fn bootstrap_joining_tablet_replica<W>(
     target: &TabletSnapshotInstallTarget,
     election_timeout: u64,
     heartbeat_interval: u64,
+    memtable_budget: NodeMemtableBudget,
 ) -> Result<BootstrappedJoiningTabletReplica<W>, TabletReplicaStartupError>
 where
     W: RaftWal,
@@ -187,8 +197,13 @@ where
         heartbeat_interval,
     )
     .map_err(|error| TabletReplicaStartupError::RaftInitialization(format!("{error:?}")))?;
-    let tablet = Tablet::new(target.tablet_id, target.table_id)
-        .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+    let tablet = Tablet::new_with_memtable_budget(
+        target.tablet_id,
+        target.table_id,
+        memtable_budget,
+        DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+    )
+    .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
     let state_machine = TabletStateMachine::new_with_replica(
         tablet,
         target.tablet_epoch,
@@ -224,6 +239,7 @@ pub fn recover_tablet_replica<W: RaftWal>(
     target: &TabletSnapshotInstallTarget,
     election_timeout: u64,
     heartbeat_interval: u64,
+    memtable_budget: NodeMemtableBudget,
 ) -> Result<RecoveredTabletReplica<W>, TabletReplicaStartupError> {
     validate_target(&bootstrap, local_replica_id, target)?;
     let (identity, _) = initial_recovery_configuration(&bootstrap, local_replica_id)?;
@@ -243,7 +259,13 @@ pub fn recover_tablet_replica<W: RaftWal>(
                 return Err(TabletReplicaStartupError::SnapshotPointerMismatch);
             }
 
-            let restored = restore_verified_snapshot(&image, target)?;
+            let restored = restore_verified_snapshot_for_replica_with_memtable_budget(
+                &image,
+                target,
+                local_replica_id,
+                memtable_budget.clone(),
+                DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+            )?;
             (
                 TabletCommandApplier::new(restored.state_machine),
                 Some(AppliedRaftFrontier::new(
@@ -258,8 +280,13 @@ pub fn recover_tablet_replica<W: RaftWal>(
                     truncated_through: recovered.progress().truncated_through_index,
                 });
             }
-            let tablet = Tablet::new(target.tablet_id, target.table_id)
-                .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+            let tablet = Tablet::new_with_memtable_budget(
+                target.tablet_id,
+                target.table_id,
+                memtable_budget.clone(),
+                DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+            )
+            .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
             let state_machine = TabletStateMachine::new_with_replica(
                 tablet,
                 target.tablet_epoch,
@@ -363,6 +390,7 @@ pub fn recover_joining_tablet_replica<W: RaftWal>(
     target: &TabletSnapshotInstallTarget,
     election_timeout: u64,
     heartbeat_interval: u64,
+    memtable_budget: NodeMemtableBudget,
 ) -> Result<RecoveredJoiningTabletReplica<W>, TabletReplicaStartupError> {
     let identity = RaftReplicaIdentity::new(target.raft_group_id, local_replica_id)
         .map_err(|error| TabletReplicaStartupError::Identity(error.to_string()))?;
@@ -392,7 +420,13 @@ pub fn recover_joining_tablet_replica<W: RaftWal>(
             if &expected_raft_pointer != raft_pointer {
                 return Err(TabletReplicaStartupError::SnapshotPointerMismatch);
             }
-            let restored = restore_verified_snapshot(&image, target)?;
+            let restored = restore_verified_snapshot_for_replica_with_memtable_budget(
+                &image,
+                target,
+                local_replica_id,
+                memtable_budget.clone(),
+                DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+            )?;
             (
                 TabletCommandApplier::new(restored.state_machine),
                 Some(AppliedRaftFrontier::new(
@@ -407,8 +441,13 @@ pub fn recover_joining_tablet_replica<W: RaftWal>(
                     truncated_through: recovered.progress().truncated_through_index,
                 });
             }
-            let tablet = Tablet::new(target.tablet_id, target.table_id)
-                .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
+            let tablet = Tablet::new_with_memtable_budget(
+                target.tablet_id,
+                target.table_id,
+                memtable_budget.clone(),
+                DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+            )
+            .map_err(|error| TabletReplicaStartupError::Tablet(error.to_string()))?;
             let state_machine = TabletStateMachine::new_with_replica(
                 tablet,
                 target.tablet_epoch,

@@ -7,6 +7,7 @@
 pub mod command_delta;
 pub mod frontier;
 pub mod internal_key;
+pub mod memory;
 pub mod value;
 
 pub use command_delta::{
@@ -14,3 +15,6 @@ pub use command_delta::{
     TabletStorageIdentity, TxnStatusEdit,
 };
 pub use frontier::{RecoveryFrontier, RecoveryFrontierError, ReplicatedWalMapping};
+pub use memory::{
+    DEFAULT_NODE_MEMTABLE_BUDGET_BYTES, DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, NodeMemtableBudget,
+};

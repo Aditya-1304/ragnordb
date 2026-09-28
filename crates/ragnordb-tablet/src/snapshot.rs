@@ -11,7 +11,7 @@ use crate::{
 };
 
 use ragnordb_storage::{
-    lsm::{RecoveryFrontier, TabletStorageIdentity},
+    lsm::{NodeMemtableBudget, RecoveryFrontier, TabletStorageIdentity},
     mvcc::{InMemoryMvcc, MvccReadGeneration},
 };
 
@@ -1431,6 +1431,27 @@ pub fn prepare_incoming_snapshot(
     receiver: IncomingTabletSnapshotReceiver,
     target: &TabletSnapshotInstallTarget,
 ) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
+    prepare_incoming_snapshot_inner(store, receiver, target, None)
+}
+
+/// Prepare an incoming image while charging the restored active generation to
+/// the same node budget used by the receiving replica.
+pub fn prepare_incoming_snapshot_with_memtable_budget(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+    budget: NodeMemtableBudget,
+    max_active_bytes: usize,
+) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
+    prepare_incoming_snapshot_inner(store, receiver, target, Some((budget, max_active_bytes)))
+}
+
+fn prepare_incoming_snapshot_inner(
+    store: &FileTabletSnapshotStore,
+    receiver: IncomingTabletSnapshotReceiver,
+    target: &TabletSnapshotInstallTarget,
+    memtable_budget: Option<(NodeMemtableBudget, usize)>,
+) -> Result<PreparedTabletSnapshotInstall, TabletSnapshotInstallError> {
     validate_install_target(&receiver.metadata, target)?;
 
     let image = receiver
@@ -1443,7 +1464,18 @@ pub fn prepare_incoming_snapshot(
         .publish(&image)
         .map_err(TabletSnapshotInstallError::Store)?;
 
-    let restored = restore_verified_snapshot(&image, target)?;
+    let restored = match memtable_budget {
+        Some((budget, max_active_bytes)) => {
+            restore_verified_snapshot_for_replica_with_memtable_budget(
+                &image,
+                target,
+                target.replica_id,
+                budget,
+                max_active_bytes,
+            )?
+        }
+        None => restore_verified_snapshot(&image, target)?,
+    };
 
     Ok(PreparedTabletSnapshotInstall {
         pointer,
@@ -1472,6 +1504,23 @@ pub fn restore_verified_snapshot(
     restore_verified_snapshot_for_replica(image, target, target.replica_id)
 }
 
+/// Restore a verified snapshot for the local replica using its shared node
+/// memtable budget before state is handed to Raft recovery or serving.
+pub fn restore_verified_snapshot_with_memtable_budget(
+    image: &TabletSnapshotImage,
+    target: &TabletSnapshotInstallTarget,
+    budget: NodeMemtableBudget,
+    max_active_bytes: usize,
+) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    restore_verified_snapshot_for_replica_with_memtable_budget(
+        image,
+        target,
+        target.replica_id,
+        budget,
+        max_active_bytes,
+    )
+}
+
 /// Restore a verified snapshot for the receiving replica lifetime. The
 /// snapshot's source replica is recorded in its metadata, while applied
 /// storage state must be rebound to the receiver's new local replica ID.
@@ -1479,6 +1528,32 @@ pub fn restore_verified_snapshot_for_replica(
     image: &TabletSnapshotImage,
     target: &TabletSnapshotInstallTarget,
     local_replica_id: ReplicaId,
+) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    restore_verified_snapshot_for_replica_inner(image, target, local_replica_id, None)
+}
+
+/// Restore a verified snapshot and charge its mutable reference generation to
+/// the node budget before the reconstructed tablet can enter Raft replay.
+pub fn restore_verified_snapshot_for_replica_with_memtable_budget(
+    image: &TabletSnapshotImage,
+    target: &TabletSnapshotInstallTarget,
+    local_replica_id: ReplicaId,
+    budget: NodeMemtableBudget,
+    max_active_bytes: usize,
+) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
+    restore_verified_snapshot_for_replica_inner(
+        image,
+        target,
+        local_replica_id,
+        Some((budget, max_active_bytes)),
+    )
+}
+
+fn restore_verified_snapshot_for_replica_inner(
+    image: &TabletSnapshotImage,
+    target: &TabletSnapshotInstallTarget,
+    local_replica_id: ReplicaId,
+    memtable_budget: Option<(NodeMemtableBudget, usize)>,
 ) -> Result<RestoredTabletSnapshot, TabletSnapshotInstallError> {
     validate_install_target(&image.metadata, target)?;
 
@@ -1515,13 +1590,18 @@ pub fn restore_verified_snapshot_for_replica(
         return Err(TabletSnapshotInstallError::StateMachineIdentityMismatch);
     }
 
-    let storage = InMemoryMvcc::restore_from_snapshot_entries(
+    let mut storage = InMemoryMvcc::restore_from_snapshot_entries(
         target.table_id,
         payload.default_values,
         payload.locks,
         payload.writes,
     )
     .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
+    if let Some((budget, max_active_bytes)) = memtable_budget {
+        storage
+            .bind_memtable_budget(budget, max_active_bytes)
+            .map_err(|error| TabletSnapshotInstallError::MvccRestore(error.to_string()))?;
+    }
 
     let tablet = Tablet::with_storage(target.tablet_id, target.table_id, storage)
         .map_err(|error| TabletSnapshotInstallError::TabletRestore(error.to_string()))?;

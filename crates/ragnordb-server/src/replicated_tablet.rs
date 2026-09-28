@@ -64,7 +64,8 @@ use ragnordb_multiraft::{
         SnapshotWorkKind, TabletSnapshotIntegrationError, TabletSnapshotTransfer,
         generate_tablet_snapshot_from_ready_loop, install_incoming_tablet_snapshot,
         persist_tablet_snapshot_boundary_via_ready_loop, prepare_incoming_tablet_snapshot,
-        raft_metadata_for_tablet, raft_pointer_for_tablet,
+        prepare_incoming_tablet_snapshot_with_memtable_budget, raft_metadata_for_tablet,
+        raft_pointer_for_tablet,
     },
     storage::{
         codec::{RaftReplicaIdentity, RaftSnapshotPointerRecord},
@@ -2268,6 +2269,7 @@ impl ReplicatedTabletRuntime {
         recovered: &RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
         reactors: Arc<FixedReactorSet>,
+        memtable_budget: ragnordb_storage::lsm::NodeMemtableBudget,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
@@ -2296,6 +2298,7 @@ impl ReplicatedTabletRuntime {
             reactors,
             true,
             None,
+            memtable_budget,
         )
     }
 
@@ -2320,6 +2323,7 @@ impl ReplicatedTabletRuntime {
         reactors: Arc<FixedReactorSet>,
         install_sql_mirror: bool,
         provided_durability_gate: Option<DurabilityGate>,
+        memtable_budget: ragnordb_storage::lsm::NodeMemtableBudget,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
@@ -2452,6 +2456,7 @@ impl ReplicatedTabletRuntime {
                 &runtime_identity.target,
                 ELECTION_TIMEOUT_TICKS,
                 HEARTBEAT_INTERVAL_TICKS,
+                memtable_budget.clone(),
             )
             .map_err(|source| Error::RecoveryFailed {
                 reason: source.to_string(),
@@ -2494,6 +2499,7 @@ impl ReplicatedTabletRuntime {
                 &runtime_identity.target,
                 ELECTION_TIMEOUT_TICKS,
                 HEARTBEAT_INTERVAL_TICKS,
+                memtable_budget.clone(),
             )
             .map_err(|source| Error::RecoveryFailed {
                 reason: source.to_string(),
@@ -2567,6 +2573,7 @@ impl ReplicatedTabletRuntime {
         start_gate: Arc<AtomicBool>,
         reactors: Arc<FixedReactorSet>,
         provided_durability_gate: Option<DurabilityGate>,
+        memtable_budget: ragnordb_storage::lsm::NodeMemtableBudget,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated tablet runtime requires cluster_id".to_string())
@@ -2645,6 +2652,7 @@ impl ReplicatedTabletRuntime {
                     &runtime_identity.target,
                     ELECTION_TIMEOUT_TICKS,
                     HEARTBEAT_INTERVAL_TICKS,
+                    memtable_budget.clone(),
                 )
                 .map_err(|source| Error::RecoveryFailed {
                     reason: source.to_string(),
@@ -2677,6 +2685,7 @@ impl ReplicatedTabletRuntime {
                     &runtime_identity.target,
                     ELECTION_TIMEOUT_TICKS,
                     HEARTBEAT_INTERVAL_TICKS,
+                    memtable_budget.clone(),
                 )
                 .map_err(|source| Error::RecoveryFailed {
                     reason: source.to_string(),
@@ -3496,12 +3505,28 @@ where
                 table_id: identity.target.table_id,
                 tablet_epoch: identity.target.tablet_epoch,
             };
-            match prepare_incoming_tablet_snapshot(
-                snapshot_store.as_ref(),
-                received.session,
-                &target,
-                install_permit,
-            ) {
+            let prepared_install = match tablet
+                .state_machine()
+                .tablet()
+                .storage()
+                .node_memtable_budget()
+            {
+                Some(budget) => prepare_incoming_tablet_snapshot_with_memtable_budget(
+                    snapshot_store.as_ref(),
+                    received.session,
+                    &target,
+                    install_permit,
+                    budget,
+                    ragnordb_storage::lsm::DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+                ),
+                None => prepare_incoming_tablet_snapshot(
+                    snapshot_store.as_ref(),
+                    received.session,
+                    &target,
+                    install_permit,
+                ),
+            };
+            match prepared_install {
                 Ok(prepared) => {
                     *pending_snapshot_install =
                         Some(PendingIncomingSnapshotInstall::BoundaryPending {

@@ -28,7 +28,10 @@ use ragnordb_multiraft::{
     },
     tablet_apply::CommittedTabletCommandDisposition,
 };
-use ragnordb_storage::key::{encode_row_key, make_row_key};
+use ragnordb_storage::{
+    key::{encode_row_key, make_row_key},
+    lsm::{DEFAULT_NODE_MEMTABLE_BUDGET_BYTES, NodeMemtableBudget},
+};
 use ragnordb_tablet::{
     Tablet,
     command::{TabletCommandApplyOutcome, TabletCommandApplyResult, TabletStateMachine},
@@ -213,6 +216,7 @@ fn new_replica_uses_durable_bootstrap_before_becoming_visible() {
         &target(),
         5,
         2,
+        NodeMemtableBudget::new(DEFAULT_NODE_MEMTABLE_BUDGET_BYTES).unwrap(),
     )
     .unwrap();
 
@@ -348,6 +352,7 @@ fn restart_restores_snapshot_then_replays_committed_suffix() {
         &target(),
         5,
         2,
+        NodeMemtableBudget::new(DEFAULT_NODE_MEMTABLE_BUDGET_BYTES).unwrap(),
     )
     .unwrap();
 

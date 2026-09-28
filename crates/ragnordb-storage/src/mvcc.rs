@@ -40,7 +40,13 @@ use std::{
     ops::Bound::{self, Excluded, Included, Unbounded},
 };
 
-use crate::{key::decode_row_key, lsm::RecoveryFrontier};
+use crate::{
+    key::decode_row_key,
+    lsm::{
+        NodeMemtableBudget, RecoveryFrontier,
+        memory::{MemoryReservation, MemtableCharge},
+    },
+};
 use prost::Message;
 
 use ragnordb_common::{
@@ -1027,7 +1033,20 @@ pub struct InMemoryMvccBackend {
 
     /// `row_key -> write_ts -> write record`.
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
+
+    /// Shared node budget used by this tablet's mutable MVCC generation.
+    memtable_budget: Option<NodeMemtableBudget>,
+
+    /// Per-tablet upper bound for the active mutable generation.
+    memtable_limit_bytes: usize,
+
+    /// RAII charge acquired before the first active record is inserted.
+    memtable_charge: Option<MemtableCharge>,
 }
+
+/// Fixed managed-byte allowance for each ordered memtable record and index
+/// entry. Encoded key/value bytes are charged in addition to this allowance.
+const MEMTABLE_INDEX_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 /// Shared MVCC rules parameterized by a physical record backend.
 ///
@@ -1128,6 +1147,49 @@ impl<B: MvccBackend> MvccEngine<B> {
 }
 
 impl InMemoryMvcc {
+    /// Construct the reference MVCC backend with shared node and tablet-local
+    /// bounds for its lazily grown active record generation.
+    pub fn with_memtable_budget(
+        budget: NodeMemtableBudget,
+        max_active_bytes: usize,
+    ) -> Result<Self> {
+        Ok(Self::with_backend(
+            InMemoryMvccBackend::with_memtable_budget(budget, max_active_bytes)?,
+        ))
+    }
+
+    /// Bind an existing restored generation to the node budget before it is
+    /// exposed to command replay or serving reads.
+    pub fn bind_memtable_budget(
+        &mut self,
+        budget: NodeMemtableBudget,
+        max_active_bytes: usize,
+    ) -> Result<()> {
+        self.backend.bind_memtable_budget(budget, max_active_bytes)
+    }
+
+    /// Return managed bytes charged to this active mutable generation.
+    pub fn active_memtable_bytes(&self) -> usize {
+        self.backend
+            .memtable_charge
+            .as_ref()
+            .map_or(0, MemtableCharge::bytes)
+    }
+
+    /// Return this tablet's configured active-generation byte limit, if its
+    /// storage instance participates in a shared memtable budget.
+    pub fn active_memtable_limit_bytes(&self) -> Option<usize> {
+        self.backend
+            .memtable_budget
+            .as_ref()
+            .map(|_| self.backend.memtable_limit_bytes)
+    }
+
+    /// Return the shared node budget used by this storage instance, when set.
+    pub fn node_memtable_budget(&self) -> Option<NodeMemtableBudget> {
+        self.backend.memtable_budget.clone()
+    }
+
     /// Reconstruct one table's complete MVCC maps from snapshot entries.
     ///
     /// Duplicate map keys, cross-table row keys, malformed rows, invalid
@@ -3082,6 +3144,223 @@ fn timestamp_in_bounds(
     above_lower && below_upper
 }
 
+impl InMemoryMvccBackend {
+    fn with_memtable_budget(budget: NodeMemtableBudget, max_active_bytes: usize) -> Result<Self> {
+        if max_active_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet active memtable limit must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            memtable_budget: Some(budget),
+            memtable_limit_bytes: max_active_bytes,
+            ..Self::default()
+        })
+    }
+
+    fn bind_memtable_budget(
+        &mut self,
+        budget: NodeMemtableBudget,
+        max_active_bytes: usize,
+    ) -> Result<()> {
+        if max_active_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "tablet active memtable limit must be greater than zero".to_string(),
+            ));
+        }
+        if self.memtable_budget.is_some() || self.memtable_charge.is_some() {
+            return Err(Error::InvalidArgument(
+                "MVCC storage already has an active memtable budget".to_string(),
+            ));
+        }
+
+        let current_bytes = self.current_memtable_bytes()?;
+        if current_bytes > max_active_bytes {
+            return Err(Error::TabletUnavailable {
+                reason: format!(
+                    "restored active memtable uses {current_bytes} bytes, exceeding its {max_active_bytes}-byte limit"
+                ),
+            });
+        }
+
+        let charge = if current_bytes == 0 {
+            None
+        } else {
+            Some(budget.reserve(current_bytes)?.commit())
+        };
+        self.memtable_budget = Some(budget);
+        self.memtable_limit_bytes = max_active_bytes;
+        self.memtable_charge = charge;
+        Ok(())
+    }
+
+    fn projected_memtable_bytes(&self, delta: &MvccDelta) -> Result<usize> {
+        let mut projected = self
+            .memtable_charge
+            .as_ref()
+            .map_or(0, MemtableCharge::bytes);
+
+        for edit in &delta.edits {
+            match edit {
+                MvccRecordEdit::PutDefault { key, start_ts, row } => {
+                    let previous = self
+                        .default
+                        .get(key)
+                        .and_then(|versions| versions.get(start_ts))
+                        .map(Vec::len);
+                    replace_memtable_record_charge(
+                        &mut projected,
+                        key.len(),
+                        previous,
+                        Some(row.len()),
+                    )?;
+                }
+                MvccRecordEdit::DeleteDefault { key, start_ts } => {
+                    let previous = self
+                        .default
+                        .get(key)
+                        .and_then(|versions| versions.get(start_ts))
+                        .map(Vec::len);
+                    replace_memtable_record_charge(&mut projected, key.len(), previous, None)?;
+                }
+                MvccRecordEdit::PutLock { key, lock } => {
+                    let previous = self
+                        .locks
+                        .get(key)
+                        .map(memtable_lock_payload_size)
+                        .transpose()?;
+                    replace_memtable_record_charge(
+                        &mut projected,
+                        key.len(),
+                        previous,
+                        Some(memtable_lock_payload_size(lock)?),
+                    )?;
+                }
+                MvccRecordEdit::DeleteLock { key } => {
+                    let previous = self
+                        .locks
+                        .get(key)
+                        .map(memtable_lock_payload_size)
+                        .transpose()?;
+                    replace_memtable_record_charge(&mut projected, key.len(), previous, None)?;
+                }
+                MvccRecordEdit::PutWrite {
+                    key,
+                    write_ts,
+                    write,
+                } => {
+                    let previous = self
+                        .writes
+                        .get(key)
+                        .and_then(|versions| versions.get(write_ts))
+                        .map(memtable_write_payload_size)
+                        .transpose()?;
+                    replace_memtable_record_charge(
+                        &mut projected,
+                        key.len(),
+                        previous,
+                        Some(memtable_write_payload_size(write)?),
+                    )?;
+                }
+            }
+        }
+
+        Ok(projected)
+    }
+
+    fn current_memtable_bytes(&self) -> Result<usize> {
+        let mut bytes = 0usize;
+        for (key, versions) in &self.default {
+            for row in versions.values() {
+                add_memtable_record_charge(&mut bytes, key.len(), row.len())?;
+            }
+        }
+        for (key, lock) in &self.locks {
+            add_memtable_record_charge(&mut bytes, key.len(), memtable_lock_payload_size(lock)?)?;
+        }
+        for (key, versions) in &self.writes {
+            for write in versions.values() {
+                add_memtable_record_charge(
+                    &mut bytes,
+                    key.len(),
+                    memtable_write_payload_size(write)?,
+                )?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn publish_memtable_charge(
+        &mut self,
+        next_bytes: usize,
+        reservation: Option<MemoryReservation>,
+    ) {
+        let current_bytes = self
+            .memtable_charge
+            .as_ref()
+            .map_or(0, MemtableCharge::bytes);
+        match (self.memtable_charge.as_ref(), reservation) {
+            (Some(charge), Some(reservation)) => reservation.commit_into(charge),
+            (None, Some(reservation)) => {
+                self.memtable_charge = Some(reservation.commit());
+            }
+            (Some(charge), None) if next_bytes < current_bytes => {
+                charge.shrink(current_bytes - next_bytes);
+            }
+            _ => {}
+        }
+
+        if next_bytes == 0 {
+            self.memtable_charge = None;
+        }
+    }
+}
+
+fn replace_memtable_record_charge(
+    total: &mut usize,
+    key_bytes: usize,
+    previous_value_bytes: Option<usize>,
+    next_value_bytes: Option<usize>,
+) -> Result<()> {
+    if let Some(value_bytes) = previous_value_bytes {
+        let previous = memtable_record_charge(key_bytes, value_bytes)?;
+        *total = total.checked_sub(previous).ok_or_else(|| {
+            Error::CorruptData("active memtable byte accounting underflowed".to_string())
+        })?;
+    }
+    if let Some(value_bytes) = next_value_bytes {
+        *total = total
+            .checked_add(memtable_record_charge(key_bytes, value_bytes)?)
+            .ok_or_else(|| Error::TabletUnavailable {
+                reason: "active memtable byte accounting overflowed".to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+fn add_memtable_record_charge(
+    total: &mut usize,
+    key_bytes: usize,
+    value_bytes: usize,
+) -> Result<()> {
+    *total = total
+        .checked_add(memtable_record_charge(key_bytes, value_bytes)?)
+        .ok_or_else(|| Error::TabletUnavailable {
+            reason: "active memtable byte accounting overflowed".to_string(),
+        })?;
+    Ok(())
+}
+
+fn memtable_record_charge(key_bytes: usize, value_bytes: usize) -> Result<usize> {
+    key_bytes
+        .checked_add(value_bytes)
+        .and_then(|bytes| bytes.checked_add(MEMTABLE_INDEX_ENTRY_OVERHEAD_BYTES))
+        .ok_or_else(|| Error::TabletUnavailable {
+            reason: "active memtable record charge overflowed".to_string(),
+        })
+}
+
 impl MvccBackend for InMemoryMvccBackend {
     type PinnedGeneration = Self;
 
@@ -3131,8 +3410,35 @@ impl MvccBackend for InMemoryMvccBackend {
             }
         }
 
+        let (next_memtable_bytes, growth_reservation) = if let Some(budget) = &self.memtable_budget
+        {
+            let next_bytes = self.projected_memtable_bytes(&delta)?;
+            if next_bytes > self.memtable_limit_bytes {
+                return Err(Error::TabletUnavailable {
+                    reason: format!(
+                        "tablet active memtable limit exceeded: {next_bytes} bytes requested with a {}-byte limit",
+                        self.memtable_limit_bytes
+                    ),
+                });
+            }
+            let current_bytes = self
+                .memtable_charge
+                .as_ref()
+                .map_or(0, MemtableCharge::bytes);
+            let reservation = if next_bytes > current_bytes {
+                Some(budget.reserve(next_bytes - current_bytes)?)
+            } else {
+                None
+            };
+            (next_bytes, reservation)
+        } else {
+            (0, None)
+        };
+
         // All fallible checks precede the first map change. The remaining
         // operations are deterministic edits to the single-owner reference map.
+        // Any growth reservation is already held, so a memory-limit failure
+        // cannot leave a partially allocated or visible MVCC delta.
         for edit in delta.edits {
             match edit {
                 MvccRecordEdit::PutDefault { key, start_ts, row } => {
@@ -3165,11 +3471,25 @@ impl MvccBackend for InMemoryMvccBackend {
             }
         }
 
+        if self.memtable_budget.is_some() {
+            self.publish_memtable_charge(next_memtable_bytes, growth_reservation);
+        }
+
         Ok(())
     }
 
     fn pin_generation(&self) -> Result<Self::PinnedGeneration> {
-        Ok(self.clone())
+        // The reference backend materializes pinned reads as a private copy.
+        // It is a read generation, not a second active memtable, so its owned
+        // compatibility copy does not share the mutable generation's charge.
+        Ok(Self {
+            default: self.default.clone(),
+            locks: self.locks.clone(),
+            writes: self.writes.clone(),
+            memtable_budget: None,
+            memtable_limit_bytes: 0,
+            memtable_charge: None,
+        })
     }
 
     fn stats(&self) -> MvccStats {
@@ -3328,6 +3648,19 @@ fn validate_encoded_key_argument(key: &[u8], context: &str) -> Result<()> {
     })
 }
 
+fn memtable_lock_payload_size(lock: &LockRecord) -> Result<usize> {
+    lock.primary_key
+        .len()
+        .checked_add(std::mem::size_of::<LockRecord>())
+        .ok_or_else(|| Error::TabletUnavailable {
+            reason: "active memtable lock charge overflowed".to_string(),
+        })
+}
+
+fn memtable_write_payload_size(_write: &WriteRecord) -> Result<usize> {
+    Ok(std::mem::size_of::<WriteRecord>())
+}
+
 fn encoded_scan_bounds(start: Option<&[u8]>, end: Option<&[u8]>) -> Result<EncodedScanBounds> {
     if let Some(start) = start {
         validate_encoded_key_argument(start, "scan start key")?;
@@ -3403,6 +3736,212 @@ mod tests {
 
     fn delete_batch(key: Vec<u8>) -> BTreeMap<Vec<u8>, Mutation> {
         BTreeMap::from([(key, Mutation::Delete)])
+    }
+
+    #[test]
+    fn active_memtable_reserves_shared_bytes_before_publication_and_releases_on_drop() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(300).unwrap();
+        let mut first = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 300).unwrap();
+        let mut second = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 300).unwrap();
+
+        assert_eq!(first.active_memtable_bytes(), 0);
+        assert_eq!(second.active_memtable_bytes(), 0);
+        assert_eq!(node_budget.used_bytes(), 0);
+
+        let key = encoded_key(1);
+        let row = encoded_row(1, "budgeted");
+        let delta = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: key.clone(),
+                start_ts: Timestamp(1),
+                row,
+            }],
+        };
+
+        first.publish_mvcc_delta(delta.clone()).unwrap();
+        let first_charge = first.active_memtable_bytes();
+        assert!(first_charge > 0);
+        assert_eq!(node_budget.used_bytes(), first_charge);
+
+        let old_generation = second.pin_read_generation().unwrap();
+        assert!(second.publish_mvcc_delta(delta.clone()).is_err());
+        assert_eq!(second.active_memtable_bytes(), 0);
+        assert_eq!(node_budget.used_bytes(), first_charge);
+        assert_eq!(second.get_default_record(&key, Timestamp(1)).unwrap(), None);
+        assert_eq!(
+            old_generation.get_default(&key, Timestamp(1)).unwrap(),
+            None
+        );
+
+        drop(first);
+        assert_eq!(node_budget.used_bytes(), 0);
+
+        second.publish_mvcc_delta(delta).unwrap();
+        assert_eq!(node_budget.used_bytes(), second.active_memtable_bytes());
+        assert!(
+            second
+                .get_default_record(&key, Timestamp(1))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn concurrent_tablets_cannot_overdraw_the_shared_memtable_budget() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(300).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let ((first_ok, first), (second_ok, second)) = std::thread::scope(|scope| {
+            let first_budget = node_budget.clone();
+            let first_barrier = std::sync::Arc::clone(&barrier);
+            let first_thread = scope.spawn(move || {
+                let mut storage = InMemoryMvcc::with_memtable_budget(first_budget, 300).unwrap();
+                first_barrier.wait();
+                let result = storage.publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key: encoded_key(11),
+                        start_ts: Timestamp(11),
+                        row: encoded_row(11, "concurrent"),
+                    }],
+                });
+                (result.is_ok(), storage)
+            });
+
+            let second_budget = node_budget.clone();
+            let second_barrier = std::sync::Arc::clone(&barrier);
+            let second_thread = scope.spawn(move || {
+                let mut storage = InMemoryMvcc::with_memtable_budget(second_budget, 300).unwrap();
+                second_barrier.wait();
+                let result = storage.publish_mvcc_delta(MvccDelta {
+                    edits: vec![MvccRecordEdit::PutDefault {
+                        key: encoded_key(12),
+                        start_ts: Timestamp(12),
+                        row: encoded_row(12, "concurrent"),
+                    }],
+                });
+                (result.is_ok(), storage)
+            });
+
+            let first = first_thread.join().unwrap();
+            let second = second_thread.join().unwrap();
+            (first, second)
+        });
+
+        assert_ne!(first_ok, second_ok, "only one active generation fits");
+        assert!(node_budget.used_bytes() <= node_budget.limit_bytes());
+        assert!(node_budget.used_bytes() > 0);
+        assert_eq!(
+            node_budget.used_bytes(),
+            if first_ok {
+                first.active_memtable_bytes()
+            } else {
+                second.active_memtable_bytes()
+            }
+        );
+
+        drop(first);
+        drop(second);
+        assert_eq!(node_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn active_memtable_capacity_rejection_leaves_records_and_charge_unchanged() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 1).unwrap();
+        let key = encoded_key(2);
+        let row = encoded_row(2, "too large for this active memtable");
+
+        let result = storage.publish_mvcc_delta(MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: key.clone(),
+                start_ts: Timestamp(2),
+                row,
+            }],
+        });
+
+        assert!(result.is_err());
+        assert_eq!(storage.active_memtable_bytes(), 0);
+        assert_eq!(node_budget.used_bytes(), 0);
+        assert_eq!(
+            storage.get_default_record(&key, Timestamp(2)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn active_memtable_charge_tracks_replacement_and_delete_edits() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 1024).unwrap();
+        let key = encoded_key(3);
+
+        storage
+            .publish_mvcc_delta(MvccDelta {
+                edits: vec![MvccRecordEdit::PutDefault {
+                    key: key.clone(),
+                    start_ts: Timestamp(3),
+                    row: encoded_row(3, "a longer row value"),
+                }],
+            })
+            .unwrap();
+        let original_charge = storage.active_memtable_bytes();
+        assert_eq!(node_budget.used_bytes(), original_charge);
+
+        storage
+            .publish_mvcc_delta(MvccDelta {
+                edits: vec![MvccRecordEdit::PutDefault {
+                    key: key.clone(),
+                    start_ts: Timestamp(3),
+                    row: encoded_row(3, "x"),
+                }],
+            })
+            .unwrap();
+        let replacement_charge = storage.active_memtable_bytes();
+        assert!(replacement_charge < original_charge);
+        assert_eq!(node_budget.used_bytes(), replacement_charge);
+
+        storage
+            .publish_mvcc_delta(MvccDelta {
+                edits: vec![MvccRecordEdit::DeleteDefault {
+                    key: key.clone(),
+                    start_ts: Timestamp(3),
+                }],
+            })
+            .unwrap();
+        assert_eq!(storage.active_memtable_bytes(), 0);
+        assert_eq!(node_budget.used_bytes(), 0);
+        assert_eq!(
+            storage.get_default_record(&key, Timestamp(3)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn binding_restored_records_reserves_before_budgeted_replay() {
+        let mut restored = InMemoryMvcc::new();
+        let key = encoded_key(4);
+        restored
+            .publish_mvcc_delta(MvccDelta {
+                edits: vec![MvccRecordEdit::PutDefault {
+                    key: key.clone(),
+                    start_ts: Timestamp(4),
+                    row: encoded_row(4, "restored"),
+                }],
+            })
+            .unwrap();
+
+        let budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+        assert!(restored.bind_memtable_budget(budget.clone(), 1).is_err());
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(
+            restored
+                .get_default_record(&key, Timestamp(4))
+                .unwrap()
+                .is_some()
+        );
+
+        restored.bind_memtable_budget(budget.clone(), 1024).unwrap();
+        assert_eq!(budget.used_bytes(), restored.active_memtable_bytes());
+        assert!(budget.used_bytes() > 0);
     }
 
     #[test]

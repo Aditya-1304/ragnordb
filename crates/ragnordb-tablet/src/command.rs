@@ -2777,7 +2777,7 @@ mod tests {
     use ragnordb_storage::mvcc::{MvccReadGeneration, MvccRecordEdit, MvccStorage};
     use ragnordb_storage::{
         key::{encode_row_key, make_row_key},
-        lsm::{RecoveryFrontier, RetryFloorEdit},
+        lsm::{NodeMemtableBudget, RecoveryFrontier, RetryFloorEdit},
     };
     use ragnordb_txn::Transaction;
 
@@ -3562,6 +3562,52 @@ mod tests {
                 applied_term: 1,
             })
         );
+    }
+
+    /// Realistic bug caught: applying a committed command after its active
+    /// memtable reservation fails must not publish row state or its Raft
+    /// frontier as separate steps.
+    #[test]
+    fn memtable_reservation_failure_keeps_command_delta_and_frontier_unpublished() {
+        let budget = NodeMemtableBudget::new(1024).unwrap();
+        let tablet =
+            Tablet::new_with_memtable_budget(LOCAL_TABLET_ID, TableId(9), budget.clone(), 1)
+                .unwrap();
+        let mut state_machine = TabletStateMachine::new_local_reference(
+            tablet,
+            LOCAL_TABLET_EPOCH,
+            LOCAL_RAFT_GROUP_ID,
+        )
+        .unwrap();
+        let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(71)]).unwrap()).unwrap();
+        let command = TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: TxnId(71),
+            start_timestamp: Timestamp(71),
+            commit_timestamp: Timestamp(72),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(test_row(71, "bounded")),
+                op: WriteKind::Put,
+            }],
+        });
+
+        assert!(
+            state_machine
+                .apply_committed_at(command_envelope(1, command), 1, 1)
+                .is_err()
+        );
+
+        assert_eq!(state_machine.tablet().stats().default_versions, 0);
+        assert_eq!(
+            state_machine
+                .tablet()
+                .storage()
+                .get_default_record(&key, Timestamp(71))
+                .unwrap(),
+            None
+        );
+        assert_eq!(state_machine.recovery_frontier(), None);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]

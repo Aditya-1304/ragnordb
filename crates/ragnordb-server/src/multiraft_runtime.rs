@@ -251,6 +251,7 @@ struct TabletLifecycleManager {
     recovered: RecoveredRaftStorage,
     start_gate: Arc<AtomicBool>,
     reactors: Arc<FixedReactorSet>,
+    memtable_budget: ragnordb_storage::lsm::NodeMemtableBudget,
     runtimes: BTreeMap<RaftReplicaIdentity, ReplicatedTabletRuntime>,
     /// Retention handles outlive a detached runtime until its safe WAL floor
     /// has been published. Keeping them here also makes interrupted cleanup
@@ -279,6 +280,7 @@ impl TabletLifecycleManager {
         recovered: RecoveredRaftStorage,
         start_gate: Arc<AtomicBool>,
         reactors: Arc<FixedReactorSet>,
+        memtable_budget: ragnordb_storage::lsm::NodeMemtableBudget,
         tablet_handles: SharedTabletHandleRegistry,
     ) -> Result<Self> {
         let cluster_id = config.cluster_id.as_deref().ok_or_else(|| {
@@ -299,6 +301,7 @@ impl TabletLifecycleManager {
             recovered,
             start_gate,
             reactors,
+            memtable_budget,
             runtimes: BTreeMap::new(),
             writers: BTreeMap::new(),
             tablet_handles,
@@ -651,6 +654,7 @@ impl TabletLifecycleManager {
                 self.reactors.clone(),
                 false,
                 Some(durability_gate),
+                self.memtable_budget.clone(),
             )?;
             let recovered = self.recovered.replica(identity).is_some();
             let hosted_group = Box::new(runtime.hosted_group());
@@ -1719,6 +1723,7 @@ impl TabletLifecycleManager {
             self.start_gate.clone(),
             self.reactors.clone(),
             Some(durability_gate),
+            self.memtable_budget.clone(),
         )?;
         let recovered = self.recovered.replica(identity).is_some();
         if active {
@@ -3384,6 +3389,9 @@ impl MultiRaftRuntime {
         let cluster_id = config.cluster_id.clone().ok_or_else(|| {
             Error::Configuration("replicated MultiRaft runtime requires cluster_id".to_string())
         })?;
+        let memtable_budget = ragnordb_storage::lsm::NodeMemtableBudget::new(
+            ragnordb_storage::lsm::DEFAULT_NODE_MEMTABLE_BUDGET_BYTES,
+        )?;
 
         let registry =
             LocalReplicaRegistry::open(config.data_dir.join("replica-registry.json"), &cluster_id)?;
@@ -3593,6 +3601,7 @@ impl MultiRaftRuntime {
             &recovered,
             Arc::clone(&start_gate),
             reactors.clone(),
+            memtable_budget.clone(),
         )?;
 
         let hosted_group = Box::new(tablet_runtime.hosted_group());
@@ -3623,6 +3632,7 @@ impl MultiRaftRuntime {
             recovered,
             Arc::clone(&start_gate),
             reactors.clone(),
+            memtable_budget.clone(),
             tablet_handles.clone(),
         )?;
         tablet_lifecycle.reconcile(&mut host, &metadata_handle, false)?;
