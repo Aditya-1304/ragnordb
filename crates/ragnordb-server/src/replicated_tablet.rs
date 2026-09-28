@@ -781,6 +781,8 @@ struct PreparedCommandRequest {
     envelope: TabletCommandEnvelope,
     /// Conservative storage-generation bound checked before Raft admission.
     delta_upper_bound: usize,
+    /// Resolution and catalog work may use the reserved committed-progress pool.
+    memory_class: Option<ragnordb_storage::lsm::MemoryClass>,
     deadline: Instant,
     reply: ClientReply,
 }
@@ -795,6 +797,7 @@ impl PreparedCommandRequest {
         self.envelope.tablet_id == first.envelope.tablet_id
             && self.envelope.expected_epoch == first.envelope.expected_epoch
             && self.envelope.request_id.raft_group_id == first.envelope.request_id.raft_group_id
+            && self.memory_class == first.memory_class
             && self.envelope.command.is_batchable()
     }
 }
@@ -3281,10 +3284,25 @@ where
                                         .to_string(),
                                 ));
                             }
-                            validate_raw_command_delta_admission(&tablet, &command)?;
+                            let admission =
+                                validate_raw_command_delta_admission(&tablet, &command)?;
+                            let admission = admission
+                                .map(|(class, bytes)| {
+                                    reserve_memtable_admission(&tablet, bytes, class)
+                                })
+                                .transpose()
+                                .map_err(|error| HostedGroupError::Retryable(error.to_string()))?
+                                .flatten();
                             let index = ready_loop
                                 .propose(command, encoded_len)
                                 .map_err(classify_ready_error)?;
+                            tablet.retain_memtable_admission(
+                                ragnordb_multiraft::proposal::ProposalPosition {
+                                    term: ready_loop.raft().hard_state().current_term,
+                                    index,
+                                },
+                                admission,
+                            );
                             if let Some(metadata) = drain_ready(
                                 &mut ready_loop,
                                 &mut tablet,
@@ -3681,7 +3699,9 @@ where
                 Ok(Some(ready)) => {
                     let installed = prepared.into_installed();
                     // Finalize: install tablet, apply suffix, advance frontier, publish
-                    *tablet = TabletCommandApplier::new(installed.state_machine);
+                    let mut replacement = TabletCommandApplier::new(installed.state_machine);
+                    replacement.inherit_memtable_admissions(tablet);
+                    *tablet = replacement;
                     if identity.sql_mirror_enabled {
                         database
                             .blocking_lock()
@@ -3737,6 +3757,7 @@ where
                     ready_loop
                         .advance_applied_frontier(frontier)
                         .map_err(|e| e.to_string())?;
+                    tablet.release_memtable_admissions_through(frontier.index);
                     for outcomes in committed_outcomes {
                         resolve_committed_entry_outcomes(
                             outcomes,
@@ -4632,6 +4653,7 @@ fn prepare_mutation_envelope(
     };
 
     Some(PreparedCommandRequest {
+        memory_class: command_memory_class(&envelope.command),
         envelope,
         delta_upper_bound,
         deadline,
@@ -4639,15 +4661,34 @@ fn prepare_mutation_envelope(
     })
 }
 
+/// Classify replicated command work before Raft admission. User mutations use
+/// ordinary capacity; operations that release or maintain an existing
+/// transaction use reserved progress capacity.
+fn command_memory_class(command: &TabletCommand) -> Option<ragnordb_storage::lsm::MemoryClass> {
+    use ragnordb_storage::lsm::MemoryClass;
+
+    match command {
+        TabletCommand::Noop(_) => None,
+        TabletCommand::Commit(_)
+        | TabletCommand::Rollback(_)
+        | TabletCommand::ResolveIntent(_)
+        | TabletCommand::PublishAbortedTransactionStatus(_)
+        | TabletCommand::HeartbeatTransactionStatus(_)
+        | TabletCommand::ExpirePendingTransactionStatus(_)
+        | TabletCommand::Catalog(_) => Some(MemoryClass::Progress),
+        TabletCommand::SingleShardCommit(_) | TabletCommand::Prewrite(_) => Some(MemoryClass::User),
+    }
+}
+
 /// Validate opaque host proposals at the final tablet-specific admission
 /// boundary so an alternate internal caller cannot bypass the delta cap.
 fn validate_raw_command_delta_admission(
     tablet: &TabletCommandApplier,
     bytes: &[u8],
-) -> std::result::Result<(), HostedGroupError> {
+) -> std::result::Result<Option<(ragnordb_storage::lsm::MemoryClass, usize)>, HostedGroupError> {
     let state_machine = tablet.state_machine();
     if let Ok(envelope) = TabletCommandEnvelope::decode(bytes) {
-        if !matches!(&envelope.command, TabletCommand::Noop(_))
+        if command_memory_class(&envelope.command) == Some(ragnordb_storage::lsm::MemoryClass::User)
             && let Some(error) = memtable_write_stall_error(tablet)
         {
             return Err(HostedGroupError::Retryable(error.to_string()));
@@ -4655,19 +4696,28 @@ fn validate_raw_command_delta_admission(
         state_machine
             .validate_proposal(&envelope)
             .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
-        state_machine
+        let delta_bound = state_machine
             .command_delta_upper_bound(&envelope)
             .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
-        return Ok(());
+        return Ok(command_memory_class(&envelope.command).map(|class| (class, delta_bound)));
     }
 
     let batch = TabletCommandBatchEnvelope::decode(bytes)
         .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
-    if batch
-        .commands
-        .iter()
-        .any(|envelope| !matches!(&envelope.command, TabletCommand::Noop(_)))
-        && let Some(error) = memtable_write_stall_error(tablet)
+    let mut batch_class = None;
+    for envelope in &batch.commands {
+        if let Some(class) = command_memory_class(&envelope.command) {
+            if batch_class.is_some_and(|existing| existing != class) {
+                return Err(HostedGroupError::Rejected(
+                    "tablet command batch mixes user and progress capacity classes".to_string(),
+                ));
+            }
+            batch_class = Some(class);
+        }
+    }
+    if batch.commands.iter().any(|envelope| {
+        command_memory_class(&envelope.command) == Some(ragnordb_storage::lsm::MemoryClass::User)
+    }) && let Some(error) = memtable_write_stall_error(tablet)
     {
         return Err(HostedGroupError::Retryable(error.to_string()));
     }
@@ -4676,10 +4726,10 @@ fn validate_raw_command_delta_admission(
             .validate_proposal(envelope)
             .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
     }
-    state_machine
+    let delta_bound = state_machine
         .command_batch_delta_upper_bound(&batch.commands)
         .map_err(|error| HostedGroupError::Rejected(error.to_string()))?;
-    Ok(())
+    Ok(batch_class.map(|class| (class, delta_bound)))
 }
 
 fn envelope_from_tablet_command_request(
@@ -4752,6 +4802,78 @@ fn memtable_write_stall_error(tablet: &TabletCommandApplier) -> Option<Error> {
         })
 }
 
+/// Reserve proposal bytes and one potential immutable-generation slot before
+/// Raft admission. The applier retains the lease until that position applies
+/// or the applied frontier proves that the entry was superseded.
+fn reserve_memtable_admission(
+    tablet: &TabletCommandApplier,
+    bytes: usize,
+    class: ragnordb_storage::lsm::MemoryClass,
+) -> Result<Option<ragnordb_storage::lsm::MemoryReservation>> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+
+    let pressure = tablet
+        .state_machine()
+        .tablet()
+        .storage()
+        .memtable_pressure();
+    if let Some(pressure) = pressure {
+        let pending_slots = tablet.pending_memtable_admission_count();
+        let next_count = pressure
+            .immutable_memtable_count
+            .checked_add(pending_slots)
+            .and_then(|count| count.checked_add(1));
+        let reserved_immutable_bytes = pending_slots
+            .checked_add(1)
+            .and_then(|slots| slots.checked_mul(pressure.active_limit_bytes));
+        let next_bytes = reserved_immutable_bytes
+            .and_then(|reserved| pressure.immutable_memtable_bytes.checked_add(reserved));
+        let (count_limit, byte_limit, node_stalled) = match class {
+            ragnordb_storage::lsm::MemoryClass::User => (
+                ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT,
+                pressure.immutable_memtable_limit_bytes,
+                pressure.user_writes_stalled(),
+            ),
+            ragnordb_storage::lsm::MemoryClass::Progress => (
+                ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_HARD_COUNT,
+                pressure
+                    .active_limit_bytes
+                    .saturating_mul(ragnordb_storage::lsm::DEFAULT_TABLET_IMMUTABLE_HARD_COUNT),
+                false,
+            ),
+        };
+        if node_stalled
+            || next_count.is_none_or(|count| count > count_limit)
+            || next_bytes.is_none_or(|bytes| bytes > byte_limit)
+        {
+            return Err(Error::ProposalUnavailable {
+                reason: match class {
+                    ragnordb_storage::lsm::MemoryClass::User => {
+                        "tablet immutable memtable soft capacity is reserved for admitted proposals"
+                    }
+                    ragnordb_storage::lsm::MemoryClass::Progress => {
+                        "tablet immutable memtable hard progress capacity is exhausted"
+                    }
+                }
+                .to_string(),
+            });
+        }
+    }
+
+    tablet
+        .state_machine()
+        .tablet()
+        .storage()
+        .node_memtable_budget()
+        .map(|budget| budget.reserve(class, bytes))
+        .transpose()
+        .map_err(|error| Error::ProposalUnavailable {
+            reason: error.to_string(),
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_prepared_command<W, LS, SS>(
     prepared: PreparedCommandRequest,
@@ -4768,16 +4890,19 @@ fn admit_prepared_command<W, LS, SS>(
 {
     let PreparedCommandRequest {
         envelope,
+        delta_upper_bound,
+        memory_class,
         deadline,
         reply,
-        ..
     } = prepared;
     let leader_id = ready_loop.raft().leader_id().map(|id| id.get());
     if !serving_leader || ready_loop.raft().leader_id() != Some(ready_loop.raft().id()) {
         send_client_error(reply, Error::NotLeader { leader_id });
         return;
     }
-    if let Some(error) = memtable_write_stall_error(tablet) {
+    if memory_class == Some(ragnordb_storage::lsm::MemoryClass::User)
+        && let Some(error) = memtable_write_stall_error(tablet)
+    {
         send_client_error(reply, error);
         return;
     }
@@ -4800,6 +4925,21 @@ fn admit_prepared_command<W, LS, SS>(
         }
     };
     record_semantic_batch(1, bytes.len(), batch_started_at);
+    let admission = match reserve_memtable_admission(
+        tablet,
+        if memory_class.is_some() {
+            delta_upper_bound
+        } else {
+            0
+        },
+        memory_class.unwrap_or(ragnordb_storage::lsm::MemoryClass::Progress),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            send_client_error(reply, error);
+            return;
+        }
+    };
     let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
         Ok(index) => index,
         Err(source) => {
@@ -4816,6 +4956,7 @@ fn admit_prepared_command<W, LS, SS>(
         term: ready_loop.raft().hard_state().current_term,
         index,
     };
+    tablet.retain_memtable_admission(position, admission);
     match registry.register(request_id, position, deadline) {
         Ok(ticket) => clients.push(PendingClient { ticket, reply }),
         Err(source) => send_client_error(
@@ -4869,7 +5010,9 @@ fn admit_prepared_batch<W, LS, SS>(
     if prepared.is_empty() {
         return;
     }
-    if memtable_write_stall_error(tablet).is_some() {
+    if prepared[0].memory_class == Some(ragnordb_storage::lsm::MemoryClass::User)
+        && memtable_write_stall_error(tablet).is_some()
+    {
         for request in prepared {
             let error = memtable_write_stall_error(tablet)
                 .expect("a stalled tablet remains stalled for this owner turn");
@@ -4938,6 +5081,64 @@ fn admit_prepared_batch<W, LS, SS>(
 
     record_semantic_batch(prepared.len(), bytes.len(), batch_started_at);
 
+    // ProposalRegistry can reject only duplicate request identities here.
+    // Reject duplicates before Raft admission so every accepted entry keeps
+    // one owner for its retained capacity lease.
+    if prepared.iter().enumerate().any(|(index, request)| {
+        prepared[..index]
+            .iter()
+            .any(|prior| prior.envelope.request_id == request.envelope.request_id)
+    }) {
+        for request in prepared {
+            send_client_error(
+                request.reply,
+                Error::ProposalUnavailable {
+                    reason: "a tablet command batch contains a duplicate request ID".to_string(),
+                },
+            );
+        }
+        return;
+    }
+    let batch_delta_upper_bound = prepared
+        .iter()
+        .map(|request| request.delta_upper_bound)
+        .try_fold(0usize, usize::checked_add);
+    let Some(batch_delta_upper_bound) = batch_delta_upper_bound else {
+        for request in prepared {
+            send_client_error(
+                request.reply,
+                Error::InvalidArgument(
+                    "tablet command batch storage estimate overflowed".to_string(),
+                ),
+            );
+        }
+        return;
+    };
+    let memory_class = prepared[0].memory_class;
+    let admission = match reserve_memtable_admission(
+        tablet,
+        if memory_class.is_some() {
+            batch_delta_upper_bound
+        } else {
+            0
+        },
+        memory_class.unwrap_or(ragnordb_storage::lsm::MemoryClass::Progress),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let reason = error.to_string();
+            for request in prepared {
+                send_client_error(
+                    request.reply,
+                    Error::ProposalUnavailable {
+                        reason: reason.clone(),
+                    },
+                );
+            }
+            return;
+        }
+    };
+
     let index = match ready_loop.propose(bytes.clone(), bytes.len()) {
         Ok(index) => index,
         Err(source) => {
@@ -4956,6 +5157,7 @@ fn admit_prepared_batch<W, LS, SS>(
         term: ready_loop.raft().hard_state().current_term,
         index,
     };
+    tablet.retain_memtable_admission(position, admission);
 
     for request in prepared {
         let request_id = request.envelope.request_id.clone();
@@ -5177,6 +5379,7 @@ fn admit_request<W, LS, SS>(
     };
 
     if internal_barrier_sequence.is_none()
+        && command_memory_class(&envelope.command) == Some(ragnordb_storage::lsm::MemoryClass::User)
         && let Some(error) = memtable_write_stall_error(tablet)
     {
         send_client_error(reply, error);
@@ -5191,10 +5394,13 @@ fn admit_request<W, LS, SS>(
         send_client_error(reply, map_tablet_rejection(source));
         return;
     }
-    if let Err(source) = tablet.state_machine().command_delta_upper_bound(&envelope) {
-        send_client_error(reply, map_tablet_rejection(source));
-        return;
-    }
+    let delta_upper_bound = match tablet.state_machine().command_delta_upper_bound(&envelope) {
+        Ok(size) => size,
+        Err(source) => {
+            send_client_error(reply, map_tablet_rejection(source));
+            return;
+        }
+    };
     let request_id = envelope.request_id.clone();
     if registry.is_pending(&request_id) {
         send_client_error(
@@ -5209,6 +5415,26 @@ fn admit_request<W, LS, SS>(
         Ok(bytes) => bytes,
         Err(source) => {
             send_client_error(reply, Error::InvalidArgument(source.to_string()));
+            return;
+        }
+    };
+    let memory_class = if internal_barrier_sequence.is_some() {
+        None
+    } else {
+        command_memory_class(&envelope.command)
+    };
+    let admission = match reserve_memtable_admission(
+        tablet,
+        if memory_class.is_some() {
+            delta_upper_bound
+        } else {
+            0
+        },
+        memory_class.unwrap_or(ragnordb_storage::lsm::MemoryClass::Progress),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            send_client_error(reply, error);
             return;
         }
     };
@@ -5231,6 +5457,7 @@ fn admit_request<W, LS, SS>(
         term: ready_loop.raft().hard_state().current_term,
         index,
     };
+    tablet.retain_memtable_admission(position, admission);
     match registry.register(request_id, position, deadline) {
         Ok(ticket) => clients.push(PendingClient { ticket, reply }),
         Err(source) => send_client_error(
@@ -7115,6 +7342,7 @@ where
         ready_loop
             .advance_applied_frontier(frontier)
             .map_err(|error| HostedGroupError::Group(error.to_string()))?;
+        tablet.release_memtable_admissions_through(frontier.index);
     }
     for outcomes in committed_outcomes {
         resolve_committed_entry_outcomes(
@@ -7705,8 +7933,8 @@ mod tests {
         catalog_codec::TableDefinition,
         codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
         command_codec::{
-            CatalogCommand, CatalogOperation, CreateTableOperation, PrewriteCommand, TabletCommand,
-            TabletCommandEnvelope, WriteEntry,
+            CatalogCommand, CatalogOperation, CreateTableOperation, PrewriteCommand,
+            ResolveIntentCommand, TabletCommand, TabletCommandEnvelope, WriteEntry,
         },
         ids::{RowKey, Timestamp},
     };
@@ -7723,6 +7951,57 @@ mod tests {
         assert!(command_delta_batch_fits([limit - 1, 1]));
         assert!(!command_delta_batch_fits([limit, 1]));
         assert!(!command_delta_batch_fits([usize::MAX, 1]));
+    }
+
+    #[test]
+    fn transaction_resolution_reserves_progress_capacity_after_user_capacity_fills() {
+        let budget =
+            ragnordb_storage::lsm::NodeMemtableBudget::new_with_progress_reserve(4096, 1024)
+                .unwrap();
+        let tablet = ragnordb_tablet::Tablet::new_with_memtable_budget(
+            TabletId(1),
+            TableId(1),
+            budget.clone(),
+            1024,
+        )
+        .unwrap();
+        let state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
+            tablet,
+            1,
+            RaftGroupId(1),
+        )
+        .unwrap();
+        let applier = TabletCommandApplier::new(state_machine);
+        let exhausted_user_capacity = budget
+            .reserve(
+                ragnordb_storage::lsm::MemoryClass::User,
+                budget.user_limit_bytes(),
+            )
+            .unwrap();
+        let resolution = TabletCommand::ResolveIntent(ResolveIntentCommand {
+            txn_id: ragnordb_common::ids::TxnId(1),
+            start_timestamp: Timestamp(1),
+            keys: Vec::new(),
+            resolved_status: TxnStatus::Aborted,
+            commit_timestamp: None,
+        });
+
+        assert_eq!(
+            command_memory_class(&resolution),
+            Some(ragnordb_storage::lsm::MemoryClass::Progress)
+        );
+        assert!(
+            reserve_memtable_admission(&applier, 128, ragnordb_storage::lsm::MemoryClass::User,)
+                .is_err()
+        );
+        assert!(reserve_memtable_admission(
+            &applier,
+            128,
+            ragnordb_storage::lsm::MemoryClass::Progress,
+        )
+        .is_ok());
+
+        drop(exhausted_user_capacity);
     }
 
     type OwnershipObservations = Arc<(

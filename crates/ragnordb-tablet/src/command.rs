@@ -27,7 +27,7 @@ use ragnordb_storage::{
     key::decode_row_key,
     lsm::{
         CommandDelta, LegacyOutcomeEdit, LogicalOutcomeEdit, MAX_COMMAND_DELTA_BYTES,
-        RecoveryFrontier, RetryFloorEdit, TabletStorageIdentity, TxnStatusEdit,
+        MemoryReservation, RecoveryFrontier, RetryFloorEdit, TabletStorageIdentity, TxnStatusEdit,
     },
     mvcc::{InMemoryMvcc, Mutation, MvccDelta, MvccReadGeneration, MvccStats, MvccStorage},
 };
@@ -50,6 +50,8 @@ pub struct TabletStateMachine<S = InMemoryMvcc> {
     raft_group_id: RaftGroupId,
     /// Private batch overlay; it is never part of a published generation.
     staged_command_delta: Option<CommandDelta>,
+    /// Capacity retained by the local leader for the committed entry now being applied.
+    pending_memtable_reservation: Option<MemoryReservation>,
 }
 
 /// Reference backend that owns one complete tablet generation: MVCC records,
@@ -105,8 +107,11 @@ pub trait TabletReadGeneration: MvccReadGeneration + Send + Sync {
 trait TabletStateBackend {
     type PinnedGeneration: TabletReadGeneration + Send + Sync + 'static;
 
-    fn publish_command_delta(&mut self, delta: CommandDelta)
-    -> Result<(), TabletCommandApplyError>;
+    fn publish_command_delta(
+        &mut self,
+        delta: CommandDelta,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<(), TabletCommandApplyError>;
     fn pin_generation(&self) -> Result<Self::PinnedGeneration, TabletCommandApplyError>;
     fn recovery_frontier(&self) -> Option<RecoveryFrontier>;
 }
@@ -273,7 +278,11 @@ impl<S: MvccStorage> InMemoryTabletStateBackend<S> {
             .map_err(map_database_error)
     }
 
-    fn publish_generation(&mut self, delta: CommandDelta) -> Result<(), TabletCommandApplyError> {
+    fn publish_generation(
+        &mut self,
+        delta: CommandDelta,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<(), TabletCommandApplyError> {
         delta
             .validate(
                 self.storage_identity,
@@ -301,7 +310,7 @@ impl<S: MvccStorage> InMemoryTabletStateBackend<S> {
         // visibility point for the complete tablet generation.
         self.tablet
             .storage
-            .publish_mvcc_delta(mvcc)
+            .publish_mvcc_delta_with_reservation(mvcc, reservation)
             .map_err(map_publication_error)?;
 
         for edit in transaction_status_edits {
@@ -389,8 +398,9 @@ impl<S: MvccStorage> TabletStateBackend for InMemoryTabletStateBackend<S> {
     fn publish_command_delta(
         &mut self,
         delta: CommandDelta,
+        reservation: Option<MemoryReservation>,
     ) -> Result<(), TabletCommandApplyError> {
-        self.publish_generation(delta)
+        self.publish_generation(delta, reservation)
     }
 
     fn pin_generation(&self) -> Result<Self::PinnedGeneration, TabletCommandApplyError> {
@@ -623,6 +633,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             epoch,
             raft_group_id,
             staged_command_delta: None,
+            pending_memtable_reservation: None,
         })
     }
 
@@ -1065,6 +1076,7 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             epoch: snapshot.tablet_epoch,
             raft_group_id: snapshot.raft_group_id,
             staged_command_delta: None,
+            pending_memtable_reservation: None,
         })
     }
 
@@ -1385,6 +1397,26 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         Ok(TabletCommandApplyOutcome::applied(result))
     }
 
+    /// Apply one committed command using capacity retained before local
+    /// proposal. Followers and recovery use `apply_committed_at` instead.
+    pub fn apply_committed_at_with_reservation(
+        &mut self,
+        envelope: TabletCommandEnvelope,
+        applied_index: u64,
+        applied_term: u64,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<TabletCommandApplyOutcome, TabletCommandApplyError> {
+        if self.pending_memtable_reservation.is_some() {
+            return Err(TabletCommandApplyError::CorruptState {
+                reason: "a memtable reservation is already attached to tablet apply".to_string(),
+            });
+        }
+        self.pending_memtable_reservation = reservation;
+        let result = self.apply_committed_at(envelope, applied_index, applied_term);
+        self.pending_memtable_reservation.take();
+        result
+    }
+
     /// Prepare all subcommands against one private sparse overlay and publish
     /// the entry's complete state once at its shared Raft position.
     pub fn apply_committed_batch_at(
@@ -1436,6 +1468,29 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             .expect("batch staging remains installed until publication");
         self.publish_command_delta(delta)?;
         Ok(outcomes)
+    }
+
+    /// Apply one committed batch using the leader's retained reservation for
+    /// its shared Raft entry.
+    pub fn apply_committed_batch_at_with_reservation(
+        &mut self,
+        envelopes: Vec<TabletCommandEnvelope>,
+        applied_index: u64,
+        applied_term: u64,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<
+        Vec<Result<TabletCommandApplyOutcome, TabletCommandApplyError>>,
+        TabletCommandApplyError,
+    > {
+        if self.pending_memtable_reservation.is_some() {
+            return Err(TabletCommandApplyError::CorruptState {
+                reason: "a memtable reservation is already attached to tablet apply".to_string(),
+            });
+        }
+        self.pending_memtable_reservation = reservation;
+        let result = self.apply_committed_batch_at(envelopes, applied_index, applied_term);
+        self.pending_memtable_reservation.take();
+        result
     }
 
     fn prepare_retry_horizon_edits(
@@ -1602,7 +1657,8 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             merge_command_delta(staged, delta)?;
             return Ok(());
         }
-        self.backend.publish_command_delta(delta)
+        self.backend
+            .publish_command_delta(delta, self.pending_memtable_reservation.take())
     }
 
     fn prepare_command(
@@ -3349,7 +3405,12 @@ mod tests {
             }],
         };
 
-        assert!(state_machine.backend.publish_command_delta(delta).is_err());
+        assert!(
+            state_machine
+                .backend
+                .publish_command_delta(delta, None)
+                .is_err()
+        );
         assert!(
             state_machine
                 .tablet()
@@ -3509,7 +3570,7 @@ mod tests {
         assert!(
             state_machine
                 .backend
-                .publish_command_delta(mismatched_removal)
+                .publish_command_delta(mismatched_removal, None)
                 .is_err()
         );
 
@@ -3525,7 +3586,7 @@ mod tests {
         assert!(
             state_machine
                 .backend
-                .publish_command_delta(write_without_removal)
+                .publish_command_delta(write_without_removal, None)
                 .is_err()
         );
 

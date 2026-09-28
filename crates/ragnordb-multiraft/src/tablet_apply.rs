@@ -4,6 +4,11 @@
 //! decodes a committed command, invokes deterministic tablet apply, and
 //! preserves the resulting RequestId and Raft position for proposal tracking
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use raft::types::LogIndex;
 use ragnordb_common::{
     command_codec::{
@@ -12,6 +17,7 @@ use ragnordb_common::{
     },
     ids::RequestId,
 };
+use ragnordb_storage::lsm::MemoryReservation;
 use ragnordb_storage::mvcc::{InMemoryMvcc, MvccStorage};
 use ragnordb_tablet::command::{
     TabletCommandApplyError, TabletCommandApplyOutcome, TabletStateMachine,
@@ -118,12 +124,61 @@ pub enum TabletApplyError {
 #[derive(Debug)]
 pub struct TabletCommandApplier<S = InMemoryMvcc> {
     state_machine: TabletStateMachine<S>,
+    pending_memtable_reservations: Arc<Mutex<HashMap<(u64, u64), MemoryReservation>>>,
 }
 
 impl<S: MvccStorage> TabletCommandApplier<S> {
     /// construct an applier around an already validated tablet state machine
     pub fn new(state_machine: TabletStateMachine<S>) -> Self {
-        Self { state_machine }
+        Self {
+            state_machine,
+            pending_memtable_reservations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Retain a proposal's exact capacity lease until its Raft position applies
+    /// or the applied frontier proves that proposal was superseded.
+    pub fn retain_memtable_admission(
+        &self,
+        position: ProposalPosition,
+        reservation: Option<MemoryReservation>,
+    ) {
+        let Some(reservation) = reservation else {
+            return;
+        };
+        let key = (position.term, position.index);
+        let mut pending = self
+            .pending_memtable_reservations
+            .lock()
+            .expect("tablet admission reservation lock poisoned");
+        assert!(
+            pending.insert(key, reservation).is_none(),
+            "memtable admission already exists for one Raft position"
+        );
+    }
+
+    /// Count local proposals whose freeze-slot reservations have not yet
+    /// reached apply or been superseded.
+    pub fn pending_memtable_admission_count(&self) -> usize {
+        self.pending_memtable_reservations
+            .lock()
+            .expect("tablet admission reservation lock poisoned")
+            .len()
+    }
+
+    /// Drop proposal leases whose positions are covered by the applied prefix.
+    /// This releases reservations for entries overwritten by a later leader.
+    pub fn release_memtable_admissions_through(&self, applied_index: u64) {
+        self.pending_memtable_reservations
+            .lock()
+            .expect("tablet admission reservation lock poisoned")
+            .retain(|(_, index), _| *index > applied_index);
+    }
+
+    /// Share outstanding group-local leases with a replacement applier during
+    /// snapshot installation so accepted proposals keep their capacity claim.
+    pub fn inherit_memtable_admissions(&mut self, previous: &Self) {
+        self.pending_memtable_reservations = Arc::clone(&previous.pending_memtable_reservations);
     }
 
     /// borrow the underlying tablet state machine for diagnostics and reads
@@ -155,7 +210,7 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         }
 
         let envelope = TabletCommandEnvelope::decode(command)?;
-        self.apply_envelope(position, envelope)
+        self.apply_envelope(position, envelope, None)
     }
 
     /// Decode a committed entry that may be either a legacy single envelope or
@@ -165,6 +220,27 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         position: ProposalPosition,
         command: &[u8],
     ) -> Result<CommittedTabletCommandEntry, TabletApplyError> {
+        let reservation = self
+            .pending_memtable_reservations
+            .lock()
+            .map_err(|_| {
+                TabletApplyError::FatalApply(TabletCommandApplyError::CorruptState {
+                    reason: "tablet admission reservation lock is poisoned".to_string(),
+                })
+            })?
+            .remove(&(position.term, position.index));
+        self.apply_committed_entry_with_reservation(position, command, reservation)
+    }
+
+    /// Apply a committed entry using capacity retained by the local leader.
+    /// Followers and recovery use `apply_committed_entry` and reserve progress
+    /// capacity from the storage backend during publication.
+    pub fn apply_committed_entry_with_reservation(
+        &mut self,
+        position: ProposalPosition,
+        command: &[u8],
+        reservation: Option<MemoryReservation>,
+    ) -> Result<CommittedTabletCommandEntry, TabletApplyError> {
         if position.term == 0 || position.index == 0 {
             return Err(TabletApplyError::InvalidRaftPosition {
                 term: position.term,
@@ -173,9 +249,11 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         }
 
         match TabletCommandEnvelope::decode(command) {
-            Ok(envelope) => Ok(CommittedTabletCommandEntry::Single(
-                self.apply_envelope(position, envelope)?,
-            )),
+            Ok(envelope) => Ok(CommittedTabletCommandEntry::Single(self.apply_envelope(
+                position,
+                envelope,
+                reservation,
+            )?)),
             Err(single_error) => {
                 let batch = match TabletCommandBatchEnvelope::decode(command) {
                     Ok(batch) => batch,
@@ -215,7 +293,12 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
                     .collect::<Vec<_>>();
                 let outcomes = self
                     .state_machine
-                    .apply_committed_batch_at(envelopes, position.index, position.term)
+                    .apply_committed_batch_at_with_reservation(
+                        envelopes,
+                        position.index,
+                        position.term,
+                        reservation,
+                    )
                     .map_err(TabletApplyError::FatalApply)?;
                 let dispositions = request_ids
                     .into_iter()
@@ -248,15 +331,18 @@ impl<S: MvccStorage> TabletCommandApplier<S> {
         &mut self,
         position: ProposalPosition,
         envelope: TabletCommandEnvelope,
+        reservation: Option<MemoryReservation>,
     ) -> Result<CommittedTabletCommandDisposition, TabletApplyError> {
         let request_id = envelope.request_id.clone();
         self.state_machine
             .command_delta_upper_bound(&envelope)
             .map_err(TabletApplyError::FatalApply)?;
-        match self
-            .state_machine
-            .apply_committed_at(envelope, position.index, position.term)
-        {
+        match self.state_machine.apply_committed_at_with_reservation(
+            envelope,
+            position.index,
+            position.term,
+            reservation,
+        ) {
             Ok(outcome) => Ok(CommittedTabletCommandDisposition::Applied(
                 AppliedTabletCommand {
                     request_id,

@@ -19,7 +19,7 @@ use ragnordb_multiraft::{
 };
 use ragnordb_storage::{
     key::{encode_row_key, make_row_key},
-    lsm::RecoveryFrontier,
+    lsm::{MemoryClass, NodeMemtableBudget, RecoveryFrontier},
     mvcc::MvccStorage,
 };
 use ragnordb_tablet::{
@@ -135,6 +135,82 @@ fn committed_entry_resolves_proposal_from_tablet_apply_result() {
             },
         }
     );
+}
+
+/// Realistic bug caught:
+///
+/// A leader could previously pass a pressure sample, propose a command, and
+/// lose the memory it needed before committed apply. Saturating both budget
+/// classes after retaining the exact proposal lease proves apply consumes the
+/// retained lease instead of asking ordinary capacity a second time.
+#[test]
+fn retained_proposal_capacity_survives_until_exact_committed_apply() {
+    let budget = NodeMemtableBudget::new_with_progress_reserve(65_536, 16_384).unwrap();
+    let tablet =
+        Tablet::new_with_memtable_budget(TABLET_ID, TABLE_ID, budget.clone(), 512).unwrap();
+    let state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let mut applier = TabletCommandApplier::new(state_machine);
+    let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(900)]).unwrap()).unwrap();
+    let envelope = TabletCommandEnvelope::new(
+        request_id(),
+        TABLET_ID,
+        TABLET_EPOCH,
+        TabletCommand::SingleShardCommit(SingleShardCommitCommand {
+            txn_id: ragnordb_common::ids::TxnId(900),
+            start_timestamp: ragnordb_common::ids::Timestamp(10),
+            commit_timestamp: ragnordb_common::ids::Timestamp(20),
+            writes: vec![WriteEntry {
+                key: key.clone(),
+                row: Some(Row {
+                    values: vec![Value::Int(900), Value::Text("reserved".to_string())],
+                }),
+                op: WriteKind::Put,
+            }],
+        }),
+    )
+    .unwrap();
+    let delta_bound = applier
+        .state_machine()
+        .command_delta_upper_bound(&envelope)
+        .unwrap();
+    let proposal_reservation = budget.reserve(MemoryClass::User, delta_bound).unwrap();
+    let ordinary_capacity_fill = budget
+        .reserve(
+            MemoryClass::User,
+            budget.user_limit_bytes() - budget.user_used_bytes(),
+        )
+        .unwrap();
+    let progress_capacity_fill = budget
+        .reserve(
+            MemoryClass::Progress,
+            budget.limit_bytes() - budget.used_bytes(),
+        )
+        .unwrap();
+    let position = ProposalPosition { term: 1, index: 1 };
+    applier.retain_memtable_admission(position, Some(proposal_reservation));
+
+    assert_eq!(applier.pending_memtable_admission_count(), 1);
+    assert_eq!(budget.used_bytes(), budget.limit_bytes());
+    applier
+        .apply_committed_entry(position, &envelope.encode().unwrap())
+        .unwrap();
+
+    assert_eq!(applier.pending_memtable_admission_count(), 0);
+    assert!(
+        applier
+            .state_machine()
+            .tablet()
+            .storage()
+            .read(&key, ragnordb_common::ids::Timestamp(20))
+            .unwrap()
+            .is_some()
+    );
+
+    drop(progress_capacity_fill);
+    drop(ordinary_capacity_fill);
+    drop(applier);
+    assert_eq!(budget.used_bytes(), 0);
 }
 
 #[test]

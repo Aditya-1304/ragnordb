@@ -43,9 +43,10 @@ use std::{
 use crate::{
     key::decode_row_key,
     lsm::{
-        DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT, MemtablePressure, NodeMemtableBudget,
-        RecoveryFrontier,
-        memory::{MemoryReservation, MemtableCharge},
+        DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, DEFAULT_TABLET_IMMUTABLE_HARD_BYTES,
+        DEFAULT_TABLET_IMMUTABLE_HARD_COUNT, DEFAULT_TABLET_IMMUTABLE_SOFT_BYTES,
+        DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT, MemoryClass, MemoryReservation, MemtablePressure,
+        NodeMemtableBudget, RecoveryFrontier, memory::MemtableCharge,
     },
 };
 use prost::Message;
@@ -545,6 +546,21 @@ pub trait MvccBackend: MvccReadGeneration {
     /// Publish all edits in one MVCC delta or leave the generation unchanged.
     fn publish_atomic(&mut self, delta: MvccDelta) -> Result<()>;
 
+    /// Publish with retained proposal capacity, or use progress capacity when
+    /// the entry arrives from a follower or recovery replay.
+    fn publish_atomic_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        if reservation.is_some() {
+            return Err(Error::NotImplemented(
+                "this MVCC backend cannot consume a retained memtable reservation",
+            ));
+        }
+        self.publish_atomic(delta)
+    }
+
     /// Pin a stable view for serving reads, snapshot export, and compaction.
     fn pin_generation(&self) -> Result<Self::PinnedGeneration>;
 
@@ -935,6 +951,22 @@ pub trait MvccStorage {
         ))
     }
 
+    /// Publish using capacity retained before local Raft admission. Followers
+    /// and recovery pass no reservation and reserve from committed-progress
+    /// capacity at apply time.
+    fn publish_mvcc_delta_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        if reservation.is_some() {
+            return Err(Error::NotImplemented(
+                "this MVCC backend cannot consume a retained memtable reservation",
+            ));
+        }
+        self.publish_mvcc_delta(delta)
+    }
+
     /// commit one previously installed distributed transaction intent
     ///
     /// an exact replay succeeds without creating a second write version. A
@@ -1085,6 +1117,22 @@ impl ImmutableMemtable {
 /// Fixed managed-byte allowance for each ordered memtable record and index
 /// entry. Encoded key/value bytes are charged in addition to this allowance.
 const MEMTABLE_INDEX_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+fn soft_immutable_memtable_limit(active_bytes: usize) -> usize {
+    if active_bytes == DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES {
+        DEFAULT_TABLET_IMMUTABLE_SOFT_BYTES
+    } else {
+        active_bytes.saturating_mul(DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT)
+    }
+}
+
+fn hard_immutable_memtable_limit(active_bytes: usize) -> usize {
+    if active_bytes == DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES {
+        DEFAULT_TABLET_IMMUTABLE_HARD_BYTES
+    } else {
+        active_bytes.saturating_mul(DEFAULT_TABLET_IMMUTABLE_HARD_COUNT)
+    }
+}
 
 /// Shared MVCC rules parameterized by a physical record backend.
 ///
@@ -2576,6 +2624,15 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
         self.backend.publish_atomic(delta)
     }
 
+    fn publish_mvcc_delta_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        self.backend
+            .publish_atomic_with_reservation(delta, reservation)
+    }
+
     fn commit_intent(
         &mut self,
         txn_id: TxnId,
@@ -3195,9 +3252,8 @@ impl InMemoryMvccBackend {
         Ok(Self {
             memtable_budget: Some(budget),
             memtable_limit_bytes: max_active_bytes,
-            immutable_memtable_limit_bytes: max_active_bytes
-                .saturating_mul(DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT),
-            immutable_memtable_count_limit: DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT,
+            immutable_memtable_limit_bytes: hard_immutable_memtable_limit(max_active_bytes),
+            immutable_memtable_count_limit: DEFAULT_TABLET_IMMUTABLE_HARD_COUNT,
             ..Self::default()
         })
     }
@@ -3230,13 +3286,16 @@ impl InMemoryMvccBackend {
         let charge = if current_bytes == 0 {
             None
         } else {
-            Some(budget.reserve(current_bytes)?.commit())
+            Some(
+                budget
+                    .reserve(MemoryClass::Progress, current_bytes)?
+                    .commit(),
+            )
         };
         self.memtable_budget = Some(budget);
         self.memtable_limit_bytes = max_active_bytes;
-        self.immutable_memtable_limit_bytes =
-            max_active_bytes.saturating_mul(DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT);
-        self.immutable_memtable_count_limit = DEFAULT_TABLET_IMMUTABLE_MEMTABLE_COUNT;
+        self.immutable_memtable_limit_bytes = hard_immutable_memtable_limit(max_active_bytes);
+        self.immutable_memtable_count_limit = DEFAULT_TABLET_IMMUTABLE_HARD_COUNT;
         self.memtable_charge = charge;
         Ok(())
     }
@@ -3250,11 +3309,15 @@ impl InMemoryMvccBackend {
                 .map_or(0, MemtableCharge::bytes),
             active_limit_bytes: self.memtable_limit_bytes,
             immutable_memtable_bytes: self.immutable_memtable_bytes,
-            immutable_memtable_limit_bytes: self.immutable_memtable_limit_bytes,
+            immutable_memtable_limit_bytes: soft_immutable_memtable_limit(
+                self.memtable_limit_bytes,
+            ),
             immutable_memtable_count: self.immutable_memtables.len(),
-            immutable_memtable_count_limit: self.immutable_memtable_count_limit,
+            immutable_memtable_count_limit: DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT,
             node_used_bytes: budget.used_bytes(),
             node_limit_bytes: budget.limit_bytes(),
+            node_user_used_bytes: budget.user_used_bytes(),
+            node_user_limit_bytes: budget.user_limit_bytes(),
         })
     }
 
@@ -3397,7 +3460,7 @@ impl InMemoryMvccBackend {
             || next_bytes > self.immutable_memtable_limit_bytes
         {
             return Err(Error::TabletUnavailable {
-                reason: "immutable memtable queue is full; user writes are stalled".to_string(),
+                reason: "immutable memtable hard progress capacity is exhausted".to_string(),
             });
         }
         Ok(())
@@ -3581,16 +3644,19 @@ impl InMemoryMvccBackend {
     fn publish_memtable_charge(
         &mut self,
         next_bytes: usize,
+        growth_bytes: usize,
         reservation: Option<MemoryReservation>,
-    ) {
+    ) -> Result<()> {
         let current_bytes = self
             .memtable_charge
             .as_ref()
             .map_or(0, MemtableCharge::bytes);
         match (self.memtable_charge.as_ref(), reservation) {
-            (Some(charge), Some(reservation)) => reservation.commit_into(charge),
+            (Some(charge), Some(reservation)) => {
+                reservation.commit_into_amount(charge, growth_bytes)?;
+            }
             (None, Some(reservation)) => {
-                self.memtable_charge = Some(reservation.commit());
+                self.memtable_charge = reservation.commit_amount(growth_bytes)?;
             }
             (Some(charge), None) if next_bytes < current_bytes => {
                 charge.shrink(current_bytes - next_bytes);
@@ -3601,6 +3667,7 @@ impl InMemoryMvccBackend {
         if next_bytes == 0 {
             self.memtable_charge = None;
         }
+        Ok(())
     }
 }
 
@@ -3652,6 +3719,14 @@ impl MvccBackend for InMemoryMvccBackend {
     type PinnedGeneration = Self;
 
     fn publish_atomic(&mut self, delta: MvccDelta) -> Result<()> {
+        self.publish_atomic_with_reservation(delta, None)
+    }
+
+    fn publish_atomic_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        mut admission_reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
         let mut changed_records = BTreeSet::new();
         for edit in &delta.edits {
             let (family, key, timestamp) = match edit {
@@ -3697,7 +3772,7 @@ impl MvccBackend for InMemoryMvccBackend {
             }
         }
 
-        let (next_memtable_bytes, growth_reservation, freeze_active) = if let Some(budget) =
+        let (next_memtable_bytes, required_growth_bytes, freeze_active) = if let Some(_budget) =
             &self.memtable_budget
         {
             let next_bytes = self.projected_memtable_bytes(&delta)?;
@@ -3718,26 +3793,37 @@ impl MvccBackend for InMemoryMvccBackend {
                 if current_bytes > 0 {
                     self.validate_freeze_capacity(current_bytes)?;
                 }
-                let reservation = if fresh_bytes > 0 {
-                    Some(budget.reserve(fresh_bytes)?)
-                } else {
-                    None
-                };
-                (fresh_bytes, reservation, current_bytes > 0)
+                (fresh_bytes, fresh_bytes, current_bytes > 0)
             } else {
                 let current_bytes = self
                     .memtable_charge
                     .as_ref()
                     .map_or(0, MemtableCharge::bytes);
-                let reservation = if next_bytes > current_bytes {
-                    Some(budget.reserve(next_bytes - current_bytes)?)
-                } else {
-                    None
-                };
-                (next_bytes, reservation, false)
+                (next_bytes, next_bytes.saturating_sub(current_bytes), false)
             }
         } else {
-            (0, None, false)
+            (0, 0, false)
+        };
+
+        let growth_reservation = if required_growth_bytes == 0 {
+            // A deterministic rejection or metadata-only command consumes no
+            // MVCC capacity; its proposal lease ends at this publication.
+            admission_reservation.take();
+            None
+        } else if let Some(reservation) = admission_reservation.take() {
+            if reservation.bytes() < required_growth_bytes {
+                return Err(Error::TabletUnavailable {
+                    reason: format!(
+                        "committed memtable edit needs {required_growth_bytes} bytes but its retained admission reservation holds {}",
+                        reservation.bytes()
+                    ),
+                });
+            }
+            Some(reservation)
+        } else if let Some(budget) = &self.memtable_budget {
+            Some(budget.reserve(MemoryClass::Progress, required_growth_bytes)?)
+        } else {
+            None
         };
 
         if freeze_active {
@@ -3793,7 +3879,11 @@ impl MvccBackend for InMemoryMvccBackend {
         }
 
         if self.memtable_budget.is_some() {
-            self.publish_memtable_charge(next_memtable_bytes, growth_reservation);
+            self.publish_memtable_charge(
+                next_memtable_bytes,
+                required_growth_bytes,
+                growth_reservation,
+            )?;
         }
 
         Ok(())
@@ -4286,12 +4376,12 @@ mod tests {
     }
 
     #[test]
-    fn immutable_memtable_rollover_retains_records_and_stalls_at_queue_capacity() {
-        let node_budget = crate::lsm::NodeMemtableBudget::new(1024).unwrap();
+    fn committed_apply_uses_hard_immutable_capacity_after_user_soft_limit() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(4096).unwrap();
         let mut storage = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 300).unwrap();
         let value = "v".repeat(64);
 
-        for id in 1..=3 {
+        for id in 1..=5 {
             storage
                 .publish_mvcc_delta(MvccDelta {
                     edits: vec![MvccRecordEdit::PutDefault {
@@ -4304,9 +4394,9 @@ mod tests {
         }
 
         let pressure = storage.memtable_pressure().unwrap();
-        assert_eq!(pressure.immutable_memtable_count, 2);
+        assert_eq!(pressure.immutable_memtable_count, 4);
         assert!(pressure.user_writes_stalled());
-        for id in 1..=3 {
+        for id in 1..=5 {
             assert!(
                 storage
                     .get_default_record(&encoded_key(id), Timestamp(id as u64))
@@ -4315,12 +4405,12 @@ mod tests {
             );
         }
 
-        let rejected_key = encoded_key(4);
+        let rejected_key = encoded_key(6);
         let rejected = storage.publish_mvcc_delta(MvccDelta {
             edits: vec![MvccRecordEdit::PutDefault {
                 key: rejected_key.clone(),
-                start_ts: Timestamp(4),
-                row: encoded_row(4, &value),
+                start_ts: Timestamp(6),
+                row: encoded_row(6, &value),
             }],
         });
 
@@ -4328,10 +4418,102 @@ mod tests {
         assert_eq!(node_budget.used_bytes(), pressure.node_used_bytes);
         assert_eq!(
             storage
-                .get_default_record(&rejected_key, Timestamp(4))
+                .get_default_record(&rejected_key, Timestamp(6))
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn retained_proposal_and_progress_capacity_allow_committed_rollover() {
+        let node_budget =
+            crate::lsm::NodeMemtableBudget::new_with_progress_reserve(4096, 1024).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget.clone(), 300).unwrap();
+        let value = "v".repeat(64);
+        let first = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: encoded_key(21),
+                start_ts: Timestamp(21),
+                row: encoded_row(21, &value),
+            }],
+        };
+        let second = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: encoded_key(22),
+                start_ts: Timestamp(22),
+                row: encoded_row(22, &value),
+            }],
+        };
+        let third = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: encoded_key(23),
+                start_ts: Timestamp(23),
+                row: encoded_row(23, &value),
+            }],
+        };
+        let fourth = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: encoded_key(24),
+                start_ts: Timestamp(24),
+                row: encoded_row(24, &value),
+            }],
+        };
+
+        storage.publish_mvcc_delta(first).unwrap();
+        let first_proposal_lease = node_budget
+            .reserve(MemoryClass::User, 512)
+            .expect("leader admission reserves bytes before proposal");
+        let second_proposal_lease = node_budget
+            .reserve(MemoryClass::User, 512)
+            .expect("the second proposal retains its own capacity before Raft");
+        let fill_user_capacity = node_budget
+            .reserve(
+                MemoryClass::User,
+                node_budget.user_limit_bytes() - node_budget.user_used_bytes(),
+            )
+            .unwrap();
+
+        storage
+            .publish_mvcc_delta_with_reservation(second, Some(first_proposal_lease))
+            .expect("the first committed entry consumes its retained lease");
+        assert_eq!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count,
+            1
+        );
+
+        storage
+            .publish_mvcc_delta_with_reservation(third, Some(second_proposal_lease))
+            .expect("the second already-admitted entry can use hard queue headroom");
+        assert_eq!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count,
+            2
+        );
+
+        drop(fill_user_capacity);
+        let fill_user_capacity = node_budget
+            .reserve(
+                MemoryClass::User,
+                node_budget.user_limit_bytes() - node_budget.user_used_bytes(),
+            )
+            .unwrap();
+        storage
+            .publish_mvcc_delta(fourth)
+            .expect("follower apply continues through the progress reserve");
+        assert_eq!(
+            storage
+                .memtable_pressure()
+                .unwrap()
+                .immutable_memtable_count,
+            3
+        );
+        assert!(node_budget.used_bytes() <= node_budget.limit_bytes());
+        drop(fill_user_capacity);
     }
 
     #[test]
