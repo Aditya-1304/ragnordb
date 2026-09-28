@@ -102,7 +102,7 @@ pub trait TabletReadGeneration: MvccReadGeneration + Send + Sync {
 
 /// Complete publication boundary for tablet state. Persistent implementations
 /// can replace the reference backend without changing command preparation.
-pub trait TabletStateBackend {
+trait TabletStateBackend {
     type PinnedGeneration: TabletReadGeneration + Send + Sync + 'static;
 
     fn publish_command_delta(&mut self, delta: CommandDelta)
@@ -574,9 +574,10 @@ pub struct TabletStateDiagnostics {
 }
 
 impl<S: MvccStorage> TabletStateMachine<S> {
-    /// bind a tablet to the non-zero descriptor epoch represented by this
-    /// state-machine instance
-    pub fn new(
+    /// Create a local reference tablet bound to the reserved replica-1 identity.
+    /// Replicated production replicas must use `new_with_replica` with their
+    /// authoritative replica descriptor.
+    pub fn new_local_reference(
         tablet: Tablet<S>,
         epoch: u64,
         raft_group_id: RaftGroupId,
@@ -654,14 +655,14 @@ impl<S: MvccStorage> TabletStateMachine<S> {
     /// Return the complete Raft position covered by the last published tablet
     /// command generation, when this instance has applied a committed entry.
     pub fn recovery_frontier(&self) -> Option<RecoveryFrontier> {
-        self.recovery_frontier
+        TabletStateBackend::recovery_frontier(&self.backend)
     }
 
     /// Pin MVCC records and all tablet command metadata from one published
     /// generation. The reference backend materializes owned memory state;
     /// storage backends may substitute a lightweight immutable handle.
     pub fn pin_generation(&self) -> Result<PinnedTabletStateGeneration, TabletCommandApplyError> {
-        self.backend.pin_complete_generation()
+        TabletStateBackend::pin_generation(&self.backend)
     }
 
     /// Publish progress for an applied Raft entry that carries no tablet
@@ -961,9 +962,10 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         .encode()
     }
 
-    /// restore replicated command metadata before applying any post-snapshot Raft
-    /// entry
-    pub fn restore_from_snapshot(
+    /// Restore command metadata for the explicitly local replica-1 reference.
+    /// Production recovery must supply the authoritative identity through
+    /// `restore_from_snapshot_with_replica`.
+    pub fn restore_from_snapshot_for_local_reference(
         tablet: Tablet<S>,
         bytes: &[u8],
     ) -> Result<Self, TabletStateMachineRestoreError> {
@@ -1169,164 +1171,61 @@ impl<S: MvccStorage> TabletStateMachine<S> {
         Ok(())
     }
 
-    /// Apply one committed command after deterministic target validation.
+    /// Test-only adapter for exercising committed apply without a Raft harness.
     ///
-    /// Target validation runs before request deduplication so a command sent to
-    /// the wrong tablet generation cannot consume a client sequence. Successful
-    /// deterministic command outcomes, including business rejections, consume
-    /// and cache the request sequence. Routing and malformed-envelope failures
-    /// occur before deduplication and leave sequence state untouched.
-    pub fn apply(
+    /// It assigns the next contiguous position from the current frontier and
+    /// delegates all state mutation to `apply_committed_at`; production builds
+    /// expose no position-free tablet command mutation API.
+    #[cfg(test)]
+    fn apply(
         &mut self,
         envelope: TabletCommandEnvelope,
     ) -> Result<TabletCommandApplyOutcome, TabletCommandApplyError> {
-        self.validate_proposal(&envelope)?;
-
-        let client_id = envelope.request_id.client_id;
-        if let Some(logical_command_id) = envelope.logical_command_id {
-            self.apply_retry_horizon(logical_command_id, envelope.acknowledged_through)?;
-
-            if self
-                .logical_client_retry_horizons
-                .get(&(
-                    logical_command_id.client_request_id.client_id,
-                    logical_command_id.client_request_id.session_epoch,
-                ))
-                .is_some_and(|acknowledged_through| {
-                    logical_command_id.client_request_id.request_sequence <= *acknowledged_through
-                })
-            {
-                return Err(TabletCommandApplyError::RequestIdExpired {
-                    client_id: logical_command_id.client_request_id.client_id,
-                    session_epoch: logical_command_id.client_request_id.session_epoch,
-                    sequence: logical_command_id.client_request_id.request_sequence,
-                    acknowledged_through: *self
-                        .logical_client_retry_horizons
-                        .get(&(
-                            logical_command_id.client_request_id.client_id,
-                            logical_command_id.client_request_id.session_epoch,
-                        ))
-                        .expect("retry horizon was checked above"),
-                });
-            }
-
-            if let Some(deduplication) = self.logical_command_deduplication.get(&logical_command_id)
-            {
-                return match &deduplication.cached_outcome {
-                    CachedTabletCommandOutcome::Applied(result) => {
-                        Ok(TabletCommandApplyOutcome::deduplicated((*result).into()))
-                    }
-                    CachedTabletCommandOutcome::Rejected(rejection) => {
-                        Err(error_from_cached_rejection(rejection))
-                    }
-                };
-            }
-
-            let result = match self.dispatch_command(envelope.command) {
-                Ok(result) => result,
-                Err(error) => {
-                    if let Some(rejection) = cached_rejection_from_error(&error) {
-                        self.logical_command_deduplication.insert(
-                            logical_command_id,
-                            ClientDeduplicationState {
-                                last_sequence_applied: 1,
-                                cached_outcome: CachedTabletCommandOutcome::Rejected(rejection),
-                            },
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-
-            self.logical_command_deduplication.insert(
-                logical_command_id,
-                ClientDeduplicationState {
-                    last_sequence_applied: 1,
-                    cached_outcome: CachedTabletCommandOutcome::Applied(result.into()),
-                },
-            );
-            return Ok(TabletCommandApplyOutcome::applied(result));
-        }
-
-        let deduplication_key = ClientDeduplicationKey {
-            client_id,
-            raft_group_id: envelope.request_id.raft_group_id,
+        let (index, term) = match self.recovery_frontier() {
+            Some(RecoveryFrontier::ReplicatedTablet {
+                applied_index,
+                applied_term,
+                ..
+            }) => (applied_index.saturating_add(1), applied_term),
+            _ => (1, 1),
         };
-        let sequence = envelope.request_id.sequence;
-
-        if let Some(deduplication) = self.client_deduplication.get(&deduplication_key) {
-            if sequence == deduplication.last_sequence_applied {
-                return match &deduplication.cached_outcome {
-                    CachedTabletCommandOutcome::Applied(result) => {
-                        Ok(TabletCommandApplyOutcome::deduplicated((*result).into()))
-                    }
-                    CachedTabletCommandOutcome::Rejected(rejection) => {
-                        Err(error_from_cached_rejection(rejection))
-                    }
-                };
-            }
-
-            if sequence < deduplication.last_sequence_applied {
-                return Err(TabletCommandApplyError::StaleRequestSequence {
-                    last_sequence_applied: deduplication.last_sequence_applied,
-                    received_sequence: sequence,
-                });
-            }
-
-            let expected_sequence = deduplication
-                .last_sequence_applied
-                .checked_add(1)
-                .ok_or(TabletCommandApplyError::RequestSequenceExhausted { client_id })?;
-
-            if sequence != expected_sequence {
-                return Err(TabletCommandApplyError::RequestSequenceGap {
-                    last_sequence_applied: deduplication.last_sequence_applied,
-                    expected_sequence,
-                    received_sequence: sequence,
-                });
-            }
-        } else if sequence != 1 {
-            return Err(TabletCommandApplyError::RequestSequenceGap {
-                last_sequence_applied: 0,
-                expected_sequence: 1,
-                received_sequence: sequence,
-            });
-        }
-
-        let dispatched = self.dispatch_command(envelope.command);
-        let result = match dispatched {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(rejection) = cached_rejection_from_error(&error) {
-                    self.client_deduplication.insert(
-                        deduplication_key,
-                        ClientDeduplicationState {
-                            last_sequence_applied: sequence,
-                            cached_outcome: CachedTabletCommandOutcome::Rejected(rejection),
-                        },
-                    );
-                }
-                return Err(error);
-            }
-        };
-
-        self.client_deduplication.insert(
-            deduplication_key,
-            ClientDeduplicationState {
-                last_sequence_applied: sequence,
-                cached_outcome: CachedTabletCommandOutcome::Applied(result.into()),
-            },
-        );
-
-        Ok(TabletCommandApplyOutcome::applied(result))
+        self.apply_committed_at(envelope, index, term)
     }
-
     /// Apply one committed Raft command as a complete tablet storage delta.
     ///
     /// The caller passes the exact applied `(index, term)` captured from the
     /// committed proposal position. Command validation and MVCC preparation
     /// remain read-only; row edits, status, retry metadata, cached outcome, and
     /// the recovery frontier cross one owner-local publication boundary.
+    ///
+    /// This compile-fail example guards the API boundary: production callers
+    /// cannot invoke replicated apply without supplying a committed position.
+    ///
+    /// ```compile_fail
+    /// use ragnordb_common::{
+    ///     command_codec::{NoopCommand, TabletCommand, TabletCommandEnvelope},
+    ///     ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId},
+    /// };
+    /// use ragnordb_tablet::{Tablet, command::TabletStateMachine};
+    ///
+    /// let tablet_id = TabletId(1);
+    /// let group_id = RaftGroupId(1);
+    /// let mut state_machine = TabletStateMachine::new_with_replica(
+    ///     Tablet::new(tablet_id, TableId(1)).unwrap(),
+    ///     1,
+    ///     group_id,
+    ///     ReplicaId(1),
+    /// )
+    /// .unwrap();
+    /// let envelope = TabletCommandEnvelope::new(
+    ///     RequestId { client_id: 1, sequence: 1, raft_group_id: group_id },
+    ///     tablet_id,
+    ///     1,
+    ///     TabletCommand::Noop(NoopCommand),
+    /// )
+    /// .unwrap();
+    /// let _ = state_machine.apply(envelope);
+    /// ```
     pub fn apply_committed_at(
         &mut self,
         envelope: TabletCommandEnvelope,
@@ -1704,77 +1603,6 @@ impl<S: MvccStorage> TabletStateMachine<S> {
             return Ok(());
         }
         self.backend.publish_command_delta(delta)
-    }
-
-    /// Apply a caller acknowledgement only through the replicated command
-    /// envelope. Outcomes at or below the new floor are then removable because
-    /// every future retry receives REQUEST_ID_EXPIRED instead of executing.
-    fn apply_retry_horizon(
-        &mut self,
-        logical_command_id: LogicalCommandId,
-        acknowledged_through: Option<u64>,
-    ) -> Result<(), TabletCommandApplyError> {
-        let Some(acknowledged_through) = acknowledged_through else {
-            return Ok(());
-        };
-
-        let session_key = (
-            logical_command_id.client_request_id.client_id,
-            logical_command_id.client_request_id.session_epoch,
-        );
-        if let Some(previous) = self.logical_client_retry_horizons.get(&session_key)
-            && acknowledged_through < *previous
-        {
-            return Err(TabletCommandApplyError::AcknowledgementRegression {
-                client_id: session_key.0,
-                session_epoch: session_key.1,
-                existing: *previous,
-                received: acknowledged_through,
-            });
-        }
-
-        if self
-            .logical_client_retry_horizons
-            .get(&session_key)
-            .is_some_and(|previous| *previous == acknowledged_through)
-        {
-            return Ok(());
-        }
-
-        self.logical_client_retry_horizons
-            .insert(session_key, acknowledged_through);
-        self.logical_command_deduplication.retain(|logical_id, _| {
-            let root = logical_id.client_request_id;
-            (root.client_id, root.session_epoch) != session_key
-                || root.request_sequence > acknowledged_through
-        });
-        Ok(())
-    }
-
-    fn dispatch_command(
-        &mut self,
-        command: TabletCommand,
-    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        let prepared = self.prepare_command(command)?;
-        self.publish_prepared_command(prepared)
-    }
-
-    fn publish_prepared_command(
-        &mut self,
-        prepared: PreparedTabletCommand,
-    ) -> Result<TabletCommandApplyResult, TabletCommandApplyError> {
-        self.tablet
-            .storage
-            .publish_mvcc_delta(prepared.mvcc)
-            .map_err(map_database_error)?;
-        for edit in prepared.transaction_status_edits {
-            match edit {
-                TxnStatusEdit::Put { txn_id, status } => {
-                    self.transaction_statuses.insert(txn_id, status);
-                }
-            }
-        }
-        Ok(prepared.result)
     }
 
     fn prepare_command(
@@ -2934,7 +2762,9 @@ mod tests {
         Error,
         codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind, WriteRecord},
         command_codec::{
-            CommitCommand, ExpirePendingTransactionStatus, HeartbeatTransactionStatus, NoopCommand,
+            CachedTabletCommandOutcome, CachedTabletCommandRejection,
+            CachedTabletCommandRejectionKind, CachedTabletCommandResult, CommitCommand,
+            ExpirePendingTransactionStatus, HeartbeatTransactionStatus, NoopCommand,
             PrewriteCommand, PublishAbortedTransactionStatus, ResolveIntentCommand,
             RollbackCommand, SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope,
             WriteEntry,
@@ -2947,14 +2777,14 @@ mod tests {
     use ragnordb_storage::mvcc::{MvccReadGeneration, MvccRecordEdit, MvccStorage};
     use ragnordb_storage::{
         key::{encode_row_key, make_row_key},
-        lsm::RecoveryFrontier,
+        lsm::{RecoveryFrontier, RetryFloorEdit},
     };
     use ragnordb_txn::Transaction;
 
     use super::{
-        CommandDelta, MvccDelta, TabletCommandApplyError, TabletCommandApplyOutcome,
-        TabletCommandApplyResult, TabletReadGeneration, TabletStateBackend, TabletStateMachine,
-        TabletStateMachineRestoreError,
+        CommandDelta, LegacyOutcomeEdit, LogicalOutcomeEdit, MvccDelta, TabletCommandApplyError,
+        TabletCommandApplyOutcome, TabletCommandApplyResult, TabletReadGeneration,
+        TabletStateBackend, TabletStateMachine, TabletStateMachineRestoreError, TxnStatusEdit,
     };
     use crate::Tablet;
     use ragnordb_storage::lsm::MAX_COMMAND_DELTA_BYTES;
@@ -2976,7 +2806,7 @@ mod tests {
         raft_group_id: RaftGroupId,
     ) -> TabletStateMachine {
         let tablet = Tablet::new(tablet_id, TableId(9)).unwrap();
-        TabletStateMachine::new(tablet, LOCAL_TABLET_EPOCH, raft_group_id).unwrap()
+        TabletStateMachine::new_local_reference(tablet, LOCAL_TABLET_EPOCH, raft_group_id).unwrap()
     }
 
     fn noop_envelope(tablet_id: TabletId, expected_epoch: u64) -> TabletCommandEnvelope {
@@ -3113,12 +2943,40 @@ mod tests {
         );
     }
 
-    /// Realistic bug caught: the new complete-delta path must preserve the
-    /// established MVCC and retry semantics for mixed commits, intents,
-    /// rollback witnesses, and a deterministic conflict.
+    /// Realistic bug caught: replica-local snapshots and recovery frontiers
+    /// must distinguish otherwise identical tablet state on replicas 1, 2, and 3.
     #[test]
-    fn complete_delta_history_matches_the_reference_state_machine() {
-        let mut reference = state_machine();
+    fn replica_frontiers_are_bound_to_each_replica_lifetime() {
+        for replica_id in 1..=3 {
+            let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
+            let mut state_machine = TabletStateMachine::new_with_replica(
+                tablet,
+                LOCAL_TABLET_EPOCH,
+                LOCAL_RAFT_GROUP_ID,
+                ReplicaId(replica_id),
+            )
+            .unwrap();
+            state_machine
+                .apply_committed_at(noop_envelope(LOCAL_TABLET_ID, LOCAL_TABLET_EPOCH), 1, 1)
+                .unwrap();
+
+            assert_eq!(
+                state_machine.recovery_frontier(),
+                Some(RecoveryFrontier::ReplicatedTablet {
+                    raft_group_id: LOCAL_RAFT_GROUP_ID,
+                    replica_id: ReplicaId(replica_id),
+                    applied_index: 1,
+                    applied_term: 1,
+                })
+            );
+        }
+    }
+
+    /// Realistic bug caught: each successful or rejected command in a mixed
+    /// MVCC history must publish its retry result and exact frontier with the
+    /// row, intent, and rollback-witness edits from that same command.
+    #[test]
+    fn committed_delta_history_keeps_mvcc_and_retry_families_coherent() {
         let mut complete_delta = state_machine();
         let key =
             |id| encode_row_key(&make_row_key(TableId(9), &[Value::Int(id)]).unwrap()).unwrap();
@@ -3203,47 +3061,34 @@ mod tests {
             }),
         ];
 
-        for (offset, command) in commands.into_iter().enumerate() {
+        let expected_results = [
+            Some(TabletCommandApplyResult::SingleShardCommit),
+            Some(TabletCommandApplyResult::Prewrite),
+            Some(TabletCommandApplyResult::Commit),
+            Some(TabletCommandApplyResult::Prewrite),
+            Some(TabletCommandApplyResult::Rollback),
+            Some(TabletCommandApplyResult::Prewrite),
+            None,
+            Some(TabletCommandApplyResult::Rollback),
+        ];
+        for (offset, (command, expected_result)) in
+            commands.into_iter().zip(expected_results).enumerate()
+        {
             let sequence = offset as u64 + 1;
-            let envelope = command_envelope(sequence, command);
-            let reference_result = reference.apply(envelope.clone());
-            let delta_result = complete_delta.apply_committed_at(envelope, sequence, 1);
-
-            assert_eq!(
-                delta_result, reference_result,
-                "command sequence {sequence}"
-            );
-            assert_eq!(
-                complete_delta
-                    .pin_generation()
-                    .unwrap()
-                    .export_snapshot()
-                    .unwrap(),
-                reference
-                    .pin_generation()
-                    .unwrap()
-                    .export_snapshot()
-                    .unwrap(),
-                "MVCC records after command sequence {sequence}"
-            );
-            assert_eq!(
-                complete_delta.transaction_statuses, reference.transaction_statuses,
-                "transaction status after command sequence {sequence}"
-            );
-            assert_eq!(
-                complete_delta.client_deduplication, reference.client_deduplication,
-                "legacy outcomes after command sequence {sequence}"
-            );
-            assert_eq!(
-                complete_delta.logical_command_deduplication,
-                reference.logical_command_deduplication,
-                "logical outcomes after command sequence {sequence}"
-            );
-            assert_eq!(
-                complete_delta.logical_client_retry_horizons,
-                reference.logical_client_retry_horizons,
-                "retry floors after command sequence {sequence}"
-            );
+            let result =
+                complete_delta.apply_committed_at(command_envelope(sequence, command), sequence, 1);
+            if let Some(expected_result) = expected_result {
+                assert_eq!(
+                    result.unwrap().result,
+                    expected_result,
+                    "command {sequence}"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TabletCommandApplyError::WriteConflict { .. })
+                ));
+            }
             assert_eq!(
                 complete_delta.recovery_frontier(),
                 Some(RecoveryFrontier::ReplicatedTablet {
@@ -3254,6 +3099,23 @@ mod tests {
                 })
             );
         }
+
+        assert_eq!(complete_delta.tablet().stats().default_versions, 2);
+        assert_eq!(complete_delta.tablet().stats().write_records, 4);
+        assert_eq!(complete_delta.tablet().stats().locks, 0);
+        assert_eq!(complete_delta.transaction_statuses.len(), 0);
+        assert_eq!(complete_delta.logical_client_retry_horizons.len(), 0);
+        assert_eq!(complete_delta.logical_command_deduplication.len(), 0);
+        assert_eq!(complete_delta.client_deduplication.len(), 1);
+        assert_eq!(
+            complete_delta
+                .client_deduplication
+                .values()
+                .next()
+                .unwrap()
+                .last_sequence_applied,
+            8
+        );
     }
 
     /// Realistic bug caught: a reader that retains generation N must not see
@@ -3338,6 +3200,87 @@ mod tests {
         );
     }
 
+    /// A published prewrite must expose its row intent, primary status,
+    /// logical retry outcome, retry floor, and exact Raft position in one
+    /// pinned generation.
+    #[test]
+    fn successful_delta_pins_data_status_retry_and_frontier_together() {
+        let mut state_machine = state_machine();
+        let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(80)]).unwrap()).unwrap();
+        let txn_id = TxnId(80);
+        let status = TxnStatusRecord {
+            txn_id,
+            start_timestamp: Timestamp(40),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let logical_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 0x80,
+                session_epoch: 4,
+                request_sequence: 2,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Prewrite,
+        };
+        let mut envelope = TabletCommandEnvelope::new_with_logical_command_id(
+            RequestId {
+                client_id: 0x80,
+                sequence: 1,
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+            },
+            logical_id,
+            LOCAL_TABLET_ID,
+            LOCAL_TABLET_EPOCH,
+            TabletCommand::Prewrite(PrewriteCommand {
+                txn_id,
+                start_timestamp: Timestamp(40),
+                writes: vec![WriteEntry {
+                    key: key.clone(),
+                    row: Some(test_row(80, "atomic generation")),
+                    op: WriteKind::Put,
+                }],
+                primary_key: key.clone(),
+                ttl_ms: 30_000,
+                pending_status: Some(status.clone()),
+            }),
+        )
+        .unwrap();
+        envelope.acknowledged_through = Some(1);
+
+        state_machine.apply_committed_at(envelope, 1, 2).unwrap();
+        let generation = state_machine.pin_generation().unwrap();
+
+        assert!(
+            generation
+                .get_default(&key, Timestamp(40))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(generation.get_lock(&key).unwrap().unwrap().txn_id, txn_id);
+        assert_eq!(generation.transaction_status(txn_id), Some(&status));
+        assert!(matches!(
+            generation.logical_outcome(&logical_id),
+            Some(CachedTabletCommandOutcome::Applied(
+                CachedTabletCommandResult::Prewrite
+            ))
+        ));
+        assert_eq!(generation.retry_floor(0x80, 4), Some(1));
+        assert_eq!(
+            generation.processed_frontier(),
+            Some(RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+                replica_id: ReplicaId(1),
+                applied_index: 1,
+                applied_term: 2,
+            })
+        );
+    }
+
     /// Realistic bug caught: a committed Put record must never publish if its
     /// referenced Default payload is absent from both the current generation
     /// and the same command delta.
@@ -3345,6 +3288,29 @@ mod tests {
     fn backend_rejects_dangling_write_before_publishing_any_family() {
         let mut state_machine = state_machine();
         let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(3)]).unwrap()).unwrap();
+        let status = TxnStatusRecord {
+            txn_id: TxnId(77),
+            start_timestamp: Timestamp(20),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let logical_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 0xabc,
+                session_epoch: 2,
+                request_sequence: 3,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Prewrite,
+        };
+        let rejection = CachedTabletCommandOutcome::Rejected(CachedTabletCommandRejection {
+            kind: CachedTabletCommandRejectionKind::WriteConflict,
+            reason: "prepared rejection must remain private".to_string(),
+        });
         let delta = CommandDelta {
             mvcc: MvccDelta {
                 edits: vec![MvccRecordEdit::PutWrite {
@@ -3363,7 +3329,24 @@ mod tests {
                 applied_index: 1,
                 applied_term: 1,
             }),
-            ..CommandDelta::default()
+            transaction_status_edits: vec![TxnStatusEdit::Put {
+                txn_id: status.txn_id,
+                status,
+            }],
+            logical_outcome_edits: vec![LogicalOutcomeEdit::Put {
+                id: logical_id,
+                outcome: rejection.clone(),
+            }],
+            legacy_outcome_edits: vec![LegacyOutcomeEdit::Put {
+                client_id: 0xdef,
+                last_sequence_applied: 1,
+                outcome: rejection,
+            }],
+            retry_floor_edits: vec![RetryFloorEdit::Advance {
+                client_id: 0xabc,
+                session_epoch: 2,
+                acknowledged_through: 3,
+            }],
         };
 
         assert!(state_machine.backend.publish_command_delta(delta).is_err());
@@ -3376,6 +3359,98 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state_machine.recovery_frontier(), None);
+        assert_eq!(state_machine.transaction_statuses.len(), 0);
+        assert_eq!(state_machine.logical_command_deduplication.len(), 0);
+        assert_eq!(state_machine.client_deduplication.len(), 0);
+        assert_eq!(state_machine.logical_client_retry_horizons.len(), 0);
+    }
+
+    /// A command that fails during its first preparation step must not publish
+    /// row edits, cached results, retry state, or the committed frontier.
+    #[test]
+    fn early_prepare_failure_leaves_all_replicated_state_unpublished() {
+        let mut state_machine = state_machine();
+        let key = encode_row_key(&make_row_key(TableId(9), &[Value::Int(31)]).unwrap()).unwrap();
+        let status = TxnStatusRecord {
+            txn_id: TxnId(31),
+            start_timestamp: Timestamp(40),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: key.clone(),
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        state_machine
+            .apply_committed_at(
+                command_envelope(
+                    1,
+                    TabletCommand::Prewrite(PrewriteCommand {
+                        txn_id: status.txn_id,
+                        start_timestamp: status.start_timestamp,
+                        writes: vec![WriteEntry {
+                            key: key.clone(),
+                            row: Some(test_row(31, "pending")),
+                            op: WriteKind::Put,
+                        }],
+                        primary_key: key.clone(),
+                        ttl_ms: 30_000,
+                        pending_status: Some(status.clone()),
+                    }),
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let changed_status = TxnStatusRecord {
+            participant_tablet_ids: vec![LOCAL_TABLET_ID.0, 42],
+            ..status.clone()
+        };
+        let error = state_machine
+            .apply_committed_at(
+                command_envelope(
+                    2,
+                    TabletCommand::Prewrite(PrewriteCommand {
+                        txn_id: status.txn_id,
+                        start_timestamp: status.start_timestamp,
+                        writes: vec![WriteEntry {
+                            key: key.clone(),
+                            row: Some(test_row(31, "must not replace")),
+                            op: WriteKind::Put,
+                        }],
+                        primary_key: key.clone(),
+                        ttl_ms: 30_000,
+                        pending_status: Some(changed_status),
+                    }),
+                ),
+                2,
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TabletCommandApplyError::CorruptState { .. }
+        ));
+        assert_eq!(
+            state_machine.recovery_frontier(),
+            Some(RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: LOCAL_RAFT_GROUP_ID,
+                replica_id: ReplicaId(1),
+                applied_index: 1,
+                applied_term: 1,
+            })
+        );
+        assert_eq!(state_machine.tablet().stats().locks, 1);
+        assert_eq!(state_machine.tablet().stats().default_versions, 1);
+        assert_eq!(state_machine.tablet().stats().write_records, 0);
+        assert_eq!(
+            state_machine.transaction_statuses.get(&status.txn_id),
+            Some(&status)
+        );
+        assert_eq!(state_machine.logical_command_deduplication.len(), 0);
+        assert_eq!(state_machine.client_deduplication.len(), 1);
+        assert_eq!(state_machine.logical_client_retry_horizons.len(), 0);
     }
 
     /// A backend caller must not remove a pending intent with a write from a
@@ -3668,7 +3743,7 @@ mod tests {
         );
 
         let snapshot = state_machine.encode_snapshot_state().unwrap();
-        let mut restored = TabletStateMachine::restore_from_snapshot(
+        let mut restored = TabletStateMachine::restore_from_snapshot_for_local_reference(
             Tablet::new(LOCAL_TABLET_ID, TableId(1)).unwrap(),
             &snapshot,
         )
@@ -3843,7 +3918,9 @@ mod tests {
         let snapshot = original.encode_snapshot_state().unwrap();
 
         let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
-        let mut restored = TabletStateMachine::restore_from_snapshot(tablet, &snapshot).unwrap();
+        let mut restored =
+            TabletStateMachine::restore_from_snapshot_for_local_reference(tablet, &snapshot)
+                .unwrap();
 
         // The last acknowledged request must be served from restored deduplication
         // state instead of being dispatched as a fresh state transition.
@@ -3883,7 +3960,9 @@ mod tests {
         let other_tablet_id = TabletId(LOCAL_TABLET_ID.0 + 1);
         let other_tablet = Tablet::new(other_tablet_id, TableId(9)).unwrap();
 
-        let error = TabletStateMachine::restore_from_snapshot(other_tablet, &snapshot).unwrap_err();
+        let error =
+            TabletStateMachine::restore_from_snapshot_for_local_reference(other_tablet, &snapshot)
+                .unwrap_err();
 
         assert_eq!(
             error,
@@ -4015,7 +4094,7 @@ mod tests {
             .unwrap();
 
         let pending_snapshot = state_machine.encode_snapshot_state().unwrap();
-        let restored_pending = TabletStateMachine::restore_from_snapshot(
+        let restored_pending = TabletStateMachine::restore_from_snapshot_for_local_reference(
             Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap(),
             &pending_snapshot,
         )
@@ -4068,7 +4147,7 @@ mod tests {
             .unwrap();
 
         let committed_snapshot = state_machine.encode_snapshot_state().unwrap();
-        let restored_committed = TabletStateMachine::restore_from_snapshot(
+        let restored_committed = TabletStateMachine::restore_from_snapshot_for_local_reference(
             Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap(),
             &committed_snapshot,
         )
@@ -4571,7 +4650,9 @@ mod tests {
         assert_eq!(state_machine.apply(delayed.clone()).unwrap_err(), error);
         let snapshot = state_machine.encode_snapshot_state().unwrap();
         let tablet = Tablet::new(LOCAL_TABLET_ID, TableId(9)).unwrap();
-        let mut restored = TabletStateMachine::restore_from_snapshot(tablet, &snapshot).unwrap();
+        let mut restored =
+            TabletStateMachine::restore_from_snapshot_for_local_reference(tablet, &snapshot)
+                .unwrap();
         assert_eq!(restored.apply(delayed).unwrap_err(), error);
 
         assert_eq!(

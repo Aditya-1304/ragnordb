@@ -7866,8 +7866,12 @@ mod tests {
             tablet_epoch: 7,
         });
         let tablet = ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap();
-        let state_machine =
-            ragnordb_tablet::command::TabletStateMachine::new(tablet, 7, RaftGroupId(9)).unwrap();
+        let state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
+            tablet,
+            7,
+            RaftGroupId(9),
+        )
+        .unwrap();
         let applier = TabletCommandApplier::new(state_machine);
         let request = TabletReadRequest {
             request_id: RequestId {
@@ -7931,14 +7935,14 @@ mod tests {
             last_heartbeat_timestamp: None,
             lease_deadline_ms: None,
         };
-        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new(
+        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
             ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap(),
             7,
             RaftGroupId(9),
         )
         .unwrap();
         state_machine
-            .apply(
+            .apply_committed_at(
                 TabletCommandEnvelope::new(
                     RequestId {
                         client_id: 100,
@@ -7963,6 +7967,8 @@ mod tests {
                     }),
                 )
                 .unwrap(),
+                1,
+                1,
             )
             .unwrap();
         let applier = TabletCommandApplier::new(state_machine);
@@ -8057,14 +8063,14 @@ mod tests {
             last_heartbeat_timestamp: None,
             lease_deadline_ms: Some(1_000),
         };
-        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new(
+        let mut state_machine = ragnordb_tablet::command::TabletStateMachine::new_local_reference(
             ragnordb_tablet::Tablet::new(TabletId(3), TableId(3)).unwrap(),
             7,
             RaftGroupId(9),
         )
         .unwrap();
         state_machine
-            .apply(
+            .apply_committed_at(
                 TabletCommandEnvelope::new(
                     RequestId {
                         client_id: 100,
@@ -8089,6 +8095,8 @@ mod tests {
                     }),
                 )
                 .unwrap(),
+                1,
+                1,
             )
             .unwrap();
 

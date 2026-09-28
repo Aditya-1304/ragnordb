@@ -26,7 +26,11 @@ use ragnordb_tablet::{
     Tablet,
     command::{
         TabletCommandApplyError, TabletCommandApplyOutcome, TabletCommandApplyResult,
-        TabletStateMachine,
+        TabletReadGeneration, TabletStateMachine,
+    },
+    snapshot::{
+        AppliedTabletFrontier, TabletSnapshotConfState, TabletSnapshotInstallTarget,
+        generate_local_snapshot, restore_verified_snapshot,
     },
 };
 
@@ -45,7 +49,8 @@ fn request_id() -> RequestId {
 
 fn applier() -> TabletCommandApplier {
     let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
 
     TabletCommandApplier::new(state_machine)
 }
@@ -561,10 +566,11 @@ fn mixed_batch_publishes_success_rejection_success_at_one_frontier() {
     )
     .unwrap();
     let last = commit(712, 40, last_key.clone(), 72);
-    let batch = TabletCommandBatchEnvelope::new(vec![first, conflict.clone(), last])
-        .unwrap()
-        .encode()
-        .unwrap();
+    let batch =
+        TabletCommandBatchEnvelope::new(vec![first.clone(), conflict.clone(), last.clone()])
+            .unwrap()
+            .encode()
+            .unwrap();
     let position = ProposalPosition { term: 4, index: 2 };
 
     let CommittedTabletCommandEntry::Batch(dispositions) =
@@ -603,16 +609,6 @@ fn mixed_batch_publishes_success_rejection_success_at_one_frontier() {
         })
     );
 
-    let CommittedTabletCommandDisposition::Rejected(replayed) = applier
-        .apply_committed(
-            ProposalPosition { term: 4, index: 3 },
-            &conflict.encode().unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("replayed conflict must return its cached rejection");
-    };
-    assert_eq!(replayed.rejection, conflict_error);
     assert_eq!(
         applier
             .state_machine()
@@ -641,6 +637,81 @@ fn mixed_batch_publishes_success_rejection_success_at_one_frontier() {
             .unwrap()
         )
     );
+
+    // Reconstruct the complete serving generation, then replay the same three
+    // requests after the original apply reply has been discarded.
+    let image = generate_local_snapshot(
+        applier.state_machine(),
+        "stage4.3-mixed-batch",
+        ReplicaId(1),
+        704,
+        TabletSnapshotConfState::new(7, [ReplicaId(1), ReplicaId(2), ReplicaId(3)], [], [])
+            .unwrap(),
+        AppliedTabletFrontier::new(2, 4),
+    )
+    .unwrap();
+    let target = TabletSnapshotInstallTarget {
+        cluster_id: "stage4.3-mixed-batch".to_string(),
+        raft_group_id: RAFT_GROUP_ID,
+        replica_id: ReplicaId(1),
+        tablet_id: TABLET_ID,
+        table_id: TABLE_ID,
+        tablet_epoch: TABLET_EPOCH,
+    };
+    let restored = restore_verified_snapshot(&image, &target)
+        .unwrap()
+        .state_machine;
+    let mut restored_applier = TabletCommandApplier::new(restored);
+    assert_eq!(
+        restored_applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 2,
+            applied_term: 4,
+        })
+    );
+    let retry_batch = TabletCommandBatchEnvelope::new(vec![first, conflict, last])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let CommittedTabletCommandEntry::Batch(replayed) = restored_applier
+        .apply_committed_entry(ProposalPosition { term: 4, index: 3 }, &retry_batch)
+        .unwrap()
+    else {
+        panic!("replayed command entry was not reported as a batch");
+    };
+    assert!(matches!(
+        &replayed[0],
+        CommittedTabletCommandDisposition::Applied(applied) if applied.outcome.deduplicated
+    ));
+    assert!(matches!(
+        &replayed[1],
+        CommittedTabletCommandDisposition::Rejected(rejected)
+            if rejected.rejection == conflict_error
+    ));
+    assert!(matches!(
+        &replayed[2],
+        CommittedTabletCommandDisposition::Applied(applied) if applied.outcome.deduplicated
+    ));
+    assert_eq!(
+        restored_applier
+            .state_machine()
+            .tablet()
+            .stats()
+            .default_versions,
+        3
+    );
+    assert_eq!(restored_applier.state_machine().tablet().stats().locks, 1);
+    assert_eq!(
+        restored_applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 3,
+            applied_term: 4,
+        })
+    );
 }
 
 /// Realistic bug caught:
@@ -652,6 +723,7 @@ fn mixed_batch_publishes_success_rejection_success_at_one_frontier() {
 #[test]
 fn fatal_later_batch_subcommand_discards_earlier_prewrite_and_frontier() {
     let mut applier = applier_with_frontier(12, 3);
+    let generation_before_entry = applier.state_machine().pin_generation().unwrap();
     let key = encode_row_key(&make_row_key(TABLE_ID, &[Value::Int(56)]).unwrap()).unwrap();
     let make_prewrite = |client_id, ttl_ms| {
         TabletCommandEnvelope::new(
@@ -705,6 +777,15 @@ fn fatal_later_batch_subcommand_discards_earlier_prewrite_and_frontier() {
     );
     assert_eq!(
         applier.state_machine().recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: RAFT_GROUP_ID,
+            replica_id: ReplicaId(1),
+            applied_index: 12,
+            applied_term: 3,
+        })
+    );
+    assert_eq!(
+        generation_before_entry.processed_frontier(),
         Some(RecoveryFrontier::ReplicatedTablet {
             raft_group_id: RAFT_GROUP_ID,
             replica_id: ReplicaId(1),

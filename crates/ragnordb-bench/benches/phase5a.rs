@@ -86,7 +86,8 @@ fn write_envelope(write_count: usize, sequence: u64) -> TabletCommandEnvelope {
 
 fn make_applier() -> TabletCommandApplier<InMemoryMvcc> {
     let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
     TabletCommandApplier::new(state_machine)
 }
 

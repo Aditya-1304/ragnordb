@@ -1,3 +1,7 @@
+#[path = "common/command_apply.rs"]
+mod command_apply_test_support;
+use command_apply_test_support::ApplyCommittedTestCommand;
+
 use ragnordb_common::{
     codec::{Row, TxnStatus, TxnStatusRecord, Value, WriteKind},
     command_codec::{
@@ -11,6 +15,7 @@ use ragnordb_common::{
 };
 use ragnordb_storage::{
     key::{encode_row_key, make_row_key},
+    lsm::RecoveryFrontier,
     mvcc::MvccStorage,
 };
 use ragnordb_tablet::{
@@ -480,8 +485,19 @@ fn participant_crash_before_and_after_apply_has_one_deterministic_outcome() {
         command,
     )
     .unwrap();
-    after_apply.apply(applied).unwrap();
+    let _published_without_delivering_reply = after_apply.apply(applied).unwrap();
+    assert_eq!(after_apply.tablet().stats().locks, 1);
+    assert_eq!(after_apply.tablet().stats().default_versions, 1);
     let mut after_apply = restart_from_durable_snapshot(&mut after_apply, ReplicaId(3), 605);
+    assert_eq!(
+        after_apply.recovery_frontier(),
+        Some(RecoveryFrontier::ReplicatedTablet {
+            raft_group_id: group,
+            replica_id: ReplicaId(3),
+            applied_index: 615,
+            applied_term: 3,
+        })
+    );
     let replay = TabletCommandEnvelope::new_with_logical_command_id(
         request_id(0x502, 77, group),
         logical_id,
@@ -506,4 +522,72 @@ fn participant_crash_before_and_after_apply_has_one_deterministic_outcome() {
     assert!(outcome.deduplicated);
     assert_eq!(after_apply.tablet().stats().locks, 1);
     assert_eq!(after_apply.tablet().stats().default_versions, 1);
+}
+
+/// A deterministic WriteConflict published before its reply is delivered must
+/// survive reconstruction as the original logical outcome without replaying
+/// the held intent or applying row data a second time.
+#[test]
+fn published_conflict_retries_with_original_result_after_restart() {
+    let tablet_id = TabletId(2);
+    let group = RaftGroupId(606);
+    let key = encoded_key(606);
+    let owner_txn = TxnId(606);
+    let rejected_txn = TxnId(607);
+    let owner = prewrite_envelope(
+        tablet_id,
+        group,
+        owner_txn,
+        key.clone(),
+        key.clone(),
+        row(606, "owner"),
+        1,
+    );
+    let mut state_machine = state_machine(tablet_id, group);
+    state_machine.apply(owner).unwrap();
+
+    let logical_id =
+        participant_logical_command_id(rejected_txn, ParticipantCommandPhase::Prewrite, &key)
+            .unwrap();
+    let rejected_command = TabletCommand::Prewrite(PrewriteCommand {
+        txn_id: rejected_txn,
+        start_timestamp: Timestamp(101),
+        writes: vec![WriteEntry {
+            key: key.clone(),
+            row: Some(row(607, "must not publish")),
+            op: WriteKind::Put,
+        }],
+        primary_key: key.clone(),
+        ttl_ms: 30_000,
+        pending_status: None,
+    });
+    let rejection_envelope = |client_id, sequence| {
+        TabletCommandEnvelope::new_with_logical_command_id(
+            request_id(client_id, sequence, group),
+            logical_id,
+            tablet_id,
+            TABLET_EPOCH,
+            rejected_command.clone(),
+        )
+        .unwrap()
+    };
+
+    let rejection = state_machine
+        .apply(rejection_envelope(0x606, 1))
+        .unwrap_err();
+    assert!(matches!(
+        rejection,
+        ragnordb_tablet::command::TabletCommandApplyError::WriteConflict { .. }
+    ));
+    assert_eq!(state_machine.tablet().stats().locks, 1);
+    assert_eq!(state_machine.tablet().stats().default_versions, 1);
+
+    let mut state_machine = restart_from_durable_snapshot(&mut state_machine, ReplicaId(2), 606);
+    let replay_error = state_machine
+        .apply(rejection_envelope(0x607, 88))
+        .unwrap_err();
+
+    assert_eq!(replay_error, rejection);
+    assert_eq!(state_machine.tablet().stats().locks, 1);
+    assert_eq!(state_machine.tablet().stats().default_versions, 1);
 }

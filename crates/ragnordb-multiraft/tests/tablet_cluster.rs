@@ -7,7 +7,7 @@ use ragnordb_common::{
         SingleShardCommitCommand, TabletCommand, TabletCommandEnvelope, TabletStateMachineSnapshot,
         WriteEntry,
     },
-    ids::{RaftGroupId, RequestId, TableId, TabletId, Timestamp, TxnId},
+    ids::{RaftGroupId, ReplicaId, RequestId, TableId, TabletId, Timestamp, TxnId},
 };
 use ragnordb_multiraft::{
     proposal::{ProposalCompletion, ProposalFailure},
@@ -279,7 +279,8 @@ fn rebuild_replica_from_durable_wal(
         RaftNode::restart(CoreReplicaId::must(node_id), log, stable, 5, 2).unwrap();
 
     let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
     let mut tablet_applier = TabletCommandApplier::new(state_machine);
 
     for entry in replica.log_view().entries() {
@@ -1119,11 +1120,12 @@ fn restored_tablet_resumes_the_internal_read_barrier_sequence() {
     const INTERNAL_READ_BARRIER_CLIENT_ID: u128 = 1_u128 << 127;
 
     let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let mut state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let mut state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
 
     for sequence in 1..=3 {
         state_machine
-            .apply(
+            .apply_committed_at(
                 TabletCommandEnvelope::new(
                     RequestId {
                         client_id: INTERNAL_READ_BARRIER_CLIENT_ID,
@@ -1135,13 +1137,20 @@ fn restored_tablet_resumes_the_internal_read_barrier_sequence() {
                     TabletCommand::Noop(NoopCommand),
                 )
                 .unwrap(),
+                sequence,
+                1,
             )
             .unwrap();
     }
 
     let snapshot = state_machine.encode_snapshot_state().unwrap();
     let restored_tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let restored = TabletStateMachine::restore_from_snapshot(restored_tablet, &snapshot).unwrap();
+    let restored = TabletStateMachine::restore_from_snapshot_with_replica(
+        restored_tablet,
+        &snapshot,
+        ReplicaId(1),
+    )
+    .unwrap();
 
     assert_eq!(
         restored

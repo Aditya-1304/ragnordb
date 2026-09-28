@@ -1,11 +1,21 @@
 # Stage 4.3: in-memory atomic CommandDelta
 
-Status: **Implementation is in place; Stage 4.3 remains open.** The
-cross-table lock-primary validation regression and the lifecycle stress test's
-per-statement deadline setup are fixed and covered by focused tests. This stage
-provides the owner-local tablet publication boundary needed by the Candidate B
-layout. It does not implement a durable LSM, WAL, memtables, SSTables, MANIFEST
-publication, or filesystem crash recovery.
+Status: **Stage 4.3 — CLOSED.** The cross-table lock-primary validation
+regression and the lifecycle stress test's per-statement deadline setup are
+fixed and covered by focused tests.
+
+This closes the complete CommandDelta contract and owner-local atomic
+publication boundary.
+
+It does NOT claim durable SST/MANIFEST atomicity or complete filesystem
+recovery. The physical realization of this boundary is implemented and
+crash-proved in Stages 4.4-4.7.
+
+The Stage 4.3 crash matrix uses privately staged in-memory CommandDelta state,
+pinned generations, tablet snapshots, and committed Raft replay. The logical
+"data prepared but not published" cut is covered before serving-generation
+publication. The literal filesystem/SST/MANIFEST crash cut remains deferred to
+Stages 4.5-4.7.
 
 ## Contract
 
@@ -41,8 +51,13 @@ state nor frontier. A deterministic command rejection publishes the cached
 rejection and consumed frontier together.
 
 The production Raft apply bridge passes each committed entry's exact index and
-term into this path. Configuration entries advance the storage frontier with
-a frontier-only delta. A committed command batch stages subcommand edits in a
+term into this path. The old position-free `TabletStateMachine::apply()` and
+its separate retry-horizon/dispatch/publication helpers are absent from
+production builds; unit and integration test adapters delegate to the exact
+committed-position API. Local reference construction names replica 1
+explicitly, while production replica construction supplies the authoritative
+`ReplicaId`. Configuration entries advance the storage frontier with a
+frontier-only delta. A committed command batch stages subcommand edits in a
 private overlay: deterministic business rejections remain individual results,
 while a fatal later subcommand discards the whole staged batch. Successful
 batch state and the shared entry frontier publish once.
@@ -71,16 +86,23 @@ partial state or replay errors:
   are rejected;
 - deterministic rejection and mixed success/rejection batches retain one
   frontier, while a fatal later command leaves the whole batch unpublished;
-- replayed commands preserve the same logical result without reapplying row
-  mutations;
+- lost-acknowledgement retries and snapshot reconstruction preserve successful
+  and deterministic rejection results without reapplying row mutations;
+- expired logical requests remain expired after their retry floor is restored;
 - a pinned reader retains a coherent generation; and
 - snapshot creation rejects replica or frontier metadata that does not match
   the pinned generation.
 
 Named regression coverage includes
 `backend_rejects_lock_transition_without_matching_start_timestamp_or_removal`,
+`backend_rejects_dangling_write_before_publishing_any_family`,
+`early_prepare_failure_leaves_all_replicated_state_unpublished`,
 `fatal_later_batch_subcommand_discards_earlier_prewrite_and_frontier`,
 `mixed_batch_publishes_success_rejection_success_at_one_frontier`,
+`participant_crash_before_and_after_apply_has_one_deterministic_outcome`,
+`published_conflict_retries_with_original_result_after_restart`,
+`replica_frontiers_are_bound_to_each_replica_lifetime`,
+`successful_delta_pins_data_status_retry_and_frontier_together`,
 `command_result_waiter_resolves_only_after_frontier_gate`, and
 `local_snapshot_rejects_boundary_or_replica_mismatch_with_pinned_generation`.
 The cross-family routing contract is covered by
@@ -99,8 +121,8 @@ and prevalidation, not durable multi-family storage.
 
 Range-tombstone, secondary-index, and unique-claim edits are reserved by the
 format but are not part of this delta yet. They must join this same complete
-publication boundary when implemented. Storage workers, lazy mutable roots,
-immutable generations, WAL records, SST blocks, MANIFEST generations, and
-crash/reopen proof also remain later-stage work. Snapshot-file checksums and
-Raft WAL recovery do not prove durable atomic publication of a future LSM
-`CommandDelta`.
+publication boundary when implemented. Stages 4.4-4.7 remain unimplemented:
+lazy/immutable memtables, SSTables, MANIFEST publication, and physical
+filesystem recovery. Snapshot checksums and Raft replay do not prove durable
+atomic publication of a future LSM `CommandDelta`; that physical proof belongs
+to those later stages.

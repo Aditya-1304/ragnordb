@@ -249,7 +249,8 @@ fn restart_restores_snapshot_then_replays_committed_suffix() {
     let mut persistence = RaftWalStorage::new(wal.clone(), identity);
 
     let tablet = Tablet::new(TABLET_ID, TABLE_ID).unwrap();
-    let mut state_machine = TabletStateMachine::new(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
+    let mut state_machine =
+        TabletStateMachine::new_local_reference(tablet, TABLET_EPOCH, RAFT_GROUP_ID).unwrap();
     let (first_command, first_key, first_row) = command(41, 1, 1, 11, 30);
     state_machine
         .apply_committed_at(TabletCommandEnvelope::decode(&first_command).unwrap(), 1, 1)

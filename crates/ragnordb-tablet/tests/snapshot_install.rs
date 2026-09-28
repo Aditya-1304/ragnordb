@@ -1,3 +1,7 @@
+#[path = "common/command_apply.rs"]
+mod command_apply_test_support;
+use command_apply_test_support::ApplyCommittedTestCommand;
+
 use std::{
     fs, process,
     sync::atomic::{AtomicU64, Ordering},
@@ -51,7 +55,8 @@ fn target() -> TabletSnapshotInstallTarget {
 
 fn snapshot_image() -> TabletSnapshotImage {
     let tablet = Tablet::new(TabletId(31), TableId(9)).unwrap();
-    let mut state_machine = TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap();
+    let mut state_machine =
+        TabletStateMachine::new_local_reference(tablet, 4, RaftGroupId(17)).unwrap();
 
     state_machine.apply_committed_at(request(), 1, 1).unwrap();
     for index in 2..=12 {

@@ -20,7 +20,7 @@ use ragnordb_tablet::{
 fn state_machine() -> TabletStateMachine {
     let tablet = Tablet::new(TabletId(31), TableId(9)).unwrap();
 
-    TabletStateMachine::new(tablet, 4, RaftGroupId(17)).unwrap()
+    TabletStateMachine::new_local_reference(tablet, 4, RaftGroupId(17)).unwrap()
 }
 
 fn conf_state() -> TabletSnapshotConfState {

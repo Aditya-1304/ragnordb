@@ -1,3 +1,7 @@
+#[path = "common/command_apply.rs"]
+mod command_apply_test_support;
+use command_apply_test_support::ApplyCommittedTestCommand;
+
 use std::collections::BTreeMap;
 
 use ragnordb_common::{
