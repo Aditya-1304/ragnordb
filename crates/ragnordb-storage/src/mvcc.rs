@@ -43,10 +43,11 @@ use std::{
 use crate::{
     key::decode_row_key,
     lsm::{
-        DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES, DEFAULT_TABLET_IMMUTABLE_HARD_BYTES,
-        DEFAULT_TABLET_IMMUTABLE_HARD_COUNT, DEFAULT_TABLET_IMMUTABLE_SOFT_BYTES,
-        DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT, MemoryClass, MemoryReservation, MemtablePressure,
-        NodeMemtableBudget, RecoveryFrontier, memory::MemtableCharge,
+        CommandGenerationMetadata, DEFAULT_TABLET_ACTIVE_MEMTABLE_BYTES,
+        DEFAULT_TABLET_IMMUTABLE_HARD_BYTES, DEFAULT_TABLET_IMMUTABLE_HARD_COUNT,
+        DEFAULT_TABLET_IMMUTABLE_SOFT_BYTES, DEFAULT_TABLET_IMMUTABLE_SOFT_COUNT, MemoryClass,
+        MemoryReservation, MemtablePressure, NodeMemtableBudget, RecoveryFrontier,
+        memory::MemtableCharge,
     },
 };
 use prost::Message;
@@ -561,6 +562,28 @@ pub trait MvccBackend: MvccReadGeneration {
         self.publish_atomic(delta)
     }
 
+    /// Determine whether a complete tablet command needs the current active
+    /// MVCC generation frozen before its edits are applied. The tablet owner
+    /// makes this decision because it owns the matching command metadata.
+    fn command_generation_requires_freeze(&self, _delta: &MvccDelta) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Publish MVCC edits together with the metadata for the same command
+    /// generation. `freeze_active` is decided by the complete tablet owner and
+    /// passed back here only to move the matching MVCC records and metadata.
+    fn publish_command_generation_with_reservation(
+        &mut self,
+        _delta: MvccDelta,
+        _metadata: CommandGenerationMetadata,
+        _freeze_active: bool,
+        _reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "complete tablet command-generation publication is not supported by this backend",
+        ))
+    }
+
     /// Pin a stable view for serving reads, snapshot export, and compaction.
     fn pin_generation(&self) -> Result<Self::PinnedGeneration>;
 
@@ -967,6 +990,28 @@ pub trait MvccStorage {
         self.publish_mvcc_delta(delta)
     }
 
+    /// Ask the tablet owner whether applying this command requires freezing
+    /// the currently active MVCC generation.
+    fn command_generation_requires_freeze(&self, _delta: &MvccDelta) -> Result<bool> {
+        Err(Error::NotImplemented(
+            "complete tablet generation rollover planning is not supported by this backend",
+        ))
+    }
+
+    /// Publish one command's MVCC and metadata changes into the same active
+    /// generation, freezing the previous complete generation when requested.
+    fn publish_command_generation_with_reservation(
+        &mut self,
+        _delta: MvccDelta,
+        _metadata: CommandGenerationMetadata,
+        _freeze_active: bool,
+        _reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "complete tablet command-generation publication is not supported by this backend",
+        ))
+    }
+
     /// commit one previously installed distributed transaction intent
     ///
     /// an exact replay succeeds without creating a second write version. A
@@ -1075,6 +1120,16 @@ pub struct InMemoryMvccBackend {
     /// Frozen generations remain owned by this tablet until a later storage
     /// stage can publish their records into a durable serving generation.
     immutable_memtables: VecDeque<ImmutableMemtable>,
+    /// Ordered command metadata belonging to the active MVCC generation.
+    active_command_metadata: Option<CommandGenerationMetadata>,
+    /// Metadata for the command currently being published through the tablet
+    /// owner. It is consumed only after the MVCC edits have passed validation.
+    pending_command_metadata: Option<CommandGenerationMetadata>,
+    /// Rollover decision made by the complete tablet-generation owner.
+    pending_freeze_decision: Option<bool>,
+    /// Once this backend participates in replicated tablet publication, reject
+    /// later MVCC-only edits that could separate rows from command metadata.
+    command_generation_mode: bool,
     immutable_memtable_bytes: usize,
     immutable_memtable_limit_bytes: usize,
     immutable_memtable_count_limit: usize,
@@ -1098,6 +1153,9 @@ struct ImmutableMemtable {
     writes: BTreeMap<Vec<u8>, BTreeMap<Timestamp, WriteRecord>>,
     default_tombstones: BTreeSet<(Vec<u8>, Timestamp)>,
     lock_tombstones: BTreeSet<Vec<u8>>,
+    /// Complete non-MVCC command transitions represented by this frozen
+    /// generation, in the same Raft order as its MVCC records.
+    command_metadata: Option<CommandGenerationMetadata>,
     _charge: Option<MemtableCharge>,
 }
 
@@ -1109,6 +1167,7 @@ impl ImmutableMemtable {
             writes: self.writes.clone(),
             default_tombstones: self.default_tombstones.clone(),
             lock_tombstones: self.lock_tombstones.clone(),
+            command_metadata: self.command_metadata.clone(),
             _charge: None,
         }
     }
@@ -2633,6 +2692,25 @@ impl<B: MvccBackend> MvccStorage for MvccEngine<B> {
             .publish_atomic_with_reservation(delta, reservation)
     }
 
+    fn command_generation_requires_freeze(&self, delta: &MvccDelta) -> Result<bool> {
+        self.backend.command_generation_requires_freeze(delta)
+    }
+
+    fn publish_command_generation_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        metadata: CommandGenerationMetadata,
+        freeze_active: bool,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        self.backend.publish_command_generation_with_reservation(
+            delta,
+            metadata,
+            freeze_active,
+            reservation,
+        )
+    }
+
     fn commit_intent(
         &mut self,
         txn_id: TxnId,
@@ -3321,6 +3399,13 @@ impl InMemoryMvccBackend {
         })
     }
 
+    fn command_generation_requires_freeze(&self, delta: &MvccDelta) -> Result<bool> {
+        if self.memtable_budget.is_none() {
+            return Ok(false);
+        }
+        Ok(self.projected_memtable_bytes(delta)? > self.memtable_limit_bytes)
+    }
+
     fn immutable_has_default(&self, key: &[u8], start_ts: Timestamp) -> bool {
         for memtable in self.immutable_memtables.iter().rev() {
             let identity = (key.to_vec(), start_ts);
@@ -3481,6 +3566,7 @@ impl InMemoryMvccBackend {
             writes: std::mem::take(&mut self.writes),
             default_tombstones: std::mem::take(&mut self.default_tombstones),
             lock_tombstones: std::mem::take(&mut self.lock_tombstones),
+            command_metadata: std::mem::take(&mut self.active_command_metadata),
             _charge: self.memtable_charge.take(),
         };
         self.immutable_memtable_bytes += bytes;
@@ -3727,6 +3813,13 @@ impl MvccBackend for InMemoryMvccBackend {
         delta: MvccDelta,
         mut admission_reservation: Option<MemoryReservation>,
     ) -> Result<()> {
+        if self.command_generation_mode && self.pending_command_metadata.is_none() {
+            return Err(Error::InvalidArgument(
+                "replicated tablet MVCC edits must publish with complete command metadata"
+                    .to_string(),
+            ));
+        }
+
         let mut changed_records = BTreeSet::new();
         for edit in &delta.edits {
             let (family, key, timestamp) = match edit {
@@ -3772,37 +3865,52 @@ impl MvccBackend for InMemoryMvccBackend {
             }
         }
 
-        let (next_memtable_bytes, required_growth_bytes, freeze_active) = if let Some(_budget) =
-            &self.memtable_budget
-        {
-            let next_bytes = self.projected_memtable_bytes(&delta)?;
-            if next_bytes > self.memtable_limit_bytes {
-                let fresh_bytes = self.projected_after_freeze(&delta)?;
-                if fresh_bytes > self.memtable_limit_bytes {
-                    return Err(Error::TabletUnavailable {
-                        reason: format!(
-                            "tablet command needs {fresh_bytes} active memtable bytes with a {}-byte limit",
-                            self.memtable_limit_bytes
-                        ),
-                    });
+        let (next_memtable_bytes, required_growth_bytes, freeze_active, requires_freeze) =
+            if let Some(_budget) = &self.memtable_budget {
+                let next_bytes = self.projected_memtable_bytes(&delta)?;
+                if next_bytes > self.memtable_limit_bytes {
+                    let fresh_bytes = self.projected_after_freeze(&delta)?;
+                    if fresh_bytes > self.memtable_limit_bytes {
+                        return Err(Error::TabletUnavailable {
+                            reason: format!(
+                                "tablet command needs {fresh_bytes} active memtable bytes with a {}-byte limit",
+                                self.memtable_limit_bytes
+                            ),
+                        });
+                    }
+                    let current_bytes = self
+                        .memtable_charge
+                        .as_ref()
+                        .map_or(0, MemtableCharge::bytes);
+                    if current_bytes > 0 {
+                        self.validate_freeze_capacity(current_bytes)?;
+                    }
+                    (fresh_bytes, fresh_bytes, current_bytes > 0, true)
+                } else {
+                    let current_bytes = self
+                        .memtable_charge
+                        .as_ref()
+                        .map_or(0, MemtableCharge::bytes);
+                    (
+                        next_bytes,
+                        next_bytes.saturating_sub(current_bytes),
+                        false,
+                        false,
+                    )
                 }
-                let current_bytes = self
-                    .memtable_charge
-                    .as_ref()
-                    .map_or(0, MemtableCharge::bytes);
-                if current_bytes > 0 {
-                    self.validate_freeze_capacity(current_bytes)?;
-                }
-                (fresh_bytes, fresh_bytes, current_bytes > 0)
             } else {
-                let current_bytes = self
-                    .memtable_charge
-                    .as_ref()
-                    .map_or(0, MemtableCharge::bytes);
-                (next_bytes, next_bytes.saturating_sub(current_bytes), false)
+                (0, 0, false, false)
+            };
+
+        let freeze_active = if let Some(owner_decision) = self.pending_freeze_decision {
+            if owner_decision != requires_freeze {
+                return Err(Error::InvalidArgument(
+                    "tablet generation freeze decision changed after projection".to_string(),
+                ));
             }
+            owner_decision && freeze_active
         } else {
-            (0, 0, false)
+            freeze_active
         };
 
         let growth_reservation = if required_growth_bytes == 0 {
@@ -3886,7 +3994,61 @@ impl MvccBackend for InMemoryMvccBackend {
             )?;
         }
 
+        if let Some(metadata) = self.pending_command_metadata.take() {
+            if let Some(active) = &mut self.active_command_metadata {
+                active.absorb(metadata);
+            } else {
+                self.active_command_metadata = Some(metadata);
+            }
+            self.command_generation_mode = true;
+        }
+        self.pending_freeze_decision = None;
+
         Ok(())
+    }
+
+    fn command_generation_requires_freeze(&self, delta: &MvccDelta) -> Result<bool> {
+        InMemoryMvccBackend::command_generation_requires_freeze(self, delta)
+    }
+
+    fn publish_command_generation_with_reservation(
+        &mut self,
+        delta: MvccDelta,
+        metadata: CommandGenerationMetadata,
+        freeze_active: bool,
+        reservation: Option<MemoryReservation>,
+    ) -> Result<()> {
+        let required_freeze = self.command_generation_requires_freeze(&delta)?;
+        if freeze_active != required_freeze {
+            return Err(Error::InvalidArgument(
+                "tablet generation freeze decision does not match the prepared MVCC projection"
+                    .to_string(),
+            ));
+        }
+        if self.pending_command_metadata.is_some() {
+            return Err(Error::InvalidArgument(
+                "another tablet command generation is already being published".to_string(),
+            ));
+        }
+        if self
+            .active_command_metadata
+            .as_ref()
+            .is_some_and(|active| active.storage_identity != metadata.storage_identity)
+        {
+            return Err(Error::InvalidArgument(
+                "tablet command metadata changed replica identity within one active generation"
+                    .to_string(),
+            ));
+        }
+
+        self.pending_command_metadata = Some(metadata);
+        self.pending_freeze_decision = Some(freeze_active);
+        let result = self.publish_atomic_with_reservation(delta, reservation);
+        if result.is_err() {
+            self.pending_command_metadata.take();
+            self.pending_freeze_decision = None;
+        }
+        result
     }
 
     fn pin_generation(&self) -> Result<Self::PinnedGeneration> {
@@ -3899,6 +4061,10 @@ impl MvccBackend for InMemoryMvccBackend {
             writes: self.writes.clone(),
             default_tombstones: self.default_tombstones.clone(),
             lock_tombstones: self.lock_tombstones.clone(),
+            active_command_metadata: self.active_command_metadata.clone(),
+            pending_command_metadata: None,
+            pending_freeze_decision: None,
+            command_generation_mode: self.command_generation_mode,
             immutable_memtables: self
                 .immutable_memtables
                 .iter()
@@ -4171,10 +4337,21 @@ fn scan_lower_bound(start: Option<&[u8]>, resume_after: Option<&[u8]>) -> Bound<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsm::{
+        CommandGenerationMetadata, LegacyOutcomeEdit, LogicalOutcomeEdit, RetryFloorEdit,
+        TabletStorageIdentity, TxnStatusEdit,
+    };
     use ragnordb_common::{
-        codec::{Row, Value},
+        codec::{Row, TxnStatus, TxnStatusRecord, Value},
+        command_codec::{
+            CachedTabletCommandOutcome, CachedTabletCommandRejection,
+            CachedTabletCommandRejectionKind, CachedTabletCommandResult,
+        },
         encoding::encode_row,
-        ids::TableId,
+        ids::{
+            ClientRequestId, CommandKind, LogicalCommandId, RaftGroupId, ReplicaId, TableId,
+            TabletId, TxnId,
+        },
     };
 
     use crate::key::{encode_row_key, make_row_key};
@@ -4372,6 +4549,160 @@ mod tests {
         assert_eq!(
             storage.get_default_record(&key, Timestamp(3)).unwrap(),
             None
+        );
+    }
+
+    /// Regression: a freeze triggered by a later row edit must retain the
+    /// earlier status, retry, identity, and frontier transitions for the same
+    /// serving generation instead of freezing MVCC records alone.
+    #[test]
+    fn rollover_keeps_command_metadata_with_its_mvcc_generation() {
+        let node_budget = crate::lsm::NodeMemtableBudget::new(4096).unwrap();
+        let mut storage = InMemoryMvcc::with_memtable_budget(node_budget, 300).unwrap();
+        let identity = TabletStorageIdentity {
+            tablet_id: TabletId(1),
+            table_id: TableId(1),
+            raft_group_id: RaftGroupId(1),
+            replica_id: ReplicaId(1),
+        };
+        let key = encoded_key(31);
+        let status = TxnStatusRecord {
+            txn_id: TxnId(31),
+            start_timestamp: Timestamp(31),
+            commit_timestamp: None,
+            status: TxnStatus::Pending,
+            primary_key: key.clone(),
+            participant_tablet_ids: vec![TabletId(1).0],
+            last_heartbeat_timestamp: None,
+            lease_deadline_ms: None,
+        };
+        let logical_id = LogicalCommandId {
+            client_request_id: ClientRequestId {
+                client_id: 31,
+                session_epoch: 1,
+                request_sequence: 1,
+            },
+            command_ordinal: 1,
+            kind: CommandKind::Prewrite,
+        };
+        let metadata = CommandGenerationMetadata {
+            storage_identity: identity,
+            transaction_status_edits: vec![TxnStatusEdit::Put {
+                txn_id: status.txn_id,
+                status,
+            }],
+            logical_outcome_edits: vec![LogicalOutcomeEdit::Put {
+                id: logical_id,
+                outcome: CachedTabletCommandOutcome::Rejected(CachedTabletCommandRejection {
+                    kind: CachedTabletCommandRejectionKind::WriteConflict,
+                    reason: "cached conflict".to_string(),
+                }),
+            }],
+            legacy_outcome_edits: vec![LegacyOutcomeEdit::Put {
+                client_id: 31,
+                last_sequence_applied: 1,
+                outcome: CachedTabletCommandOutcome::Applied(CachedTabletCommandResult::Noop),
+            }],
+            retry_floor_edits: vec![RetryFloorEdit::Advance {
+                client_id: 31,
+                session_epoch: 1,
+                acknowledged_through: 1,
+            }],
+            frontier: RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: RaftGroupId(1),
+                replica_id: ReplicaId(1),
+                applied_index: 1,
+                applied_term: 3,
+            },
+        };
+        let first = MvccDelta::default();
+        assert!(!storage.command_generation_requires_freeze(&first).unwrap());
+        storage
+            .publish_command_generation_with_reservation(first, metadata.clone(), false, None)
+            .unwrap();
+        assert!(storage.publish_mvcc_delta(MvccDelta::default()).is_err());
+
+        let second = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: key.clone(),
+                start_ts: Timestamp(31),
+                row: encoded_row(31, &"a".repeat(64)),
+            }],
+        };
+        let second_metadata = CommandGenerationMetadata {
+            storage_identity: identity,
+            transaction_status_edits: Vec::new(),
+            logical_outcome_edits: Vec::new(),
+            legacy_outcome_edits: Vec::new(),
+            retry_floor_edits: Vec::new(),
+            frontier: RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: RaftGroupId(1),
+                replica_id: ReplicaId(1),
+                applied_index: 2,
+                applied_term: 3,
+            },
+        };
+        let freeze_active = storage.command_generation_requires_freeze(&second).unwrap();
+        assert!(!freeze_active);
+        storage
+            .publish_command_generation_with_reservation(
+                second,
+                second_metadata.clone(),
+                freeze_active,
+                None,
+            )
+            .unwrap();
+
+        let third = MvccDelta {
+            edits: vec![MvccRecordEdit::PutDefault {
+                key: encoded_key(32),
+                start_ts: Timestamp(32),
+                row: encoded_row(32, &"b".repeat(64)),
+            }],
+        };
+        let third_metadata = CommandGenerationMetadata {
+            storage_identity: identity,
+            transaction_status_edits: Vec::new(),
+            logical_outcome_edits: Vec::new(),
+            legacy_outcome_edits: Vec::new(),
+            retry_floor_edits: Vec::new(),
+            frontier: RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: RaftGroupId(1),
+                replica_id: ReplicaId(1),
+                applied_index: 3,
+                applied_term: 3,
+            },
+        };
+        let freeze_active = storage.command_generation_requires_freeze(&third).unwrap();
+        assert!(freeze_active);
+        storage
+            .publish_command_generation_with_reservation(
+                third,
+                third_metadata.clone(),
+                freeze_active,
+                None,
+            )
+            .unwrap();
+
+        let frozen = storage.backend.immutable_memtables.front().unwrap();
+        let mut expected_frozen_metadata = metadata.clone();
+        expected_frozen_metadata.frontier = second_metadata.frontier;
+        assert_eq!(frozen.command_metadata, Some(expected_frozen_metadata));
+        assert!(frozen.default.contains_key(&key));
+        let frozen_metadata = frozen.command_metadata.as_ref().unwrap();
+        assert_eq!(frozen_metadata.storage_identity, identity);
+        assert_eq!(
+            frozen_metadata.frontier,
+            RecoveryFrontier::ReplicatedTablet {
+                raft_group_id: RaftGroupId(1),
+                replica_id: ReplicaId(1),
+                applied_index: 2,
+                applied_term: 3,
+            }
+        );
+        assert_eq!(
+            storage.backend.active_command_metadata,
+            Some(third_metadata)
         );
     }
 

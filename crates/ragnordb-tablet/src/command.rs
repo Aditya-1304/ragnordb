@@ -26,8 +26,9 @@ use ragnordb_common::{
 use ragnordb_storage::{
     key::decode_row_key,
     lsm::{
-        CommandDelta, LegacyOutcomeEdit, LogicalOutcomeEdit, MAX_COMMAND_DELTA_BYTES,
-        MemoryReservation, RecoveryFrontier, RetryFloorEdit, TabletStorageIdentity, TxnStatusEdit,
+        CommandDelta, CommandGenerationMetadata, LegacyOutcomeEdit, LogicalOutcomeEdit,
+        MAX_COMMAND_DELTA_BYTES, MemoryReservation, RecoveryFrontier, RetryFloorEdit,
+        TabletStorageIdentity, TxnStatusEdit,
     },
     mvcc::{InMemoryMvcc, Mutation, MvccDelta, MvccReadGeneration, MvccStats, MvccStorage},
 };
@@ -303,14 +304,27 @@ impl<S: MvccStorage> InMemoryTabletStateBackend<S> {
             frontier,
         } = delta;
         let frontier = frontier.expect("validated command delta has a frontier");
+        let metadata = CommandGenerationMetadata {
+            storage_identity: self.storage_identity,
+            transaction_status_edits: transaction_status_edits.clone(),
+            logical_outcome_edits: logical_outcome_edits.clone(),
+            legacy_outcome_edits: legacy_outcome_edits.clone(),
+            retry_floor_edits: retry_floor_edits.clone(),
+            frontier,
+        };
+        let freeze_active = self
+            .tablet
+            .storage
+            .command_generation_requires_freeze(&mvcc)
+            .map_err(map_publication_error)?;
 
-        // MVCC publication validates all remaining physical edits before its
-        // first mutation. Metadata edits below are prevalidated map updates
-        // with no fallible work, making this owner-local method the sole
-        // visibility point for the complete tablet generation.
+        // The tablet owner decides when the current generation rolls over.
+        // MVCC receives that decision together with the command metadata, so
+        // a frozen segment contains the rows and retry/status/frontier edits
+        // represented by exactly the same command interval.
         self.tablet
             .storage
-            .publish_mvcc_delta_with_reservation(mvcc, reservation)
+            .publish_command_generation_with_reservation(mvcc, metadata, freeze_active, reservation)
             .map_err(map_publication_error)?;
 
         for edit in transaction_status_edits {

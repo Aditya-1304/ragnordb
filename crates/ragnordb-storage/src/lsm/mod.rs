@@ -11,8 +11,8 @@ pub mod memory;
 pub mod value;
 
 pub use command_delta::{
-    CommandDelta, LegacyOutcomeEdit, LogicalOutcomeEdit, MAX_COMMAND_DELTA_BYTES, RetryFloorEdit,
-    TabletStorageIdentity, TxnStatusEdit,
+    CommandDelta, CommandGenerationMetadata, LegacyOutcomeEdit, LogicalOutcomeEdit,
+    MAX_COMMAND_DELTA_BYTES, RetryFloorEdit, TabletStorageIdentity, TxnStatusEdit,
 };
 pub use frontier::{RecoveryFrontier, RecoveryFrontierError, ReplicatedWalMapping};
 pub use memory::{

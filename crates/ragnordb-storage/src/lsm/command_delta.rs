@@ -88,6 +88,64 @@ pub struct CommandDelta {
     pub frontier: Option<RecoveryFrontier>,
 }
 
+/// Non-MVCC portion of one tablet command retained with the MVCC records in
+/// the same active or immutable memtable generation. The ordered values form
+/// the complete command history represented by that memtable, including its
+/// replica identity and exact processed frontier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandGenerationMetadata {
+    pub storage_identity: TabletStorageIdentity,
+    pub transaction_status_edits: Vec<TxnStatusEdit>,
+    pub logical_outcome_edits: Vec<LogicalOutcomeEdit>,
+    pub legacy_outcome_edits: Vec<LegacyOutcomeEdit>,
+    pub retry_floor_edits: Vec<RetryFloorEdit>,
+    pub frontier: RecoveryFrontier,
+}
+
+impl CommandGenerationMetadata {
+    /// Fold a validated transition into this generation's sparse metadata
+    /// projection, retaining only the latest edit for each logical identity.
+    pub(crate) fn absorb(&mut self, transition: Self) {
+        debug_assert_eq!(self.storage_identity, transition.storage_identity);
+
+        for edit in transition.transaction_status_edits {
+            let TxnStatusEdit::Put { txn_id, .. } = &edit;
+            self.transaction_status_edits.retain(|existing| {
+                !matches!(existing, TxnStatusEdit::Put { txn_id: old_id, .. } if old_id == txn_id)
+            });
+            self.transaction_status_edits.push(edit);
+        }
+        for edit in transition.logical_outcome_edits {
+            let id = match &edit {
+                LogicalOutcomeEdit::Put { id, .. } | LogicalOutcomeEdit::Delete { id } => id,
+            };
+            self.logical_outcome_edits.retain(|existing| {
+                !matches!(existing, LogicalOutcomeEdit::Put { id: old_id, .. } | LogicalOutcomeEdit::Delete { id: old_id } if old_id == id)
+            });
+            self.logical_outcome_edits.push(edit);
+        }
+        for edit in transition.legacy_outcome_edits {
+            let LegacyOutcomeEdit::Put { client_id, .. } = &edit;
+            self.legacy_outcome_edits.retain(|existing| {
+                !matches!(existing, LegacyOutcomeEdit::Put { client_id: old_id, .. } if old_id == client_id)
+            });
+            self.legacy_outcome_edits.push(edit);
+        }
+        for edit in transition.retry_floor_edits {
+            let RetryFloorEdit::Advance {
+                client_id,
+                session_epoch,
+                ..
+            } = &edit;
+            self.retry_floor_edits.retain(|existing| {
+                !matches!(existing, RetryFloorEdit::Advance { client_id: old_client, session_epoch: old_epoch, .. } if old_client == client_id && old_epoch == session_epoch)
+            });
+            self.retry_floor_edits.push(edit);
+        }
+        self.frontier = transition.frontier;
+    }
+}
+
 impl CommandDelta {
     /// Build a metadata-only transition, commonly used by a deterministic
     /// rejection or a committed no-op that still advances applied progress.
